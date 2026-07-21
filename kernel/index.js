@@ -37,6 +37,7 @@ const PinokioDomainRouter = require("./router/pinokio_domain_router")
 const Procs = require('./procs')
 const Peer = require('./peer')
 const Git = require('./git')
+const Vault = require('./vault')
 const Connect = require('./connect')
 const Favicon = require('./favicon')
 const AppLauncher = require('./app_launcher')
@@ -1215,6 +1216,29 @@ class Kernel {
       console.time("git.loadCheckpoints")
       await this.git.loadCheckpoints()
       console.timeEnd("git.loadCheckpoints")
+
+      // Shared model store: registry verification only at startup — never a
+      // discovery walk (spec/requirements/shared-model-store.md, trigger 5).
+      this.vault = new Vault(this)
+      if (this.homedir) {
+        this.vault.ready = this.vault.init({ existingOnly: true }).then(async (result) => {
+          if (result && result.enabled && this.vault.initialized) {
+            this.vault.verificationPending = true
+            await this.vault.runExclusive(async () => {
+              await this.vault.verify()
+              await this.vault.registry.flush()
+            })
+            this.vault.verificationPending = false
+          }
+          return result
+        }).catch((err) => {
+          // Keep an enabled Vault retryable after transient registry or
+          // filesystem errors. A genuinely disabled Vault already has
+          // enabled=false from its environment check.
+          console.warn("Vault init error:", err && err.message ? err.message : err)
+          return { enabled: false, error: err && err.message ? err.message : String(err) }
+        })
+      }
 
 //      let contents = await fs.promises.readdir(this.homedir)
       //await this.bin.init()

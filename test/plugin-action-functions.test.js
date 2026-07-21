@@ -77,6 +77,19 @@ test("resolveActionSteps preserves array actions without changing launcher synta
   })
 })
 
+test("running request ids retain their authoritative script paths", () => {
+  const api = new Api(createKernel())
+  const request = { id: "custom-run-id", path: "/pinokio/api/demo/start.js" }
+
+  api.setRunning(request, () => {})
+  assert.equal(api.running[request.id], true)
+  assert.equal(api.running_paths[request.id], request.path)
+
+  api.clearRunning(request)
+  assert.equal(api.running[request.id], undefined)
+  assert.equal(api.running_paths[request.id], undefined)
+})
+
 test("resolveActionSteps executes function actions once per request and clears cached steps", async () => {
   const api = new Api(createKernel())
   const request = { id: "function-request", path: "/pinokio/api/demo/plugin/pinokio.js" }
@@ -311,6 +324,7 @@ test("step clears resolved function actions when an RPC returns an error", async
     }
     const steps = [{ method: "test.fail" }]
     api.running[request.id] = true
+    api.running_paths[request.id] = request.path
     api.resolved_actions[request.id] = { actionKey: "run", steps }
     api.resolveScript = async () => ({
       cwd: appDir,
@@ -328,6 +342,8 @@ test("step clears resolved function actions when an RPC returns an error", async
     await api.step(request, steps[0], {}, 0, 1, {})
 
     assert.equal(api.resolved_actions[request.id], undefined)
+    assert.equal(api.running[request.id], true)
+    assert.equal(api.running_paths[request.id], request.path)
   })
 })
 
@@ -339,6 +355,7 @@ test("step clears resolved function actions when an RPC throws", async () => {
     }
     const steps = [{ method: "test.throw" }]
     api.running[request.id] = true
+    api.running_paths[request.id] = request.path
     api.resolved_actions[request.id] = { actionKey: "run", steps }
     api.resolveScript = async () => ({
       cwd: appDir,
@@ -361,5 +378,7 @@ test("step clears resolved function actions when an RPC throws", async () => {
     }
 
     assert.equal(api.resolved_actions[request.id], undefined)
+    assert.equal(api.running[request.id], true)
+    assert.equal(api.running_paths[request.id], request.path)
   })
 })

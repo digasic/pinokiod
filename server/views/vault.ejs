@@ -1,0 +1,72 @@
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<link href="/css/fontawesome.min.css" rel="stylesheet">
+<link href="/css/solid.min.css" rel="stylesheet">
+<link href="/css/regular.min.css" rel="stylesheet">
+<link href="/css/brands.min.css" rel="stylesheet">
+<link href="/noty.css" rel="stylesheet"/>
+<link href="/style.css" rel="stylesheet"/>
+<link href="/task-launcher.css" rel="stylesheet"/>
+<% if (agent === "electron") { %>
+  <link href="/electron.css" rel="stylesheet"/>
+<% } %>
+<link href="/vault.css" rel="stylesheet"/>
+</head>
+<body class='<%=theme%> main-sidebar-page task-launcher-page task-page vault-page' data-agent="<%=agent%>">
+<%- include('partials/app_navheader', { agent }) %>
+<main>
+  <div class='task-container'>
+      <section class='task-shell vault-shell'>
+      <div class='task-shell-body'>
+        <div class='vault-body'>
+          <section class='vault-overview'>
+            <div class='vault-metrics' id='vault-metrics'></div>
+            <div class='vault-overview-actions'>
+              <button class='vault-button primary' id='btn-scan' type='button'></button>
+              <details class='vault-advanced' id='vault-advanced'>
+                <summary class='vault-icon-button' id='btn-vault-options'><i class='fa-solid fa-ellipsis'></i></summary>
+                <div class='vault-advanced-menu'>
+                  <div class='vault-advanced-title' id='vault-repair-title'></div>
+                  <p class='vault-advanced-copy' id='vault-repair-description'></p>
+                  <button class='vault-button' id='btn-repair' type='button'></button>
+                </div>
+              </details>
+            </div>
+          </section>
+          <div class='vault-scan-state' id='vault-scan-state' aria-live='polite'></div>
+          <div class='vault-result' id='vault-result' role='status' aria-live='polite'></div>
+          <div class='vault-feedback' id='vault-feedback' role='status' aria-live='polite'></div>
+          <div class='vault-cloud-warning' id='vault-cloud-warning' role='status'></div>
+          <section class='vault-explorer' id='vault-explorer'>
+            <aside class='vault-rail'>
+              <div class='vault-rail-section'>
+                <div class='vault-rail-label' id='views-label'></div>
+                <div class='vault-nav-list' id='vault-views'></div>
+              </div>
+              <div class='vault-rail-section'>
+                <div class='vault-rail-heading'>
+                  <div class='vault-rail-label' id='locations-label'></div>
+                  <button class='vault-rail-add' id='btn-add-source' type='button'><i class='fa-solid fa-plus'></i></button>
+                </div>
+                <div id='vault-locations'></div>
+              </div>
+              <div class='vault-rail-footer' id='vault-rail-footer'></div>
+            </aside>
+            <section class='vault-pane' id='vault-pane'>
+              <div class='vault-toolbar' id='vault-toolbar'></div>
+              <div class='vault-table-wrap' id='vault-table-wrap'></div>
+              <footer class='vault-pane-footer' id='vault-pane-footer'></footer>
+            </section>
+          </section>
+        </div>
+      </div>
+    </section>
+  </div>
+  <%- include('partials/main_sidebar', { selected: 'vault' }) %>
+</main>
+<script src="/Socket.js"></script>
+<script src="/vault.js"></script>
+</body>
+</html>

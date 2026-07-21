@@ -66,7 +66,7 @@ function assertKnownAsset(relativePath) {
   return normalized
 }
 
-function isInstallRequestAllowed(req) {
+function isSameOriginRequest(req) {
   const fetchSite = String(req && typeof req.get === 'function' ? req.get('Sec-Fetch-Site') || '' : '').trim().toLowerCase()
   if (fetchSite && fetchSite !== 'same-origin' && fetchSite !== 'none') {
     return false
@@ -89,6 +89,8 @@ function isInstallRequestAllowed(req) {
     return false
   }
 }
+
+const isInstallRequestAllowed = isSameOriginRequest
 
 function assetPath(kernel, relativePath) {
   const normalized = assertKnownAsset(relativePath)
@@ -280,6 +282,7 @@ module.exports = {
   normalizeDtype,
   cacheRoot,
   modelRoot,
+  isSameOriginRequest,
   isInstallRequestAllowed,
   status,
   ensure

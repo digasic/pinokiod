@@ -110,6 +110,7 @@ test('privacy filter cache install endpoint accepts only same-origin browser wri
   const { mod, restore } = loadCacheWithAxiosMock({ get: async () => ({ data: Readable.from(['']) }) })
   try {
     assert.equal(mod.isInstallRequestAllowed(fakeRequest({})), true)
+    assert.strictEqual(mod.isSameOriginRequest, mod.isInstallRequestAllowed)
     assert.equal(mod.isInstallRequestAllowed(fakeRequest({
       Host: 'localhost:42000',
       Origin: 'http://localhost:42000',

@@ -6664,6 +6664,10 @@ class Server {
 
     this.started = false
     this.app = express();
+    this.app.use((req, res, next) => {
+      res.locals.vaultEnabled = !!(this.kernel.vault && this.kernel.vault.enabled)
+      next()
+    })
     this.app.use(cors({
       origin: '*'
     }));
@@ -15732,6 +15736,62 @@ class Server {
 //    }))
 
 
+    // Vault dashboard data: registry-backed with bounded per-blob stats,
+    // never a discovery walk. Scans run ONLY via the explicit action below.
+    this.app.get("/info/dedup", ex(async (req, res) => {
+      if (!privacyFilterCache.isSameOriginRequest(req)) {
+        res.sendStatus(403)
+        return
+      }
+      const vault = this.kernel.vault
+      if (vault && vault.ready) await vault.ready
+      if (!vault || !vault.enabled) {
+        res.sendStatus(404)
+        return
+      }
+      await vault.ensureInitialized()
+      res.set("Cache-Control", "no-store")
+      if (req.query && req.query.progress === "1") {
+        res.json(vault.progressStatus())
+        return
+      }
+      res.json(await vault.status())
+    }))
+    this.app.get("/vault", ex(async (req, res) => {
+      const vault = this.kernel.vault
+      if (vault && vault.ready) await vault.ready
+      if (!vault || !vault.enabled) {
+        res.sendStatus(404)
+        return
+      }
+      const { install_required, requirements_pending } = await this.kernel.bin.check({
+        bin: this.kernel.bin.preset("dev"),
+      })
+      if (requirements_pending || install_required) {
+        res.redirect(`/setup/dev?callback=${encodeURIComponent(req.originalUrl)}`)
+        return
+      }
+      await vault.ensureInitialized()
+      res.render("vault", { theme: this.theme, agent: req.agent })
+    }))
+    this.app.post("/vault/action", ex(async (req, res) => {
+      if (!privacyFilterCache.isSameOriginRequest(req)) {
+        res.sendStatus(403)
+        return
+      }
+      const vault = this.kernel.vault
+      if (vault && vault.ready) await vault.ready
+      if (!vault || !vault.enabled) {
+        res.sendStatus(404)
+        return
+      }
+      const body = req.body || {}
+      try {
+        res.json(await vault.perform(body.action, body))
+      } catch (e) {
+        res.json({ error: e && e.message ? e.message : String(e) })
+      }
+    }))
     this.app.get("/info/scripts", ex(async (req, res) => {
     /*
       returns something like this by using the this.kernel.memory.local variable, extracting the api name and adding all running scripts in each associated array, setting the uri as the script path, and the local variables as the local attribute

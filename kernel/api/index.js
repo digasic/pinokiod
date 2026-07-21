@@ -31,6 +31,7 @@ class Api {
     this.listeners = {}
     this.counter = 0;
     this.running = {}
+    this.running_paths = {}
     this.done = {}
     this.waiter = {}
     this.proxies = {}
@@ -419,12 +420,19 @@ class Api {
       delete this.resolved_actions[id]
     }
   }
+  clearRunning(requestOrId) {
+    const id = typeof requestOrId === "string" ? requestOrId : this.requestId(requestOrId)
+    if (!id) return
+    delete this.running[id]
+    delete this.running_paths[id]
+  }
   setRunning(request, done) {
     const id = this.requestId(request)
     if (!id) {
       return
     }
     this.running[id] = true
+    this.running_paths[id] = request.path || null
     this.done[id] = done
     if (this.kernel && typeof this.kernel.markAppLaunchStarted === "function") {
       this.kernel.markAppLaunchStarted(request.path)
@@ -634,7 +642,7 @@ class Api {
     if (req.params.id) stoppedKeys.add(req.params.id)
     stoppedKeys.add(requestPath)
     for (const key of stoppedKeys) {
-      delete this.running[key]
+      this.clearRunning(key)
       delete this.kernel.memory.local[key]
     }
     if (this.kernel && typeof this.kernel.markAppLaunchStopped === "function") {
@@ -1994,7 +2002,7 @@ class Api {
               })
             } catch (e) {
               this.clearResolvedAction(request)
-              delete this.running[this.requestId(request)]
+              this.clearRunning(request)
               if (this.kernel && typeof this.kernel.markAppLaunchFailed === "function") {
                 this.kernel.markAppLaunchFailed(request.path, e)
               }
@@ -2008,7 +2016,7 @@ class Api {
 
             if (!Array.isArray(steps) || steps.length === 0) {
               this.clearResolvedAction(request)
-              delete this.running[this.requestId(request)]
+              this.clearRunning(request)
               if (this.kernel && typeof this.kernel.markAppLaunchFailed === "function") {
                 this.kernel.markAppLaunchFailed(request.path, new Error(`missing or invalid attribute: ${actionKey}`))
               }
@@ -2070,6 +2078,7 @@ class Api {
       let id = request.id ? request.id : request.method 
       if (request.id) {
         this.running[request.id] = true
+        delete this.running_paths[request.id]
       }
       try {
         resolved.dirname = resolved.dirname

@@ -1618,7 +1618,8 @@ class Shell {
 
 
     if (this.kernel.api.running[this.id]) {
-      delete this.kernel.api.running[this.id]
+      if (typeof this.kernel.api.clearRunning === "function") this.kernel.api.clearRunning(this.id)
+      else delete this.kernel.api.running[this.id]
     }
     if (this.kernel.memory.local[this.id]) {
       delete this.kernel.memory.local[this.id]

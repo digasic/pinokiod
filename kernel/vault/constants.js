@@ -1,0 +1,9 @@
+module.exports = {
+  SIZE_THRESHOLD: 100 * 1024 * 1024,
+  TMP_SUFFIX: ".pinokio-dedup-tmp",
+  SHA256_RE: /^[0-9a-f]{64}$/,
+  ENTRY_BATCH_SIZE: 256,
+  DIR_CONCURRENCY: 8,
+  STAT_CONCURRENCY: 32,
+  HASH_QUEUE_LIMIT: 256
+}
