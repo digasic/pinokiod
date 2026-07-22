@@ -1990,6 +1990,9 @@ class Server {
     result.hasSnapshots = !!(options && options.hasSnapshots)
     result.pendingSnapshotId = options && options.pendingSnapshotId ? String(options.pendingSnapshotId) : null
     result.registryEnabled = registryEnabled
+    const vault = this.kernel.vault
+    if (vault && vault.ready) await vault.ready
+    result.vault_enabled = !!(vault && vault.enabled)
     if (!registryEnabled) {
       result.pendingSnapshotId = null
     }
@@ -15751,11 +15754,14 @@ class Server {
       }
       await vault.ensureInitialized()
       res.set("Cache-Control", "no-store")
+      const scopeId = req.query && typeof req.query.scope_id === "string"
+        ? req.query.scope_id
+        : null
       if (req.query && req.query.progress === "1") {
-        res.json(vault.progressStatus())
+        res.json(vault.progressStatus(scopeId))
         return
       }
-      res.json(await vault.status())
+      res.json(await vault.status(scopeId))
     }))
     this.app.get("/vault", ex(async (req, res) => {
       const vault = this.kernel.vault
@@ -15773,6 +15779,31 @@ class Server {
       }
       await vault.ensureInitialized()
       res.render("vault", { theme: this.theme, agent: req.agent })
+    }))
+    this.app.get("/vault/app/:name", ex(async (req, res) => {
+      if (!privacyFilterCache.isSameOriginRequest(req)) {
+        res.sendStatus(403)
+        return
+      }
+      const vault = this.kernel.vault
+      if (vault && vault.ready) await vault.ready
+      if (!vault || !vault.enabled) {
+        res.sendStatus(404)
+        return
+      }
+      await vault.ensureInitialized()
+      await vault.refreshSources()
+      const source = vault.sources().find((item) =>
+        item.kind === "app" && item.app === req.params.name && item.available)
+      if (!source) {
+        res.sendStatus(404)
+        return
+      }
+      res.render("vault_app", {
+        theme: this.theme,
+        agent: req.agent,
+        scope_id: source.id
+      })
     }))
     this.app.post("/vault/action", ex(async (req, res) => {
       if (!privacyFilterCache.isSameOriginRequest(req)) {

@@ -4,7 +4,7 @@ const COPY = {
   all: "All tracked files",
   duplicates: "Duplicates",
   shared: "Shared",
-  independent: "Kept independent",
+  skipped: "Skipped",
   reclaimable: "Reclaimable",
   activity: "Activity",
   add_external_folder: "Add external folder",
@@ -17,15 +17,22 @@ const COPY = {
   on_disk_help: "File managers may count shared files more than once. This is the physical space used by tracked files.",
   already_shared: "Already shared",
   already_shared_help: "Space already avoided by files sharing the same data",
+  shared_files: "Shared",
+  shared_files_help: "Size of this app’s files that share data with another tracked location",
   saved_by_vault: "Saved by Vault",
   saved_by_vault_help: "Space saved through your Deduplicate actions",
   can_save: "Can save",
   pinokio_folder: "Pinokio folder",
+  app_folder: "App folder",
+  tracked_files: "Tracked files",
   last_scanned: "Last scanned",
   never: "Never",
   scan: "Scan now",
+  scan_app: "Scan this app",
   scan_again: "Scan again",
   scanning: "Scanning…",
+  scanning_elsewhere: "Vault is scanning another location",
+  scanning_elsewhere_hint: "This app can be scanned when the current Vault scan finishes.",
   vault_options: "Vault options",
   repair_index: "Repair Vault index",
   repair_action: "Repair index",
@@ -34,6 +41,7 @@ const COPY = {
   repair_done: "Vault index repaired",
   scan_counting: "Counting files",
   scan_progress: "Scanning your configured locations",
+  scan_location: "Scanning {location}",
   scan_queued: "Waiting to start scan",
   scan_analyzing: "Analyzing large files",
   scan_finishing: "Finishing scan",
@@ -68,7 +76,7 @@ const COPY = {
   search_all: "Search tracked files",
   search_duplicates: "Search duplicates",
   search_shared: "Search shared files",
-  search_independent: "Search independent files",
+  search_skipped: "Search skipped files",
   search_activity: "Search activity",
   search_in: "Search in {location}",
   status_request_failed: "Vault status request failed ({status})",
@@ -88,7 +96,11 @@ const COPY = {
   sharing_unavailable: "Sharing is unavailable on this disk",
   permissions_differ: "File permissions differ",
   changed_since_scan: "Some files changed since the scan. Scan again before deduplicating them.",
-  undo_incomplete: "Some files could not be made independent. No existing files were overwritten.",
+  separate_locked: "Stop the app before separating this file.",
+  separate_changed: "This file changed since it was scanned. Scan again, then try again.",
+  separate_conflict: "A temporary file already exists next to this file. Vault left both files unchanged.",
+  separate_not_found: "This file is no longer tracked. Scan again to refresh this view.",
+  undo_incomplete: "Some files could not be separated. No existing files were overwritten.",
   action_not_completed: "The action could not be completed. No existing files were overwritten.",
   activity_write_failed: "The file action completed, but some activity history could not be recorded.",
   persistence_write_failed: "The file action completed, but Vault could not save its updated record yet. It will retry automatically.",
@@ -108,9 +120,9 @@ const COPY = {
   files: "files",
   location: "location",
   deduplicate: "Deduplicate",
-  ignore: "Ignore",
-  make_independent: "Make independent",
-  allow_sharing: "Allow sharing again",
+  skip: "Skip",
+  separate: "Separate",
+  include_in_scans: "Include in scans",
   reclaim: "Reclaim",
   reclaim_all: "Reclaim all",
   undo: "Undo",
@@ -123,8 +135,8 @@ const COPY = {
   no_duplicates_hint: "There are no files waiting for your review.",
   no_shared: "Nothing is shared yet",
   no_shared_hint: "Shared files will appear here after you review duplicates.",
-  no_independent: "No independent files",
-  no_independent_hint: "Files you choose to keep separate will appear here.",
+  no_skipped: "Nothing skipped",
+  no_skipped_hint: "Files you ask Vault to skip will appear here.",
   no_reclaimable: "Nothing to reclaim",
   no_reclaimable_hint: "Files no longer used by any configured location will appear here.",
   no_activity: "No activity yet",
@@ -134,23 +146,36 @@ const COPY = {
   tracked_note: "Only tracked files 100 MB and larger appear here. Files keep their current locations.",
   duplicate_note: "Only files waiting for review are shown.",
   converted: "Deduplicated",
-  ignored: "Kept independent",
+  skipped_action: "Skipped",
+  separated: "Separated",
   reclaimed: "Reclaimed",
-  allowed: "Sharing allowed again",
+  included_in_scans: "Included in scans",
   event_convert: "Deduplicated",
   event_found: "Duplicate found",
   event_adopt: "Added to your vault",
   event_reclaim: "Reclaimed",
   event_undo: "Undid deduplication",
   event_diverged: "Changed by an app — no longer shared",
-  event_detach: "Made independent",
-  event_reshare: "Sharing allowed again"
+  event_detach: "Separated",
+  event_skip: "Skipped",
+  event_reshare: "Included in scans"
 }
+
+const SCOPE_ID = document.body.dataset.vaultScope || null
+const IS_APP_MODE = document.body.dataset.vaultMode === "app" && !!SCOPE_ID
+const statusUrl = (progress = false) => {
+  const query = new URLSearchParams()
+  if (progress) query.set("progress", "1")
+  if (SCOPE_ID) query.set("scope_id", SCOPE_ID)
+  const suffix = query.toString()
+  return `/info/dedup${suffix ? `?${suffix}` : ""}`
+}
+const reviewedScanKey = `pinokio:vault:reviewed-scan:${SCOPE_ID || "global"}`
 
 const state = {
   data: null,
   view: "all",
-  sourceId: null,
+  sourceId: SCOPE_ID,
   query: "",
   statusFilter: "all",
   collapsedSources: new Set(),
@@ -213,7 +238,7 @@ const sourcePath = (source) => {
   if (!source) return ""
   if (source.kind === "pinokio") return `~/${basename(source.root)}`
   if (source.kind === "external") return source.target_path || source.display_path || ""
-  if (source.kind === "app") return ""
+  if (source.kind === "app") return IS_APP_MODE ? (source.display_path || source.root || "") : ""
   return source.display_path || source.root || ""
 }
 const isDescendantSource = (candidateId, parentId) => {
@@ -236,7 +261,10 @@ const buildItems = () => {
   const excludedPaths = new Set(data.excluded.map((item) => item.path))
   for (const blob of data.blobs) {
     const linkedNames = blob.names.filter((name) => name.mode === "link")
-    for (const name of blob.names) {
+    const visibleNames = IS_APP_MODE
+      ? blob.names.filter((name) => name.source_id === SCOPE_ID)
+      : blob.names
+    for (const name of visibleNames) {
       if (duplicatePaths.has(name.path) || excludedPaths.has(name.path)) continue
       const shared = name.mode === "link" && linkedNames.length > 1
       items.push({
@@ -307,7 +335,7 @@ const viewIcon = {
   all: "fa-regular fa-file-lines",
   duplicates: "fa-regular fa-copy",
   shared: "fa-solid fa-link",
-  independent: "fa-solid fa-code-branch",
+  independent: "fa-solid fa-circle-minus",
   reclaimable: "fa-regular fa-trash-can",
   activity: "fa-solid fa-wave-square"
 }
@@ -315,7 +343,7 @@ const viewLabel = {
   all: COPY.all,
   duplicates: COPY.duplicates,
   shared: COPY.shared,
-  independent: COPY.independent,
+  independent: COPY.skipped,
   reclaimable: COPY.reclaimable,
   activity: COPY.activity
 }
@@ -327,6 +355,7 @@ const eventLabels = {
   undo: COPY.event_undo,
   diverged: COPY.event_diverged,
   detach: COPY.event_detach,
+  skip: COPY.event_skip,
   reshare: COPY.event_reshare
 }
 const activityItems = () => {
@@ -338,7 +367,9 @@ const activityItems = () => {
 const renderViews = (items) => {
   const counts = getCounts(items)
   el("views-label").textContent = COPY.views
-  const views = ["all", "duplicates", "shared", "independent", "reclaimable", "activity"]
+  const views = IS_APP_MODE
+    ? ["all", "duplicates", "shared", "independent", "activity"]
+    : ["all", "duplicates", "shared", "independent", "reclaimable", "activity"]
   el("vault-views").innerHTML = views.map((view) => `
     <button class="vault-nav-row ${state.view === view ? "selected" : ""}" type="button" data-view="${view}" ${state.view === view ? 'aria-current="page"' : ""}>
       <i class="${viewIcon[view]}"></i>
@@ -354,7 +385,7 @@ const renderSourceNode = (source, depth, counts) => {
   })
   const duplicateCount = counts.duplicates.get(source.id) || 0
   const trackedCount = counts.tracked.get(source.id) || 0
-  if (state.view === "duplicates" && duplicateCount === 0) return ""
+  if (!IS_APP_MODE && state.view === "duplicates" && duplicateCount === 0) return ""
   const collapsed = state.collapsedSources.has(source.id)
   const pathText = source.kind === "virtual" ? (source.id === "apps" ? "api" : "") : sourcePath(source)
   const count = state.view === "duplicates" ? duplicateCount : trackedCount
@@ -382,10 +413,16 @@ const renderLocations = (items) => {
     duplicates: sourceCounts(state.data.duplicates),
     tracked: sourceCounts(items)
   }
-  let html = pinokio ? renderSourceNode(pinokio, 0, counts) : ""
-  if (external && sourceChildren("external").length) html += renderSourceNode(external, 0, counts)
+  let html
+  if (IS_APP_MODE) {
+    const source = sourceById(SCOPE_ID)
+    html = source ? renderSourceNode(source, 0, counts) : ""
+  } else {
+    html = pinokio ? renderSourceNode(pinokio, 0, counts) : ""
+    if (external && sourceChildren("external").length) html += renderSourceNode(external, 0, counts)
+  }
   el("vault-locations").innerHTML = html
-  el("vault-rail-footer").innerHTML = state.view === "duplicates"
+  el("vault-rail-footer").innerHTML = !IS_APP_MODE && state.view === "duplicates"
     ? `<button class="vault-text-button" type="button" data-view="all">${esc(COPY.show_all_locations)}</button>`
     : ""
 }
@@ -424,7 +461,7 @@ const updateToolbarSummary = (visibleItems) => {
 const searchPlaceholder = () => {
   if (state.view === "duplicates") return COPY.search_duplicates
   if (state.view === "shared") return COPY.search_shared
-  if (state.view === "independent") return COPY.search_independent
+  if (state.view === "independent") return COPY.search_skipped
   if (state.view === "activity") return COPY.search_activity
   const source = selectedSource()
   return source && source.kind === "app" ? COPY.search_in.replace("{location}", source.label) : COPY.search_all
@@ -444,7 +481,7 @@ const renderToolbar = (visibleItems) => {
       <option value="duplicate" ${state.statusFilter === "duplicate" ? "selected" : ""}>${esc(COPY.duplicates)}</option>
       <option value="shared" ${state.statusFilter === "shared" ? "selected" : ""}>${esc(COPY.shared)}</option>
       <option value="tracked" ${state.statusFilter === "tracked" ? "selected" : ""}>${esc(COPY.tracked)}</option>
-      <option value="independent" ${state.statusFilter === "independent" ? "selected" : ""}>${esc(COPY.independent)}</option>
+      <option value="independent" ${state.statusFilter === "independent" ? "selected" : ""}>${esc(COPY.skipped)}</option>
     </select>` : state.view === "duplicates" ? `<span class="vault-select">${esc(COPY.by_location)}</span>` : ""}
     <span class="vault-toolbar-count" id="vault-toolbar-summary">${esc(toolbarSummary(visibleItems))}</span>
     ${state.view === "all" ? batchAction(source) : ""}`
@@ -460,7 +497,7 @@ const statusMarkup = (item) => {
       : `<span class="vault-status"><i class="fa-regular fa-circle-xmark"></i>${esc(unavailable)}</span>`
   }
   if (item.status === "shared") return `<span class="vault-status"><i class="fa-solid fa-link"></i>${esc(COPY.shared)} · ${item.locations.length} ${esc(COPY.locations_lower)}</span>`
-  if (item.status === "independent") return `<span class="vault-status"><i class="fa-solid fa-code-branch"></i>${esc(COPY.independent)}</span>`
+  if (item.status === "independent") return `<span class="vault-status"><i class="fa-solid fa-circle-minus"></i>${esc(COPY.skipped)}</span>`
   return `<span class="vault-status"><span class="vault-status-dot"></span>${esc(COPY.tracked)}</span>`
 }
 const spaceMarkup = (item) => {
@@ -468,9 +505,10 @@ const spaceMarkup = (item) => {
   return "—"
 }
 const rowAction = (item) => {
-  if (item.status === "duplicate") return `<button class="vault-text-button" type="button" data-detach="${attr(item.path)}">${esc(COPY.ignore)}</button>`
-  if (item.status === "independent") return `<button class="vault-text-button" type="button" data-reshare="${attr(item.path)}">${esc(COPY.allow_sharing)}</button>`
-  return `<button class="vault-text-button" type="button" data-detach="${attr(item.path)}">${esc(COPY.make_independent)}</button>`
+  if (item.status === "duplicate") return `<button class="vault-text-button" type="button" data-detach="${attr(item.path)}">${esc(COPY.skip)}</button>`
+  if (item.status === "shared") return `<button class="vault-text-button" type="button" data-detach="${attr(item.path)}">${esc(COPY.separate)}</button>`
+  if (item.status === "independent") return `<button class="vault-text-button" type="button" data-reshare="${attr(item.path)}">${esc(COPY.include_in_scans)}</button>`
+  return ""
 }
 
 const fileDetail = (item) => {
@@ -596,18 +634,20 @@ const renderInventoryGroups = (items) => {
 }
 
 const emptyState = (view) => {
-  const scanning = scanActive(state.data && state.data.scan)
+  const activeScan = scanActive(state.data && state.data.scan)
+  const scanning = scanMatchesContext(state.data && state.data.scan)
   const content = {
     all: scanning
       ? [COPY.scan_waiting, COPY.scan_waiting_hint, "fa-solid fa-circle-notch fa-spin"]
       : [COPY.no_files, COPY.no_files_hint, "fa-regular fa-folder-open"],
     duplicates: [COPY.no_duplicates, COPY.no_duplicates_hint, "fa-regular fa-circle-check"],
     shared: [COPY.no_shared, COPY.no_shared_hint, "fa-solid fa-link"],
-    independent: [COPY.no_independent, COPY.no_independent_hint, "fa-solid fa-code-branch"],
+    independent: [COPY.no_skipped, COPY.no_skipped_hint, "fa-solid fa-circle-minus"],
     reclaimable: [COPY.no_reclaimable, COPY.no_reclaimable_hint, "fa-regular fa-circle-check"],
     activity: [COPY.no_activity, COPY.no_activity_hint, "fa-solid fa-wave-square"]
   }[view]
-  return `<div class="vault-empty"><div class="vault-empty-inner"><i class="${content[2]}"></i><h3>${esc(content[0])}</h3><p>${esc(content[1])}</p>${view === "duplicates" ? `<button class="vault-button" type="button" data-view="all">${esc(COPY.view_all)}</button>` : view === "all" && !scanning ? `<button class="vault-button" type="button" id="btn-empty-scan">${esc(COPY.scan)}</button>` : ""}</div></div>`
+  const scanLabel = IS_APP_MODE ? COPY.scan_app : COPY.scan
+  return `<div class="vault-empty"><div class="vault-empty-inner"><i class="${content[2]}"></i><h3>${esc(content[0])}</h3><p>${esc(content[1])}</p>${view === "duplicates" ? `<button class="vault-button" type="button" data-view="all">${esc(COPY.view_all)}</button>` : view === "all" && !activeScan ? `<button class="vault-button" type="button" id="btn-empty-scan">${esc(scanLabel)}</button>` : ""}</div></div>`
 }
 
 const renderReclaimable = () => {
@@ -662,22 +702,46 @@ const renderTable = (items) => {
 const renderOverview = () => {
   const data = state.data
   const last = data.last_scan
-  const folderMetric = last ? `<div class="vault-metric"><span class="vault-metric-value">${fmt(last.home_bytes_total == null ? last.bytes_total : last.home_bytes_total)}</span><span class="vault-metric-label">${esc(COPY.pinokio_folder)}</span></div>` : ""
-  el("vault-metrics").innerHTML = `${folderMetric}
-    <div class="vault-metric" title="${attr(`${COPY.on_disk_help} ${fmt(data.bytes_without_sharing)} ${COPY.without_sharing}.`)}"><span class="vault-metric-value">${fmt(data.bytes_on_disk)}</span><span class="vault-metric-label">${esc(COPY.on_disk)}</span></div>
-    <div class="vault-metric" title="${attr(COPY.already_shared_help)}"><span class="vault-metric-value">${fmt(data.saved_by_sharing)}</span><span class="vault-metric-label">${esc(COPY.already_shared)}</span></div>
-    <div class="vault-metric" title="${attr(COPY.saved_by_vault_help)}"><span class="vault-metric-value">${fmt(data.lifetime_bytes_saved)}</span><span class="vault-metric-label">${esc(COPY.saved_by_vault)}</span></div>
-    <button class="vault-metric" type="button" id="btn-review-metric" aria-label="${attr(`${COPY.can_save}: ${fmt(data.pending_bytes)}. ${COPY.review} ${COPY.duplicates.toLowerCase()}.`)}"><span class="vault-metric-value">${fmt(data.pending_bytes)}</span><span class="vault-metric-label">${esc(COPY.can_save)}</span></button>
-    <div class="vault-metric"><span class="vault-metric-value">${esc(timeAgo(last && last.ts))}</span><span class="vault-metric-label">${esc(COPY.last_scanned)}</span></div>`
-  const scanning = scanActive(data.scan)
-  el("btn-scan").innerHTML = scanning ? `<i class="fa-solid fa-circle-notch fa-spin"></i>${esc(COPY.scanning)}` : `<i class="fa-solid fa-rotate"></i>${esc(last ? COPY.scan_again : COPY.scan)}`
-  el("btn-scan").disabled = !!scanning
-  el("btn-vault-options").setAttribute("aria-label", COPY.vault_options)
-  el("vault-repair-title").textContent = COPY.repair_index
-  el("vault-repair-description").textContent = COPY.repair_description
-  el("btn-repair").textContent = COPY.repair_action
-  el("btn-repair").disabled = !!scanning
+  if (IS_APP_MODE) {
+    el("vault-metrics").innerHTML = `
+      <div class="vault-metric"><span class="vault-metric-value">${last ? fmt(last.bytes_total) : "—"}</span><span class="vault-metric-label">${esc(COPY.app_folder)}</span></div>
+      <div class="vault-metric"><span class="vault-metric-value">${fmt(data.tracked_bytes)}</span><span class="vault-metric-label">${esc(COPY.tracked_files)}</span></div>
+      <div class="vault-metric" title="${attr(COPY.shared_files_help)}"><span class="vault-metric-value">${fmt(data.shared_bytes)}</span><span class="vault-metric-label">${esc(COPY.shared_files)}</span></div>
+      <button class="vault-metric" type="button" id="btn-review-metric" aria-label="${attr(`${COPY.can_save}: ${fmt(data.pending_bytes)}. ${COPY.review} ${COPY.duplicates.toLowerCase()}.`)}"><span class="vault-metric-value">${fmt(data.pending_bytes)}</span><span class="vault-metric-label">${esc(COPY.can_save)}</span></button>
+      <div class="vault-metric"><span class="vault-metric-value">${esc(timeAgo(last && last.ts))}</span><span class="vault-metric-label">${esc(COPY.last_scanned)}</span></div>`
+  } else {
+    const folderMetric = last ? `<div class="vault-metric"><span class="vault-metric-value">${fmt(last.home_bytes_total == null ? last.bytes_total : last.home_bytes_total)}</span><span class="vault-metric-label">${esc(COPY.pinokio_folder)}</span></div>` : ""
+    el("vault-metrics").innerHTML = `${folderMetric}
+      <div class="vault-metric" title="${attr(`${COPY.on_disk_help} ${fmt(data.bytes_without_sharing)} ${COPY.without_sharing}.`)}"><span class="vault-metric-value">${fmt(data.bytes_on_disk)}</span><span class="vault-metric-label">${esc(COPY.on_disk)}</span></div>
+      <div class="vault-metric" title="${attr(COPY.already_shared_help)}"><span class="vault-metric-value">${fmt(data.saved_by_sharing)}</span><span class="vault-metric-label">${esc(COPY.already_shared)}</span></div>
+      <div class="vault-metric" title="${attr(COPY.saved_by_vault_help)}"><span class="vault-metric-value">${fmt(data.lifetime_bytes_saved)}</span><span class="vault-metric-label">${esc(COPY.saved_by_vault)}</span></div>
+      <button class="vault-metric" type="button" id="btn-review-metric" aria-label="${attr(`${COPY.can_save}: ${fmt(data.pending_bytes)}. ${COPY.review} ${COPY.duplicates.toLowerCase()}.`)}"><span class="vault-metric-value">${fmt(data.pending_bytes)}</span><span class="vault-metric-label">${esc(COPY.can_save)}</span></button>
+      <div class="vault-metric"><span class="vault-metric-value">${esc(timeAgo(last && last.ts))}</span><span class="vault-metric-label">${esc(COPY.last_scanned)}</span></div>`
+  }
+  const activeScan = scanActive(data.scan)
+  const scanning = scanMatchesContext(data.scan)
+  const busyElsewhere = activeScan && !scanning
+  el("btn-scan").innerHTML = activeScan
+    ? `<i class="fa-solid fa-circle-notch fa-spin"></i>${esc(COPY.scanning)}`
+    : `<i class="fa-solid fa-rotate"></i>${esc(last ? COPY.scan_again : (IS_APP_MODE ? COPY.scan_app : COPY.scan))}`
+  el("btn-scan").disabled = activeScan
+  const optionsButton = el("btn-vault-options")
+  const repairTitle = el("vault-repair-title")
+  const repairDescription = el("vault-repair-description")
+  const repairButton = el("btn-repair")
+  if (optionsButton) optionsButton.setAttribute("aria-label", COPY.vault_options)
+  if (repairTitle) repairTitle.textContent = COPY.repair_index
+  if (repairDescription) repairDescription.textContent = COPY.repair_description
+  if (repairButton) {
+    repairButton.textContent = COPY.repair_action
+    repairButton.disabled = activeScan
+  }
   const scanState = el("vault-scan-state")
+  if (busyElsewhere) {
+    scanState.classList.add("show")
+    scanState.innerHTML = `<i class="fa-solid fa-circle-notch fa-spin"></i><strong>${esc(COPY.scanning_elsewhere)}</strong><span class="vault-scan-detail">${esc(COPY.scanning_elsewhere_hint)}</span>`
+    return
+  }
   if (scanning) {
     const scan = data.scan
     const scanPhase = scan.phase || "counting"
@@ -688,7 +752,11 @@ const renderOverview = () => {
     const hashTotal = scan.hash_total || 0
     const hashDone = Math.min(Math.max(0, hashTotal - (scan.queued || 0)), hashTotal)
     const hashRatio = hashTotal ? Math.min(1, hashDone / hashTotal) : 1
-    const phase = queued ? COPY.scan_queued : counting ? COPY.scan_counting : walking ? COPY.scan_progress : verifying ? COPY.scan_finishing : COPY.scan_analyzing
+    const scanSource = scan.scope_id ? sourceById(scan.scope_id) : null
+    const scanProgressLabel = scanSource
+      ? COPY.scan_location.replace("{location}", scanSource.label)
+      : COPY.scan_progress
+    const phase = queued ? COPY.scan_queued : counting ? COPY.scan_counting : walking ? scanProgressLabel : verifying ? COPY.scan_finishing : COPY.scan_analyzing
     const rawCountWeight = Number.isFinite(scan.estimated_count_weight) ? scan.estimated_count_weight : 0.4
     const countWeight = Math.max(0, Math.min(0.98, rawCountWeight))
     const rawWalkWeight = Number.isFinite(scan.estimated_walk_weight) ? scan.estimated_walk_weight : 0.5
@@ -837,14 +905,15 @@ const render = () => {
 }
 
 const scanActive = (scan) => !!(scan && (scan.pending || scan.active || scan.queued > 0))
+const scanMatchesContext = (scan) => scanActive(scan) && (!IS_APP_MODE || scan.scope_id === SCOPE_ID)
 const reviewedScan = () => {
-  try { return localStorage.getItem("pinokio:vault:reviewed-scan") }
+  try { return localStorage.getItem(reviewedScanKey) }
   catch (error) { return null }
 }
 const markScanReviewed = () => {
   const last = state.data && state.data.last_scan
   if (!last || !last.ts) return
-  try { localStorage.setItem("pinokio:vault:reviewed-scan", String(last.ts)) } catch (error) {}
+  try { localStorage.setItem(reviewedScanKey, String(last.ts)) } catch (error) {}
 }
 const fetchJson = async (url) => {
   const response = await fetch(url)
@@ -853,9 +922,10 @@ const fetchJson = async (url) => {
 }
 const applyFullData = (data) => {
   const scanning = scanActive(data.scan)
+  const contextualScan = !IS_APP_MODE || !data.scan || data.scan.scope_id === SCOPE_ID
   const completed = state.scanRequested && !scanning && data.last_scan && data.last_scan.ts !== state.scanBaseline
-  const incomplete = !scanning && data.scan && data.scan.phase === "incomplete"
-  const failed = state.scanRequested && !scanning && data.scan && data.scan.error
+  const incomplete = contextualScan && !scanning && data.scan && data.scan.phase === "incomplete"
+  const failed = contextualScan && state.scanRequested && !scanning && data.scan && data.scan.error
   const unreviewed = !scanning && data.last_scan &&
     reviewedScan() !== String(data.last_scan.ts) &&
     (data.duplicates.some((item) => item.shareable !== false) || data.last_scan.hash_failures > 0)
@@ -889,7 +959,7 @@ const refresh = async () => {
   try {
     const progressOnly = !!(state.data && scanActive(state.data.scan))
     if (progressOnly) {
-      const progress = await fetchJson("/info/dedup?progress=1")
+      const progress = await fetchJson(statusUrl(true))
       state.data.scan = progress.scan
       state.data.last_scan = progress.last_scan
       if (scanActive(progress.scan)) {
@@ -897,10 +967,10 @@ const refresh = async () => {
         renderOverview()
         renderFeedback()
       } else {
-        if (applyFullData(await fetchJson("/info/dedup")) || state.scanRequested) delay = 1500
+        if (applyFullData(await fetchJson(statusUrl())) || state.scanRequested) delay = 1500
       }
     } else {
-      if (applyFullData(await fetchJson("/info/dedup")) || state.scanRequested) delay = 1500
+      if (applyFullData(await fetchJson(statusUrl())) || state.scanRequested) delay = 1500
     }
   } catch (error) {
     state.feedback = { error: true, message: error && error.message ? error.message : String(error) }
@@ -950,6 +1020,18 @@ const deduplicateFeedback = (result) => {
   }
 }
 
+const detachFeedback = (result) => {
+  if (result.status === "detached") return COPY.separated
+  if (result.status === "ignored") return COPY.skipped_action
+  const messages = {
+    locked: COPY.separate_locked,
+    stale: COPY.separate_changed,
+    conflict: COPY.separate_conflict,
+    "not-found": COPY.separate_not_found
+  }
+  return { error: true, message: messages[result.status] || COPY.action_not_completed }
+}
+
 const chooseExternalFolder = () => new Promise((resolve, reject) => {
   const picker = new Socket()
   let settled = false
@@ -981,7 +1063,7 @@ const chooseExternalFolder = () => new Promise((resolve, reject) => {
 
 document.addEventListener("click", async (event) => {
   const advanced = el("vault-advanced")
-  if (advanced.open && !advanced.contains(event.target)) advanced.open = false
+  if (advanced && advanced.open && !advanced.contains(event.target)) advanced.open = false
   const target = event.target.closest("button")
   if (!target) return
   if (target.id === "btn-dismiss-cloud") {
@@ -989,7 +1071,7 @@ document.addEventListener("click", async (event) => {
     renderCloudWarning()
   } else if (target.dataset.view) {
     state.view = target.dataset.view
-    state.sourceId = null
+    state.sourceId = SCOPE_ID
     state.query = ""
     state.statusFilter = "all"
     if (state.view === "duplicates") {
@@ -998,7 +1080,9 @@ document.addEventListener("click", async (event) => {
     }
     render()
   } else if (target.dataset.source) {
-    state.sourceId = state.sourceId === target.dataset.source ? null : target.dataset.source
+    state.sourceId = IS_APP_MODE
+      ? SCOPE_ID
+      : (state.sourceId === target.dataset.source ? null : target.dataset.source)
     render()
   } else if (target.dataset.toggleSource) {
     const id = target.dataset.toggleSource
@@ -1050,7 +1134,7 @@ document.addEventListener("click", async (event) => {
     state.scanProblemsOpen = false
     state.feedback = null
     try {
-      const result = await post({ action: "scan" })
+      const result = await post({ action: "scan", scope_id: SCOPE_ID })
       if (result.error) throw new Error(result.error)
       await refresh()
     } catch (error) {
@@ -1068,24 +1152,21 @@ document.addEventListener("click", async (event) => {
     target.disabled = true
     target.textContent = COPY.repairing
     await runAction({ action: "repair" }, COPY.repair_done)
-    advanced.open = false
+    if (advanced) advanced.open = false
   } else if (target.id === "btn-review-result" || target.id === "btn-review-metric") {
     if (!state.scanResult || !state.scanResult.incomplete) markScanReviewed()
     state.view = "duplicates"
-    state.sourceId = null
+    state.sourceId = SCOPE_ID
     state.query = ""
     state.scanResult = null
     render()
   } else if (target.dataset.deduplicateScope) {
     await runAction({ action: "deduplicate", scope_id: target.dataset.deduplicateScope }, deduplicateFeedback)
   } else if (target.dataset.detach) {
-    await runAction({ action: "detach", path: target.dataset.detach }, (result) =>
-      result.status === "detached" || result.status === "ignored"
-        ? COPY.ignored
-        : { error: true, message: COPY.action_not_completed })
+    await runAction({ action: "detach", path: target.dataset.detach }, detachFeedback)
   } else if (target.dataset.reshare) {
     await runAction({ action: "reshare", path: target.dataset.reshare }, (result) => result.status === "resharable"
-      ? COPY.allowed
+      ? COPY.included_in_scans
       : { error: true, message: COPY.action_not_completed })
   } else if (target.dataset.reclaim) {
     await runAction({ action: "reclaim", hash: target.dataset.reclaim }, (result) => result.status === "reclaimed"
@@ -1116,11 +1197,14 @@ document.addEventListener("change", (event) => {
 })
 
 el("btn-scan").textContent = COPY.scan
-el("btn-add-source").setAttribute("aria-label", COPY.add_external_folder)
-el("btn-add-source").setAttribute("title", COPY.add_external_folder)
+const addSourceButton = el("btn-add-source")
+if (addSourceButton) {
+  addSourceButton.setAttribute("aria-label", COPY.add_external_folder)
+  addSourceButton.setAttribute("title", COPY.add_external_folder)
+}
 el("vault-pane").setAttribute("aria-label", COPY.files_region)
-el("btn-vault-options").setAttribute("aria-label", COPY.vault_options)
-el("vault-repair-title").textContent = COPY.repair_index
-el("vault-repair-description").textContent = COPY.repair_description
-el("btn-repair").textContent = COPY.repair_action
+if (el("btn-vault-options")) el("btn-vault-options").setAttribute("aria-label", COPY.vault_options)
+if (el("vault-repair-title")) el("vault-repair-title").textContent = COPY.repair_index
+if (el("vault-repair-description")) el("vault-repair-description").textContent = COPY.repair_description
+if (el("btn-repair")) el("btn-repair").textContent = COPY.repair_action
 refresh()

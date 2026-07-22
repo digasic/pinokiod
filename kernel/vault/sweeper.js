@@ -55,7 +55,7 @@ class Sweeper {
     return {
       active: false, phase: "idle", dirs: 0, files: 0, bytes_total: 0,
       counted_dirs: 0, counted_files: 0, total_files: null, count_estimate_files: null,
-      home_bytes_total: 0, source_bytes: {},
+      home_bytes_total: 0, source_bytes: {}, source_files: {}, source_hash_failures: {}, scope_id: null,
       candidates: 0, hashed: 0, hash_total: 0, hash_bytes: 0, queued: 0,
       inode_reuses: 0, unstable_hashes: 0, hash_failures: 0,
       inaccessible: 0, inaccessible_paths: [],
@@ -65,10 +65,13 @@ class Sweeper {
       hash_duration_ms: 0
     }
   }
-  // The one entry point: the Pinokio home plus explicit linked imports.
-  async scan() {
+  // A global scan covers Pinokio plus explicit imports. A scoped scan covers
+  // exactly one physical source (used by an app's Save space page).
+  async scan(scopeId = null) {
     if (this.state.active) return { already_running: true }
-    this.state = Object.assign(this.idleState(), { active: true, phase: "counting", started: Date.now() })
+    this.state = Object.assign(this.idleState(), {
+      active: true, phase: "counting", started: Date.now(), scope_id: scopeId
+    })
     this.metadataBaseCache.clear()
     this.hashJobsByIno.clear()
     this.completedHashesByIno.clear()
@@ -78,9 +81,10 @@ class Sweeper {
     let incomplete = false
     try {
       await this.vault.refreshSources()
-      this.vault.reconcileConfiguredSources()
-      const scanRoots = this.vault.scanRoots()
-      const previous = this.vault.registry.lastScan
+      if (!scopeId) this.vault.reconcileConfiguredSources()
+      const scanRoots = this.vault.scanRoots(scopeId)
+      if (!scanRoots.length) throw new Error("That scan location is no longer available.")
+      const previous = this.vault.registry.scanFor(scopeId)
       if (previous) {
         if (Number.isFinite(previous.files) && previous.files > 0) {
           this.state.count_estimate_files = previous.files
@@ -121,6 +125,8 @@ class Sweeper {
         bytes_total: this.state.bytes_total,
         home_bytes_total: this.state.home_bytes_total,
         source_bytes: Object.assign({}, this.state.source_bytes),
+        source_files: Object.assign({}, this.state.source_files),
+        source_hash_failures: Object.assign({}, this.state.source_hash_failures),
         candidates: this.state.candidates,
         hashed: this.state.hashed,
         hash_total: this.state.hash_total,
@@ -137,6 +143,11 @@ class Sweeper {
       // every completed discovery pass, as required by the Vault contract.
       this.state.phase = "verifying"
       await this.vault.verify({
+        includePath: scopeId
+          ? (filePath) => isPathWithin(scanRoots[0].root, filePath)
+          : undefined,
+        reconcile: !scopeId,
+        verifyBlobs: !scopeId,
         preservePath: (filePath) => this.isInaccessible(filePath),
         onAccessError: (error, filePath) => this.recordInaccessible(error, filePath)
       })
@@ -145,7 +156,30 @@ class Sweeper {
       if (!incomplete) {
         scanMeta.ts = Date.now()
         scanMeta.duration_ms = this.state.duration_ms
-        this.vault.registry.setLastScan(scanMeta)
+        this.vault.registry.setLastScan(scanMeta, scopeId)
+        if (!scopeId) {
+          for (const source of this.vault.sources()) {
+            if (source.kind !== "app" || !source.available) continue
+            const sourceId = source.id
+            const bytes = scanMeta.source_bytes[sourceId] || 0
+            this.vault.registry.setLastScan({
+              ts: scanMeta.ts,
+              duration_ms: scanMeta.duration_ms,
+              count_duration_ms: scanMeta.count_duration_ms,
+              walk_duration_ms: scanMeta.walk_duration_ms,
+              hash_wait_duration_ms: scanMeta.hash_wait_duration_ms,
+              files: scanMeta.source_files[sourceId] || 0,
+              bytes_total: bytes,
+              home_bytes_total: 0,
+              hash_failures: scanMeta.source_hash_failures[sourceId] || 0,
+              source_bytes: { [sourceId]: bytes },
+              source_files: { [sourceId]: scanMeta.source_files[sourceId] || 0 },
+              source_hash_failures: {
+                [sourceId]: scanMeta.source_hash_failures[sourceId] || 0
+              }
+            }, sourceId)
+          }
+        }
       }
       completed = true
     } finally {
@@ -245,8 +279,9 @@ class Sweeper {
       }
     }
   }
-  countFile() {
+  countFile(sourceId) {
     this.state.files += 1
+    this.state.source_files[sourceId] = (this.state.source_files[sourceId] || 0) + 1
     if (this.state.total_files !== null && this.state.files > this.state.total_files) {
       this.state.total_files = this.state.files
     }
@@ -257,9 +292,9 @@ class Sweeper {
     const source = this.vault.sourceForPath(filePath, preferredSourceId)
     const sourceId = source ? source.id : null
     const appName = source && source.kind === "app" ? source.app : null
-    this.countFile()
-    this.state.bytes_total += st.size
     const sourceKey = sourceId || preferredSourceId || "pinokio"
+    this.countFile(sourceKey)
+    this.state.bytes_total += st.size
     this.state.source_bytes[sourceKey] = (this.state.source_bytes[sourceKey] || 0) + st.size
     if (!preferredSourceId) this.state.home_bytes_total += st.size
     if (registry.excluded.has(filePath)) {
@@ -414,7 +449,12 @@ class Sweeper {
         }
       }
     } catch (e) {
-      if (!this.recordInaccessible(e, primary.filePath)) this.state.hash_failures += 1
+      if (!this.recordInaccessible(e, primary.filePath)) {
+        this.state.hash_failures += 1
+        const sourceId = primary.source_id || "pinokio"
+        this.state.source_hash_failures[sourceId] =
+          (this.state.source_hash_failures[sourceId] || 0) + 1
+      }
     } finally {
       this.state.hash_duration_ms += Date.now() - started
       if (job.inodeKey && this.hashJobsByIno.get(job.inodeKey) === job) {
@@ -555,9 +595,9 @@ class Sweeper {
       const source = this.vault.sourceForPath(full, preferredSourceId)
       const sourceId = source ? source.id : null
       const appName = source && source.kind === "app" ? source.app : null
-      this.countFile()
-      this.state.bytes_total += st.size
       const sourceKey = sourceId || preferredSourceId || "pinokio"
+      this.countFile(sourceKey)
+      this.state.bytes_total += st.size
       this.state.source_bytes[sourceKey] = (this.state.source_bytes[sourceKey] || 0) + st.size
       if (!preferredSourceId) this.state.home_bytes_total += st.size
       if (!SHA256_RE.test(name)) continue

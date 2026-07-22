@@ -25,6 +25,9 @@
     if (!link.hasAttribute("href")) {
       return false
     }
+    if (link.dataset.tabLinkPopover === "false") {
+      return false
+    }
     const href = link.getAttribute("href")
     return typeof href === "string" && href.trim().length > 0
   }

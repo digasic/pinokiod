@@ -1,0 +1,20 @@
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<link href="/css/fontawesome.min.css" rel="stylesheet">
+<link href="/css/solid.min.css" rel="stylesheet">
+<link href="/style.css" rel="stylesheet"/>
+<link href="/task-launcher.css" rel="stylesheet"/>
+<% if (agent === "electron") { %>
+  <link href="/electron.css" rel="stylesheet"/>
+<% } %>
+<link href="/vault.css" rel="stylesheet"/>
+</head>
+<body class='<%=theme%> task-launcher-page task-page vault-page vault-embed-page' data-agent="<%=agent%>" data-vault-mode="app" data-vault-scope="<%=scope_id%>">
+  <main class='vault-embed-main'>
+    <%- include('partials/vault_workspace', { appMode: true }) %>
+  </main>
+  <script src="/vault.js"></script>
+</body>
+</html>

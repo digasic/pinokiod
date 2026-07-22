@@ -5,6 +5,7 @@ const os = require('os')
 const path = require('path')
 const crypto = require('crypto')
 const Vault = require('../kernel/vault')
+const Registry = require('../kernel/vault/registry')
 const { walkBatches } = require('../kernel/vault/walker')
 
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex')
@@ -125,6 +126,40 @@ describe('vault manual scan (phase 3)', () => {
     assert.ok(vault.registry.lastScan.hash_duration_ms >= 0, 'hash duration is measured')
     assert.strictEqual(vault.registry.lastScan.hash_total, 1, 'hash work has a determinate total after walking')
     assert.strictEqual(vault.sweeper.state.total_files, 2, 'scan progress uses an exact pre-count')
+  })
+
+  test('an app-scoped scan walks only that app and preserves unrelated registry state', async () => {
+    const { home, vault } = await makeEnv()
+    const content = crypto.randomBytes(4096)
+    const appAFile = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
+    const appBFile = await writeFile(path.resolve(home, 'api', 'appB', 'model.bin'), content)
+    await fs.promises.mkdir(path.resolve(home, 'api', 'emptyApp'))
+    await vault.sweeper.scan()
+    const appA = vault.sources().find((source) => source.kind === 'app' && source.app === 'appA')
+    const emptyApp = vault.sources().find((source) => source.kind === 'app' && source.app === 'emptyApp')
+    assert.ok(appA)
+    assert.strictEqual(vault.registry.scanFor(emptyApp.id).files, 0,
+      'a global scan refreshes the baseline for an empty app')
+    assert.strictEqual(vault.registry.duplicates.has(appBFile), true)
+    const globalScan = JSON.parse(JSON.stringify(vault.registry.lastScan))
+
+    await fs.promises.unlink(appBFile)
+    const result = await vault.sweeper.scan(appA.id)
+
+    assert.strictEqual(result.files, 1)
+    assert.strictEqual(result.bytes_total, content.length)
+    assert.deepStrictEqual(vault.registry.lastScan, globalScan, 'app scan does not replace global totals')
+    assert.strictEqual(vault.registry.duplicates.has(appBFile), true,
+      'scoped verification does not reconcile another app')
+    assert.strictEqual(vault.registry.links.has(appAFile), true)
+    assert.strictEqual(vault.registry.scanFor(appA.id).files, 1)
+    assert.strictEqual(vault.registry.scanFor(appA.id).bytes_total, content.length)
+    await vault.registry.flush()
+    const snapshot = JSON.parse(await fs.promises.readFile(vault.registry.snapshotPath, 'utf8'))
+    assert.strictEqual(snapshot.source_scans[appA.id].bytes_total, content.length)
+    const reloaded = new Registry(vault.root)
+    await reloaded.load()
+    assert.strictEqual(reloaded.scanFor(appA.id).bytes_total, content.length)
   })
 
   test('scans NEVER convert: every byte-identical copy is pending, even in HF caches', async () => {

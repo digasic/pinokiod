@@ -90,6 +90,7 @@ class Vault {
     this.initializationPromise = null
     this.verificationPending = false
     this.scanError = null
+    this.scanScopeId = null
   }
   get root() {
     return path.resolve(this.kernel.homedir, "vault")
@@ -157,16 +158,20 @@ class Vault {
       return result
     })
   }
-  startScan() {
+  startScan(scopeId = null) {
     if (!this.enabled || !this.sweeper) return { started: false, disabled: true }
     if (this.scanPromise) return { started: false, already_running: true }
     this.scanError = null
-    this.scanPromise = this.runExclusive(() => this.sweeper.scan())
+    this.scanScopeId = scopeId
+    this.scanPromise = this.runExclusive(() => this.sweeper.scan(scopeId))
       .catch((error) => {
         this.scanError = error && error.message ? error.message : String(error)
         throw error
       })
-      .finally(() => { this.scanPromise = null })
+      .finally(() => {
+        this.scanPromise = null
+        this.scanScopeId = null
+      })
     this.scanPromise.catch(() => {})
     return { started: true }
   }
@@ -187,7 +192,10 @@ class Vault {
         }
       }
       case "scan":
-        return this.startScan()
+        if (payload.scope_id && !this.scanSource(payload.scope_id)) {
+          return { error: "That scan location is no longer available." }
+        }
+        return this.startScan(payload.scope_id || null)
       case "deduplicate":
         if (typeof payload.scope_id !== "string" || !payload.scope_id) {
           return { error: "Choose a location to deduplicate." }
@@ -453,7 +461,16 @@ class Vault {
       return false
     }
   }
-  scanRoots() {
+  scanSource(scopeId) {
+    if (!scopeId) return null
+    return this._sources.find((source) =>
+      source.id === scopeId && source.kind !== "virtual" && source.available && source.root) || null
+  }
+  scanRoots(scopeId = null) {
+    if (scopeId) {
+      const source = this.scanSource(scopeId)
+      return source ? [{ root: path.resolve(source.root), source_id: source.id }] : []
+    }
     const home = path.resolve(this.kernel.homedir)
     const candidates = [{ root: home, source_id: "pinokio" }]
     for (const source of this._sources) {
@@ -1026,11 +1043,13 @@ class Vault {
   async verify(options = {}) {
     if (!this.enabled || !this.registry) return
     const preservePath = options.preservePath || (() => false)
+    const includePath = options.includePath || (() => true)
     const handleAccessError = (error, filePath) => !!(
       isAccessError(error) && options.onAccessError && options.onAccessError(error, filePath)
     )
-    this.reconcileConfiguredSources()
+    if (options.reconcile !== false) this.reconcileConfiguredSources()
     for (const [linkPath, entry] of [...this.registry.links]) {
+      if (!includePath(linkPath)) continue
       if (preservePath(linkPath)) continue
       try {
         const source = this.sourceForPath(linkPath, entry.source_id)
@@ -1048,6 +1067,7 @@ class Vault {
       }
     }
     for (const [dupPath, entry] of [...this.registry.duplicates]) {
+      if (!includePath(dupPath)) continue
       if (preservePath(dupPath)) continue
       let valid = false
       try {
@@ -1067,6 +1087,10 @@ class Vault {
       if (storeStat && storeStat.isFile()) {
         await unlinkIfSame(dupPath + TMP_SUFFIX, storeStat)
       }
+    }
+    if (options.verifyBlobs === false) {
+      this.registry.schedulePersist()
+      return
     }
     const linksByHash = new Map()
     for (const [linkPath, entry] of this.registry.links) {
@@ -1172,6 +1196,7 @@ class Vault {
       excluded: new Map(registry.excluded),
       totals: Object.assign({}, registry.totals),
       lastScan: registry.lastScan ? Object.assign({}, registry.lastScan) : null,
+      sourceScans: new Map([...registry.sourceScans].map(([id, scan]) => [id, Object.assign({}, scan)])),
       duplicates: new Map(registry.duplicates),
       scanIndex: new Map(registry.scanIndex)
     } : null
@@ -1335,6 +1360,7 @@ class Vault {
       duplicates: rebuiltDuplicates,
       excluded: preserved ? preserved.excluded : new Map(),
       lastScan: preserved ? preserved.lastScan : null,
+      sourceScans: preserved ? preserved.sourceScans : new Map(),
       totals: preserved ? preserved.totals : { lifetime_bytes_saved: 0 },
       byIno: rebuiltByIno,
       pathsByIno: rebuiltPathsByIno
@@ -1385,21 +1411,33 @@ class Vault {
   }
   // Global state for the vault page and the health endpoint. Answered from
   // memory + one stat per blob and occupied shard; never a walk.
-  async status() {
+  async status(scopeId = null) {
     if (!this.enabled || !this.registry) return { enabled: false }
     const registry = this.registry
+    const scope = scopeId ? this.scanSource(scopeId) : null
+    if (scopeId && !scope) throw new Error("That Vault location is no longer available.")
+    const scopeHashes = scopeId ? new Set() : null
+    if (scopeHashes) {
+      for (const entry of registry.links.values()) {
+        if (entry.source_id === scopeId) scopeHashes.add(entry.hash)
+      }
+      for (const entry of registry.duplicates.values()) {
+        if (entry.source_id === scopeId) scopeHashes.add(entry.hash)
+      }
+    }
     const blobs = []
     const blobByHash = new Map()
     const storeStats = new Map()
     const namesByHash = new Map()
     const undoBatchMap = new Map()
     for (const [linkPath, entry] of registry.links) {
+      if (scopeHashes && !scopeHashes.has(entry.hash)) continue
       if (!namesByHash.has(entry.hash)) namesByHash.set(entry.hash, [])
       const location = this.locationForPath(linkPath, entry.source_id)
       namesByHash.get(entry.hash).push(Object.assign({
         path: linkPath, app: entry.app || null, mode: entry.mode
       }, location))
-      if (entry.batch_id) {
+      if (entry.batch_id && (!scopeId || entry.source_id === scopeId)) {
         if (!undoBatchMap.has(entry.batch_id)) {
           undoBatchMap.set(entry.batch_id, { batch_id: entry.batch_id, files: 0, bytes: 0, ts: null })
         }
@@ -1411,9 +1449,10 @@ class Vault {
     }
     const pendingBytesByHash = new Map()
     for (const entry of registry.duplicates.values()) {
+      if (scopeId && entry.source_id !== scopeId) continue
       pendingBytesByHash.set(entry.hash, (pendingBytesByHash.get(entry.hash) || 0) + (entry.size || 0))
     }
-    const blobEntries = [...registry.blobs]
+    const blobEntries = [...registry.blobs].filter(([hash]) => !scopeHashes || scopeHashes.has(hash))
     if (!await this.directoryIfSafe(this.root) || !await this.directoryIfSafe(this.blobRoot)) {
       throw unsafeStoragePath(this.blobRoot)
     }
@@ -1451,6 +1490,7 @@ class Vault {
     }
     const duplicates = []
     for (const [p, entry] of registry.duplicates) {
+      if (scopeId && entry.source_id !== scopeId) continue
       const location = this.locationForPath(p, entry.source_id)
       const source = this.sourceForPath(p, location.source_id)
       const index = registry.scanIndex.get(p)
@@ -1470,7 +1510,9 @@ class Vault {
         shareable, unavailable_reason: unavailableReason, match
       }, location))
     }
-    const events = (await registry.readEvents()).reverse().map((event) => {
+    const events = (await registry.readEvents()).reverse()
+      .filter((event) => !scopeId || event.source_id === scopeId)
+      .map((event) => {
       const currentLocation = event.path ? this.locationForPath(event.path, event.source_id) : null
       const fallbackLocation = currentLocation && currentLocation.source_id
         ? currentLocation
@@ -1494,24 +1536,25 @@ class Vault {
     const scan = this.scanStatus()
     const excluded = []
     for (const [p, meta] of registry.excluded) {
+      if (scopeId && meta.source_id !== scopeId) continue
       excluded.push(Object.assign({
         path: p,
         ts: meta.ts || null,
         size: Number(meta.size) || 0
       }, this.locationForPath(p, meta.source_id)))
     }
-    const publicSources = this._sources.map((source) => ({
+    const publicSources = this._sources.filter((source) => !scopeId || source.id === scopeId).map((source) => ({
       id: source.id, kind: source.kind, label: source.label, root: source.root,
       display_path: source.kind === "pinokio" ? source.root : (source.mount_path || source.root),
       target_path: source.kind === "external" ? source.root : null,
-      parent_id: source.parent_id, app: source.app || null,
+      parent_id: scopeId ? null : source.parent_id, app: source.app || null,
       available: source.available !== false, shareable: source.kind === "virtual" ? null : !!source.shareable
     }))
-    return {
+    const result = {
       enabled: true,
       mode: this.mode,
       scan,
-      last_scan: registry.lastScan,
+      last_scan: registry.scanFor(scopeId),
       bytes_on_disk: bytesOnDisk,
       bytes_without_sharing: wouldBe,
       saved_by_sharing: wouldBe - bytesOnDisk,
@@ -1523,13 +1566,28 @@ class Vault {
       sources: publicSources, blobs, duplicates, excluded, events,
       undo_batches: undoBatches
     }
+    if (scopeId) {
+      const linkedBytes = blobs.reduce((sum, blob) => sum + blob.size *
+        blob.names.filter((name) => name.source_id === scopeId).length, 0)
+      const duplicateBytes = duplicates.reduce((sum, item) => sum + item.size, 0)
+      const excludedBytes = excluded.reduce((sum, item) => sum + item.size, 0)
+      result.scope_id = scopeId
+      result.tracked_bytes = linkedBytes + duplicateBytes + excludedBytes
+      result.shared_bytes = blobs.reduce((sum, blob) => {
+        const hardlinked = blob.names.filter((name) => name.mode === "link")
+        if (hardlinked.length < 2) return sum
+        return sum + blob.size * hardlinked.filter((name) => name.source_id === scopeId).length
+      }, 0)
+      result.reclaimable = 0
+    }
+    return result
   }
   scanStatus() {
     const sweeper = this.sweeper
     if (!sweeper) return null
     const pending = !!this.scanPromise && !sweeper.state.active
     const state = pending
-      ? Object.assign(sweeper.idleState(), { phase: "queued" })
+      ? Object.assign(sweeper.idleState(), { phase: "queued", scope_id: this.scanScopeId })
       : sweeper.state
     return Object.assign({}, state, {
       current_file: sweeper.currentHash ? path.basename(sweeper.currentHash.path) : null,
@@ -1537,11 +1595,11 @@ class Vault {
       error: this.scanError
     })
   }
-  progressStatus() {
+  progressStatus(scopeId = null) {
     return {
       enabled: !!this.enabled,
       scan: this.scanStatus(),
-      last_scan: this.registry ? this.registry.lastScan : null
+      last_scan: this.registry ? this.registry.scanFor(scopeId) : null
     }
   }
   async copyOut(filePath, sourcePath, expectedTarget, expectedSource = expectedTarget, options = {}) {
@@ -1602,7 +1660,7 @@ class Vault {
           ts: Date.now(), source_id: entry.source_id || null, size: st.size
         })
         await this.recordEvent({
-          kind: "detach", hash: entry.hash, path: filePath,
+          kind: "skip", hash: entry.hash, path: filePath,
           app: entry.app || null, source_id: entry.source_id || null, size: st.size
         })
         return { status: "ignored" }
@@ -1623,7 +1681,7 @@ class Vault {
     if (this.registry.duplicates.has(filePath)) {
       const dup = this.registry.duplicates.get(filePath)
       this.registry.exclude(filePath, { ts: Date.now(), source_id: dup.source_id || null, size: dup.size || 0 })
-      await this.recordEvent({ kind: "detach", hash: dup.hash, path: filePath, app: dup.app || null, source_id: dup.source_id || null, size: dup.size || 0 })
+      await this.recordEvent({ kind: "skip", hash: dup.hash, path: filePath, app: dup.app || null, source_id: dup.source_id || null, size: dup.size || 0 })
       return { status: "ignored" }
     }
     return { status: "not-found" }

@@ -15,6 +15,21 @@ body.dark.vault-page {
 }
 .vault-shell,
 .vault-shell * { box-sizing: border-box; }
+.vault-embed-page {
+  width: 100%;
+  height: 100vh;
+  margin: 0;
+  overflow: hidden;
+}
+.vault-embed-main {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+.vault-embed-main .vault-shell { width: 100%; }
 body.vault-page .task-container {
   display: flex;
   min-height: 0;

@@ -47,6 +47,7 @@ class Registry {
     this.duplicates = new Map() // path -> { hash, size, app, source_id, discovered } pending user conversion
     this.excluded = new Map()   // path -> { ts, source_id, size } user chose "keep independent"
     this.lastScan = null        // scan totals, duration, and hash work
+    this.sourceScans = new Map() // source id -> last complete scoped scan
     this.totals = { lifetime_bytes_saved: 0 }
     this.byIno = new Map()      // "dev:ino" -> hash
     this.pathsByIno = new Map() // "dev:ino" -> Set(paths), for bounded group updates
@@ -164,8 +165,12 @@ class Registry {
       await handle.close()
     }
   }
-  setLastScan(meta) {
-    this.lastScan = meta
+  scanFor(sourceId = null) {
+    return sourceId ? (this.sourceScans.get(sourceId) || null) : this.lastScan
+  }
+  setLastScan(meta, sourceId = null) {
+    if (sourceId) this.sourceScans.set(sourceId, meta)
+    else this.lastScan = meta
     this.schedulePersist()
   }
   inoKey(dev, ino) {
@@ -291,6 +296,7 @@ class Registry {
     this.duplicates = state.duplicates
     this.excluded = state.excluded
     this.lastScan = state.lastScan
+    this.sourceScans = state.sourceScans
     this.totals = state.totals
     this.byIno = state.byIno
     this.pathsByIno = state.pathsByIno
@@ -368,6 +374,9 @@ class Registry {
     if (isRecord(json.last_scan)) {
       this.lastScan = json.last_scan
     }
+    for (const [sourceId, scan] of Object.entries(json.source_scans || {})) {
+      if (isRecord(scan)) this.sourceScans.set(sourceId, scan)
+    }
     if (json.totals && Number.isFinite(json.totals.lifetime_bytes_saved)) {
       this.totals = { lifetime_bytes_saved: Math.max(0, json.totals.lifetime_bytes_saved) }
     }
@@ -413,6 +422,7 @@ class Registry {
       duplicates: Object.fromEntries(this.duplicates),
       excluded: Object.fromEntries(this.excluded),
       last_scan: this.lastScan,
+      source_scans: Object.fromEntries(this.sourceScans),
       totals: this.totals
     }
     const write = async () => {

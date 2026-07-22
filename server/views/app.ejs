@@ -8459,6 +8459,15 @@ body.dark .pinokio-custom-terminal-header {
             <div class='flexible'></div>
           </div>
         </button>
+        <% if (typeof vault_enabled !== 'undefined' && vault_enabled) { %>
+        <a id='save-space-tab' data-mode="refresh" target="app-vault" href="/vault/app/<%=encodeURIComponent(name)%>" class="btn header-item frame-link" data-index="vault" data-static="retain" data-tab-link-popover="false">
+          <div class='tab'>
+            <i class="fa-solid fa-hard-drive menu-action-leading-icon"></i>
+            <div class='display'>Save space</div>
+            <div class='flexible'></div>
+          </div>
+        </a>
+        <% } %>
         <% if (typeof autolaunch_app !== 'undefined' && autolaunch_app) { %>
           <div class="app-autolaunch" data-app-autolaunch data-app-id="<%=name%>">
             <button type="button" class="app-autolaunch-row" data-app-autolaunch-button data-enabled="<%= autolaunch_app.autolaunch_enabled ? 'true' : 'false' %>" aria-haspopup="dialog" aria-expanded="false">

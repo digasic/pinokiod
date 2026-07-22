@@ -4,6 +4,8 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const crypto = require('crypto')
+const ejs = require('ejs')
+const { JSDOM } = require('jsdom')
 const Vault = require('../kernel/vault')
 
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex')
@@ -26,7 +28,7 @@ const duplicateEntry = async (filePath, entry) => {
 
 const vaultPageSource = async () => {
   const root = path.resolve(__dirname, '..', 'server')
-  const files = ['views/vault.ejs', 'public/vault.css', 'public/vault.js']
+  const files = ['views/vault.ejs', 'views/partials/vault_workspace.ejs', 'public/vault.css', 'public/vault.js']
   return (await Promise.all(files.map((file) => fs.promises.readFile(path.resolve(root, file), 'utf8')))).join('\n')
 }
 
@@ -449,6 +451,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(vault.registry.duplicates.has(b), false)
     assert.ok(vault.registry.excluded.has(b))
     assert.strictEqual(vault.registry.excluded.get(b).size, content.length)
+    assert.ok((await vault.registry.readEvents()).some((event) => event.kind === 'skip' && event.path === b))
   })
 
   test('detach pins a copy-mode file without copying it again', async () => {
@@ -476,6 +479,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(after.ino, before.ino)
     assert.deepStrictEqual(await fs.promises.readFile(file), content)
     assert.strictEqual(vault.registry.excluded.get(file).size, content.length)
+    assert.ok((await vault.registry.readEvents()).some((event) => event.kind === 'skip' && event.path === file))
   })
 
   test('status(): disk figures, scan metadata, excluded list', async () => {
@@ -514,6 +518,34 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(status.bytes_on_disk, content.length * 2)
     assert.strictEqual(status.bytes_without_sharing, content.length * 2)
     assert.strictEqual(status.saved_by_sharing, 0)
+  })
+
+  test('app status exposes only that app while retaining its matching locations', async () => {
+    const { home, vault } = await makeEnv()
+    const content = crypto.randomBytes(4096)
+    const appAFile = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
+    const appBFile = await writeFile(path.resolve(home, 'api', 'appB', 'model.bin'), content)
+    await vault.sweeper.scan()
+    const appB = vault.sources().find((source) => source.kind === 'app' && source.app === 'appB')
+
+    const status = await vault.status(appB.id)
+
+    assert.strictEqual(status.scope_id, appB.id)
+    assert.deepStrictEqual(status.sources.map((source) => source.id), [appB.id])
+    assert.strictEqual(status.sources[0].parent_id, null)
+    assert.deepStrictEqual(status.duplicates.map((item) => item.path), [appBFile])
+    assert.strictEqual(status.blobs.length, 1)
+    assert.deepStrictEqual(new Set(status.blobs[0].names.map((name) => name.path)),
+      new Set([appAFile]))
+    assert.strictEqual(status.pending_bytes, content.length)
+    assert.strictEqual(status.tracked_bytes, content.length)
+    assert.strictEqual(status.shared_bytes, 0)
+    assert.ok(status.last_scan && status.last_scan.files === 1)
+
+    const converted = await vault.perform('deduplicate', { scope_id: appB.id })
+    assert.strictEqual(converted.converted, 1)
+    const sharedStatus = await vault.status(appB.id)
+    assert.strictEqual(sharedStatus.shared_bytes, content.length)
   })
 
   test('activity exposes source-relative paths instead of bare filenames', async () => {
@@ -804,7 +836,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /identical_contents_at:\s*"Identical contents at"/)
     assert.doesNotMatch(vaultPage, /Matching locations/)
     assert.match(vaultPage, /scan_waiting:\s*"Waiting for scan results"/)
-    assert.match(vaultPage, /view === "all" && !scanning \? `<button class="vault-button" type="button" id="btn-empty-scan"/)
+    assert.match(vaultPage, /view === "all" && !activeScan \? `<button class="vault-button" type="button" id="btn-empty-scan"/)
     assert.match(vaultPage, /class="vault-progress-track"/)
     assert.match(vaultPage, /role="progressbar"/)
     assert.match(vaultPage, /const counting = scanPhase === "counting"/)
@@ -849,6 +881,124 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(template, /<script src="\/vault\.js"><\/script>/)
     assert.doesNotMatch(template, /<style>/)
     assert.doesNotMatch(template, /<script>\s*const COPY/)
+  })
+
+  test('app Save space reuses the Vault workspace in the retained app frame', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const [appTemplate, globalTemplate, embeddedTemplate] = await Promise.all([
+      fs.promises.readFile(path.resolve(views, 'app.ejs'), 'utf8'),
+      fs.promises.readFile(path.resolve(views, 'vault.ejs'), 'utf8'),
+      fs.promises.readFile(path.resolve(views, 'vault_app.ejs'), 'utf8')
+    ])
+    assert.match(appTemplate, /id='save-space-tab'[\s\S]*?target="app-vault"[\s\S]*?class="btn header-item frame-link"/)
+    assert.match(appTemplate, /class="btn header-item frame-link"[^>]*data-tab-link-popover="false"/)
+    assert.ok(appTemplate.indexOf("id='save-space-tab'") < appTemplate.indexOf('class="app-autolaunch"'))
+    assert.match(globalTemplate, /include\('partials\/vault_workspace', \{ appMode: false \}\)/)
+    assert.match(embeddedTemplate, /include\('partials\/vault_workspace', \{ appMode: true \}\)/)
+
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', agent: 'electron', scope_id: 'app:appB'
+    })
+    assert.match(html, /data-vault-mode="app"/)
+    assert.match(html, /data-vault-scope="app:appB"/)
+    assert.match(html, /id='btn-scan'/)
+    assert.match(html, /id='vault-explorer'/)
+    assert.doesNotMatch(html, /id='btn-add-source'/)
+    assert.doesNotMatch(html, /id='btn-repair'/)
+    assert.doesNotMatch(html, /src="\/Socket\.js"/)
+
+    const serverSource = await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'index.js'), 'utf8')
+    const routeStart = serverSource.indexOf('this.app.get("/vault/app/:name"')
+    const routeEnd = serverSource.indexOf('this.app.post("/vault/action"', routeStart)
+    const route = serverSource.slice(routeStart, routeEnd)
+    assert.ok(routeStart >= 0 && routeEnd > routeStart)
+    assert.match(route, /isSameOriginRequest/)
+    assert.match(route, /item\.kind === "app" && item\.app === req\.params\.name && item\.available/)
+    assert.match(route, /res\.render\("vault_app"/)
+    const infoRoute = serverSource.slice(
+      serverSource.indexOf('this.app.get("/info/dedup"'),
+      serverSource.indexOf('this.app.get("/vault"')
+    )
+    assert.match(infoRoute, /req\.query\.scope_id/)
+    assert.match(infoRoute, /vault\.status\(scopeId\)/)
+    assert.match(infoRoute, /vault\.progressStatus\(scopeId\)/)
+  })
+
+  test('fixed Save space navigation opts out of dynamic tab actions', async () => {
+    const script = await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'public', 'tab-link-popover.js'), 'utf8')
+    const dom = new JSDOM(`
+      <div class="appcanvas"><aside><div class="menu-container">
+        <a id="save-space" class="frame-link" href="/vault/app/example" data-tab-link-popover="false">Save space</a>
+        <a id="dynamic-tab" class="frame-link" href="http://localhost:8000">Web UI</a>
+      </div></aside></div>
+    `, { url: 'http://localhost/app/example', runScripts: 'dangerously' })
+    dom.window.eval(script)
+    dom.window.setupTabLinkHover()
+
+    assert.strictEqual(dom.window.document.querySelector('#save-space .tab-link-popover-trigger'), null)
+    assert.ok(dom.window.document.querySelector('#dynamic-tab .tab-link-popover-trigger'))
+    dom.window.close()
+  })
+
+  test('app Vault workspace loads scoped data without global-only controls', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', agent: 'electron', scope_id: 'app:appB'
+    })
+    const dom = new JSDOM(html, { url: 'http://localhost/vault/app/appB', runScripts: 'dangerously' })
+    const requests = []
+    dom.window.fetch = async (url) => {
+      requests.push(String(url))
+      return {
+        ok: true,
+        json: async () => ({
+          enabled: true,
+          mode: 'link',
+          scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+          last_scan: null,
+          tracked_bytes: 0,
+          shared_bytes: 0,
+          pending_bytes: 0,
+          activity_error: null,
+          cloud_sync_warning: null,
+          sources: [{
+            id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
+            display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
+          }],
+          blobs: [], duplicates: [], excluded: [], events: [], undo_batches: []
+        })
+      }
+    }
+    const script = await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'public', 'vault.js'), 'utf8')
+    dom.window.eval(script)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    assert.deepStrictEqual(requests, ['/info/dedup?scope_id=app%3AappB'])
+    assert.match(dom.window.document.getElementById('btn-scan').textContent, /Scan this app/)
+    assert.strictEqual(dom.window.document.querySelector('[data-source="app:appB"]').getAttribute('aria-current'), 'page')
+    assert.strictEqual(dom.window.document.getElementById('btn-add-source'), null)
+    assert.strictEqual(dom.window.document.getElementById('btn-repair'), null)
+    dom.window.close()
+  })
+
+  test('separate explains each safe refusal instead of showing a generic failure', async () => {
+    const source = await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'public', 'vault.js'), 'utf8')
+    assert.match(source, /const detachFeedback = \(result\) =>/)
+    assert.match(source, /locked:\s*COPY\.separate_locked/)
+    assert.match(source, /stale:\s*COPY\.separate_changed/)
+    assert.match(source, /conflict:\s*COPY\.separate_conflict/)
+    assert.match(source, /"not-found":\s*COPY\.separate_not_found/)
+    assert.match(source, /runAction\(\{ action: "detach", path: target\.dataset\.detach \}, detachFeedback\)/)
+  })
+
+  test('row actions describe one clear operation for each actionable state', async () => {
+    const source = await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'public', 'vault.js'), 'utf8')
+    assert.match(source, /if \(item\.status === "duplicate"\)[^\n]+COPY\.skip/)
+    assert.match(source, /if \(item\.status === "shared"\)[^\n]+COPY\.separate/)
+    assert.match(source, /if \(item\.status === "independent"\)[^\n]+COPY\.include_in_scans/)
+    assert.match(source, /if \(item\.status === "independent"\)[^\n]+\n\s*return ""/)
+    const copyBlock = source.match(/const COPY = \{[\s\S]*?\n\}/)[0]
+    assert.doesNotMatch(copyBlock, /Kept independent|Make independent|Allow sharing again|Sharing allowed again/)
   })
 
   test('vault route provisions the dev requirements needed by its folder picker', async () => {
