@@ -6,7 +6,7 @@ const { SHA256_RE } = require('./constants')
 const isMissingError = (error) => !!(error && (error.code === "ENOENT" || error.code === "ENOTDIR"))
 const isRecord = (value) => !!(value && typeof value === "object" && !Array.isArray(value))
 const unsafeRegistryPath = (filePath) => {
-  const error = new Error(`Vault registry path is not safe: ${filePath}`)
+  const error = new Error(`Storage index path is not safe: ${filePath}`)
   error.code = "EVAULTPATH"
   return error
 }

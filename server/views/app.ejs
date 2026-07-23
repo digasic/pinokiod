@@ -8143,6 +8143,7 @@ body.dark .pinokio-custom-terminal-header {
 <script src="/sweetalert2.js"></script>
 <script src="/nav.js"></script>
 <script src="/common.js"></script>
+<script src="/storage-size.js"></script>
 <script src="/opener.js"></script>
 <script src="/report.js"></script>
 <script src="/normalize.js"></script>
@@ -12579,19 +12580,7 @@ const rerenderMenuSection = (container, html) => {
         return res.json()
       }).then((res) => {
         if (res.du > 0) {
-          let val
-          //let k = 1024
-          let k = 1000
-          if (res.du > k * k * k) {
-            // GB
-            val = `${Math.floor(res.du/k/k/k * 100) / 100} GB`
-          } else if (res.du > k * k) {
-            // MB
-            val = `${Math.floor(res.du/k/k * 100) / 100} MB`
-          } else {
-            // KB
-            val = `${Math.floor(res.du/k * 100) / 100} KB`
-          }
+          const val = window.PinokioFormatStorageSize(res.du)
           els.forEach((el) => {
             const metricLabel = el.getAttribute("data-metric-label")
             el.innerHTML = `<i class="fa-solid fa-database"></i> ${metricLabel ? `${metricLabel} ` : ""}${val}`

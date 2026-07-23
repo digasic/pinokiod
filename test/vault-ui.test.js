@@ -28,8 +28,15 @@ const duplicateEntry = async (filePath, entry) => {
 
 const vaultPageSource = async () => {
   const root = path.resolve(__dirname, '..', 'server')
-  const files = ['views/vault.ejs', 'views/partials/vault_workspace.ejs', 'public/vault.css', 'public/vault.js']
+  const files = ['views/vault.ejs', 'views/partials/vault_workspace.ejs', 'public/vault.css', 'public/storage-size.js', 'public/vault.js']
   return (await Promise.all(files.map((file) => fs.promises.readFile(path.resolve(root, file), 'utf8')))).join('\n')
+}
+
+const runVaultScript = async (dom) => {
+  const publicRoot = path.resolve(__dirname, '..', 'server', 'public')
+  const scripts = await Promise.all(['storage-size.js', 'vault.js']
+    .map((file) => fs.promises.readFile(path.resolve(publicRoot, file), 'utf8')))
+  dom.window.eval(scripts.join('\n'))
 }
 
 describe('vault dashboard backend (phase 4)', () => {
@@ -539,6 +546,7 @@ describe('vault dashboard backend (phase 4)', () => {
       new Set([appAFile]))
     assert.strictEqual(status.pending_bytes, content.length)
     assert.strictEqual(status.tracked_bytes, content.length)
+    assert.strictEqual(status.effective_bytes, content.length)
     assert.strictEqual(status.shared_bytes, 0)
     assert.ok(status.last_scan && status.last_scan.files === 1)
 
@@ -546,6 +554,35 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(converted.converted, 1)
     const sharedStatus = await vault.status(appB.id)
     assert.strictEqual(sharedStatus.shared_bytes, content.length)
+    assert.strictEqual(sharedStatus.effective_bytes, content.length / 2)
+  })
+
+  test('app effective usage divides shared files across locations and fully counts other files', async () => {
+    const { home, vault } = await makeEnv()
+    const shared = crypto.randomBytes(4096)
+    const small = crypto.randomBytes(512)
+    const hash = sha256(shared)
+    const appAFile = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), shared)
+    const appBFile = await writeFile(path.resolve(home, 'api', 'appB', 'model.bin'), shared)
+    const appCFile = await writeFile(path.resolve(home, 'api', 'appC', 'model.bin'), shared)
+    await writeFile(path.resolve(home, 'api', 'appA', 'config.bin'), small)
+    await vault.sweeper.scan()
+    const sources = Object.fromEntries(vault.sources()
+      .filter((source) => source.kind === 'app')
+      .map((source) => [source.app, source]))
+
+    assert.strictEqual((await vault.convert(appBFile, hash, {
+      app: 'appB', source_id: sources.appB.id
+    })).status, 'converted')
+    assert.strictEqual((await vault.convert(appCFile, hash, {
+      app: 'appC', source_id: sources.appC.id
+    })).status, 'converted')
+
+    const status = await vault.status(sources.appA.id)
+    assert.strictEqual(status.last_scan.bytes_total, shared.length + small.length)
+    assert.strictEqual(status.tracked_bytes, shared.length)
+    assert.strictEqual(status.effective_bytes, small.length + (shared.length / 3))
+    assert.strictEqual((await fs.promises.stat(appAFile)).nlink, 4, 'three locations plus the hidden store name')
   })
 
   test('activity exposes source-relative paths instead of bare filenames', async () => {
@@ -753,7 +790,7 @@ describe('vault dashboard backend (phase 4)', () => {
   })
 
   test('item 16: vocabulary lint — vault page copy avoids forbidden terms', async () => {
-    const forbidden = /hard.?link|junction|symlink|inode|\bblob\b|\bstore\b|\bdedupe\b/i
+    const forbidden = /hard.?link|junction|symlink|inode|\bblob\b|\bstore\b|\bdedupe\b|\bvault\b/i
     const vaultPage = await vaultPageSource()
     const copyBlock = vaultPage.match(/const COPY = \{[\s\S]*?\n\}/)
     assert.ok(copyBlock, 'vault.ejs must keep user copy in a COPY object')
@@ -761,7 +798,7 @@ describe('vault dashboard backend (phase 4)', () => {
       assert.ok(!forbidden.test(m[1]), `forbidden term in vault page copy: "${m[1]}"`)
     }
     const outsideCopy = vaultPage.replace(copyBlock[0], '')
-    assert.doesNotMatch(outsideCopy, /Add external folder|Vault files|folder picker could not be opened|Vault status request failed|Search in \$\{/)
+    assert.doesNotMatch(outsideCopy, /Add external folder|folder picker could not be opened|Couldn’t load Save space status|Search in \$\{/)
   })
 
   test('duplicate matches show complete filesystem paths without ellipsis', async () => {
@@ -793,10 +830,18 @@ describe('vault dashboard backend (phase 4)', () => {
 
   test('repair is advanced, metrics distinguish detected and explicit savings, and refresh retries', async () => {
     const vaultPage = await vaultPageSource()
-    assert.match(vaultPage, /already_shared:\s*"Already shared"/)
-    assert.match(vaultPage, /on_disk_help:\s*"File managers may count shared files more than once\./)
-    assert.match(vaultPage, /saved_by_vault:\s*"Saved by Vault"/)
-    assert.match(vaultPage, /repair_index:\s*"Repair Vault index"/)
+    assert.match(vaultPage, /disk_space_saved:\s*"of disk space saved"/)
+    assert.match(vaultPage, /before_help:\s*"Estimated space if every app stored its own copy\."/)
+    assert.match(vaultPage, /nothing_more_to_save:\s*"Nothing else to save"/)
+    assert.match(vaultPage, /more_can_be_saved:\s*"\{size\} more can be saved"/)
+    assert.match(vaultPage, /fmt\(data\.saved_by_sharing\)/)
+    assert.match(vaultPage, /Number\(data\.bytes_without_sharing\)/)
+    assert.match(vaultPage, /Number\(data\.bytes_on_disk\)/)
+    assert.match(vaultPage, /Number\(data\.pending_bytes\)/)
+    assert.match(vaultPage, /id="btn-review-metric"/)
+    assert.match(vaultPage, /id='vault-storage-details'/)
+    assert.match(vaultPage, /fmt\(data\.lifetime_bytes_saved\)/)
+    assert.match(vaultPage, /repair_index:\s*"Repair index"/)
     assert.match(vaultPage, /<details class='vault-advanced'/)
     assert.doesNotMatch(vaultPage, /id='btn-rebuild'/)
     const refreshBlock = vaultPage.match(/const refresh = async \(\) => \{[\s\S]*?\n\}/)
@@ -827,9 +872,22 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /\.vault-match-path \{[\s\S]*?overflow-wrap:\s*anywhere/)
     assert.doesNotMatch(vaultPage, /<header class='task-shell-header'>/)
     assert.doesNotMatch(vaultPage, /id='vault-(?:title|subtitle)'/)
-    assert.match(vaultPage, /\.vault-overview \{[\s\S]*?padding:\s*7px var\(--vault-inline\)/)
-    assert.match(vaultPage, /\.vault-metric \{[\s\S]*?border:\s*0;[\s\S]*?border-left:\s*1px solid var\(--task-border\)/)
-    assert.match(vaultPage, /button\.vault-metric \{[\s\S]*?font:\s*inherit/)
+    assert.match(vaultPage, /body\[data-vault-mode="global"\] \.vault-overview,[\s\S]*?min-height:\s*104px/)
+    assert.match(vaultPage, /\.vault-metrics\.summary \{[\s\S]*?grid-template-columns:\s*minmax\(430px, 620px\) minmax\(230px, 1fr\)/)
+    assert.match(vaultPage, /\.vault-compare-row \{[\s\S]*?grid-template-columns:\s*54px minmax\(180px, 1fr\) 68px/)
+    assert.match(vaultPage, /\.vault-compare-fill\.after \{[\s\S]*?width:\s*var\(--vault-after-ratio\)/)
+    assert.match(vaultPage, /class="vault-compare-info" tabindex="0" aria-describedby="\$\{helpId\}"/)
+    assert.match(vaultPage, /class="vault-compare-tooltip" id="\$\{helpId\}" role="tooltip"/)
+    assert.match(vaultPage, /\.vault-compare-info:hover \.vault-compare-tooltip,[\s\S]*?\.vault-compare-info:focus \.vault-compare-tooltip \{[\s\S]*?visibility:\s*visible/)
+    assert.doesNotMatch(vaultPage, /\.vault-metric \{/)
+    assert.match(vaultPage, /\.vault-table\.inventory \.vault-columns,[\s\S]*?grid-template-columns:\s*minmax\(260px, 1\.7fr\) minmax\(72px, \.4fr\) minmax\(240px, 1fr\)/)
+    assert.match(vaultPage, /\.vault-table\.activity \.vault-columns,[\s\S]*?grid-template-columns:[^;]+;/)
+    assert.match(vaultPage, /\.vault-table\.flat \.vault-columns,[\s\S]*?grid-template-columns:[^;]+;/)
+    assert.match(vaultPage, /\.vault-display-mode \{[\s\S]*?height:\s*30px/)
+    assert.match(vaultPage, /\.vault-flat-location \{[\s\S]*?overflow-wrap:\s*anywhere;[\s\S]*?white-space:\s*normal/)
+    assert.match(vaultPage, /\.vault-sharing-switch::before \{[\s\S]*?width:\s*32px;[\s\S]*?height:\s*18px;/)
+    assert.match(vaultPage, /\.vault-sharing-switch\.on \.vault-sharing-thumb \{[\s\S]*?transform:\s*translateX\(14px\)/)
+    assert.match(vaultPage, /\.vault-sharing-switch:focus-visible/)
     assert.match(vaultPage, /id='btn-add-source'/)
     assert.match(vaultPage, /<script src="\/Socket\.js"><\/script>/)
     assert.match(vaultPage, /action:\s*"add_source"/)
@@ -957,6 +1015,7 @@ describe('vault dashboard backend (phase 4)', () => {
           scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
           last_scan: null,
           tracked_bytes: 0,
+          effective_bytes: null,
           shared_bytes: 0,
           pending_bytes: 0,
           activity_error: null,
@@ -969,8 +1028,7 @@ describe('vault dashboard backend (phase 4)', () => {
         })
       }
     }
-    const script = await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'public', 'vault.js'), 'utf8')
-    dom.window.eval(script)
+    await runVaultScript(dom)
     await new Promise((resolve) => setTimeout(resolve, 25))
 
     assert.deepStrictEqual(requests, ['/info/dedup?scope_id=app%3AappB'])
@@ -978,6 +1036,114 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(dom.window.document.querySelector('[data-source="app:appB"]').getAttribute('aria-current'), 'page')
     assert.strictEqual(dom.window.document.getElementById('btn-add-source'), null)
     assert.strictEqual(dom.window.document.getElementById('btn-repair'), null)
+    dom.window.close()
+  })
+
+  test('app Save space header shows proportional effective disk usage', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', agent: 'electron', scope_id: 'app:appB'
+    })
+    const dom = new JSDOM(html, { url: 'http://localhost/vault/app/appB', runScripts: 'dangerously' })
+    const gb = 1024 ** 3
+    dom.window.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        enabled: true,
+        mode: 'link',
+        scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+        last_scan: { ts: Date.now(), bytes_total: 6.6 * gb },
+        tracked_bytes: 6.5 * gb,
+        effective_bytes: 2.4 * gb,
+        shared_bytes: 4.3 * gb,
+        pending_bytes: 0,
+        activity_error: null,
+        cloud_sync_warning: null,
+        sources: [{
+          id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
+          display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
+        }],
+        blobs: [], duplicates: [], excluded: [], events: [], undo_batches: []
+      })
+    })
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    assert.strictEqual(dom.window.document.querySelector('.vault-summary-value').textContent, '4.51 GB saved for this app')
+    assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-compare-value')].map((node) => node.textContent), ['7.09 GB', '2.58 GB'])
+    assert.match(dom.window.document.querySelector('.vault-compare-fill.after').getAttribute('style'), /--vault-after-ratio:36\.36%/)
+    assert.strictEqual(dom.window.document.getElementById('vault-after-help').textContent,
+      'Shared files are divided evenly among every location using them.')
+    assert.match(await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'public', 'vault.css'), 'utf8'),
+      /body\[data-vault-mode="app"\] \.vault-compare-tooltip \{[\s\S]*?left:\s*0;[\s\S]*?transform:\s*translateY\(-2px\)/)
+    assert.match(dom.window.document.querySelector('.vault-summary-side').textContent, /Nothing else to save/)
+    dom.window.close()
+  })
+
+  test('app header and Save space share decimal storage units', async () => {
+    const dom = new JSDOM('', { runScripts: 'dangerously' })
+    const formatter = await fs.promises.readFile(
+      path.resolve(__dirname, '..', 'server', 'public', 'storage-size.js'), 'utf8')
+    dom.window.eval(formatter)
+    assert.strictEqual(dom.window.PinokioFormatStorageSize(7.05e9), '7.05 GB')
+    assert.strictEqual(dom.window.PinokioFormatStorageSize(5.3e9), '5.3 GB')
+
+    const appView = await fs.promises.readFile(
+      path.resolve(__dirname, '..', 'server', 'views', 'app.ejs'), 'utf8')
+    assert.match(appView, /<script src="\/storage-size\.js"><\/script>/)
+    assert.match(appView, /PinokioFormatStorageSize\(res\.du\)/)
+    dom.window.close()
+  })
+
+  test('global Save space header explains current savings and keeps pending savings actionable', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const workspace = await ejs.renderFile(path.resolve(views, 'partials', 'vault_workspace.ejs'), { appMode: false })
+    const dom = new JSDOM(`<body data-vault-mode="global">${workspace}</body>`, {
+      url: 'http://localhost/vault', runScripts: 'dangerously'
+    })
+    const gb = 1024 ** 3
+    dom.window.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        enabled: true,
+        mode: 'link',
+        scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+        last_scan: { ts: Date.now(), bytes_total: 154.8 * gb, home_bytes_total: 154.8 * gb },
+        bytes_on_disk: 377 * gb,
+        bytes_without_sharing: 616.3 * gb,
+        saved_by_sharing: 239.3 * gb,
+        lifetime_bytes_saved: 241 * gb,
+        pending_bytes: 12.4 * gb,
+        reclaimable: 2048,
+        activity_error: null,
+        cloud_sync_warning: null,
+        sources: [{
+          id: 'pinokio', kind: 'pinokio', label: 'Pinokio', root: '/pinokio',
+          display_path: '/pinokio', parent_id: null, available: true, shareable: true
+        }],
+        blobs: [{ hash: 'c'.repeat(64), size: 2048, orphan: true, nlink: 1, names: [] }],
+        duplicates: [], excluded: [], events: [], undo_batches: []
+      })
+    })
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    assert.strictEqual(dom.window.document.querySelector('.vault-summary-value').textContent, '256.95 GB of disk space saved')
+    assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-compare-label')].map((node) => node.firstChild.textContent.trim()), ['Before', 'After'])
+    assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-compare-value')].map((node) => node.textContent), ['661.75 GB', '404.8 GB'])
+    assert.match(dom.window.document.querySelector('.vault-compare-fill.after').getAttribute('style'), /--vault-after-ratio:61\.17%/)
+    assert.strictEqual(dom.window.document.getElementById('vault-before-help').textContent, 'Estimated space if every app stored its own copy.')
+    assert.strictEqual(dom.window.document.querySelector('.vault-compare-info').getAttribute('tabindex'), '0')
+    assert.match(dom.window.document.querySelector('.vault-summary-side').textContent, /13\.31 GB more can be saved/)
+    assert.strictEqual(dom.window.document.getElementById('btn-review-metric').textContent, 'Review files')
+    assert.match(dom.window.document.getElementById('vault-storage-details').textContent, /Pinokio folder\s*166\.22 GB/)
+    assert.match(dom.window.document.getElementById('vault-storage-details').textContent, /Saved by your actions\s*258\.77 GB/)
+    const unusedView = dom.window.document.querySelector('[data-view="reclaimable"]')
+    assert.strictEqual(unusedView.querySelector('.vault-nav-name').textContent, 'Unused files')
+    unusedView.click()
+    assert.strictEqual(dom.window.document.getElementById('btn-reclaim-all').textContent, 'Delete all')
+    assert.strictEqual(dom.window.document.querySelector('[data-reclaim]').textContent, 'Delete')
+    assert.match(dom.window.document.getElementById('vault-pane-footer').textContent, /Deleting them frees disk space/)
     dom.window.close()
   })
 
@@ -991,14 +1157,183 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(source, /runAction\(\{ action: "detach", path: target\.dataset\.detach \}, detachFeedback\)/)
   })
 
-  test('row actions describe one clear operation for each actionable state', async () => {
+  test('inventory puts sharing switches in status and keeps duplicate Skip inline', async () => {
     const source = await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'public', 'vault.js'), 'utf8')
-    assert.match(source, /if \(item\.status === "duplicate"\)[^\n]+COPY\.skip/)
-    assert.match(source, /if \(item\.status === "shared"\)[^\n]+COPY\.separate/)
-    assert.match(source, /if \(item\.status === "independent"\)[^\n]+COPY\.include_in_scans/)
-    assert.match(source, /if \(item\.status === "independent"\)[^\n]+\n\s*return ""/)
-    const copyBlock = source.match(/const COPY = \{[\s\S]*?\n\}/)[0]
-    assert.doesNotMatch(copyBlock, /Kept independent|Make independent|Allow sharing again|Sharing allowed again/)
+    assert.match(source, /const duplicateAction = \(item\) => \{[\s\S]*?COPY\.skip/)
+    assert.match(source, /item\.status === "shared"[\s\S]*?role="switch" aria-checked="true"[\s\S]*?data-detach/)
+    assert.match(source, /item\.status === "independent"[\s\S]*?role="switch" aria-checked="false"[\s\S]*?data-reshare/)
+    assert.match(source, /class="vault-status-cell"/)
+    assert.doesNotMatch(source, /separate:\s*"Separate"/)
+    assert.doesNotMatch(source, /include_in_scans:\s*"Include in scans"/)
+    assert.match(source, /headers = \[COPY\.name, COPY\.size, COPY\.status\]/)
+    assert.match(source, /headers = \[COPY\.name, COPY\.size, COPY\.matches, COPY\.can_save, ""\]/)
+    assert.match(source, /headers = \[COPY\.name, COPY\.size, COPY\.can_free, ""\]/)
+    assert.match(source, /headers = \[COPY\.name, COPY\.size, COPY\.last_scanned, ""\]/)
+    assert.match(source, /reclaimable:\s*"Unused files"/)
+    assert.match(source, /reclaim:\s*"Delete"/)
+    assert.match(source, /reclaim_all:\s*"Delete all"/)
+    assert.match(source, /data-sort-size/)
+    assert.match(source, /data-display-mode="folders"/)
+    assert.match(source, /data-display-mode="files"/)
+    assert.match(source, /headers = \[COPY\.name, COPY\.location_column, COPY\.size, COPY\.status\]/)
+    assert.match(source, /aria-sort="\$\{state\.sizeSort === "desc" \? "descending" : state\.sizeSort === "asc" \? "ascending" : "none"\}"/)
+  })
+
+  test('app inventory renders real sharing switches without empty columns', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', agent: 'electron', scope_id: 'app:appB'
+    })
+    const dom = new JSDOM(html, { url: 'http://localhost/vault/app/appB', runScripts: 'dangerously' })
+    const actions = []
+    const status = {
+      enabled: true,
+      mode: 'link',
+      scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+      last_scan: { ts: Date.now(), bytes_total: 2048 },
+      tracked_bytes: 2048,
+      effective_bytes: 1536,
+      shared_bytes: 1024,
+      pending_bytes: 0,
+      activity_error: null,
+      cloud_sync_warning: null,
+      sources: [{
+        id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
+        display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
+      }],
+      blobs: [{
+        hash: 'a'.repeat(64), size: 1024, orphan: false, nlink: 3,
+        names: [
+          { path: '/pinokio/api/appB/shared.bin', relative_path: 'shared.bin', source_id: 'app:appB', source_label: 'appB', mode: 'link' },
+          { path: '/pinokio/api/appA/shared.bin', relative_path: 'shared.bin', source_id: 'app:appA', source_label: 'appA', mode: 'link' }
+        ]
+      }],
+      duplicates: [],
+      excluded: [{
+        path: '/pinokio/api/appB/own.bin', relative_path: 'own.bin',
+        source_id: 'app:appB', source_label: 'appB', size: 1024
+      }],
+      events: [], undo_batches: []
+    }
+    dom.window.fetch = async (url, options = {}) => {
+      if (options.method === 'POST') {
+        const action = JSON.parse(options.body)
+        actions.push(action)
+        return { ok: true, json: async () => action.action === 'reshare' ? { status: 'resharable' } : { status: 'detached' } }
+      }
+      return { ok: true, json: async () => status }
+    }
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-table.inventory .vault-columns span')]
+      .map((node) => node.textContent), ['Name', 'Size', 'Sharing status'])
+    assert.strictEqual(dom.window.document.querySelector('.vault-table.inventory .vault-space'), null)
+    assert.strictEqual(dom.window.document.querySelector('.vault-table.inventory .vault-row-action'), null)
+    const on = dom.window.document.querySelector('.vault-sharing-switch[aria-checked="true"]')
+    const off = dom.window.document.querySelector('.vault-sharing-switch[aria-checked="false"]')
+    assert.ok(on && on.classList.contains('on'))
+    assert.ok(off && !off.classList.contains('on'))
+    assert.strictEqual(on.getAttribute('role'), 'switch')
+    assert.strictEqual(on.getAttribute('aria-label'), 'Allow shared.bin to share storage')
+    assert.strictEqual(off.getAttribute('aria-label'), 'Allow own.bin to share storage')
+    assert.match(off.closest('.vault-status-cell').textContent, /Kept separate/)
+
+    on.click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    dom.window.document.querySelector('.vault-sharing-switch[aria-checked="false"]').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    assert.deepStrictEqual(actions, [
+      { action: 'detach', path: '/pinokio/api/appB/shared.bin' },
+      { action: 'reshare', path: '/pinokio/api/appB/own.bin' }
+    ])
+    dom.window.close()
+  })
+
+  test('Shared defaults to a globally size-sorted Files mode and can return to Folders', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', agent: 'electron', scope_id: 'app:appB'
+    })
+    const dom = new JSDOM(html, { url: 'http://localhost/vault/app/appB', runScripts: 'dangerously' })
+    const sharedBlob = (hash, size, name) => ({
+      hash, size, orphan: false, nlink: 3,
+      names: [
+        { path: `/pinokio/api/appB/${name}`, relative_path: name, source_id: 'app:appB', source_label: 'appB', mode: 'link' },
+        { path: `/pinokio/api/appA/${name}`, relative_path: name, source_id: 'app:appA', source_label: 'appA', mode: 'link' }
+      ]
+    })
+    const status = {
+      enabled: true,
+      mode: 'link',
+      scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+      last_scan: { ts: Date.now(), bytes_total: 5120 },
+      tracked_bytes: 5120,
+      effective_bytes: 2560,
+      shared_bytes: 5120,
+      pending_bytes: 0,
+      activity_error: null,
+      cloud_sync_warning: null,
+      sources: [{
+        id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
+        display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
+      }],
+      blobs: [
+        sharedBlob('a'.repeat(64), 1024, 'a-small/a-small.bin'),
+        sharedBlob('b'.repeat(64), 4096, 'z-large/z-large.bin')
+      ],
+      duplicates: [], excluded: [], events: [], undo_batches: []
+    }
+    dom.window.fetch = async () => ({ ok: true, json: async () => status })
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    dom.window.document.querySelector('[data-view="shared"]').click()
+    const names = () => [...dom.window.document.querySelectorAll('.vault-file-row:not(.directory) .vault-file-name')]
+      .map((node) => node.textContent)
+    const directories = () => [...dom.window.document.querySelectorAll('.vault-file-row.directory .vault-file-name')]
+      .map((node) => node.textContent)
+    const locations = () => [...dom.window.document.querySelectorAll('.vault-flat-location')]
+      .map((node) => node.textContent)
+    const sort = () => dom.window.document.querySelector('[data-sort-size]')
+    const mode = (name) => dom.window.document.querySelector(`[data-display-mode="${name}"]`)
+    assert.strictEqual(mode('files').getAttribute('aria-pressed'), 'true')
+    assert.strictEqual(mode('folders').getAttribute('aria-pressed'), 'false')
+    assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-columns > span')]
+      .map((node) => node.textContent), ['Name', 'Location', 'Size', 'Sharing status'])
+    assert.deepStrictEqual(names(), ['z-large.bin', 'a-small.bin'])
+    assert.deepStrictEqual(directories(), [])
+    assert.match(locations()[0], /appB \/ z-large\/z-large\.bin/)
+    assert.match(locations()[1], /appB \/ a-small\/a-small\.bin/)
+    assert.strictEqual(sort().getAttribute('aria-label'), 'Sort by size, smallest first')
+    assert.strictEqual(sort().parentElement.getAttribute('aria-sort'), 'descending')
+    assert.strictEqual(dom.window.document.getElementById('vault-pane-footer').textContent,
+      '2 shared files · sorted largest first')
+
+    sort().click()
+    assert.deepStrictEqual(names(), ['a-small.bin', 'z-large.bin'])
+    assert.strictEqual(sort().getAttribute('aria-label'), 'Sort by size, largest first')
+    assert.strictEqual(sort().parentElement.getAttribute('aria-sort'), 'ascending')
+    assert.strictEqual(dom.window.document.getElementById('vault-pane-footer').textContent,
+      '2 shared files · sorted smallest first')
+
+    sort().click()
+    assert.deepStrictEqual(names(), ['z-large.bin', 'a-small.bin'])
+    assert.strictEqual(sort().getAttribute('aria-label'), 'Sort by size, smallest first')
+    assert.strictEqual(sort().parentElement.getAttribute('aria-sort'), 'descending')
+
+    mode('folders').click()
+    assert.strictEqual(mode('folders').getAttribute('aria-pressed'), 'true')
+    assert.strictEqual(mode('files').getAttribute('aria-pressed'), 'false')
+    assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-columns > span')]
+      .map((node) => node.textContent), ['Name', 'Size', 'Sharing status'])
+    assert.deepStrictEqual(directories(), ['a-small', 'z-large'])
+    assert.strictEqual(sort(), null)
+
+    mode('files').click()
+    assert.deepStrictEqual(names(), ['z-large.bin', 'a-small.bin'])
+    assert.strictEqual(sort().parentElement.getAttribute('aria-sort'), 'descending')
+    dom.window.close()
   })
 
   test('vault route provisions the dev requirements needed by its folder picker', async () => {
@@ -1027,6 +1362,9 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(infoRoute, /isSameOriginRequest/)
     assert.match(actionRoute, /isSameOriginRequest/)
     assert.match(sidebar, /vaultEnabled/)
+    assert.match(sidebar, /fa-solid fa-hard-drive[^\n]*<div class='caption'>Save space<\/div>/)
+    assert.doesNotMatch(sidebar, /<div class='caption'>Vault<\/div>/)
+    assert.ok(sidebar.indexOf("<div class='caption'>Save space</div>") < sidebar.indexOf("<div class='caption'>Checkpoints</div>"))
     assert.doesNotMatch(kernelSource, /catch\(\(err\) => \{\s*this\.vault\.enabled = false/)
   })
 

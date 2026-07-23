@@ -25,10 +25,10 @@
 
     <div class='main-sidebar-section' aria-label="Manage">
       <div class="main-sidebar-section-title">Manage</div>
-      <a class="tab <%= sidebarSelected === 'checkpoints' ? 'selected' : '' %>" href="/checkpoints"><i class="fa-solid fa-clock-rotate-left"></i><div class='caption'>Checkpoints</div></a>
       <% if (typeof vaultEnabled === "undefined" || vaultEnabled) { %>
-        <a class="tab <%= sidebarSelected === 'vault' ? 'selected' : '' %>" href="/vault"><i class="fa-solid fa-hard-drive"></i><div class='caption'>Vault</div></a>
+        <a class="tab <%= sidebarSelected === 'vault' ? 'selected' : '' %>" href="/vault"><i class="fa-solid fa-hard-drive"></i><div class='caption'>Save space</div></a>
       <% } %>
+      <a class="tab <%= sidebarSelected === 'checkpoints' ? 'selected' : '' %>" href="/checkpoints"><i class="fa-solid fa-clock-rotate-left"></i><div class='caption'>Checkpoints</div></a>
       <a class="tab <%= sidebarSelected === 'tools' ? 'selected' : '' %>" href="/tools"><i class="fa-solid fa-toolbox"></i><div class='caption'>Tools</div></a>
       <a class="tab <%= sidebarSelected === 'plugins' ? 'selected' : '' %>" href="/plugins"><i class="fa-solid fa-plug-circle-bolt"></i><div class='caption'>Plugins</div></a>
       <a class="tab <%= sidebarSelected === 'tasks' ? 'selected' : '' %>" href="/tasks"><i class="fa-solid fa-list-check"></i><div class='caption'>Tasks</div></a>

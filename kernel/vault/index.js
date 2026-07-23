@@ -42,7 +42,7 @@ const unlinkIfSame = async (filePath, expected) => {
   }
 }
 const unsafeStoragePath = (filePath) => {
-  const error = new Error(`Vault storage path is not a real directory: ${filePath}`)
+  const error = new Error(`Storage path is not a real directory: ${filePath}`)
   error.code = "EVAULTPATH"
   return error
 }
@@ -176,7 +176,7 @@ class Vault {
     return { started: true }
   }
   async perform(action, payload = {}) {
-    if (!this.enabled) return { error: "Vault is disabled." }
+    if (!this.enabled) return { error: "Save space is disabled." }
     await this.ensureInitialized()
     switch (action) {
       case "add_source": {
@@ -336,7 +336,7 @@ class Vault {
     return this._sources
   }
   async addExternalSource(folderPath) {
-    if (!this.enabled) throw new Error("Vault is disabled.")
+    if (!this.enabled) throw new Error("Save space is disabled.")
     if (typeof folderPath !== "string" || !path.isAbsolute(folderPath.trim())) {
       throw new Error("Choose a valid folder.")
     }
@@ -1415,7 +1415,7 @@ class Vault {
     if (!this.enabled || !this.registry) return { enabled: false }
     const registry = this.registry
     const scope = scopeId ? this.scanSource(scopeId) : null
-    if (scopeId && !scope) throw new Error("That Vault location is no longer available.")
+    if (scopeId && !scope) throw new Error("That location is no longer available.")
     const scopeHashes = scopeId ? new Set() : null
     if (scopeHashes) {
       for (const entry of registry.links.values()) {
@@ -1567,17 +1567,36 @@ class Vault {
       undo_batches: undoBatches
     }
     if (scopeId) {
-      const linkedBytes = blobs.reduce((sum, blob) => sum + blob.size *
-        blob.names.filter((name) => name.source_id === scopeId).length, 0)
       const duplicateBytes = duplicates.reduce((sum, item) => sum + item.size, 0)
       const excludedBytes = excluded.reduce((sum, item) => sum + item.size, 0)
+      let linkedBytes = 0
+      let effectiveLinkedBytes = 0
+      let sharedBytes = 0
+      for (const blob of blobs) {
+        const scopedNames = blob.names.filter((name) => name.source_id === scopeId)
+        const scopedLinks = scopedNames.filter((name) => name.mode === "link").length
+        const scopedCopies = scopedNames.length - scopedLinks
+        const registeredLinks = blob.names.filter((name) => name.mode === "link").length
+        // The store name is one hardlink but not a user-visible location.
+        // Registry count prevents stale filesystem metadata from over-attributing the inode.
+        const filesystemLinks = Number.isFinite(blob.nlink) ? Math.max(0, blob.nlink - 1) : 0
+        const sharingLocations = Math.max(1, registeredLinks, filesystemLinks)
+        linkedBytes += blob.size * scopedNames.length
+        effectiveLinkedBytes += (blob.size * scopedCopies) +
+          (blob.size * scopedLinks / sharingLocations)
+        if (registeredLinks >= 2) sharedBytes += blob.size * scopedLinks
+      }
+      const trackedBytes = linkedBytes + duplicateBytes + excludedBytes
+      const effectiveTrackedBytes = effectiveLinkedBytes + duplicateBytes + excludedBytes
+      const folderBytes = result.last_scan && Number.isFinite(result.last_scan.bytes_total)
+        ? result.last_scan.bytes_total
+        : null
       result.scope_id = scopeId
-      result.tracked_bytes = linkedBytes + duplicateBytes + excludedBytes
-      result.shared_bytes = blobs.reduce((sum, blob) => {
-        const hardlinked = blob.names.filter((name) => name.mode === "link")
-        if (hardlinked.length < 2) return sum
-        return sum + blob.size * hardlinked.filter((name) => name.source_id === scopeId).length
-      }, 0)
+      result.tracked_bytes = trackedBytes
+      result.effective_bytes = folderBytes === null
+        ? null
+        : Math.max(0, folderBytes - trackedBytes) + effectiveTrackedBytes
+      result.shared_bytes = sharedBytes
       result.reclaimable = 0
     }
     return result
