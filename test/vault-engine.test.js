@@ -627,6 +627,112 @@ describe('vault engine (phase 1)', () => {
     assert.deepStrictEqual(await fs.promises.readFile(pendingPath), changedContent)
   })
 
+  test('deduplication rehashes a ctime-only snapshot mismatch before converting', async () => {
+    const h = await home()
+    const vault = await makeVault(h)
+    vault.sizeThreshold = 1
+    const content = crypto.randomBytes(4096)
+    await writeFile(path.resolve(h, 'api', 'appA', 'model.bin'), content)
+    await writeFile(path.resolve(h, 'api', 'appB', 'model.bin'), content)
+    await vault.sweeper.scan()
+
+    const [pendingPath, pendingEntry] = [...vault.registry.duplicates][0]
+    const indexed = vault.registry.scanIndex.get(pendingPath)
+    vault.registry.scanIndex.set(pendingPath, Object.assign({}, indexed, {
+      ctime: indexed.ctime - 1
+    }))
+    const realHashFile = vault.hashFile.bind(vault)
+    let targetRehashes = 0
+    vault.hashFile = async (filePath) => {
+      if (path.resolve(filePath) === pendingPath) targetRehashes += 1
+      return realHashFile(filePath)
+    }
+
+    let result
+    try {
+      result = await vault.perform('deduplicate', { scope_id: pendingEntry.source_id })
+    } finally {
+      vault.hashFile = realHashFile
+    }
+
+    assert.strictEqual(targetRehashes, 1)
+    assert.strictEqual(result.converted, 1)
+    assert.strictEqual(result.stale, 0)
+    assert.strictEqual(vault.registry.duplicates.has(pendingPath), false)
+    assert.deepStrictEqual(await fs.promises.readFile(pendingPath), content)
+  })
+
+  test('ctime recovery never converts different bytes with matching identity, size, and mtime', async () => {
+    const h = await home()
+    const vault = await makeVault(h)
+    vault.sizeThreshold = 1
+    const originalContent = Buffer.from('AAAA')
+    const changedContent = Buffer.from('BBBB')
+    await writeFile(path.resolve(h, 'api', 'appA', 'model.bin'), originalContent)
+    await writeFile(path.resolve(h, 'api', 'appB', 'model.bin'), originalContent)
+    await vault.sweeper.scan()
+
+    const [pendingPath, pendingEntry] = [...vault.registry.duplicates][0]
+    const indexed = vault.registry.scanIndex.get(pendingPath)
+    await fs.promises.writeFile(pendingPath, changedContent)
+    const current = await fs.promises.lstat(pendingPath)
+    vault.registry.scanIndex.set(pendingPath, Object.assign({}, indexed, {
+      dev: current.dev,
+      ino: current.ino,
+      size: current.size,
+      mtime: current.mtimeMs,
+      ctime: current.ctimeMs - 1
+    }))
+
+    const result = await vault.perform('deduplicate', { scope_id: pendingEntry.source_id })
+
+    assert.strictEqual(result.converted, 0)
+    assert.strictEqual(result.stale, 1)
+    assert.strictEqual((await fs.promises.stat(pendingPath)).nlink, 1)
+    assert.ok(vault.registry.duplicates.has(pendingPath))
+    assert.deepStrictEqual(await fs.promises.readFile(pendingPath), changedContent)
+  })
+
+  test('ctime recovery never overwrites a file replaced during its verification hash', async () => {
+    const h = await home()
+    const vault = await makeVault(h)
+    vault.sizeThreshold = 1
+    const content = crypto.randomBytes(4096)
+    const replacement = crypto.randomBytes(4096)
+    await writeFile(path.resolve(h, 'api', 'appA', 'model.bin'), content)
+    await writeFile(path.resolve(h, 'api', 'appB', 'model.bin'), content)
+    await vault.sweeper.scan()
+
+    const [pendingPath, pendingEntry] = [...vault.registry.duplicates][0]
+    const indexed = vault.registry.scanIndex.get(pendingPath)
+    vault.registry.scanIndex.set(pendingPath, Object.assign({}, indexed, {
+      ctime: indexed.ctime - 1
+    }))
+    const realHashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath) => {
+      const result = await realHashFile(filePath)
+      if (path.resolve(filePath) === pendingPath) {
+        const writerPath = `${pendingPath}.writer-replacement`
+        await fs.promises.writeFile(writerPath, replacement)
+        await fs.promises.rename(writerPath, pendingPath)
+      }
+      return result
+    }
+
+    let result
+    try {
+      result = await vault.perform('deduplicate', { scope_id: pendingEntry.source_id })
+    } finally {
+      vault.hashFile = realHashFile
+    }
+
+    assert.strictEqual(result.converted, 0)
+    assert.strictEqual(result.stale, 1)
+    assert.strictEqual((await fs.promises.stat(pendingPath)).nlink, 1)
+    assert.ok(vault.registry.duplicates.has(pendingPath))
+    assert.deepStrictEqual(await fs.promises.readFile(pendingPath), replacement)
+  })
+
   test('deduplication revalidates canonical content before replacing a pending file', async () => {
     const h = await home()
     const vault = await makeVault(h)

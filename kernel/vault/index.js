@@ -875,10 +875,26 @@ class Vault {
       return { status: "no-blob" }
     }
     if (!storeStat) return { status: "no-blob" }
-    const targetStat = await fs.promises.lstat(targetPath)
+    let targetStat = await fs.promises.lstat(targetPath)
     if (!storeStat.isFile() || !targetStat.isFile()) return { status: "stale" }
     if (meta.expected && !sameSnapshot(meta.expected, targetStat)) {
-      return { status: "stale" }
+      // Windows metadata operations can change ctime without changing the
+      // file's identity or bytes. Recover only that isolated mismatch by
+      // hashing the target again, then retain the exact pre-rename check below.
+      if (!sameContentState(meta.expected, targetStat)) return { status: "stale" }
+      const before = fileSnapshot(targetStat)
+      let verifiedTarget
+      try {
+        verifiedTarget = await this.hashFile(targetPath)
+      } catch (error) {
+        return { status: "stale" }
+      }
+      const after = await lstatIfPresent(targetPath)
+      if (!sameSnapshot(before, after) ||
+          verifiedTarget.hash !== hash || verifiedTarget.size !== after.size) {
+        return { status: "stale" }
+      }
+      targetStat = after
     }
     if (storeStat.dev !== targetStat.dev) {
       return { status: "unavailable", code: "EXDEV" }
