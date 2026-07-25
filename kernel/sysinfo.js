@@ -3,6 +3,7 @@ const fs = require('fs')
 const path = require('path')
 const nvidia = require("./gpu/nvidia")
 const amd = require("./gpu/amd")
+const amd_pci = require("./gpu/amd_pci")
 class Sysinfo {
   async init(kernel) {
     this.kernel = kernel
@@ -139,7 +140,11 @@ class Sysinfo {
     if (detected.is_nvidia) {
       return await nvidia.resolve_cuda_sm_target(detected.primaryController)
     } else if (detected.is_amd) {
-      return await amd.resolve_gpu_target(detected.gpu_model, detected.cpu_brand || (() => this.cpu_brand()))
+      let target = await amd.resolve_gpu_target(
+        detected.gpu_model,
+        detected.cpu_brand || (() => this.cpu_brand())
+      )
+      return target || await amd_pci.resolve_gpu_target(detected.primaryController)
     } else {
       return null
     }

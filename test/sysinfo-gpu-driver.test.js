@@ -2,6 +2,7 @@ const assert = require('node:assert/strict')
 const test = require('node:test')
 
 const system = require('systeminformation')
+const amdPci = require('../kernel/gpu/amd_pci')
 const nvidia = require('../kernel/gpu/nvidia')
 const Sysinfo = require('../kernel/sysinfo')
 
@@ -54,6 +55,9 @@ test('GPU sysinfo exposes per-controller drivers and primary NVIDIA driver', asy
 })
 
 test('GPU sysinfo uses selected highest-VRAM AMD controller for gpu_driver', async (t) => {
+  t.mock.method(amdPci, 'resolve_gpu_target', async () => {
+    throw new Error('PCI fallback should not run for a resolved model')
+  })
   t.mock.method(system, 'graphics', async () => ({
     controllers: [
       {

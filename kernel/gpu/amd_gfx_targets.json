@@ -1,5 +1,7 @@
 {
-  "source": "https://raw.githubusercontent.com/ROCm/ROCm/develop/docs/reference/gpu-arch-specs.rst",
+  "source": "https://raw.githubusercontent.com/ROCm/ROCm/14f8138863403a26e0caef6671cfab9b09aa636e/docs/reference/gpu-arch-specs.rst",
+  "source_revision": "14f8138863403a26e0caef6671cfab9b09aa636e",
+  "source_sha256": "24bbbc77da046c5eabf8255c508bb328ffc052d84c8e2842b78f89f482a0d412",
   "generated_by": "script/update-amd-gfx-targets.js",
   "entries": {
     "mi100": "gfx908",
