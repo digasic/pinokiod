@@ -95,6 +95,28 @@ function createFallbackStateSnapshot(kernel) {
   }
 }
 
+function createCurrentSystemSnapshot(kernel, version) {
+  kernel = kernel || {}
+  return {
+    platform: kernel.platform,
+    arch: kernel.arch,
+    running: kernel.api && kernel.api.running,
+    home: kernel.homedir,
+    vars: kernel.vars,
+    memory: kernel.memory,
+    procs: kernel.procs,
+    gpu: kernel.gpu,
+    gpus: kernel.gpus,
+    gpu_model: kernel.gpu_model,
+    gpu_driver: kernel.gpu_driver,
+    gpu_target: kernel.gpu_target,
+    ram: kernel.ram,
+    vram: kernel.vram,
+    version,
+    ...kernel.sysinfo
+  }
+}
+
 function createCurrentLogSnapshot(kernel, version) {
   const liveShells = kernel && kernel.shell && Array.isArray(kernel.shell.shells)
     ? kernel.shell.shells
@@ -118,21 +140,10 @@ function createCurrentLogSnapshot(kernel, version) {
     }
   }
 
-  const info = {
-    platform: kernel.platform,
-    arch: kernel.arch,
-    running: kernel.api.running,
-    home: kernel.homedir,
-    vars: kernel.vars,
-    memory: kernel.memory,
-    procs: kernel.procs,
-    gpu: kernel.gpu,
-    gpus: kernel.gpus,
-    version,
-    ...kernel.sysinfo
+  return {
+    info: createCurrentSystemSnapshot(kernel, version),
+    states
   }
-
-  return { info, states }
 }
 
 async function writeCurrentLogSnapshot(kernel, version) {
@@ -418,6 +429,7 @@ module.exports = {
   LOG_REDACTION_FILE_MAX_BYTES,
   isTopLevelRedactableLogPath,
   normalizeTailLineCount,
+  createCurrentSystemSnapshot,
   createCurrentLogSnapshot,
   writeCurrentLogSnapshot,
   normalizeLogRedactionOverrides,

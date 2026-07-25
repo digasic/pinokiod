@@ -2,10 +2,12 @@ const fs = require('fs')
 const os = require('os')
 const path = require('path')
 const Environment = require('../../kernel/environment')
+const { createCurrentSystemSnapshot } = require('./log_redaction')
 
 const DEFAULT_TAIL_LINES = 800
 const MAX_SECTION_CHARS = 120000
 const SENSITIVE_ENV_KEY = /(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API[_-]?KEY|APIKEY|CREDENTIAL|COOKIE|SESSION|AUTH|PRIVATE[_-]?KEY)/i
+const SENSITIVE_FIELD_KEY = /(?:^|[_-])(?:TOKEN|SECRET|PASSWORD|PASSWD|PASSPHRASE|API[_-]?KEY|APIKEY|CREDENTIAL|COOKIE|SESSION|AUTH|AUTHORIZATION|PRIVATE[_-]?KEY)(?:$|[_-])/i
 
 const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 
@@ -52,6 +54,13 @@ class AppLogReportService {
       }
     }
 
+    let systemSpec = this.buildSystemSpec()
+    if (redact) {
+      const redacted = this.redactStructuredValue(systemSpec, { appRoot, workspaceRoot })
+      systemSpec = redacted.value
+      this.mergeCounts(totals, redacted.counts)
+    }
+
     const metadata = {
       app_id: appId,
       title: status.title || appId,
@@ -62,7 +71,7 @@ class AppLogReportService {
       arch: os.arch(),
       node: process.version,
       tail_count: tailLines,
-      system_spec: this.buildSystemSpec(),
+      system_spec: systemSpec,
       redaction_mode: redact ? 'server_deterministic' : 'none',
       latest_session: sessionIndex.latest_session,
       session: selectedSession,
@@ -305,6 +314,27 @@ class AppLogReportService {
     }
   }
 
+  redactStructuredValue(input, context = {}) {
+    const counts = {}
+    const json = JSON.stringify(input, (key, value) => {
+      const normalizedKey = String(key).replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+      if (key && SENSITIVE_FIELD_KEY.test(normalizedKey) && value !== undefined && value !== null && value !== '') {
+        counts.env_secrets = (counts.env_secrets || 0) + 1
+        return '[REDACTED_SECRET]'
+      }
+      if (typeof value === 'string') {
+        const redacted = this.redactText(value, context)
+        this.mergeCounts(counts, redacted.counts)
+        return redacted.text
+      }
+      return value
+    })
+    return {
+      value: JSON.parse(json),
+      counts
+    }
+  }
+
   renderMarkdown(metadata, sections, redactions) {
     const lines = [
       '# Issue Report',
@@ -418,9 +448,11 @@ class AppLogReportService {
   buildSystemSpec() {
     const kernel = this.kernel || {}
     const info = kernel.sysinfo && typeof kernel.sysinfo === 'object' ? kernel.sysinfo : {}
-    return this.compactObject({
+    const version = this.readPinokioVersion()
+    const snapshot = createCurrentSystemSnapshot(kernel, version)
+    const spec = this.compactObject({
       pinokio: {
-        version: this.readPinokioVersion(),
+        version,
         node: process.version,
         platform: kernel.platform || process.platform,
         arch: kernel.arch || process.arch
@@ -438,6 +470,16 @@ class AppLogReportService {
       gpus: this.sanitizeGpus(info.gpus),
       graphics: this.sanitizeGraphics(info.graphics)
     })
+
+    return {
+      ...spec,
+      hardware: {
+        ...spec.hardware,
+        gpu_driver: snapshot.gpu_driver ?? null,
+        gpu_target: snapshot.gpu_target ?? null
+      },
+      diagnostics: snapshot
+    }
   }
 
   sanitizeOsInfo(value) {

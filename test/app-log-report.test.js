@@ -272,3 +272,70 @@ test('app log report rejects manifest paths outside the app log folder and logs/
     await fs.rm(root, { recursive: true, force: true })
   }
 })
+
+test('app log report preserves the complete diagnostic snapshot', () => {
+  const gpus = [{
+    name: 'advanced micro devices, inc.',
+    model: 'amd radeon rx 6600m',
+    driver: '32.0.1'
+  }]
+  const kernel = {
+    platform: 'win32',
+    arch: 'x64',
+    homedir: 'C:\\Users\\alice\\pinokio',
+    api: { running: { demo: { step: 2 } } },
+    vars: { pip: { install: { torch: 'pip3 install torch' } } },
+    memory: { local: {}, global: {} },
+    procs: { demo: { pid: 1234 } },
+    gpu: 'amd',
+    gpus,
+    gpu_model: 'amd radeon rx 6600m',
+    gpu_driver: '32.0.1',
+    gpu_target: 'gfx1032',
+    ram: 16,
+    vram: 8,
+    sysinfo: {
+      gpu: 'amd',
+      gpus,
+      gpu_model: 'amd radeon rx 6600m',
+      gpu_driver: '32.0.1',
+      gpu_target: 'gfx1032',
+      ram: 16,
+      vram: 8,
+      system: { manufacturer: 'Example', serial: 'SYSTEM-SERIAL' },
+      mem: { total: 16, reclaimable: 4, writeback: null },
+      shell: 'powershell.exe',
+      audio: [{ name: 'Example Audio Device' }],
+      future_diagnostic: { nested_null: null, nested_value: 'preserved' }
+    }
+  }
+  const service = new AppLogReportService({ registry: createRegistry(), kernel })
+  const spec = service.buildSystemSpec()
+
+  assert.equal(spec.hardware.gpu_target, 'gfx1032')
+  assert.equal(spec.hardware.gpu_driver, '32.0.1')
+  assert.deepEqual(spec.diagnostics.gpus, gpus)
+  assert.equal(spec.diagnostics.system.serial, 'SYSTEM-SERIAL')
+  assert.deepEqual(spec.diagnostics.mem, kernel.sysinfo.mem)
+  assert.equal(spec.diagnostics.shell, 'powershell.exe')
+  assert.deepEqual(spec.diagnostics.audio, [{ name: 'Example Audio Device' }])
+  assert.deepEqual(spec.diagnostics.future_diagnostic, kernel.sysinfo.future_diagnostic)
+  assert.deepEqual(spec.diagnostics.memory, kernel.memory)
+})
+
+test('app log report redacts values without dropping diagnostic fields', () => {
+  const service = new AppLogReportService({ registry: createRegistry() })
+  const redacted = service.redactStructuredValue({
+    author: 'Alice',
+    apiKey: 'plain-secret',
+    support_email: 'alice@example.com',
+    gpu_target: null
+  })
+
+  assert.deepEqual(redacted.value, {
+    author: 'Alice',
+    apiKey: '[REDACTED_SECRET]',
+    support_email: '[REDACTED_EMAIL]',
+    gpu_target: null
+  })
+})
