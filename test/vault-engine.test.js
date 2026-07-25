@@ -1513,13 +1513,72 @@ describe('vault engine (phase 1)', () => {
     const second = crypto.randomBytes(1024 * 1024)
     const firstFile = await writeFile(path.resolve(h, 'api', 'appA', 'x.bin'), first)
     const secondFile = await writeFile(path.resolve(h, 'api', 'appA', 'y.bin'), second)
-    const firstResult = await vault.hashFile(firstFile)
+    const progress = []
+    const firstResult = await vault.hashFile(firstFile, {
+      onProgress: (bytes) => progress.push(bytes)
+    })
     const worker = vault.worker
     const secondResult = await vault.hashFile(secondFile)
     assert.strictEqual(firstResult.hash, sha256(first))
     assert.strictEqual(firstResult.size, first.length)
+    assert.strictEqual(progress.at(-1), first.length)
     assert.strictEqual(secondResult.hash, sha256(second))
     assert.strictEqual(vault.worker, worker, 'worker startup is amortized across files')
+  })
+
+  test('a hash worker with no read progress is retired instead of hanging forever', async () => {
+    const h = await home()
+    const vault = await makeVault(h)
+    const file = await writeFile(path.resolve(h, 'api', 'appA', 'stalled.bin'), 'data')
+    let terminated = false
+    const stalledWorker = {
+      postMessage: () => {},
+      terminate: async () => { terminated = true }
+    }
+    vault.worker = stalledWorker
+    vault.hashInactivityMs = 20
+
+    const keepAlive = setTimeout(() => {}, 1000)
+    try {
+      await assert.rejects(vault.hashFile(file), (error) => error.code === 'ETIMEDOUT')
+    } finally {
+      clearTimeout(keepAlive)
+    }
+
+    assert.strictEqual(terminated, true)
+    assert.strictEqual(vault.worker, null)
+    assert.strictEqual(vault.workerJobs.size, 0)
+    vault.hashInactivityMs = 120 * 1000
+    const recovered = await vault.hashFile(file)
+    assert.strictEqual(recovered.hash, sha256(Buffer.from('data')))
+  })
+
+  test('hash progress keeps an active worker alive beyond the inactivity limit', async () => {
+    const h = await home()
+    const vault = await makeVault(h)
+    const content = Buffer.from('data')
+    const file = await writeFile(path.resolve(h, 'api', 'appA', 'slow.bin'), content)
+    await vault.hashFile(file)
+    const worker = vault.worker
+    const realPostMessage = worker.postMessage.bind(worker)
+    worker.postMessage = () => {}
+    vault.hashInactivityMs = 100
+    const progress = []
+    const hashing = vault.hashFile(file, {
+      onProgress: (bytes) => progress.push(bytes)
+    })
+    const id = vault.workerSeq
+    worker.postMessage = realPostMessage
+
+    for (const bytes of [1, 2, 3]) {
+      await new Promise((resolve) => setTimeout(resolve, 60))
+      worker.emit('message', { id, bytes_read: bytes })
+    }
+    worker.emit('message', { id, hash: sha256(content), size: content.length })
+
+    assert.deepStrictEqual(await hashing, { hash: sha256(content), size: content.length })
+    assert.deepStrictEqual(progress, [1, 2, 3, content.length])
+    assert.strictEqual(vault.worker, worker)
   })
 
   test('unsupported conversion leaves the independent copy pending and unregistered', async () => {

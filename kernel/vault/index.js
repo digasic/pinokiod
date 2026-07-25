@@ -6,7 +6,10 @@ const Registry = require('./registry')
 const Sweeper = require('./sweeper')
 const { walkBatches, statMany } = require('./walker')
 const { fileSnapshot, sameSnapshot, sameContentState } = require('./snapshot')
-const { SIZE_THRESHOLD, TMP_SUFFIX, SHA256_RE, DIR_CONCURRENCY, STAT_CONCURRENCY } = require('./constants')
+const {
+  SIZE_THRESHOLD, TMP_SUFFIX, SHA256_RE, DIR_CONCURRENCY, STAT_CONCURRENCY,
+  HASH_INACTIVITY_MS
+} = require('./constants')
 
 // Shared model store engine (spec/requirements/shared-model-store.md).
 // Store + registry + volume probe + hashing + adopt/convert/verify, plus the
@@ -81,6 +84,7 @@ class Vault {
     this.workerSeq = 0
     this.workerIdleTimer = null
     this.workerIdleMs = 750
+    this.hashInactivityMs = HASH_INACTIVITY_MS
     this.statConcurrency = STAT_CONCURRENCY
     this.dirConcurrency = DIR_CONCURRENCY
     this.sizeThreshold = SIZE_THRESHOLD
@@ -675,7 +679,21 @@ class Vault {
     this.volumeModes.set(dev, mode)
     return mode
   }
-  async hashFile(filePath) {
+  failHashWorker(worker, error, terminate = false) {
+    if (this.worker === worker) {
+      if (this.workerIdleTimer) clearTimeout(this.workerIdleTimer)
+      this.workerIdleTimer = null
+      this.worker = null
+    }
+    for (const [id, job] of [...this.workerJobs]) {
+      if (job.worker !== worker) continue
+      clearTimeout(job.inactivityTimer)
+      this.workerJobs.delete(id)
+      job.reject(error)
+    }
+    if (terminate) worker.terminate().catch(() => {})
+  }
+  async hashFile(filePath, options = {}) {
     if (this.workerIdleTimer) {
       clearTimeout(this.workerIdleTimer)
       this.workerIdleTimer = null
@@ -684,12 +702,24 @@ class Vault {
       const worker = new Worker(path.resolve(__dirname, "hash_worker.js"))
       this.worker = worker
       worker.unref()
-      worker.on("message", ({ id, hash, size, error }) => {
+      worker.on("message", ({ id, hash, size, bytes_read: bytesRead, error, code }) => {
         const job = this.workerJobs.get(id)
-        if (!job) return
+        if (!job || job.worker !== worker) return
+        if (Number.isFinite(bytesRead)) {
+          job.resetInactivity()
+          job.reportProgress(bytesRead)
+          return
+        }
+        clearTimeout(job.inactivityTimer)
         this.workerJobs.delete(id)
-        if (error) job.reject(new Error(error))
-        else job.resolve({ hash, size })
+        if (error) {
+          const failure = new Error(error)
+          if (code) failure.code = code
+          job.reject(failure)
+        } else {
+          job.reportProgress(size)
+          job.resolve({ hash, size })
+        }
         // Keep the worker warm across the scan queue. Starting one worker per
         // file costs ~30ms and adds up quickly on a first scan.
         if (this.workerJobs.size === 0 && this.worker === worker) {
@@ -705,27 +735,46 @@ class Vault {
       })
       worker.on("error", (error) => {
         if (this.worker !== worker) return
-        if (this.workerIdleTimer) clearTimeout(this.workerIdleTimer)
-        this.workerIdleTimer = null
-        for (const job of this.workerJobs.values()) job.reject(error)
-        this.workerJobs.clear()
-        this.worker = null
+        this.failHashWorker(worker, error)
       })
       worker.on("exit", (code) => {
         if (this.worker !== worker) return
-        if (this.workerIdleTimer) clearTimeout(this.workerIdleTimer)
-        this.workerIdleTimer = null
-        for (const job of this.workerJobs.values()) {
-          job.reject(new Error(`hash worker exited with code ${code}`))
-        }
-        this.workerJobs.clear()
-        this.worker = null
+        this.failHashWorker(worker, new Error(`hash worker exited with code ${code}`))
       })
     }
+    const worker = this.worker
     const id = ++this.workerSeq
     return new Promise((resolve, reject) => {
-      this.workerJobs.set(id, { resolve, reject })
-      this.worker.postMessage({ id, filePath })
+      const onProgress = typeof options.onProgress === "function" ? options.onProgress : null
+      const job = {
+        worker,
+        resolve,
+        reject,
+        reportProgress: (bytes) => {
+          if (!onProgress) return
+          // Progress is observational and must never fail a content hash.
+          try { onProgress(bytes) } catch (_) {}
+        },
+        inactivityTimer: null,
+        resetInactivity: null
+      }
+      job.resetInactivity = () => {
+        clearTimeout(job.inactivityTimer)
+        const inactivityMs = Math.max(1, Number(this.hashInactivityMs) || HASH_INACTIVITY_MS)
+        job.inactivityTimer = setTimeout(() => {
+          const failure = new Error(`Timed out while reading ${path.basename(filePath)}`)
+          failure.code = "ETIMEDOUT"
+          this.failHashWorker(worker, failure, true)
+        }, inactivityMs)
+        if (job.inactivityTimer.unref) job.inactivityTimer.unref()
+      }
+      this.workerJobs.set(id, job)
+      job.resetInactivity()
+      try {
+        worker.postMessage({ id, filePath })
+      } catch (error) {
+        this.failHashWorker(worker, error, true)
+      }
     })
   }
   async refreshLinkSnapshots(hash, dev, ino) {
@@ -1798,6 +1847,8 @@ class Vault {
       : sweeper.state
     return Object.assign({}, state, {
       current_file: sweeper.currentHash ? path.basename(sweeper.currentHash.path) : null,
+      current_file_bytes: sweeper.currentHash ? sweeper.currentHash.bytes : null,
+      current_file_size: sweeper.currentHash ? sweeper.currentHash.size : null,
       pending,
       error: this.scanError
     })

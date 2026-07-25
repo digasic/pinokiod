@@ -54,12 +54,11 @@ class Sweeper {
   idleState() {
     return {
       active: false, phase: "idle", dirs: 0, files: 0, bytes_total: 0,
-      counted_dirs: 0, counted_files: 0, total_files: null, count_estimate_files: null,
+      counted_dirs: 0, counted_files: 0, total_files: null,
       home_bytes_total: 0, source_bytes: {}, source_files: {}, source_hash_failures: {}, scope_id: null,
       candidates: 0, hashed: 0, hash_total: 0, hash_bytes: 0, queued: 0,
       inode_reuses: 0, unstable_hashes: 0, hash_failures: 0,
       inaccessible: 0, inaccessible_paths: [],
-      estimated_count_weight: 0.4, estimated_walk_weight: 0.5,
       started: null, duration_ms: null,
       count_duration_ms: null, walk_duration_ms: null, hash_wait_duration_ms: null,
       hash_duration_ms: 0
@@ -84,24 +83,6 @@ class Sweeper {
       if (!scopeId) this.vault.reconcileConfiguredSources()
       const scanRoots = this.vault.scanRoots(scopeId)
       if (!scanRoots.length) throw new Error("That scan location is no longer available.")
-      const previous = this.vault.registry.scanFor(scopeId)
-      if (previous) {
-        if (Number.isFinite(previous.files) && previous.files > 0) {
-          this.state.count_estimate_files = previous.files
-        }
-        const duration = Math.max(0, Number(previous.duration_ms) || 0)
-        const walkDuration = Math.max(0, Number(previous.walk_duration_ms) || 0)
-        const waitDuration = Math.max(0, Number(previous.hash_wait_duration_ms) || 0)
-        const countDuration = Number.isFinite(previous.count_duration_ms)
-          ? Math.max(0, previous.count_duration_ms)
-          : Math.max(0, duration - walkDuration - waitDuration)
-        const finishDuration = Math.max(1, duration - countDuration - walkDuration)
-        const measuredDuration = countDuration + walkDuration + finishDuration
-        if (measuredDuration > 1) {
-          this.state.estimated_count_weight = countDuration / measuredDuration
-          this.state.estimated_walk_weight = walkDuration / measuredDuration
-        }
-      }
       const countStarted = Date.now()
       for (const source of scanRoots) await this.countFiles(source.root)
       this.state.count_duration_ms = Date.now() - countStarted
@@ -411,9 +392,20 @@ class Sweeper {
   async _hashJob(job) {
     const primary = job.names[0]
     const started = Date.now()
-    this.currentHash = { path: primary.filePath }
+    const currentHash = {
+      path: primary.filePath,
+      size: Math.max(0, Number(primary.expected.size) || 0),
+      bytes: 0
+    }
+    this.currentHash = currentHash
     try {
-      const { hash, size } = await this.vault.hashFile(primary.filePath)
+      const { hash, size } = await this.vault.hashFile(primary.filePath, {
+        onProgress: (bytes) => {
+          if (this.currentHash === currentHash) {
+            currentHash.bytes = Math.min(currentHash.size, Math.max(0, Number(bytes) || 0))
+          }
+        }
+      })
       this.state.hashed += 1
       this.state.hash_bytes += size || 0
       const primaryStat = await fs.promises.lstat(primary.filePath)
@@ -460,7 +452,7 @@ class Sweeper {
       if (job.inodeKey && this.hashJobsByIno.get(job.inodeKey) === job) {
         this.hashJobsByIno.delete(job.inodeKey)
       }
-      this.currentHash = null
+      if (this.currentHash === currentHash) this.currentHash = null
       this.state.queued = Math.max(0, this.state.queued - 1)
       if (this.state.queued < this.hashQueueLimit) {
         for (const resolve of this.hashCapacityWaiters.splice(0)) resolve()

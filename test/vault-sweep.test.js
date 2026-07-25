@@ -585,37 +585,6 @@ describe('vault manual scan (phase 3)', () => {
     assert.strictEqual(vault.sweeper.state.total_files, 1)
   })
 
-  test('a rescan exposes its previous exact count as an approximate counting baseline', async () => {
-    const { home, vault } = await makeEnv()
-    await writeFile(path.resolve(home, 'api', 'appA', 'first.txt'), 'x')
-    vault.registry.lastScan = {
-      files: 100,
-      duration_ms: 1000,
-      count_duration_ms: 300,
-      walk_duration_ms: 600,
-      hash_wait_duration_ms: 100
-    }
-    const sweeper = vault.sweeper
-    const realCount = sweeper.countFiles.bind(sweeper)
-    let inspect
-    sweeper.countFiles = async (...args) => {
-      inspect = {
-        estimate: sweeper.state.count_estimate_files,
-        countWeight: sweeper.state.estimated_count_weight,
-        walkWeight: sweeper.state.estimated_walk_weight
-      }
-      return realCount(...args)
-    }
-    try {
-      await sweeper.scan()
-    } finally {
-      sweeper.countFiles = realCount
-    }
-
-    assert.deepStrictEqual(inspect, { estimate: 100, countWeight: 0.3, walkWeight: 0.6 })
-    assert.strictEqual(sweeper.state.total_files, 1, 'the completed current count remains exact')
-  })
-
   test('a transient metadata failure fails the scan without replacing its last complete result', async () => {
     const { home, vault } = await makeEnv()
     await writeFile(path.resolve(home, 'api', 'appA', 'first.txt'), 'x')
@@ -808,6 +777,56 @@ describe('vault manual scan (phase 3)', () => {
     assert.strictEqual(vault.registry.lastScan.hashed, 0)
     assert.strictEqual(vault.registry.lastScan.hash_failures, 1)
     assert.strictEqual(vault.registry.scanIndex.has(file), false)
+  })
+
+  test('scan status reports byte progress for the large file being hashed', async () => {
+    const { home, vault } = await makeEnv()
+    const content = crypto.randomBytes(4096)
+    await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
+    const realHashFile = vault.hashFile.bind(vault)
+    let progress
+    vault.hashFile = async (target, options) => {
+      options.onProgress(1024)
+      progress = vault.scanStatus()
+      return realHashFile(target, options)
+    }
+
+    try {
+      await vault.sweeper.scan()
+    } finally {
+      vault.hashFile = realHashFile
+    }
+
+    assert.strictEqual(progress.current_file, 'model.bin')
+    assert.strictEqual(progress.current_file_bytes, 1024)
+    assert.strictEqual(progress.current_file_size, content.length)
+  })
+
+  test('a timed-out file read is skipped and the scan continues', async () => {
+    const { home, vault } = await makeEnv()
+    await writeFile(path.resolve(home, 'api', 'appA', 'first.bin'), crypto.randomBytes(4096))
+    await writeFile(path.resolve(home, 'api', 'appA', 'second.bin'), crypto.randomBytes(4096))
+    const realHashFile = vault.hashFile.bind(vault)
+    let hashCalls = 0
+    vault.hashFile = async (...args) => {
+      if (hashCalls++ === 0) {
+        const error = new Error('hash read timed out')
+        error.code = 'ETIMEDOUT'
+        throw error
+      }
+      return realHashFile(...args)
+    }
+
+    try {
+      await vault.sweeper.scan()
+    } finally {
+      vault.hashFile = realHashFile
+    }
+
+    assert.strictEqual(vault.sweeper.state.phase, 'complete')
+    assert.strictEqual(vault.registry.lastScan.hash_total, 2)
+    assert.strictEqual(vault.registry.lastScan.hash_failures, 1)
+    assert.strictEqual(vault.registry.lastScan.hashed, 1)
   })
 
   test('conversion tmp files are never candidates', async () => {

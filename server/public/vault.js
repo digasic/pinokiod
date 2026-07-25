@@ -56,15 +56,13 @@ const COPY = {
   scan_queued: "Waiting to start scan",
   scan_analyzing: "Analyzing large files",
   scan_finishing: "Finishing scan",
-  scan_estimate_help: "Overall progress combines file scanning and large-file analysis",
   scan_counting_help: "The first scan cannot know its total until this pass finishes",
-  scan_count_estimate_help: "Estimated from the exact file total and timing of the last completed scan",
-  scan_file_progress_help: "This pass uses the exact current file total; overall timing is estimated from the last scan",
-  scan_hash_progress_help: "File discovery is complete; the remaining large-file count is exact",
+  scan_file_progress_help: "Based on the exact current file total",
+  scan_hash_progress_help: "Based on the exact large-file count and current-file bytes",
   scan_finishing_help: "File analysis is complete; deduplication records are being verified",
-  about_percent: "About {percent} percent.",
   exact_percent: "{percent} percent.",
   scan_checked: "{done} of {total} large files checked",
+  scan_file_bytes: "{done} of {total}",
   scan_files_checked: "{done} of {total} files checked",
   scan_folders: "folders checked",
   scan_files: "files checked",
@@ -903,50 +901,48 @@ const renderOverview = () => {
     const verifying = scanPhase === "verifying"
     const hashTotal = scan.hash_total || 0
     const hashDone = Math.min(Math.max(0, hashTotal - (scan.queued || 0)), hashTotal)
-    const hashRatio = hashTotal ? Math.min(1, hashDone / hashTotal) : 1
+    const currentFileSize = Math.max(0, Number(scan.current_file_size) || 0)
+    const currentFileBytes = Math.min(currentFileSize, Math.max(0, Number(scan.current_file_bytes) || 0))
+    const currentFileRatio = currentFileSize ? currentFileBytes / currentFileSize : 0
+    const hashRatio = hashTotal ? Math.min(1, (hashDone + currentFileRatio) / hashTotal) : 1
     const scanSource = scan.scope_id ? sourceById(scan.scope_id) : null
     const scanProgressLabel = scanSource
       ? COPY.scan_location.replace("{location}", scanSource.label)
       : COPY.scan_progress
     const phase = queued ? COPY.scan_queued : counting ? COPY.scan_counting : walking ? scanProgressLabel : verifying ? COPY.scan_finishing : COPY.scan_analyzing
-    const rawCountWeight = Number.isFinite(scan.estimated_count_weight) ? scan.estimated_count_weight : 0.4
-    const countWeight = Math.max(0, Math.min(0.98, rawCountWeight))
-    const rawWalkWeight = Number.isFinite(scan.estimated_walk_weight) ? scan.estimated_walk_weight : 0.5
-    const walkWeight = Math.max(0, Math.min(0.98 - countWeight, rawWalkWeight))
-    const analysisWeight = Math.max(0, 1 - countWeight - walkWeight)
-    const countEstimate = Number.isFinite(scan.count_estimate_files) && scan.count_estimate_files > 0
-      ? scan.count_estimate_files
-      : null
-    const countRatio = countEstimate === null ? null : Math.min(1, (scan.counted_files || 0) / countEstimate)
     const totalFiles = Number.isFinite(scan.total_files) ? scan.total_files : null
     const details = counting
       ? [`${scan.counted_dirs || 0} ${COPY.scan_folders_found}`, `${scan.counted_files || 0} ${COPY.scan_files_found}`]
       : [`${scan.dirs || 0} ${COPY.scan_folders}`, totalFiles === null
           ? `${scan.files || 0} ${COPY.scan_files}`
           : COPY.scan_files_checked.replace("{done}", scan.files || 0).replace("{total}", totalFiles), fmt(scan.bytes_total || 0)]
-    if (scan.current_file) details.push(`${COPY.analyzing} ${scan.current_file}`)
+    if (scan.current_file) {
+      const fileProgress = currentFileSize
+        ? ` (${COPY.scan_file_bytes.replace("{done}", fmt(currentFileBytes)).replace("{total}", fmt(currentFileSize))})`
+        : ""
+      details.push(`${COPY.analyzing} ${scan.current_file}${fileProgress}`)
+    }
     if (walking && scan.queued > 1) details.push(`${scan.queued} ${COPY.waiting}`)
     if (!walking && hashTotal) {
       details.push(COPY.scan_checked.replace("{done}", hashDone).replace("{total}", hashTotal))
     }
     let percent = ""
     let progress
-    if (queued || (counting && countRatio === null) || (walking && totalFiles === null)) {
-      const ariaText = `${details.join(" · ")}. ${COPY.scan_counting_help}.`
+    if (queued || counting || verifying || (walking && totalFiles === null)) {
+      const progressHelp = verifying
+        ? COPY.scan_finishing_help
+        : counting ? COPY.scan_counting_help : phase
+      const ariaText = `${details.join(" · ")}. ${progressHelp}.`
       progress = { determinate: false, ariaText }
     } else {
-      const progressRatio = counting
-        ? countRatio * countWeight
-        : verifying
-        ? 0.99
-        : walking
-        ? countWeight + ((totalFiles ? Math.min(1, (scan.files || 0) / totalFiles) : 1) * walkWeight)
-        : Math.min(0.98, countWeight + walkWeight + (analysisWeight * hashRatio))
+      const progressRatio = walking
+        ? (totalFiles ? Math.min(1, (scan.files || 0) / totalFiles) : 1)
+        : hashRatio
       const boundedProgress = Math.max(0, Math.min(1, progressRatio))
       const progressValue = Math.round(boundedProgress * 1000) / 10
-      const progressHelp = counting ? COPY.scan_count_estimate_help : verifying ? COPY.scan_finishing_help : walking ? COPY.scan_file_progress_help : COPY.scan_estimate_help
-      const progressText = COPY.about_percent.replace("{percent}", progressValue)
-      percent = `~${progressValue}%`
+      const progressHelp = walking ? COPY.scan_file_progress_help : COPY.scan_hash_progress_help
+      const progressText = COPY.exact_percent.replace("{percent}", progressValue)
+      percent = `${progressValue}%`
       progress = { determinate: true, value: progressValue, ratio: boundedProgress, help: progressHelp, text: progressText }
     }
     if (!scanState.querySelector(".vault-progress-track")) {

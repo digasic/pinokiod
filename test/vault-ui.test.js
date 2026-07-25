@@ -915,7 +915,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.doesNotMatch(vaultPage, /inaccessiblePaths\.map\(esc\)\.join\(" · "\)/)
   })
 
-  test('progress remains active and below completion while scan verification runs', async () => {
+  test('scan remains active while verification runs', async () => {
     const { vault } = await makeEnv()
     const realVerify = vault.verify.bind(vault)
     let entered
@@ -934,12 +934,106 @@ describe('vault dashboard backend (phase 4)', () => {
       const status = vault.progressStatus().scan
       assert.strictEqual(status.active, true)
       assert.strictEqual(status.phase, 'verifying')
-      const source = await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'public', 'vault.js'), 'utf8')
-      assert.match(source, /verifying\s*\?\s*0\.99/)
     } finally {
       release()
       await scan
       vault.verify = realVerify
+    }
+  })
+
+  test('scan progress renders each phase with its real determinate state', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const workspace = await ejs.renderFile(
+      path.resolve(views, 'partials', 'vault_workspace.ejs'),
+      { appMode: false }
+    )
+    const baseStatus = {
+      enabled: true,
+      mode: 'link',
+      last_scan: null,
+      bytes_on_disk: 0,
+      bytes_without_sharing: 0,
+      saved_by_sharing: 0,
+      lifetime_bytes_saved: 0,
+      pending_bytes: 0,
+      reclaimable: 0,
+      file_action: null,
+      activity_error: null,
+      cloud_sync_warning: null,
+      sources: [{
+        id: 'pinokio', kind: 'pinokio', label: 'Pinokio', root: '/pinokio',
+        display_path: '/pinokio', parent_id: null, available: true, shareable: true
+      }],
+      blobs: [], duplicates: [], excluded: [], events: [], undo_batches: []
+    }
+    const cases = [
+      {
+        scan: {
+          active: true, pending: false, phase: 'counting', scope_id: null,
+          counted_dirs: 4, counted_files: 10, queued: 0
+        },
+        label: 'Counting files',
+        value: null
+      },
+      {
+        scan: {
+          active: true, pending: false, phase: 'discovering', scope_id: null,
+          dirs: 2, files: 2, total_files: 8, bytes_total: 2000, queued: 0
+        },
+        label: 'Scanning your configured locations',
+        value: '25'
+      },
+      {
+        scan: {
+          active: true, pending: false, phase: 'analyzing', scope_id: null,
+          dirs: 4, files: 8, total_files: 8, bytes_total: 8000,
+          hash_total: 4, queued: 3,
+          current_file: 'model.bin', current_file_bytes: 500, current_file_size: 1000
+        },
+        label: 'Analyzing large files',
+        value: '37.5'
+      },
+      {
+        scan: {
+          active: true, pending: false, phase: 'verifying', scope_id: null,
+          dirs: 4, files: 8, total_files: 8, bytes_total: 8000,
+          hash_total: 4, queued: 0
+        },
+        label: 'Finishing scan',
+        value: null
+      }
+    ]
+
+    for (const item of cases) {
+      const dom = new JSDOM(
+        `<body data-platform="darwin" data-vault-mode="global">${workspace}</body>`,
+        { url: 'http://localhost/vault', runScripts: 'dangerously' }
+      )
+      dom.window.fetch = async () => ({
+        ok: true,
+        json: async () => Object.assign({}, baseStatus, { scan: item.scan })
+      })
+      try {
+        await runVaultScript(dom)
+        await new Promise((resolve) => setTimeout(resolve, 25))
+
+        const state = dom.window.document.getElementById('vault-scan-state')
+        const track = state.querySelector('[role="progressbar"]')
+        const percent = state.querySelector('.vault-scan-percent')
+        assert.strictEqual(state.querySelector('strong').textContent, item.label)
+        assert.strictEqual(track.getAttribute('aria-valuenow'), item.value)
+        assert.strictEqual(percent.hidden, item.value === null)
+        if (item.value !== null) {
+          assert.strictEqual(percent.textContent, `${item.value}%`)
+          assert.match(track.getAttribute('aria-valuetext'), new RegExp(`^${item.value} percent\\.`))
+        }
+        if (item.scan.phase === 'analyzing') {
+          assert.match(state.querySelector('.vault-scan-detail').textContent,
+            /analyzing model\.bin \(500 B of 1 KB\)/)
+        }
+      } finally {
+        dom.window.close()
+      }
     }
   })
 
@@ -1062,25 +1156,14 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /role="progressbar"/)
     assert.match(vaultPage, /id='vault-action-state' role='status' aria-live='polite'/)
     assert.match(vaultPage, /\.vault-action-state\.show,[\s\S]*?display:\s*flex/)
-    assert.match(vaultPage, /const counting = scanPhase === "counting"/)
-    assert.match(vaultPage, /const hashTotal = scan\.hash_total/)
-    assert.match(vaultPage, /const totalFiles = Number\.isFinite\(scan\.total_files\)/)
-    assert.match(vaultPage, /scan_counting_help:\s*"The first scan cannot know its total until this pass finishes"/)
-    assert.match(vaultPage, /scan_count_estimate_help:\s*"Estimated from the exact file total and timing of the last completed scan"/)
-    assert.match(vaultPage, /const countEstimate = Number\.isFinite\(scan\.count_estimate_files\)/)
-    assert.match(vaultPage, /const countRatio = countEstimate === null/)
-    assert.match(vaultPage, /counting\s*\? countRatio \* countWeight/)
     assert.match(vaultPage, /pinokio:vault:reviewed-scan/)
     assert.match(vaultPage, /completed \|\| incomplete \|\| \(!state\.scanResult && unreviewed\)/)
     assert.match(vaultPage, /state\.data\.undo_batches/)
     assert.match(vaultPage, /data-undo="\$\{attr\(batch\.batch_id\)\}"/)
     assert.match(vaultPage, /last_scan && data\.last_scan\.hash_failures/)
     assert.match(vaultPage, /scan_not_analyzed:\s*"could not be analyzed"/)
-    assert.match(vaultPage, /percent = `~\$\{progressValue\}%`/)
-    assert.match(vaultPage, /COPY\.scan_checked\.replace\("\{done\}", hashDone\)\.replace\("\{total\}", hashTotal\)/)
     assert.match(vaultPage, /\.vault-progress-bar\.determinate \{[\s\S]*?transform:\s*scaleX/)
     assert.match(vaultPage, /\.vault-progress-bar\.indeterminate \{[\s\S]*?animation:\s*vault-progress-discovery/)
-    assert.match(vaultPage, /COPY\.scan_files_checked\.replace\("\{done\}", scan\.files \|\| 0\)\.replace\("\{total\}", totalFiles\)/)
     assert.match(vaultPage, /if \(!scanState\.querySelector\("\.vault-progress-track"\)\)/)
     assert.doesNotMatch(vaultPage, /scanState\.innerHTML = `<i[^\n]*\$\{progress\}/)
     assert.match(vaultPage, /body\.vault-page \.task-container \{[\s\S]*?overflow:\s*hidden/)
