@@ -6,7 +6,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const newWindowButton = document.querySelector("#new-window");
   const agent = document.body.getAttribute("data-agent");
-  if (newWindowButton && !headerCollapseOnly) {
+  if (newWindowButton) {
     newWindowButton.addEventListener("click", (event) => {
       if (agent === "electron") {
         window.open("/", "_blank", "pinokio");
