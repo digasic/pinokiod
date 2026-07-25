@@ -142,7 +142,6 @@ const COPY = {
   files: "files",
   location: "location",
   deduplicate: "Deduplicate",
-  deduplicate_all: "Deduplicate all",
   deduplicating: "Deduplicating files",
   deduplicating_file: "Deduplicating file",
   deduplication_progress: "{done} of {total} files",
@@ -468,8 +467,8 @@ const bulkDeduplicationAction = (items) => {
   const candidates = bulkDeduplicationItems(items, selection)
   if (!candidates.length) return ""
   const context = state.sourceId || ""
-  const label = `${COPY.deduplicate_all}: ${countLabel(candidates.length)}`
-  return `<button class="vault-button" type="button" data-deduplicate-all="${selection}" data-deduplicate-context="${attr(context)}" aria-label="${attr(label)}" title="${attr(label)}">${esc(COPY.deduplicate_all)}</button>`
+  const label = `${COPY.deduplicate} ${countLabel(candidates.length)}`
+  return `<button class="vault-button primary" type="button" data-deduplicate-all="${selection}" data-deduplicate-context="${attr(context)}" aria-label="${attr(label)}" title="${attr(label)}">${esc(label)}</button>`
 }
 const batchAction = (source) => {
   if (!source || source.kind === "virtual" || source.kind === "pinokio") return ""
@@ -854,7 +853,7 @@ const renderOverview = () => {
     const opportunity = activeScan
       ? `<span class="vault-summary-state"><i class="fa-solid fa-circle-notch fa-spin"></i>${esc(COPY.scanning)}</span>`
       : pendingBytes
-        ? `<span class="vault-summary-state attention"><i class="fa-regular fa-copy"></i><strong>${esc(COPY.more_can_be_saved.replace("{size}", fmt(pendingBytes)))}</strong></span><button class="vault-button review-primary" type="button" id="btn-review-metric">${esc(COPY.review_files)}</button>`
+        ? `<span class="vault-summary-state attention"><i class="fa-regular fa-copy"></i><strong>${esc(COPY.more_can_be_saved.replace("{size}", fmt(pendingBytes)))}</strong></span>${state.view === "duplicates" ? "" : `<button class="vault-button${state.view === "independent" ? "" : " primary"}" type="button" id="btn-review-metric">${esc(COPY.review_files)}</button>`}`
         : `<span class="vault-summary-state"><i class="fa-regular fa-circle-check"></i>${esc(COPY.nothing_more_to_save)}</span>`
     const freshness = last ? `${COPY.scanned} ${timeAgo(last.ts)}` : COPY.not_scanned
     metrics.innerHTML = `
@@ -994,7 +993,9 @@ const renderResult = () => {
   }
   const info = state.scanResult
   const duplicateLabel = countLabel(info.count, COPY.duplicate.toLowerCase(), COPY.duplicates.toLowerCase())
-  const review = info.count ? `<button class="vault-button review-primary" type="button" id="btn-review-result">${esc(COPY.review)} ${duplicateLabel}<i class="fa-solid fa-chevron-right"></i></button>` : ""
+  const review = info.count && state.view !== "duplicates"
+    ? `<button class="vault-button${state.view === "independent" ? "" : " primary"}" type="button" id="btn-review-result">${esc(COPY.review)} ${duplicateLabel}<i class="fa-solid fa-chevron-right"></i></button>`
+    : ""
   if (info.incomplete) {
     result.className = `vault-result show incomplete${state.scanProblemsOpen ? " expanded" : ""}`
     const unreadableLabel = `${info.inaccessible} ${info.inaccessible === 1 ? COPY.scan_unreadable_path : COPY.scan_unreadable_paths}`

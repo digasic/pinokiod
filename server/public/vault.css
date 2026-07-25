@@ -234,13 +234,13 @@ body[data-vault-mode="app"] .vault-overview {
   white-space: nowrap;
 }
 .vault-button:hover { background: var(--task-soft); }
-.vault-button.review-primary {
+.vault-button.primary {
   border-color: var(--task-accent-contrast);
   background: var(--task-accent-contrast);
   color: #101828;
   font-weight: 650;
 }
-.vault-button.review-primary:hover {
+.vault-button.primary:hover {
   border-color: color-mix(in srgb, var(--task-accent-contrast) 88%, var(--task-panel));
   background: color-mix(in srgb, var(--task-accent-contrast) 88%, var(--task-panel));
   color: #101828;
