@@ -1,18 +1,24 @@
 const COPY = {
   views: "VIEWS",
   locations: "LOCATIONS",
-  all: "All tracked files",
+  all: "All files",
   duplicates: "Duplicates",
-  shared: "Shared",
-  skipped: "Skipped",
+  shared: "Deduplicated",
+  skipped: "Kept separate",
   reclaimable: "Unused files",
   activity: "Activity",
+  all_description: "Every scanned file and its current deduplication status.",
+  duplicates_description: "Identical files waiting to be deduplicated or kept separate.",
+  shared_description: "Files that share disk storage across multiple locations.",
+  independent_description: "Duplicate files that remain as separate copies.",
+  reclaimable_description: "Stored copies no longer used by any configured location.",
+  activity_description: "A history of scans and changes made by Save space.",
   add_external_folder: "Add external folder",
   files_region: "Files",
   folder_picker_error: "The folder picker could not be opened.",
   external_added: "Added to Locations. Run a scan when you’re ready.",
   external_exists: "That folder is already in Locations.",
-  external_other_disk: "Added to Locations. It can be scanned, but files on this disk cannot share storage with your Pinokio folder.",
+  external_other_disk: "Added to Locations. It can be scanned, but files on this disk cannot be deduplicated with files in your Pinokio folder.",
   pinokio_folder: "Pinokio folder",
   save_space: "Save space",
   disk_space_saved: "of disk space saved",
@@ -20,7 +26,7 @@ const COPY = {
   before: "Before",
   before_help: "Estimated space if every app stored its own copy.",
   after: "After",
-  effective_help: "Shared files are divided evenly among every location using them.",
+  effective_help: "For deduplicated files, disk usage is divided evenly among every location using them.",
   nothing_more_to_save: "Nothing else to save",
   more_can_be_saved: "{size} more can be saved",
   review_files: "Review files",
@@ -41,7 +47,7 @@ const COPY = {
   vault_options: "Save space options",
   repair_index: "Repair index",
   repair_action: "Repair index",
-  repair_description: "Reconstruct the internal index if tracked files or sharing status look incorrect. This does not scan for new duplicates.",
+  repair_description: "Reconstruct the internal index if file records or deduplication status look incorrect. This does not scan for new duplicates.",
   repairing: "Repairing…",
   repair_done: "Index repaired",
   scan_counting: "Counting files",
@@ -55,7 +61,7 @@ const COPY = {
   scan_count_estimate_help: "Estimated from the exact file total and timing of the last completed scan",
   scan_file_progress_help: "This pass uses the exact current file total; overall timing is estimated from the last scan",
   scan_hash_progress_help: "File discovery is complete; the remaining large-file count is exact",
-  scan_finishing_help: "File analysis is complete; sharing records are being verified",
+  scan_finishing_help: "File analysis is complete; deduplication records are being verified",
   about_percent: "About {percent} percent.",
   exact_percent: "{percent} percent.",
   scan_checked: "{done} of {total} large files checked",
@@ -78,10 +84,10 @@ const COPY = {
   locations_lower: "locations",
   can_be_saved: "can be saved",
   review: "Review",
-  search_all: "Search tracked files",
+  search_all: "Search files",
   search_duplicates: "Search duplicates",
-  search_shared: "Search shared files",
-  search_skipped: "Search skipped files",
+  search_shared: "Search deduplicated files",
+  search_skipped: "Search files kept separate",
   search_activity: "Search activity",
   search_in: "Search in {location}",
   status_request_failed: "Couldn’t load Save space status ({status})",
@@ -98,18 +104,21 @@ const COPY = {
   display_mode: "Display mode",
   sorted_largest: "sorted largest first",
   sorted_smallest: "sorted smallest first",
-  status: "Sharing status",
+  status: "Deduplication status",
   matches: "Matches",
   can_save: "Can save",
   can_free: "Can free",
   duplicate: "Duplicate",
-  tracked: "Tracked",
+  tracked: "No action needed",
   different_disk: "Different disk",
   can_save_suffix: "can save",
   unavailable: "Unavailable",
-  sharing_unavailable: "Sharing is unavailable on this disk",
+  sharing_unavailable: "Deduplication is unavailable on this disk",
   permissions_differ: "File permissions differ",
   changed_since_scan: "Some files changed since the scan. Scan again before deduplicating them.",
+  deduplicate_locked: "Stop the app before deduplicating this file.",
+  deduplicate_changed: "This file changed while it was being checked. Nothing was changed.",
+  deduplicate_no_match: "This file no longer matches a deduplicated file. Nothing was changed.",
   separate_locked: "Stop the app before separating this file.",
   separate_changed: "This file changed since it was scanned. Scan again, then try again.",
   separate_conflict: "A temporary file already exists next to this file. Nothing was changed.",
@@ -119,7 +128,7 @@ const COPY = {
   activity_write_failed: "The file action completed, but some activity history could not be recorded.",
   persistence_write_failed: "The file action completed, but its updated record could not be saved yet. It will retry automatically.",
   files_still_waiting: "{count} still waiting for review",
-  cloud_sync_warning: "Cloud syncing with {provider} can make shared files use separate disk space again.",
+  cloud_sync_warning: "Cloud syncing with {provider} can make deduplicated files use separate disk space again.",
   dismiss: "Dismiss",
   just_now: "Just now",
   minutes_ago: "m ago",
@@ -133,45 +142,51 @@ const COPY = {
   files: "files",
   location: "location",
   deduplicate: "Deduplicate",
-  skip: "Skip",
+  deduplicate_all: "Deduplicate all",
+  deduplicating: "Deduplicating files",
+  deduplicating_file: "Deduplicating file",
+  deduplication_progress: "{done} of {total} files",
+  making_separate: "Making file separate",
+  keeping_separate: "Keeping file separate",
+  keep_separate: "Keep separate",
   kept_separate: "Kept separate",
-  allow_storage_sharing: "Allow {file} to share storage",
+  make_separate: "Make separate",
   reclaim: "Delete",
   reclaim_all: "Delete all",
   undo: "Undo",
   identical_contents_at: "Identical contents at",
-  no_files: "Nothing tracked yet",
+  no_files: "No files found",
   no_files_hint: "Run a scan to find large files. Scanning never changes them.",
   scan_waiting: "Waiting for scan results",
-  scan_waiting_hint: "Tracked files will appear here when this scan finishes.",
-  no_duplicates: "Everything is already shared",
+  scan_waiting_hint: "Files will appear here when this scan finishes.",
+  no_duplicates: "No duplicates to review",
   no_duplicates_hint: "There are no files waiting for your review.",
-  no_shared: "Nothing is shared yet",
-  no_shared_hint: "Shared files will appear here after you review duplicates.",
-  no_skipped: "Nothing skipped",
-  no_skipped_hint: "Files you skip will appear here.",
+  no_shared: "Nothing deduplicated yet",
+  no_shared_hint: "Deduplicated files will appear here after you review duplicates.",
+  no_skipped: "Nothing kept separate",
+  no_skipped_hint: "Files you keep separate will appear here.",
   no_reclaimable: "No unused files",
   no_reclaimable_hint: "Copies no longer used by any configured location will appear here.",
   no_activity: "No activity yet",
   no_activity_hint: "Scans and actions will be recorded here.",
-  view_all: "View all tracked files",
+  view_all: "View all files",
   show_all_locations: "Show all locations",
-  tracked_note: "Only tracked files 100 MB and larger appear here. Files keep their current locations.",
+  tracked_note: "Only files 100 MB and larger appear here. Files keep their current locations.",
   duplicate_note: "Only files waiting for review are shown.",
   reclaimable_note: "These copies are no longer used by any configured location. Deleting them frees disk space.",
   converted: "Deduplicated",
-  skipped_action: "Skipped",
+  files_left_separate: "{count} remained separate",
+  skipped_action: "Kept separate",
   separated: "Separated",
   reclaimed: "Deleted",
-  included_in_scans: "Included in scans",
   event_convert: "Deduplicated",
   event_found: "Duplicate found",
-  event_adopt: "Tracked",
+  event_adopt: "Added",
   event_reclaim: "Deleted unused file",
   event_undo: "Undid deduplication",
-  event_diverged: "Changed by an app — no longer shared",
+  event_diverged: "Changed by an app — no longer deduplicated",
   event_detach: "Separated",
-  event_skip: "Skipped",
+  event_skip: "Kept separate",
   event_reshare: "Included in scans"
 }
 
@@ -201,7 +216,9 @@ const state = {
   scanBaseline: null,
   scanResult: null,
   scanProblemsOpen: false,
-  feedback: null
+  feedback: null,
+  actionProgress: null,
+  actionRequest: false
 }
 
 const el = (id) => document.getElementById(id)
@@ -438,6 +455,22 @@ const renderLocations = (items) => {
 
 const selectedSource = () => state.sourceId ? sourceById(state.sourceId) : null
 const scopeDuplicates = (sourceId) => state.data.duplicates.filter((item) => item.source_id === sourceId)
+const bulkDeduplicationItems = (items, selection) => items.filter((item) =>
+  (!state.sourceId || isDescendantSource(item.source_id, state.sourceId)) &&
+  (selection === "duplicates"
+    ? item.status === "duplicate" && item.shareable !== false
+    : item.status === "independent"))
+const bulkDeduplicationAction = (items) => {
+  const selection = state.view === "duplicates"
+    ? "duplicates"
+    : state.view === "independent" ? "kept-separate" : null
+  if (!selection) return ""
+  const candidates = bulkDeduplicationItems(items, selection)
+  if (!candidates.length) return ""
+  const context = state.sourceId || ""
+  const label = `${COPY.deduplicate_all}: ${countLabel(candidates.length)}`
+  return `<button class="vault-button" type="button" data-deduplicate-all="${selection}" data-deduplicate-context="${attr(context)}" aria-label="${attr(label)}" title="${attr(label)}">${esc(COPY.deduplicate_all)}</button>`
+}
 const batchAction = (source) => {
   if (!source || source.kind === "virtual" || source.kind === "pinokio") return ""
   const duplicates = scopeDuplicates(source.id)
@@ -480,12 +513,14 @@ const displayModeControl = () => supportsDisplayMode() ? `<div class="vault-disp
   <button type="button" data-display-mode="folders" aria-pressed="${state.displayMode === "folders"}" class="${state.displayMode === "folders" ? "selected" : ""}">${esc(COPY.folders)}</button>
   <button type="button" data-display-mode="files" aria-pressed="${state.displayMode === "files"}" class="${state.displayMode === "files" ? "selected" : ""}">${esc(COPY.files_mode)}</button>
 </div>` : ""
-const renderToolbar = (visibleItems) => {
+const renderToolbar = (visibleItems, allItems) => {
+  const description = COPY[`${state.view}_description`] || ""
+  const descriptionMarkup = `<span class="vault-toolbar-description" title="${attr(description)}">${esc(description)}</span>`
   if (state.view === "reclaimable") {
     const count = state.data.blobs.filter((blob) => blob.orphan).length
     el("vault-toolbar").innerHTML = count
-      ? `<span class="vault-toolbar-count" id="vault-toolbar-summary">${esc(toolbarSummary(visibleItems))}</span><button class="vault-button" type="button" id="btn-reclaim-all">${esc(COPY.reclaim_all)}</button>`
-      : ""
+      ? `${descriptionMarkup}<span class="vault-toolbar-count" id="vault-toolbar-summary">${esc(toolbarSummary(visibleItems))}</span><button class="vault-button" type="button" id="btn-reclaim-all">${esc(COPY.reclaim_all)}</button>`
+      : descriptionMarkup
     return
   }
   const source = selectedSource()
@@ -498,8 +533,9 @@ const renderToolbar = (visibleItems) => {
       <option value="independent" ${state.statusFilter === "independent" ? "selected" : ""}>${esc(COPY.skipped)}</option>
     </select>` : state.view === "duplicates" ? `<span class="vault-select">${esc(COPY.by_location)}</span>` : ""}
     ${displayModeControl()}
+    ${descriptionMarkup}
     <span class="vault-toolbar-count" id="vault-toolbar-summary">${esc(toolbarSummary(visibleItems))}</span>
-    ${state.view === "all" ? batchAction(source) : ""}`
+    ${state.view === "all" ? batchAction(source) : bulkDeduplicationAction(allItems)}`
 }
 
 const statusMarkup = (item) => {
@@ -513,22 +549,24 @@ const statusMarkup = (item) => {
   }
   if (item.status === "shared") return `<span class="vault-status"><i class="fa-solid fa-link"></i>${esc(COPY.shared)} · ${item.locations.length} ${esc(COPY.locations_lower)}</span>`
   if (item.status === "independent") return `<span class="vault-status"><i class="fa-solid fa-circle-minus"></i>${esc(COPY.kept_separate)}</span>`
-  return `<span class="vault-status"><span class="vault-status-dot"></span>${esc(COPY.tracked)}</span>`
+  return `<span class="vault-status"><i class="fa-regular fa-circle-check"></i>${esc(COPY.tracked)}</span>`
 }
 const spaceMarkup = (item) => {
   if (item.status === "duplicate") return item.shareable ? `${fmt(item.size)} ${COPY.can_save_suffix}` : COPY.unavailable
   return "—"
 }
 const duplicateAction = (item) => {
-  if (item.status === "duplicate") return `<button class="vault-text-button" type="button" data-detach="${attr(item.path)}">${esc(COPY.skip)}</button>`
+  if (item.status === "duplicate") {
+    return `<button class="vault-text-button" type="button" aria-label="${attr(`${COPY.keep_separate}: ${basename(item.relative_path)}`)}" data-detach="${attr(item.path)}" data-detach-kind="keep">${esc(COPY.keep_separate)}</button>`
+  }
   return ""
 }
 const sharingControl = (item) => {
   let control = ""
   if (item.status === "shared") {
-    control = `<button class="vault-sharing-switch on" type="button" role="switch" aria-checked="true" aria-label="${attr(COPY.allow_storage_sharing.replace("{file}", basename(item.relative_path)))}" data-detach="${attr(item.path)}"><span class="vault-sharing-thumb"></span></button>`
+    control = `<button class="vault-text-button" type="button" aria-label="${attr(`${COPY.make_separate}: ${basename(item.relative_path)}`)}" data-detach="${attr(item.path)}" data-detach-kind="make">${esc(COPY.make_separate)}</button>`
   } else if (item.status === "independent") {
-    control = `<button class="vault-sharing-switch" type="button" role="switch" aria-checked="false" aria-label="${attr(COPY.allow_storage_sharing.replace("{file}", basename(item.relative_path)))}" data-reshare="${attr(item.path)}"><span class="vault-sharing-thumb"></span></button>`
+    control = `<button class="vault-text-button" type="button" aria-label="${attr(`${COPY.deduplicate}: ${basename(item.relative_path)}`)}" data-deduplicate-file="${attr(item.path)}">${esc(COPY.deduplicate)}</button>`
   } else if (item.status === "duplicate") {
     control = duplicateAction(item)
   }
@@ -785,9 +823,14 @@ const renderOverview = () => {
     const afterBytes = IS_APP_MODE
       ? Math.max(0, Number(data.effective_bytes) || 0)
       : Math.max(0, Number(data.bytes_on_disk) || 0)
+    const hasComparison = IS_APP_MODE
+      ? !!(last && Number.isFinite(last.bytes_total) && Number.isFinite(data.effective_bytes))
+      : Number.isFinite(data.bytes_without_sharing) &&
+        Number.isFinite(data.bytes_on_disk) &&
+        (!!last || beforeBytes > 0 || afterBytes > 0 || Number(data.pending_bytes) > 0)
     const afterRatio = beforeBytes ? Math.min(100, (afterBytes / beforeBytes) * 100) : 0
     const pendingBytes = Math.max(0, Number(data.pending_bytes) || 0)
-    const headline = last
+    const headline = hasComparison
       ? (IS_APP_MODE
           ? COPY.saved_for_app.replace("{size}", fmt(Math.max(0, beforeBytes - afterBytes)))
           : `${fmt(data.saved_by_sharing)} ${COPY.disk_space_saved}`)
@@ -795,7 +838,7 @@ const renderOverview = () => {
     const help = IS_APP_MODE ? COPY.effective_help : COPY.before_help
     const helpId = IS_APP_MODE ? "vault-after-help" : "vault-before-help"
     const helpMarkup = `<span class="vault-compare-info" tabindex="0" aria-describedby="${helpId}"><i class="fa-regular fa-circle-question" aria-hidden="true"></i><span class="vault-compare-tooltip" id="${helpId}" role="tooltip">${esc(help)}</span></span>`
-    const comparison = last ? `
+    const comparison = hasComparison ? `
       <div class="vault-comparison" aria-label="${attr(`${COPY.before}: ${fmt(beforeBytes)}. ${COPY.after}: ${fmt(afterBytes)}.`)}">
         <div class="vault-compare-row">
           <span class="vault-compare-label">${esc(COPY.before)}${IS_APP_MODE ? "" : helpMarkup}</span>
@@ -811,7 +854,7 @@ const renderOverview = () => {
     const opportunity = activeScan
       ? `<span class="vault-summary-state"><i class="fa-solid fa-circle-notch fa-spin"></i>${esc(COPY.scanning)}</span>`
       : pendingBytes
-        ? `<span class="vault-summary-state attention"><i class="fa-regular fa-copy"></i><strong>${esc(COPY.more_can_be_saved.replace("{size}", fmt(pendingBytes)))}</strong></span><button class="vault-button" type="button" id="btn-review-metric">${esc(COPY.review_files)}</button>`
+        ? `<span class="vault-summary-state attention"><i class="fa-regular fa-copy"></i><strong>${esc(COPY.more_can_be_saved.replace("{size}", fmt(pendingBytes)))}</strong></span><button class="vault-button review-primary" type="button" id="btn-review-metric">${esc(COPY.review_files)}</button>`
         : `<span class="vault-summary-state"><i class="fa-regular fa-circle-check"></i>${esc(COPY.nothing_more_to_save)}</span>`
     const freshness = last ? `${COPY.scanned} ${timeAgo(last.ts)}` : COPY.not_scanned
     metrics.innerHTML = `
@@ -951,7 +994,7 @@ const renderResult = () => {
   }
   const info = state.scanResult
   const duplicateLabel = countLabel(info.count, COPY.duplicate.toLowerCase(), COPY.duplicates.toLowerCase())
-  const review = info.count ? `<button class="vault-button" type="button" id="btn-review-result">${esc(COPY.review)} ${duplicateLabel}<i class="fa-solid fa-chevron-right"></i></button>` : ""
+  const review = info.count ? `<button class="vault-button review-primary" type="button" id="btn-review-result">${esc(COPY.review)} ${duplicateLabel}<i class="fa-solid fa-chevron-right"></i></button>` : ""
   if (info.incomplete) {
     result.className = `vault-result show incomplete${state.scanProblemsOpen ? " expanded" : ""}`
     const unreadableLabel = `${info.inaccessible} ${info.inaccessible === 1 ? COPY.scan_unreadable_path : COPY.scan_unreadable_paths}`
@@ -977,6 +1020,76 @@ const renderFeedback = () => {
   }
   feedback.className = `vault-feedback show ${state.feedback.error ? "error" : ""}`
   feedback.innerHTML = `<i class="fa-solid fa-${state.feedback.error ? "triangle-exclamation" : "circle-check"}"></i><span>${esc(state.feedback.message)}</span>`
+}
+const fileActionButtons = () => document.querySelectorAll("[data-deduplicate-all], [data-deduplicate-scope], [data-deduplicate-file], [data-detach]")
+const fileActionLabel = (action) => ({
+  "deduplicate-file": COPY.deduplicating_file,
+  "keep-separate": COPY.keeping_separate,
+  "make-separate": COPY.making_separate
+}[action.kind] || COPY.deduplicating)
+const serverFileAction = (action) => {
+  if (!action || typeof action !== "object") return null
+  if (action.kind === "deduplicate") {
+    return {
+      kind: action.kind,
+      scope_id: action.scope_id || null,
+      selection: action.selection || null,
+      files_completed: Math.max(0, Number(action.files_completed) || 0),
+      files_total: Math.max(0, Number(action.files_total) || 0)
+    }
+  }
+  if (!action.path) return null
+  return { kind: action.kind, path: action.path }
+}
+let renderedActionProgress = null
+const renderActionProgress = () => {
+  const container = el("vault-action-state")
+  if (!container) return
+  const action = state.actionProgress
+  for (const button of fileActionButtons()) {
+    const active = !!(action && (
+      (action.kind === "deduplicate" && (
+        button.dataset.deduplicateScope === action.scope_id ||
+        (button.dataset.deduplicateAll === action.selection &&
+          (button.dataset.deduplicateContext || null) === action.scope_id)
+      )) ||
+      (action.kind === "deduplicate-file" && button.dataset.deduplicateFile === action.path) ||
+      ((action.kind === "keep-separate" || action.kind === "make-separate") &&
+        button.dataset.detach === action.path)
+    ))
+    button.disabled = !!action
+    if (active) button.setAttribute("aria-busy", "true")
+    else button.removeAttribute("aria-busy")
+  }
+  if (!action) {
+    container.className = "vault-action-state"
+    if (renderedActionProgress) {
+      container.innerHTML = ""
+      renderedActionProgress = null
+    }
+    return
+  }
+  container.className = "vault-action-state show"
+  if (renderedActionProgress === action) return
+  let label
+  let detail
+  let progress
+  if (action.kind === "deduplicate") {
+    const completed = Math.max(0, Number(action.files_completed) || 0)
+    const total = Math.max(completed, Number(action.files_total) || 0)
+    const ratio = total ? Math.min(1, completed / total) : 0
+    label = COPY.deduplicating
+    detail = COPY.deduplication_progress
+      .replace("{done}", completed)
+      .replace("{total}", total)
+    progress = `<span class="vault-progress-track" role="progressbar" aria-label="${attr(label)}" aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="${completed}"><span class="vault-progress-bar determinate" style="--vault-progress:${ratio}"></span></span>`
+  } else {
+    label = fileActionLabel(action)
+    detail = basename(action.path)
+    progress = `<span class="vault-progress-track" role="progressbar" aria-label="${attr(label)}" aria-valuetext="${attr(`${label}: ${detail}`)}"><span class="vault-progress-bar indeterminate"></span></span>`
+  }
+  container.innerHTML = `<i class="fa-solid fa-circle-notch fa-spin"></i><strong>${esc(label)}</strong><span class="vault-action-detail">${esc(detail)}</span>${progress}`
+  renderedActionProgress = action
 }
 const renderCloudWarning = () => {
   const warning = el("vault-cloud-warning")
@@ -1009,14 +1122,15 @@ const render = () => {
   renderViews(items)
   renderLocations(items)
   const visible = activeItems(items)
-  renderToolbar(visible)
+  renderToolbar(visible, items)
   renderTable(visible)
+  renderActionProgress()
   if (state.displayMode === "files" && supportsDisplayMode()) {
     const count = state.view === "shared"
-      ? countLabel(visible.length, "shared file", "shared files")
+      ? countLabel(visible.length, "deduplicated file", "deduplicated files")
       : state.view === "independent"
         ? countLabel(visible.length, "file kept separate", "files kept separate")
-        : countLabel(visible.length, "tracked file", "tracked files")
+        : countLabel(visible.length)
     const order = state.sizeSort === "desc" ? COPY.sorted_largest : state.sizeSort === "asc" ? COPY.sorted_smallest : ""
     el("vault-pane-footer").textContent = `${count}${order ? ` · ${order}` : ""}`
   } else {
@@ -1052,6 +1166,9 @@ const applyFullData = (data) => {
     reviewedScan() !== String(data.last_scan.ts) &&
     (data.duplicates.some((item) => item.shareable !== false) || data.last_scan.hash_failures > 0)
   state.data = data
+  const fileAction = serverFileAction(data.file_action)
+  if (fileAction) state.actionProgress = fileAction
+  else if (!state.actionRequest) state.actionProgress = null
   if (failed) {
     state.scanRequested = false
     state.feedback = { error: true, message: data.scan.error }
@@ -1074,19 +1191,24 @@ const applyFullData = (data) => {
     state.feedback = { error: true, message: COPY.activity_write_failed }
   }
   render()
-  return scanning
+  return scanning || !!fileAction
 }
-const refresh = async () => {
+const refresh = async (forceFull = false) => {
   let delay = null
   try {
-    const progressOnly = !!(state.data && scanActive(state.data.scan))
+    const progressOnly = !forceFull &&
+      !!(state.data && (scanActive(state.data.scan) || state.actionProgress))
     if (progressOnly) {
       const progress = await fetchJson(statusUrl(true))
       state.data.scan = progress.scan
       state.data.last_scan = progress.last_scan
-      if (scanActive(progress.scan)) {
+      const fileAction = serverFileAction(progress.file_action)
+      if (fileAction) state.actionProgress = fileAction
+      else if (!state.actionRequest) state.actionProgress = null
+      if (scanActive(progress.scan) || fileAction) {
         delay = 1500
         renderOverview()
+        renderActionProgress()
         renderFeedback()
       } else {
         if (applyFullData(await fetchJson(statusUrl())) || state.scanRequested) delay = 1500
@@ -1126,7 +1248,7 @@ const runAction = async (payload, success) => {
   } catch (error) {
     state.feedback = { error: true, message: error && error.message ? error.message : String(error) }
   }
-  await refresh()
+  await refresh(true)
 }
 
 const deduplicateFeedback = (result) => {
@@ -1139,6 +1261,87 @@ const deduplicateFeedback = (result) => {
   return {
     error: true,
     message: messages.join(" ")
+  }
+}
+
+const deduplicateKeptFeedback = (result) => {
+  const unchanged = (result.locked || 0) + (result.stale || 0) + (result.unmatched || 0) +
+    (result.incompatible || 0) + (result.unavailable || 0) + (result.failed || 0)
+  const messages = []
+  if (result.converted || result.bytes_saved) messages.push(`${COPY.converted}: ${fmt(result.bytes_saved || 0)}.`)
+  if (unchanged) messages.push(`${COPY.files_left_separate.replace("{count}", countLabel(unchanged))}.`)
+  if (!unchanged) return messages.join(" ") || `${COPY.converted}: ${fmt(0)}`
+  return { error: true, message: messages.join(" ") }
+}
+
+const deduplicateFileFeedback = (result) => {
+  if (result.status === "converted" || result.status === "already") {
+    return result.bytes_saved ? `${COPY.converted}: ${fmt(result.bytes_saved)}.` : COPY.converted
+  }
+  const messages = {
+    locked: COPY.deduplicate_locked,
+    stale: COPY.deduplicate_changed,
+    "no-match": COPY.deduplicate_no_match,
+    "no-blob": COPY.deduplicate_no_match,
+    "stale-blob": COPY.deduplicate_no_match,
+    "size-mismatch": COPY.deduplicate_no_match,
+    "metadata-mismatch": COPY.permissions_differ,
+    unavailable: COPY.sharing_unavailable,
+    conflict: COPY.separate_conflict,
+    "not-found": COPY.separate_not_found
+  }
+  return { error: true, message: messages[result.status] || COPY.action_not_completed }
+}
+
+const showDeduplicationProgress = (scopeId, selection, progress, fallbackTotal) => {
+  const completed = Math.max(0, Number(progress.files_completed) || 0)
+  const total = Math.max(completed, Number(progress.files_total) || fallbackTotal)
+  const current = state.actionProgress
+  if (current &&
+      current.kind === "deduplicate" &&
+      current.scope_id === scopeId &&
+      current.selection === selection &&
+      current.files_completed === completed &&
+      current.files_total === total) return
+  state.actionProgress = {
+    kind: "deduplicate",
+    scope_id: scopeId,
+    selection,
+    files_completed: completed,
+    files_total: total
+  }
+  renderActionProgress()
+}
+
+const trackDeduplication = (scopeId, selection = "duplicates", total = null) => {
+  const fallbackTotal = total === null
+    ? scopeDuplicates(scopeId).filter((item) => item.shareable !== false).length
+    : total
+  let stopped = false
+  let timer = null
+  showDeduplicationProgress(scopeId, selection, { files_completed: 0, files_total: fallbackTotal }, fallbackTotal)
+  const poll = async () => {
+    try {
+      const status = await fetchJson(statusUrl(true))
+      const action = serverFileAction(status.file_action)
+      if (!stopped && action && action.kind === "deduplicate" &&
+          action.scope_id === scopeId && action.selection === selection) {
+        showDeduplicationProgress(scopeId, selection, action, fallbackTotal)
+      }
+    } catch (error) {}
+    if (!stopped) timer = setTimeout(poll, 250)
+  }
+  poll()
+  return () => {
+    stopped = true
+    clearTimeout(timer)
+    if (state.actionProgress &&
+        state.actionProgress.kind === "deduplicate" &&
+        state.actionProgress.scope_id === scopeId &&
+        state.actionProgress.selection === selection) {
+      state.actionProgress = null
+    }
+    renderActionProgress()
   }
 }
 
@@ -1188,6 +1391,7 @@ document.addEventListener("click", async (event) => {
   if (advanced && advanced.open && !advanced.contains(event.target)) advanced.open = false
   const target = event.target.closest("button")
   if (!target) return
+  if (state.actionProgress && (target.dataset.deduplicateAll || target.dataset.deduplicateScope || target.dataset.deduplicateFile || target.dataset.detach)) return
   if (target.id === "btn-dismiss-cloud") {
     try { localStorage.setItem(target.dataset.warningKey, "1") } catch (error) {}
     renderCloudWarning()
@@ -1295,22 +1499,70 @@ document.addEventListener("click", async (event) => {
     state.query = ""
     state.scanResult = null
     render()
+  } else if (target.dataset.deduplicateAll) {
+    const selection = target.dataset.deduplicateAll
+    const scopeId = target.dataset.deduplicateContext || null
+    const total = bulkDeduplicationItems(buildItems(), selection).length
+    const stopTracking = trackDeduplication(scopeId, selection, total)
+    state.actionRequest = true
+    try {
+      await runAction(
+        { action: "deduplicate", selection, scope_id: scopeId },
+        selection === "kept-separate" ? deduplicateKeptFeedback : deduplicateFeedback
+      )
+    } finally {
+      state.actionRequest = false
+      stopTracking()
+    }
   } else if (target.dataset.deduplicateScope) {
-    await runAction({ action: "deduplicate", scope_id: target.dataset.deduplicateScope }, deduplicateFeedback)
+    const scopeId = target.dataset.deduplicateScope
+    const stopTracking = trackDeduplication(scopeId)
+    state.actionRequest = true
+    try {
+      await runAction({ action: "deduplicate", scope_id: scopeId }, deduplicateFeedback)
+    } finally {
+      state.actionRequest = false
+      stopTracking()
+    }
+  } else if (target.dataset.deduplicateFile) {
+    const filePath = target.dataset.deduplicateFile
+    state.actionProgress = {
+      kind: "deduplicate-file",
+      path: filePath
+    }
+    state.actionRequest = true
+    renderActionProgress()
+    try {
+      await runAction({ action: "deduplicate", path: filePath }, deduplicateFileFeedback)
+    } finally {
+      state.actionRequest = false
+      if (state.actionProgress &&
+          state.actionProgress.kind === "deduplicate-file" &&
+          state.actionProgress.path === filePath) {
+        state.actionProgress = null
+      }
+      renderActionProgress()
+    }
   } else if (target.dataset.detach) {
-    if (target.classList.contains("vault-sharing-switch")) {
-      target.disabled = true
-      target.setAttribute("aria-busy", "true")
+    const filePath = target.dataset.detach
+    state.actionProgress = {
+      kind: target.dataset.detachKind === "keep"
+        ? "keep-separate"
+        : "make-separate",
+      path: filePath
     }
-    await runAction({ action: "detach", path: target.dataset.detach }, detachFeedback)
-  } else if (target.dataset.reshare) {
-    if (target.classList.contains("vault-sharing-switch")) {
-      target.disabled = true
-      target.setAttribute("aria-busy", "true")
+    state.actionRequest = true
+    renderActionProgress()
+    try {
+      await runAction({ action: "detach", path: filePath }, detachFeedback)
+    } finally {
+      state.actionRequest = false
+      if (state.actionProgress &&
+          state.actionProgress.path === filePath) {
+        state.actionProgress = null
+      }
+      renderActionProgress()
     }
-    await runAction({ action: "reshare", path: target.dataset.reshare }, (result) => result.status === "resharable"
-      ? COPY.included_in_scans
-      : { error: true, message: COPY.action_not_completed })
   } else if (target.dataset.reclaim) {
     await runAction({ action: "reclaim", hash: target.dataset.reclaim }, (result) => result.status === "reclaimed"
       ? `${COPY.reclaimed}: ${fmt(result.bytes_freed || 0)}`
@@ -1332,6 +1584,7 @@ document.addEventListener("input", (event) => {
   const items = activeItems(buildItems())
   updateToolbarSummary(items)
   renderTable(items)
+  renderActionProgress()
 })
 document.addEventListener("change", (event) => {
   if (event.target.id !== "vault-status-filter") return

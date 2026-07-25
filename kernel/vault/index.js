@@ -91,6 +91,7 @@ class Vault {
     this.verificationPending = false
     this.scanError = null
     this.scanScopeId = null
+    this.fileActionProgress = null
   }
   get root() {
     return path.resolve(this.kernel.homedir, "vault")
@@ -158,6 +159,14 @@ class Vault {
       return result
     })
   }
+  async runFileAction(progress, operation) {
+    this.fileActionProgress = progress
+    try {
+      return await operation(progress)
+    } finally {
+      if (this.fileActionProgress === progress) this.fileActionProgress = null
+    }
+  }
   startScan(scopeId = null) {
     if (!this.enabled || !this.sweeper) return { started: false, disabled: true }
     if (this.scanPromise) return { started: false, already_running: true }
@@ -197,11 +206,42 @@ class Vault {
         }
         return this.startScan(payload.scope_id || null)
       case "deduplicate":
-        if (typeof payload.scope_id !== "string" || !payload.scope_id) {
+        if (typeof payload.path === "string" && payload.path) {
+          return this.runMutation(() => this.runFileAction({
+            kind: "deduplicate-file",
+            path: path.resolve(payload.path)
+          }, () => this.deduplicateFile(payload.path, {
+            batch_id: `batch-${crypto.randomUUID()}`
+          })))
+        }
+        const selection = payload.selection || null
+        if (selection && selection !== "duplicates" && selection !== "kept-separate") {
+          return { error: "Choose files to deduplicate." }
+        }
+        if (payload.scope_id != null &&
+            (typeof payload.scope_id !== "string" || !payload.scope_id)) {
+          return { error: "Choose a valid location to deduplicate." }
+        }
+        const scopeId = typeof payload.scope_id === "string" && payload.scope_id
+          ? payload.scope_id
+          : null
+        if (!selection && !scopeId) {
           return { error: "Choose a location to deduplicate." }
         }
-        return this.runMutation(() => this.deduplicateScope(payload.scope_id, {
-          batch_id: `batch-${crypto.randomUUID()}`
+        return this.runMutation(() => this.runFileAction({
+          kind: "deduplicate",
+          scope_id: scopeId,
+          selection: selection || "duplicates",
+          files_total: 0,
+          files_completed: 0
+        }, async (progress) => {
+          const options = {
+            batch_id: `batch-${crypto.randomUUID()}`,
+            progress
+          }
+          return selection
+            ? this.deduplicateSelection(selection, scopeId, options)
+            : this.deduplicateScope(scopeId, options)
         }))
       case "reclaim":
         return this.runMutation(() => this.reclaim(payload.hash))
@@ -219,9 +259,14 @@ class Vault {
       case "undo":
         return this.runMutation(() => this.undoBatch(payload.batch_id))
       case "detach":
-        return this.runMutation(() => this.detach(payload.path))
-      case "reshare":
-        return this.runMutation(() => this.reshare(payload.path))
+        if (typeof payload.path !== "string" || !payload.path) return { status: "not-found" }
+        return this.runMutation(() => {
+          const targetPath = path.resolve(payload.path)
+          const kind = this.registry.duplicates.has(targetPath)
+            ? "keep-separate"
+            : "make-separate"
+          return this.runFileAction({ kind, path: targetPath }, () => this.detach(targetPath))
+        })
       default:
         return { error: "unknown action" }
     }
@@ -943,24 +988,147 @@ class Vault {
       return !!(runningPath && isPathWithin(appRoot, runningPath))
     })
   }
+  async deduplicateFile(filePath, options = {}) {
+    if (!this.enabled || typeof filePath !== "string" || !filePath) {
+      return { status: this.enabled ? "not-found" : "disabled" }
+    }
+    await this.refreshSources()
+    return this.deduplicateExcludedFile(filePath, options)
+  }
+  async deduplicateExcludedFile(filePath, options = {}) {
+    const targetPath = path.resolve(filePath)
+    const excluded = this.registry.excluded.get(targetPath)
+    if (!excluded) return { status: "not-found" }
+    const source = this.sourceForPath(targetPath, excluded.source_id)
+    if (!source || !await this.canonicalPathIsWithinSource(targetPath, source)) {
+      return { status: "stale" }
+    }
+    if (!source.shareable) return { status: "unavailable" }
+    if (this.sourceAppIsRunning(source)) return { status: "locked" }
+
+    const before = await lstatIfPresent(targetPath)
+    if (!before || !before.isFile()) return { status: "stale" }
+    let hashed
+    try {
+      hashed = await this.hashFile(targetPath)
+    } catch (error) {
+      return { status: "stale" }
+    }
+    const after = await lstatIfPresent(targetPath)
+    if (!sameSnapshot(fileSnapshot(before), after) || hashed.size !== after.size) {
+      return { status: "stale" }
+    }
+    if (!this.registry.blobs.has(hashed.hash)) return { status: "no-match" }
+    if (!await this.canonicalPathIsWithinSource(targetPath, source)) return { status: "stale" }
+    const current = await lstatIfPresent(targetPath)
+    if (!sameSnapshot(fileSnapshot(after), current)) return { status: "stale" }
+
+    const result = await this.convert(targetPath, hashed.hash, {
+      app: source.kind === "app" ? source.app : null,
+      source_id: source.id,
+      batch_id: options.batch_id || `batch-${crypto.randomUUID()}`,
+      source,
+      expected: fileSnapshot(current)
+    })
+    if (result.status === "converted" || result.status === "already") {
+      this.registry.allowSharing(targetPath)
+    }
+    return result
+  }
+  sourceIsWithinScope(source, scopeId) {
+    if (!scopeId) return true
+    const seen = new Set()
+    let current = source
+    while (current && !seen.has(current.id)) {
+      if (current.id === scopeId) return true
+      seen.add(current.id)
+      current = this._sources.find((item) => item.id === current.parent_id)
+    }
+    return false
+  }
+  async deduplicateSelection(selection, scopeId, options = {}) {
+    if (selection === "duplicates") {
+      return this.deduplicateScope(scopeId, Object.assign({}, options, { includeDescendants: true }))
+    }
+    await this.refreshSources()
+    if (scopeId && !this._sources.some((source) => source.id === scopeId)) {
+      return { error: "That location is no longer available. Scan again to refresh it." }
+    }
+    const paths = [...this.registry.excluded].filter(([filePath, entry]) => {
+      const source = this.sourceForPath(filePath, entry.source_id)
+      return source ? this.sourceIsWithinScope(source, scopeId) : !scopeId
+    }).map(([filePath]) => filePath)
+    if (options.progress) options.progress.files_total = paths.length
+    const summary = {
+      converted: 0, bytes_saved: 0, locked: 0, stale: 0, unmatched: 0,
+      incompatible: 0, unavailable: 0, failed: 0
+    }
+    const batch = options.batch_id || `batch-${crypto.randomUUID()}`
+    for (const filePath of paths) {
+      try {
+        const result = await this.deduplicateExcludedFile(filePath, { batch_id: batch })
+        if (result.status === "converted" || result.status === "already") {
+          summary.converted += 1
+          summary.bytes_saved += result.bytes_saved || 0
+        } else if (result.status === "locked") {
+          summary.locked += 1
+        } else if (result.status === "stale") {
+          summary.stale += 1
+        } else if (result.status === "no-match" || result.status === "no-blob" ||
+            result.status === "size-mismatch") {
+          summary.unmatched += 1
+        } else if (result.status === "metadata-mismatch") {
+          summary.incompatible += 1
+        } else if (result.status === "unavailable" || result.status === "copy-mode") {
+          summary.unavailable += 1
+        } else {
+          summary.failed += 1
+        }
+      } catch (error) {
+        summary.failed += 1
+      }
+      if (options.progress) options.progress.files_completed += 1
+    }
+    return summary
+  }
   async deduplicateScope(scopeId, options = {}) {
     await this.refreshSources()
-    const source = this._sources.find((item) => item.id === scopeId && item.kind !== "virtual")
-    if (!source) return { error: "That location is no longer available. Scan again to refresh it." }
-    if (!source.shareable) return { error: "This location is on a disk that cannot share space with this vault." }
-    if (this.sourceAppIsRunning(source)) {
-      return { error: "This app has a running script. Stop it first, then deduplicate." }
+    const includeDescendants = options.includeDescendants === true
+    const source = scopeId
+      ? this._sources.find((item) => item.id === scopeId && (includeDescendants || item.kind !== "virtual"))
+      : null
+    if ((!includeDescendants || scopeId) && !source) {
+      return { error: "That location is no longer available. Scan again to refresh it." }
+    }
+    if (!includeDescendants) {
+      if (!source.shareable) return { error: "This location is on a disk that cannot share space with this vault." }
+      if (this.sourceAppIsRunning(source)) {
+        return { error: "This app has a running script. Stop it first, then deduplicate." }
+      }
     }
 
     const registry = this.registry
     const batch = options.batch_id || `batch-${crypto.randomUUID()}`
     const summary = { converted: 0, bytes_saved: 0, locked: 0, stale: 0, incompatible: 0, unavailable: 0, failed: 0 }
     const staleHashes = new Set()
-    for (const [filePath, entry] of [...registry.duplicates]) {
+    const entries = [...registry.duplicates]
+    const matchesScope = (currentSource) => currentSource && currentSource.shareable &&
+      (includeDescendants ? this.sourceIsWithinScope(currentSource, scopeId) : currentSource.id === scopeId)
+    if (options.progress) {
+      options.progress.files_total = entries.reduce((total, [filePath, entry]) => {
+        const currentSource = this.sourceForPath(filePath, entry.source_id)
+        return total + (matchesScope(currentSource) ? 1 : 0)
+      }, 0)
+    }
+    const completeProgress = () => {
+      if (options.progress) options.progress.files_completed += 1
+    }
+    for (const [filePath, entry] of entries) {
       const currentSource = this.sourceForPath(filePath, entry.source_id)
-      if (!currentSource || currentSource.id !== scopeId || !currentSource.shareable) continue
+      if (!matchesScope(currentSource)) continue
       if (!await this.canonicalPathIsWithinSource(filePath, currentSource)) {
         summary.stale += 1
+        completeProgress()
         continue
       }
       const indexed = registry.scanIndex.get(filePath)
@@ -970,16 +1138,18 @@ class Vault {
             entry.mtime !== undefined && entry.ctime !== undefined ? entry : null)
       if (!expected) {
         summary.stale += 1
+        completeProgress()
         continue
       }
       if (staleHashes.has(entry.hash)) {
         summary.stale += 1
+        completeProgress()
         continue
       }
       try {
         const result = await this.convert(filePath, entry.hash, {
-          app: source.kind === "app" ? source.app : (entry.app || null),
-          source_id: scopeId,
+          app: currentSource.kind === "app" ? currentSource.app : (entry.app || null),
+          source_id: currentSource.id,
           batch_id: batch,
           source: currentSource,
           expected
@@ -1005,6 +1175,7 @@ class Vault {
       } catch (error) {
         summary.failed += 1
       }
+      completeProgress()
     }
     registry.schedulePersist()
     return summary
@@ -1561,6 +1732,7 @@ class Vault {
       lifetime_bytes_saved: registry.totals.lifetime_bytes_saved,
       reclaimable: blobs.filter((b) => b.orphan).reduce((sum, b) => sum + b.size, 0),
       pending_bytes: duplicates.filter((d) => d.shareable).reduce((sum, d) => sum + d.size, 0),
+      file_action: this.fileActionStatus(scopeId),
       activity_error: registry.eventError,
       cloud_sync_warning: this.cloudSyncProvider(),
       sources: publicSources, blobs, duplicates, excluded, events,
@@ -1614,10 +1786,23 @@ class Vault {
       error: this.scanError
     })
   }
+  fileActionStatus(scopeId = null) {
+    const progress = this.fileActionProgress
+    if (!progress) return null
+    if (scopeId) {
+      if (progress.scope_id && progress.scope_id !== scopeId) return null
+      if (progress.path) {
+        const source = this.sourceForPath(progress.path)
+        if (!source || source.id !== scopeId) return null
+      }
+    }
+    return Object.assign({}, progress)
+  }
   progressStatus(scopeId = null) {
     return {
       enabled: !!this.enabled,
       scan: this.scanStatus(),
+      file_action: this.fileActionStatus(scopeId),
       last_scan: this.registry ? this.registry.scanFor(scopeId) : null
     }
   }
@@ -1702,16 +1887,6 @@ class Vault {
       this.registry.exclude(filePath, { ts: Date.now(), source_id: dup.source_id || null, size: dup.size || 0 })
       await this.recordEvent({ kind: "skip", hash: dup.hash, path: filePath, app: dup.app || null, source_id: dup.source_id || null, size: dup.size || 0 })
       return { status: "ignored" }
-    }
-    return { status: "not-found" }
-  }
-  // reshare: un-pin a detached path; the next scan may list it again.
-  async reshare(filePath) {
-    if (!this.enabled) return { status: "disabled" }
-    const excluded = this.registry.allowSharing(filePath)
-    if (excluded) {
-      await this.recordEvent({ kind: "reshare", path: filePath, source_id: excluded && excluded.source_id ? excluded.source_id : null })
-      return { status: "resharable" }
     }
     return { status: "not-found" }
   }

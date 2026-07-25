@@ -15778,7 +15778,7 @@ class Server {
         return
       }
       await vault.ensureInitialized()
-      res.render("vault", { theme: this.theme, agent: req.agent })
+      res.render("vault", { theme: this.theme, platform: this.kernel.platform, agent: req.agent })
     }))
     this.app.get("/vault/app/:name", ex(async (req, res) => {
       if (!privacyFilterCache.isSameOriginRequest(req)) {
@@ -15801,6 +15801,7 @@ class Server {
       }
       res.render("vault_app", {
         theme: this.theme,
+        platform: this.kernel.platform,
         agent: req.agent,
         scope_id: source.id
       })

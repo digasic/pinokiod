@@ -174,12 +174,138 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual((await fs.promises.stat(b)).nlink, 1)
     assert.strictEqual(vault.registry.duplicates.has(b), false)
 
-    // Re-share un-pins; the next scan lists it as pending again (no auto-convert).
-    const reshared = await vault.reshare(b)
-    assert.strictEqual(reshared.status, 'resharable')
-    await vault.sweeper.scan()
-    assert.ok(vault.registry.duplicates.has(b))
+  })
+
+  test('deduplicate on a kept-separate file converts only that file', async () => {
+    const { home, vault } = await makeEnv()
+    const { content, hash, a, b } = await makeSharedPair(home, vault, 'one-file.bin')
+    assert.strictEqual((await vault.detach(b)).status, 'detached')
+    const other = await writeFile(path.resolve(home, 'api', 'appB', 'other.bin'), content)
+    vault.registry.duplicates.set(other, {
+      hash, size: content.length, app: 'appB', source_id: 'app:appB'
+    })
+
+    const result = await vault.perform('deduplicate', { path: b })
+
+    assert.strictEqual(result.status, 'converted')
+    assert.strictEqual(result.bytes_saved, content.length)
+    assert.strictEqual(vault.registry.excluded.has(b), false)
+    assert.strictEqual((await fs.promises.stat(b)).ino, (await fs.promises.stat(a)).ino)
+    assert.strictEqual((await fs.promises.stat(other)).nlink, 1)
+    assert.strictEqual(vault.registry.duplicates.has(other), true)
+  })
+
+  test('deduplicate on a kept-separate file never overwrites a writer replacement', async () => {
+    const { home, vault } = await makeEnv()
+    const { b } = await makeSharedPair(home, vault, 'one-file-race.bin')
+    assert.strictEqual((await vault.detach(b)).status, 'detached')
+    const replacement = crypto.randomBytes(4096)
+    const realHashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath) => {
+      const result = await realHashFile(filePath)
+      const writerPath = `${filePath}.writer-replacement`
+      await fs.promises.writeFile(writerPath, replacement)
+      await fs.promises.rename(writerPath, filePath)
+      return result
+    }
+
+    let result
+    try {
+      result = await vault.perform('deduplicate', { path: b })
+    } finally {
+      vault.hashFile = realHashFile
+    }
+
+    assert.strictEqual(result.status, 'stale')
+    assert.strictEqual(vault.registry.excluded.has(b), true)
+    assert.deepStrictEqual(await fs.promises.readFile(b), replacement)
     assert.strictEqual((await fs.promises.stat(b)).nlink, 1)
+  })
+
+  test('deduplicate leaves a kept-separate file alone when no identical file remains', async () => {
+    const { home, vault } = await makeEnv()
+    const { b } = await makeSharedPair(home, vault, 'one-file-no-match.bin')
+    assert.strictEqual((await vault.detach(b)).status, 'detached')
+    const replacement = crypto.randomBytes(4096)
+    await fs.promises.writeFile(b, replacement)
+    const before = await fs.promises.stat(b)
+
+    const result = await vault.perform('deduplicate', { path: b })
+
+    const after = await fs.promises.stat(b)
+    assert.strictEqual(result.status, 'no-match')
+    assert.strictEqual(vault.registry.excluded.has(b), true)
+    assert.deepStrictEqual(await fs.promises.readFile(b), replacement)
+    assert.strictEqual(after.ino, before.ino)
+    assert.strictEqual(after.nlink, 1)
+  })
+
+  test('contextual Deduplicate all converts only duplicate descendants of the selected location', async () => {
+    const { home, vault } = await makeEnv()
+    const content = crypto.randomBytes(4096)
+    const hash = sha256(content)
+    const original = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
+    const appBFile = await writeFile(path.resolve(home, 'api', 'appB', 'model.bin'), content)
+    const appCFile = await writeFile(path.resolve(home, 'api', 'appC', 'model.bin'), content)
+    const outsideFile = await writeFile(path.resolve(home, 'models', 'model.bin'), content)
+    await vault.adopt(original, hash, { app: 'appA' })
+    await vault.refreshSources()
+    const sourceFor = (filePath) => vault.sourceForPath(filePath)
+    for (const filePath of [appBFile, appCFile, outsideFile]) {
+      const source = sourceFor(filePath)
+      vault.registry.duplicates.set(filePath, await duplicateEntry(filePath, {
+        hash, size: content.length, app: source.app || null, source_id: source.id
+      }))
+    }
+
+    const result = await vault.perform('deduplicate', {
+      selection: 'duplicates',
+      scope_id: 'apps'
+    })
+
+    assert.strictEqual(result.converted, 2)
+    assert.strictEqual(result.bytes_saved, content.length * 2)
+    assert.strictEqual((await fs.promises.stat(appBFile)).ino, (await fs.promises.stat(original)).ino)
+    assert.strictEqual((await fs.promises.stat(appCFile)).ino, (await fs.promises.stat(original)).ino)
+    assert.strictEqual((await fs.promises.stat(outsideFile)).nlink, 1)
+    assert.ok(vault.registry.duplicates.has(outsideFile))
+    const events = (await vault.registry.readEvents())
+      .filter((event) => event.kind === 'convert' && [appBFile, appCFile].includes(event.path))
+    assert.strictEqual(new Set(events.map((event) => event.batch_id)).size, 1)
+
+    const globalResult = await vault.perform('deduplicate', {
+      selection: 'duplicates',
+      scope_id: null
+    })
+    assert.strictEqual(globalResult.converted, 1)
+    assert.strictEqual((await fs.promises.stat(outsideFile)).ino, (await fs.promises.stat(original)).ino)
+  })
+
+  test('contextual Deduplicate all rechecks kept-separate files and leaves other locations alone', async () => {
+    const { home, vault } = await makeEnv()
+    const { content, a, b } = await makeSharedPair(home, vault, 'kept-bulk.bin')
+    assert.strictEqual((await vault.detach(b)).status, 'detached')
+    const unmatched = await writeFile(path.resolve(home, 'api', 'appB', 'unmatched.bin'), crypto.randomBytes(4096))
+    const otherLocation = await writeFile(path.resolve(home, 'api', 'appC', 'kept-bulk.bin'), content)
+    await vault.refreshSources()
+    const appB = vault.sourceForPath(b)
+    const appC = vault.sourceForPath(otherLocation)
+    vault.registry.exclude(unmatched, { ts: Date.now(), source_id: appB.id, size: content.length })
+    vault.registry.exclude(otherLocation, { ts: Date.now(), source_id: appC.id, size: content.length })
+    const unmatchedBefore = await fs.promises.stat(unmatched)
+
+    const result = await vault.perform('deduplicate', {
+      selection: 'kept-separate',
+      scope_id: appB.id
+    })
+
+    assert.strictEqual(result.converted, 1)
+    assert.strictEqual(result.unmatched, 1)
+    assert.strictEqual((await fs.promises.stat(b)).ino, (await fs.promises.stat(a)).ino)
+    assert.strictEqual((await fs.promises.stat(unmatched)).ino, unmatchedBefore.ino)
+    assert.ok(vault.registry.excluded.has(unmatched))
+    assert.ok(vault.registry.excluded.has(otherLocation))
+    assert.strictEqual((await fs.promises.stat(otherLocation)).nlink, 1)
   })
 
   test('a committed file action reports a persistence warning instead of a false failure', async () => {
@@ -208,6 +334,34 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.deepStrictEqual(await fs.promises.readFile(b), content)
     assert.ok(vault.registry.excluded.has(b))
     await vault.registry.flush()
+  })
+
+  test('make separate progress is exposed by backend status while the copy runs', async () => {
+    const { home, vault } = await makeEnv()
+    const { b } = await makeSharedPair(home, vault, 'separate-progress.bin')
+    const copyOut = vault.copyOut.bind(vault)
+    let reportStarted
+    let releaseCopy
+    const started = new Promise((resolve) => { reportStarted = resolve })
+    const gate = new Promise((resolve) => { releaseCopy = resolve })
+    vault.copyOut = async (...args) => {
+      reportStarted()
+      await gate
+      return copyOut(...args)
+    }
+
+    const pending = vault.perform('detach', { path: b })
+    await started
+    const active = vault.progressStatus().file_action
+    releaseCopy()
+    assert.deepStrictEqual(active, {
+      kind: 'make-separate',
+      path: b
+    })
+    const result = await pending
+
+    assert.strictEqual(result.status, 'detached')
+    assert.strictEqual(vault.progressStatus().file_action, null)
   })
 
   test('detach and undo preserve an unrelated temporary-name collision', async () => {
@@ -839,12 +993,15 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /Number\(data\.bytes_on_disk\)/)
     assert.match(vaultPage, /Number\(data\.pending_bytes\)/)
     assert.match(vaultPage, /id="btn-review-metric"/)
+    assert.match(vaultPage, /\.vault-button\.review-primary \{[\s\S]*?background:\s*var\(--task-accent-contrast\)[\s\S]*?color:\s*#101828/)
+    assert.match(vaultPage, /class="vault-button review-primary" type="button" id="btn-review-result"/)
+    assert.match(vaultPage, /class='vault-button' id='btn-scan'/)
     assert.match(vaultPage, /id='vault-storage-details'/)
     assert.match(vaultPage, /fmt\(data\.lifetime_bytes_saved\)/)
     assert.match(vaultPage, /repair_index:\s*"Repair index"/)
     assert.match(vaultPage, /<details class='vault-advanced'/)
     assert.doesNotMatch(vaultPage, /id='btn-rebuild'/)
-    const refreshBlock = vaultPage.match(/const refresh = async \(\) => \{[\s\S]*?\n\}/)
+    const refreshBlock = vaultPage.match(/const refresh = async \(forceFull = false\) => \{[\s\S]*?\n\}/)
     assert.ok(refreshBlock)
     assert.match(refreshBlock[0], /finally/)
     assert.doesNotMatch(vaultPage, /priorScanning/)
@@ -885,9 +1042,15 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /\.vault-table\.flat \.vault-columns,[\s\S]*?grid-template-columns:[^;]+;/)
     assert.match(vaultPage, /\.vault-display-mode \{[\s\S]*?height:\s*30px/)
     assert.match(vaultPage, /\.vault-flat-location \{[\s\S]*?overflow-wrap:\s*anywhere;[\s\S]*?white-space:\s*normal/)
-    assert.match(vaultPage, /\.vault-sharing-switch::before \{[\s\S]*?width:\s*32px;[\s\S]*?height:\s*18px;/)
-    assert.match(vaultPage, /\.vault-sharing-switch\.on \.vault-sharing-thumb \{[\s\S]*?transform:\s*translateX\(14px\)/)
-    assert.match(vaultPage, /\.vault-sharing-switch:focus-visible/)
+    assert.doesNotMatch(vaultPage, /\.vault-sharing-switch/)
+    assert.match(vaultPage, /\.vault-text-button:disabled \{[\s\S]*?cursor:\s*progress;[\s\S]*?opacity:\s*\.55;/)
+    assert.match(vaultPage, /\.vault-status-cell > \.vault-text-button \{[\s\S]*?min-height:\s*24px;/)
+    assert.match(vaultPage, /\.vault-status-cell > \.vault-text-button,[\s\S]*?\.vault-row-action \.vault-text-button \{[\s\S]*?border:\s*1px solid var\(--task-border\);[\s\S]*?border-radius:\s*5px;[\s\S]*?background:\s*color-mix/)
+    assert.match(vaultPage, /\.vault-status-cell > \.vault-text-button:hover:not\(:disabled\),[\s\S]*?border-color:\s*var\(--task-border-strong\);/)
+    assert.match(vaultPage, /body\.dark \.vault-status-cell > \.vault-text-button,[\s\S]*?border-color:\s*color-mix\(in srgb, var\(--task-text\) 24%, transparent\);[\s\S]*?background:\s*color-mix\(in srgb, var\(--task-text\) 7%, var\(--task-panel\)\);/)
+    assert.match(vaultPage, /@media \(pointer: coarse\) \{[\s\S]*?\.vault-status-cell > \.vault-text-button,[\s\S]*?min-height:\s*44px;/)
+    assert.match(vaultPage, /make_separate:\s*"Make separate"/)
+    assert.doesNotMatch(vaultPage, /review_again:\s*"Review again"/)
     assert.match(vaultPage, /id='btn-add-source'/)
     assert.match(vaultPage, /<script src="\/Socket\.js"><\/script>/)
     assert.match(vaultPage, /action:\s*"add_source"/)
@@ -897,6 +1060,8 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /view === "all" && !activeScan \? `<button class="vault-button" type="button" id="btn-empty-scan"/)
     assert.match(vaultPage, /class="vault-progress-track"/)
     assert.match(vaultPage, /role="progressbar"/)
+    assert.match(vaultPage, /id='vault-action-state' role='status' aria-live='polite'/)
+    assert.match(vaultPage, /\.vault-action-state\.show,[\s\S]*?display:\s*flex/)
     assert.match(vaultPage, /const counting = scanPhase === "counting"/)
     assert.match(vaultPage, /const hashTotal = scan\.hash_total/)
     assert.match(vaultPage, /const totalFiles = Number\.isFinite\(scan\.total_files\)/)
@@ -955,10 +1120,11 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(embeddedTemplate, /include\('partials\/vault_workspace', \{ appMode: true \}\)/)
 
     const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
-      theme: 'light', agent: 'electron', scope_id: 'app:appB'
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
     })
     assert.match(html, /data-vault-mode="app"/)
     assert.match(html, /data-vault-scope="app:appB"/)
+    assert.match(html, /data-platform="darwin"/)
     assert.match(html, /id='btn-scan'/)
     assert.match(html, /id='vault-explorer'/)
     assert.doesNotMatch(html, /id='btn-add-source'/)
@@ -1001,7 +1167,7 @@ describe('vault dashboard backend (phase 4)', () => {
   test('app Vault workspace loads scoped data without global-only controls', async () => {
     const views = path.resolve(__dirname, '..', 'server', 'views')
     const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
-      theme: 'light', agent: 'electron', scope_id: 'app:appB'
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
     })
     const dom = new JSDOM(html, { url: 'http://localhost/vault/app/appB', runScripts: 'dangerously' })
     const requests = []
@@ -1042,7 +1208,7 @@ describe('vault dashboard backend (phase 4)', () => {
   test('app Save space header shows proportional effective disk usage', async () => {
     const views = path.resolve(__dirname, '..', 'server', 'views')
     const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
-      theme: 'light', agent: 'electron', scope_id: 'app:appB'
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
     })
     const dom = new JSDOM(html, { url: 'http://localhost/vault/app/appB', runScripts: 'dangerously' })
     const gb = 1024 ** 3
@@ -1073,25 +1239,39 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-compare-value')].map((node) => node.textContent), ['7.09 GB', '2.58 GB'])
     assert.match(dom.window.document.querySelector('.vault-compare-fill.after').getAttribute('style'), /--vault-after-ratio:36\.36%/)
     assert.strictEqual(dom.window.document.getElementById('vault-after-help').textContent,
-      'Shared files are divided evenly among every location using them.')
-    assert.match(await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'public', 'vault.css'), 'utf8'),
-      /body\[data-vault-mode="app"\] \.vault-compare-tooltip \{[\s\S]*?left:\s*0;[\s\S]*?transform:\s*translateY\(-2px\)/)
+      'For deduplicated files, disk usage is divided evenly among every location using them.')
+    const styles = await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'public', 'vault.css'), 'utf8')
+    const tooltip = styles.match(/\.vault-compare-tooltip \{[\s\S]*?\n\}/)
+    assert.ok(tooltip)
+    assert.match(tooltip[0], /left:\s*0;/)
+    assert.match(tooltip[0], /width:\s*min\(220px, calc\(100vw - var\(--vault-inline\) - var\(--vault-inline\)\)\);/)
+    assert.match(tooltip[0], /transform:\s*translateY\(-2px\);/)
+    assert.doesNotMatch(tooltip[0], /translateX/)
     assert.match(dom.window.document.querySelector('.vault-summary-side').textContent, /Nothing else to save/)
     dom.window.close()
   })
 
-  test('app header and Save space share decimal storage units', async () => {
-    const dom = new JSDOM('', { runScripts: 'dangerously' })
+  test('file sizes follow the host file explorer convention', async () => {
+    const dom = new JSDOM('<body data-platform="darwin"></body>', { runScripts: 'dangerously' })
     const formatter = await fs.promises.readFile(
       path.resolve(__dirname, '..', 'server', 'public', 'storage-size.js'), 'utf8')
     dom.window.eval(formatter)
     assert.strictEqual(dom.window.PinokioFormatStorageSize(7.05e9), '7.05 GB')
     assert.strictEqual(dom.window.PinokioFormatStorageSize(5.3e9), '5.3 GB')
+    assert.strictEqual(dom.window.PinokioFormatStorageSize(1024 ** 3), '1.07 GB')
+    dom.window.document.body.dataset.platform = 'win32'
+    assert.strictEqual(dom.window.PinokioFormatStorageSize(1024 ** 3), '1 GB')
 
     const appView = await fs.promises.readFile(
       path.resolve(__dirname, '..', 'server', 'views', 'app.ejs'), 'utf8')
     assert.match(appView, /<script src="\/storage-size\.js"><\/script>/)
     assert.match(appView, /PinokioFormatStorageSize\(res\.du\)/)
+    const vaultView = await fs.promises.readFile(
+      path.resolve(__dirname, '..', 'server', 'views', 'vault.ejs'), 'utf8')
+    const vaultAppView = await fs.promises.readFile(
+      path.resolve(__dirname, '..', 'server', 'views', 'vault_app.ejs'), 'utf8')
+    assert.match(vaultView, /data-platform="<%=platform%>"/)
+    assert.match(vaultAppView, /data-platform="<%=platform%>"/)
     dom.window.close()
   })
 
@@ -1136,14 +1316,76 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(dom.window.document.querySelector('.vault-compare-info').getAttribute('tabindex'), '0')
     assert.match(dom.window.document.querySelector('.vault-summary-side').textContent, /13\.31 GB more can be saved/)
     assert.strictEqual(dom.window.document.getElementById('btn-review-metric').textContent, 'Review files')
+    assert.strictEqual(dom.window.document.getElementById('btn-review-metric').classList.contains('review-primary'), true)
+    assert.strictEqual(dom.window.document.getElementById('btn-scan').classList.contains('primary'), false)
     assert.match(dom.window.document.getElementById('vault-storage-details').textContent, /Pinokio folder\s*166\.22 GB/)
     assert.match(dom.window.document.getElementById('vault-storage-details').textContent, /Saved by your actions\s*258\.77 GB/)
+    const viewDescriptions = {
+      all: 'Every scanned file and its current deduplication status.',
+      duplicates: 'Identical files waiting to be deduplicated or kept separate.',
+      shared: 'Files that share disk storage across multiple locations.',
+      independent: 'Duplicate files that remain as separate copies.',
+      reclaimable: 'Stored copies no longer used by any configured location.',
+      activity: 'A history of scans and changes made by Save space.'
+    }
+    for (const [view, description] of Object.entries(viewDescriptions)) {
+      dom.window.document.querySelector(`[data-view="${view}"]`).click()
+      const explanation = dom.window.document.querySelector('.vault-toolbar-description')
+      assert.strictEqual(explanation.textContent, description)
+      assert.strictEqual(explanation.parentElement.id, 'vault-toolbar')
+    }
+    dom.window.document.querySelector('[data-view="all"]').click()
+    const allDescription = dom.window.document.querySelector('.vault-toolbar-description')
+    assert.strictEqual(allDescription.previousElementSibling.classList.contains('vault-display-mode'), true)
+    assert.strictEqual(allDescription.nextElementSibling.id, 'vault-toolbar-summary')
     const unusedView = dom.window.document.querySelector('[data-view="reclaimable"]')
     assert.strictEqual(unusedView.querySelector('.vault-nav-name').textContent, 'Unused files')
     unusedView.click()
     assert.strictEqual(dom.window.document.getElementById('btn-reclaim-all').textContent, 'Delete all')
     assert.strictEqual(dom.window.document.querySelector('[data-reclaim]').textContent, 'Delete')
     assert.match(dom.window.document.getElementById('vault-pane-footer').textContent, /Deleting them frees disk space/)
+    dom.window.close()
+  })
+
+  test('global savings remain visible when scan metadata is missing', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const workspace = await ejs.renderFile(path.resolve(views, 'partials', 'vault_workspace.ejs'), { appMode: false })
+    const dom = new JSDOM(`<body data-platform="darwin" data-vault-mode="global">${workspace}</body>`, {
+      url: 'http://localhost/vault', runScripts: 'dangerously'
+    })
+    dom.window.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        enabled: true,
+        mode: 'link',
+        scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+        last_scan: null,
+        bytes_on_disk: 7e9,
+        bytes_without_sharing: 10e9,
+        saved_by_sharing: 3e9,
+        lifetime_bytes_saved: 3e9,
+        pending_bytes: 1e9,
+        reclaimable: 0,
+        file_action: null,
+        activity_error: null,
+        cloud_sync_warning: null,
+        sources: [{
+          id: 'pinokio', kind: 'pinokio', label: 'Pinokio', root: '/pinokio',
+          display_path: '/pinokio', parent_id: null, available: true, shareable: true
+        }],
+        blobs: [], duplicates: [], excluded: [], events: [], undo_batches: []
+      })
+    })
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    assert.strictEqual(dom.window.document.querySelector('.vault-summary-value').textContent,
+      '3 GB of disk space saved')
+    assert.deepStrictEqual(
+      [...dom.window.document.querySelectorAll('.vault-compare-value')].map((node) => node.textContent),
+      ['10 GB', '7 GB'])
+    assert.match(dom.window.document.querySelector('.vault-summary-side').textContent,
+      /1 GB more can be saved.*Not scanned yet/)
     dom.window.close()
   })
 
@@ -1154,14 +1396,20 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(source, /stale:\s*COPY\.separate_changed/)
     assert.match(source, /conflict:\s*COPY\.separate_conflict/)
     assert.match(source, /"not-found":\s*COPY\.separate_not_found/)
-    assert.match(source, /runAction\(\{ action: "detach", path: target\.dataset\.detach \}, detachFeedback\)/)
+    assert.match(source, /runAction\(\{ action: "detach", path: filePath \}, detachFeedback\)/)
   })
 
-  test('inventory puts sharing switches in status and keeps duplicate Skip inline', async () => {
+  test('inventory puts explicit sharing actions in the status column', async () => {
     const source = await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'public', 'vault.js'), 'utf8')
-    assert.match(source, /const duplicateAction = \(item\) => \{[\s\S]*?COPY\.skip/)
-    assert.match(source, /item\.status === "shared"[\s\S]*?role="switch" aria-checked="true"[\s\S]*?data-detach/)
-    assert.match(source, /item\.status === "independent"[\s\S]*?role="switch" aria-checked="false"[\s\S]*?data-reshare/)
+    assert.match(source, /all:\s*"All files"/)
+    assert.match(source, /tracked:\s*"No action needed"/)
+    assert.match(source, /fa-regular fa-circle-check/)
+    assert.doesNotMatch(source, /"All tracked files"|"Search tracked files"|"Nothing tracked yet"|"View all tracked files"/)
+    assert.match(source, /const duplicateAction = \(item\) => \{[\s\S]*?COPY\.keep_separate/)
+    assert.match(source, /item\.status === "shared"[\s\S]*?COPY\.make_separate[\s\S]*?data-detach[\s\S]*?data-detach-kind="make"[\s\S]*?COPY\.make_separate/)
+    assert.match(source, /item\.status === "independent"[\s\S]*?COPY\.deduplicate[\s\S]*?data-deduplicate-file[\s\S]*?COPY\.deduplicate/)
+    assert.doesNotMatch(source, /data-reshare|COPY\.review_again/)
+    assert.doesNotMatch(source, /role="switch"/)
     assert.match(source, /class="vault-status-cell"/)
     assert.doesNotMatch(source, /separate:\s*"Separate"/)
     assert.doesNotMatch(source, /include_in_scans:\s*"Include in scans"/)
@@ -1179,13 +1427,309 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(source, /aria-sort="\$\{state\.sizeSort === "desc" \? "descending" : state\.sizeSort === "asc" \? "ascending" : "none"\}"/)
   })
 
-  test('app inventory renders real sharing switches without empty columns', async () => {
+  test('Deduplicate shows determinate progress in the dedicated operation strip', async () => {
     const views = path.resolve(__dirname, '..', 'server', 'views')
     const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
-      theme: 'light', agent: 'electron', scope_id: 'app:appB'
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
+    })
+    const dom = new JSDOM(html, { url: 'http://localhost/vault/app/appB', runScripts: 'dangerously' })
+    const status = {
+      enabled: true,
+      mode: 'link',
+      scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+      last_scan: { ts: Date.now(), bytes_total: 2048 },
+      tracked_bytes: 2048,
+      effective_bytes: 2048,
+      shared_bytes: 0,
+      pending_bytes: 2048,
+      activity_error: null,
+      cloud_sync_warning: null,
+      sources: [{
+        id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
+        display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
+      }],
+      blobs: [],
+      duplicates: [
+        {
+          path: '/pinokio/api/appB/one.bin', relative_path: 'one.bin',
+          source_id: 'app:appB', source_label: 'appB', size: 1024,
+          shareable: true, match: { path: '/pinokio/api/appA/one.bin' }
+        },
+        {
+          path: '/pinokio/api/appB/two.bin', relative_path: 'two.bin',
+          source_id: 'app:appB', source_label: 'appB', size: 1024,
+          shareable: true, match: { path: '/pinokio/api/appA/two.bin' }
+        }
+      ],
+      excluded: [], events: [], undo_batches: []
+    }
+    let finishAction
+    let holdProgress = false
+    let releaseLateProgress
+    const actionResponse = new Promise((resolve) => {
+      finishAction = () => resolve({
+        ok: true,
+        json: async () => ({ converted: 2, bytes_saved: 2048 })
+      })
+    })
+    dom.window.fetch = async (url, options = {}) => {
+      if (options.method === 'POST') return actionResponse
+      if (String(url).includes('progress=1')) {
+        if (holdProgress) {
+          return {
+            ok: true,
+            json: () => new Promise((resolve) => {
+              releaseLateProgress = () => resolve({
+                enabled: true,
+                scan: status.scan,
+                last_scan: status.last_scan,
+                file_action: {
+                  kind: 'deduplicate', scope_id: 'app:appB', selection: 'duplicates',
+                  files_total: 2, files_completed: 1
+                }
+              })
+            })
+          }
+        }
+        return {
+          ok: true,
+          json: async () => ({
+            enabled: true,
+            scan: status.scan,
+            last_scan: status.last_scan,
+            file_action: {
+              kind: 'deduplicate', scope_id: 'app:appB', selection: 'duplicates',
+              files_total: 2, files_completed: 1
+            }
+          })
+        }
+      }
+      return { ok: true, json: async () => status }
+    }
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    try {
+      dom.window.document.querySelector('[data-deduplicate-scope="app:appB"]').click()
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      const running = [...dom.window.document.querySelectorAll('[data-deduplicate-scope="app:appB"]')]
+      assert.strictEqual(running.length, 1)
+      for (const button of running) {
+        assert.strictEqual(button.disabled, true)
+        assert.strictEqual(button.getAttribute('aria-busy'), 'true')
+        assert.strictEqual(button.querySelector('[role="progressbar"]'), null)
+        assert.strictEqual(button.textContent, 'Deduplicate 2 files')
+      }
+      const operation = dom.window.document.getElementById('vault-action-state')
+      assert.strictEqual(operation.classList.contains('show'), true)
+      assert.strictEqual(operation.querySelector('[role="progressbar"]').getAttribute('aria-valuenow'), '1')
+      assert.strictEqual(operation.textContent, 'Deduplicating files1 of 2 files')
+      const progressBar = operation.querySelector('[role="progressbar"]')
+      dom.window.document.getElementById('vault-search').dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+      assert.strictEqual(operation.querySelector('[role="progressbar"]'), progressBar)
+
+      holdProgress = true
+      await new Promise((resolve) => setTimeout(resolve, 275))
+      assert.ok(releaseLateProgress)
+      finishAction()
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      const finished = [...dom.window.document.querySelectorAll('[data-deduplicate-scope="app:appB"]')]
+      assert.strictEqual(finished.length, 1)
+      assert.ok(finished.every((button) => !button.disabled && button.textContent === 'Deduplicate 2 files'))
+      assert.strictEqual(operation.classList.contains('show'), false)
+      assert.strictEqual(operation.innerHTML, '')
+      releaseLateProgress()
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      assert.ok(finished.every((button) => !button.disabled))
+      assert.strictEqual(operation.classList.contains('show'), false)
+    } finally {
+      finishAction()
+      if (releaseLateProgress) releaseLateProgress()
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      dom.window.close()
+    }
+  })
+
+  test('a running file action is restored after reloading the page', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
+    })
+    const dom = new JSDOM(html, { url: 'http://localhost/vault/app/appB', runScripts: 'dangerously' })
+    const requests = []
+    dom.window.fetch = async (url) => {
+      requests.push(String(url))
+      return {
+        ok: true,
+        json: async () => ({
+          enabled: true,
+          mode: 'link',
+          scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+          last_scan: { ts: Date.now(), bytes_total: 2048 },
+          tracked_bytes: 2048,
+          effective_bytes: 2048,
+          shared_bytes: 0,
+          pending_bytes: 2048,
+          file_action: {
+            kind: 'deduplicate',
+            scope_id: 'app:appB',
+            selection: 'duplicates',
+            files_total: 2,
+            files_completed: 1
+          },
+          activity_error: null,
+          cloud_sync_warning: null,
+          sources: [{
+            id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
+            display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
+          }],
+          blobs: [], duplicates: [], excluded: [], events: [], undo_batches: []
+        })
+      }
+    }
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    const operation = dom.window.document.getElementById('vault-action-state')
+    assert.strictEqual(requests[0], '/info/dedup?scope_id=app%3AappB')
+    assert.strictEqual(operation.classList.contains('show'), true)
+    assert.strictEqual(operation.querySelector('[role="progressbar"]').getAttribute('aria-valuenow'), '1')
+    assert.strictEqual(operation.textContent, 'Deduplicating files1 of 2 files')
+    assert.notStrictEqual(dom.window.__vaultRefresh, null)
+    dom.window.close()
+  })
+
+  test('Deduplicate all is contextual to Duplicates and Kept separate and reuses determinate progress', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
     })
     const dom = new JSDOM(html, { url: 'http://localhost/vault/app/appB', runScripts: 'dangerously' })
     const actions = []
+    const status = {
+      enabled: true,
+      mode: 'link',
+      scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+      last_scan: { ts: Date.now(), bytes_total: 4096 },
+      tracked_bytes: 4096,
+      effective_bytes: 4096,
+      shared_bytes: 0,
+      pending_bytes: 2048,
+      activity_error: null,
+      cloud_sync_warning: null,
+      sources: [{
+        id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
+        display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
+      }],
+      blobs: [],
+      duplicates: ['one.bin', 'two.bin'].map((name) => ({
+        path: `/pinokio/api/appB/${name}`, relative_path: name,
+        source_id: 'app:appB', source_label: 'appB', size: 1024,
+        shareable: true, match: { path: `/pinokio/api/appA/${name}` }
+      })),
+      excluded: ['kept-one.bin', 'kept-two.bin'].map((name) => ({
+        path: `/pinokio/api/appB/${name}`, relative_path: name,
+        source_id: 'app:appB', source_label: 'appB', size: 1024
+      })),
+      events: [],
+      undo_batches: []
+    }
+    let finishKept
+    const keptResponse = new Promise((resolve) => {
+      finishKept = () => resolve({
+        ok: true,
+        json: async () => ({ converted: 2, bytes_saved: 2048, unmatched: 0 })
+      })
+    })
+    dom.window.fetch = async (url, options = {}) => {
+      if (options.method === 'POST') {
+        const action = JSON.parse(options.body)
+        actions.push(action)
+        if (action.selection === 'kept-separate') return keptResponse
+        return { ok: true, json: async () => ({ converted: 2, bytes_saved: 2048 }) }
+      }
+      if (String(url).includes('progress=1')) {
+        return {
+          ok: true,
+          json: async () => ({
+            enabled: true,
+            scan: status.scan,
+            last_scan: status.last_scan,
+            file_action: {
+              kind: 'deduplicate', scope_id: 'app:appB',
+              selection: actions.length ? actions[actions.length - 1].selection : 'duplicates',
+              files_total: 2, files_completed: 1
+            }
+          })
+        }
+      }
+      return { ok: true, json: async () => status }
+    }
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    try {
+      assert.strictEqual(dom.window.document.querySelector('[data-deduplicate-all]'), null)
+      dom.window.document.querySelector('[data-view="duplicates"]').click()
+      let bulk = dom.window.document.querySelector('[data-deduplicate-all="duplicates"]')
+      assert.strictEqual(bulk.textContent, 'Deduplicate all')
+      assert.strictEqual(bulk.dataset.deduplicateContext, 'app:appB')
+      assert.strictEqual(bulk.getAttribute('aria-label'), 'Deduplicate all: 2 files')
+      const search = dom.window.document.getElementById('vault-search')
+      search.value = 'one.bin'
+      search.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+      assert.strictEqual(bulk.getAttribute('aria-label'), 'Deduplicate all: 2 files',
+        'search never silently narrows the bulk action')
+      bulk.click()
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      assert.deepStrictEqual(actions[0], {
+        action: 'deduplicate',
+        selection: 'duplicates',
+        scope_id: 'app:appB'
+      })
+
+      dom.window.document.querySelector('[data-view="shared"]').click()
+      assert.strictEqual(dom.window.document.querySelector('[data-deduplicate-all]'), null)
+      dom.window.document.querySelector('[data-view="independent"]').click()
+      bulk = dom.window.document.querySelector('[data-deduplicate-all="kept-separate"]')
+      assert.strictEqual(bulk.getAttribute('aria-label'), 'Deduplicate all: 2 files')
+      bulk.click()
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      const operation = dom.window.document.getElementById('vault-action-state')
+      assert.strictEqual(bulk.disabled, true)
+      assert.strictEqual(bulk.getAttribute('aria-busy'), 'true')
+      assert.strictEqual(operation.querySelector('[role="progressbar"]').getAttribute('aria-valuenow'), '1')
+      assert.strictEqual(operation.textContent, 'Deduplicating files1 of 2 files')
+      assert.deepStrictEqual(actions[1], {
+        action: 'deduplicate',
+        selection: 'kept-separate',
+        scope_id: 'app:appB'
+      })
+      finishKept()
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      assert.strictEqual(operation.classList.contains('show'), false)
+    } finally {
+      finishKept()
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      dom.window.close()
+    }
+  })
+
+  test('app inventory uses explicit sharing actions without ambiguous switches', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
+    })
+    const dom = new JSDOM(html, { url: 'http://localhost/vault/app/appB', runScripts: 'dangerously' })
+    const actions = []
+    let finishSeparate
+    const separateResponse = new Promise((resolve) => {
+      finishSeparate = () => resolve({ ok: true, json: async () => ({ status: 'detached' }) })
+    })
+    let finishDeduplicate
+    const deduplicateResponse = new Promise((resolve) => {
+      finishDeduplicate = () => resolve({ ok: true, json: async () => ({ status: 'converted', bytes_saved: 1024 }) })
+    })
     const status = {
       enabled: true,
       mode: 'link',
@@ -1208,7 +1752,11 @@ describe('vault dashboard backend (phase 4)', () => {
           { path: '/pinokio/api/appA/shared.bin', relative_path: 'shared.bin', source_id: 'app:appA', source_label: 'appA', mode: 'link' }
         ]
       }],
-      duplicates: [],
+      duplicates: [{
+        path: '/pinokio/api/appB/duplicate.bin', relative_path: 'duplicate.bin',
+        source_id: 'app:appB', source_label: 'appB', size: 1024,
+        shareable: true, match: { path: '/pinokio/api/appA/duplicate.bin' }
+      }],
       excluded: [{
         path: '/pinokio/api/appB/own.bin', relative_path: 'own.bin',
         source_id: 'app:appB', source_label: 'appB', size: 1024
@@ -1219,7 +1767,14 @@ describe('vault dashboard backend (phase 4)', () => {
       if (options.method === 'POST') {
         const action = JSON.parse(options.body)
         actions.push(action)
-        return { ok: true, json: async () => action.action === 'reshare' ? { status: 'resharable' } : { status: 'detached' } }
+        if (action.path && action.path.endsWith('/shared.bin')) return separateResponse
+        if (action.path && action.path.endsWith('/own.bin')) return deduplicateResponse
+        return {
+          ok: true,
+          json: async () => action.path.endsWith('/duplicate.bin')
+            ? { status: 'ignored' }
+            : { status: 'detached' }
+        }
       }
       return { ok: true, json: async () => status }
     }
@@ -1227,33 +1782,64 @@ describe('vault dashboard backend (phase 4)', () => {
     await new Promise((resolve) => setTimeout(resolve, 25))
 
     assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-table.inventory .vault-columns span')]
-      .map((node) => node.textContent), ['Name', 'Size', 'Sharing status'])
+      .map((node) => node.textContent), ['Name', 'Size', 'Deduplication status'])
     assert.strictEqual(dom.window.document.querySelector('.vault-table.inventory .vault-space'), null)
     assert.strictEqual(dom.window.document.querySelector('.vault-table.inventory .vault-row-action'), null)
-    const on = dom.window.document.querySelector('.vault-sharing-switch[aria-checked="true"]')
-    const off = dom.window.document.querySelector('.vault-sharing-switch[aria-checked="false"]')
-    assert.ok(on && on.classList.contains('on'))
-    assert.ok(off && !off.classList.contains('on'))
-    assert.strictEqual(on.getAttribute('role'), 'switch')
-    assert.strictEqual(on.getAttribute('aria-label'), 'Allow shared.bin to share storage')
-    assert.strictEqual(off.getAttribute('aria-label'), 'Allow own.bin to share storage')
-    assert.match(off.closest('.vault-status-cell').textContent, /Kept separate/)
+    const makeSeparate = dom.window.document.querySelector('[data-detach="/pinokio/api/appB/shared.bin"]')
+    const keepSeparate = dom.window.document.querySelector('[data-detach="/pinokio/api/appB/duplicate.bin"]')
+    assert.strictEqual(dom.window.document.querySelector('.vault-sharing-switch'), null)
+    assert.strictEqual(makeSeparate.textContent, 'Make separate')
+    assert.strictEqual(makeSeparate.getAttribute('aria-label'), 'Make separate: shared.bin')
+    assert.strictEqual(makeSeparate.dataset.detachKind, 'make')
+    const deduplicate = dom.window.document.querySelector('[data-deduplicate-file="/pinokio/api/appB/own.bin"]')
+    assert.strictEqual(dom.window.document.querySelector('[data-reshare]'), null)
+    assert.strictEqual(deduplicate.textContent, 'Deduplicate')
+    assert.strictEqual(deduplicate.getAttribute('aria-label'), 'Deduplicate: own.bin')
+    assert.strictEqual(keepSeparate.textContent, 'Keep separate')
+    assert.strictEqual(keepSeparate.getAttribute('aria-label'), 'Keep separate: duplicate.bin')
+    assert.strictEqual(keepSeparate.dataset.detachKind, 'keep')
+    for (const button of [makeSeparate, deduplicate, keepSeparate]) {
+      assert.ok(button.getAttribute('aria-label').includes(button.textContent))
+    }
+    assert.match(deduplicate.closest('.vault-status-cell').textContent, /Kept separate/)
 
-    on.click()
+    makeSeparate.click()
     await new Promise((resolve) => setTimeout(resolve, 25))
-    dom.window.document.querySelector('.vault-sharing-switch[aria-checked="false"]').click()
+    const separateProgress = dom.window.document.getElementById('vault-action-state')
+    assert.strictEqual(makeSeparate.disabled, true)
+    assert.strictEqual(makeSeparate.getAttribute('aria-busy'), 'true')
+    assert.strictEqual(separateProgress.classList.contains('show'), true)
+    assert.strictEqual(separateProgress.textContent, 'Making file separateshared.bin')
+    assert.ok(separateProgress.querySelector('.vault-progress-bar').classList.contains('indeterminate'))
+    assert.strictEqual(separateProgress.querySelector('[role="progressbar"]').hasAttribute('aria-valuenow'), false)
+    finishSeparate()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    assert.strictEqual(separateProgress.classList.contains('show'), false)
+    const currentDeduplicate = dom.window.document.querySelector('[data-deduplicate-file="/pinokio/api/appB/own.bin"]')
+    currentDeduplicate.click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    assert.strictEqual(currentDeduplicate.disabled, true)
+    assert.strictEqual(currentDeduplicate.getAttribute('aria-busy'), 'true')
+    assert.strictEqual(separateProgress.classList.contains('show'), true)
+    assert.strictEqual(separateProgress.textContent, 'Deduplicating fileown.bin')
+    assert.ok(separateProgress.querySelector('.vault-progress-bar').classList.contains('indeterminate'))
+    finishDeduplicate()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    assert.strictEqual(separateProgress.classList.contains('show'), false)
+    dom.window.document.querySelector('[data-detach="/pinokio/api/appB/duplicate.bin"]').click()
     await new Promise((resolve) => setTimeout(resolve, 25))
     assert.deepStrictEqual(actions, [
       { action: 'detach', path: '/pinokio/api/appB/shared.bin' },
-      { action: 'reshare', path: '/pinokio/api/appB/own.bin' }
+      { action: 'deduplicate', path: '/pinokio/api/appB/own.bin' },
+      { action: 'detach', path: '/pinokio/api/appB/duplicate.bin' }
     ])
     dom.window.close()
   })
 
-  test('Shared defaults to a globally size-sorted Files mode and can return to Folders', async () => {
+  test('Deduplicated defaults to a globally size-sorted Files mode and can return to Folders', async () => {
     const views = path.resolve(__dirname, '..', 'server', 'views')
     const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
-      theme: 'light', agent: 'electron', scope_id: 'app:appB'
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
     })
     const dom = new JSDOM(html, { url: 'http://localhost/vault/app/appB', runScripts: 'dangerously' })
     const sharedBlob = (hash, size, name) => ({
@@ -1300,7 +1886,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(mode('files').getAttribute('aria-pressed'), 'true')
     assert.strictEqual(mode('folders').getAttribute('aria-pressed'), 'false')
     assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-columns > span')]
-      .map((node) => node.textContent), ['Name', 'Location', 'Size', 'Sharing status'])
+      .map((node) => node.textContent), ['Name', 'Location', 'Size', 'Deduplication status'])
     assert.deepStrictEqual(names(), ['z-large.bin', 'a-small.bin'])
     assert.deepStrictEqual(directories(), [])
     assert.match(locations()[0], /appB \/ z-large\/z-large\.bin/)
@@ -1308,14 +1894,14 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(sort().getAttribute('aria-label'), 'Sort by size, smallest first')
     assert.strictEqual(sort().parentElement.getAttribute('aria-sort'), 'descending')
     assert.strictEqual(dom.window.document.getElementById('vault-pane-footer').textContent,
-      '2 shared files · sorted largest first')
+      '2 deduplicated files · sorted largest first')
 
     sort().click()
     assert.deepStrictEqual(names(), ['a-small.bin', 'z-large.bin'])
     assert.strictEqual(sort().getAttribute('aria-label'), 'Sort by size, largest first')
     assert.strictEqual(sort().parentElement.getAttribute('aria-sort'), 'ascending')
     assert.strictEqual(dom.window.document.getElementById('vault-pane-footer').textContent,
-      '2 shared files · sorted smallest first')
+      '2 deduplicated files · sorted smallest first')
 
     sort().click()
     assert.deepStrictEqual(names(), ['z-large.bin', 'a-small.bin'])
@@ -1326,7 +1912,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(mode('folders').getAttribute('aria-pressed'), 'true')
     assert.strictEqual(mode('files').getAttribute('aria-pressed'), 'false')
     assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-columns > span')]
-      .map((node) => node.textContent), ['Name', 'Size', 'Sharing status'])
+      .map((node) => node.textContent), ['Name', 'Size', 'Deduplication status'])
     assert.deepStrictEqual(directories(), ['a-small', 'z-large'])
     assert.strictEqual(sort(), null)
 
@@ -1347,6 +1933,8 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(route, /requirements_pending \|\| install_required/)
     assert.match(route, /\/setup\/dev\?callback=\$\{encodeURIComponent\(req\.originalUrl\)\}/)
     assert.ok(route.indexOf('res.redirect') < route.indexOf('res.render("vault"'), 'requirements redirect must happen before rendering Vault')
+    assert.match(route, /res\.render\("vault", \{ theme: this\.theme, platform: this\.kernel\.platform, agent: req\.agent \}\)/)
+    assert.match(route, /res\.render\("vault_app", \{[\s\S]*?platform: this\.kernel\.platform/)
   })
 
   test('disabled Vault routes return no data and the sidebar entry can be hidden', async () => {
@@ -1368,7 +1956,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.doesNotMatch(kernelSource, /catch\(\(err\) => \{\s*this\.vault\.enabled = false/)
   })
 
-  test('dashboard actions delegate to the engine and deduplication requires a scope', async () => {
+  test('dashboard actions delegate to the engine and unscoped deduplication requires an explicit selection', async () => {
     const { home, vault } = await makeEnv()
     const content = crypto.randomBytes(4096)
     const hash = sha256(content)
@@ -1378,8 +1966,13 @@ describe('vault dashboard backend (phase 4)', () => {
     vault.registry.duplicates.set(pending, { hash, size: content.length, app: 'appB' })
 
     const result = await vault.perform('deduplicate', {})
+    const malformed = await vault.perform('deduplicate', {
+      selection: 'duplicates',
+      scope_id: 42
+    })
 
     assert.match(result.error, /location/i)
+    assert.match(malformed.error, /valid location/i)
     assert.strictEqual((await fs.promises.stat(pending)).nlink, 1)
     const serverSource = await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'index.js'), 'utf8')
     const actionRoute = serverSource.slice(serverSource.indexOf('this.app.post("/vault/action"'), serverSource.indexOf('this.app.get("/info/scripts"'))

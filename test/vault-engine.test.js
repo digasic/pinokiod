@@ -1093,6 +1093,59 @@ describe('vault engine (phase 1)', () => {
     assert.ok(batches.every((batch) => /^batch-[0-9a-f-]{36}$/.test(batch)))
   })
 
+  test('deduplication reports transient file progress and clears it when complete', async () => {
+    const h = await home()
+    const vault = await makeVault(h)
+    const source = {
+      id: 'app:appA',
+      kind: 'app',
+      app: 'appA',
+      root: path.resolve(h, 'api', 'appA'),
+      shareable: true
+    }
+    vault.refreshSources = async () => {}
+    vault._sources = [source]
+    vault.sourceForPath = () => source
+    vault.sourceAppIsRunning = () => false
+    vault.canonicalPathIsWithinSource = async () => true
+    vault.registry.duplicates = new Map([
+      ['/models/one.bin', { hash: 'a'.repeat(64), dev: 1, ino: 1, mtime: 1, ctime: 1 }],
+      ['/models/two.bin', { hash: 'b'.repeat(64), dev: 1, ino: 2, mtime: 1, ctime: 1 }]
+    ])
+
+    let calls = 0
+    let releaseSecond
+    let reportSecond
+    const secondStarted = new Promise((resolve) => { reportSecond = resolve })
+    const secondGate = new Promise((resolve) => { releaseSecond = resolve })
+    vault.convert = async () => {
+      calls += 1
+      if (calls === 2) {
+        reportSecond()
+        await secondGate
+      }
+      return { status: 'converted', bytes_saved: 1 }
+    }
+
+    const pending = vault.perform('deduplicate', { scope_id: source.id })
+    await secondStarted
+    const active = vault.progressStatus().file_action
+    const dashboard = await vault.status()
+    releaseSecond()
+    const result = await pending
+
+    assert.deepStrictEqual(active, {
+      kind: 'deduplicate',
+      scope_id: source.id,
+      selection: 'duplicates',
+      files_total: 2,
+      files_completed: 1
+    })
+    assert.deepStrictEqual(dashboard.file_action, active)
+    assert.strictEqual(result.converted, 2)
+    assert.strictEqual(vault.progressStatus().file_action, null)
+  })
+
   test('verification keeps copy-mode content groups without a managed file', async () => {
     const h = await home()
     const vault = await makeVault(h)

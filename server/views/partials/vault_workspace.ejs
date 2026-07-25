@@ -4,7 +4,7 @@
       <section class='vault-overview'>
         <div class='vault-metrics' id='vault-metrics'></div>
         <div class='vault-overview-actions'>
-          <button class='vault-button primary' id='btn-scan' type='button'></button>
+          <button class='vault-button' id='btn-scan' type='button'></button>
           <% if (!appMode) { %>
           <details class='vault-advanced' id='vault-advanced'>
             <summary class='vault-icon-button' id='btn-vault-options'><i class='fa-solid fa-ellipsis'></i></summary>
@@ -20,6 +20,7 @@
         </div>
       </section>
       <div class='vault-scan-state' id='vault-scan-state' aria-live='polite'></div>
+      <div class='vault-action-state' id='vault-action-state' role='status' aria-live='polite'></div>
       <div class='vault-result' id='vault-result' role='status' aria-live='polite'></div>
       <div class='vault-feedback' id='vault-feedback' role='status' aria-live='polite'></div>
       <div class='vault-cloud-warning' id='vault-cloud-warning' role='status'></div>

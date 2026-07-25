@@ -141,8 +141,8 @@ body[data-vault-mode="app"] .vault-overview {
   position: absolute;
   z-index: 30;
   top: calc(100% + 6px);
-  left: 50%;
-  width: 220px;
+  left: 0;
+  width: min(220px, calc(100vw - var(--vault-inline) - var(--vault-inline)));
   padding: 7px 9px;
   border: 1px solid var(--task-border-strong);
   border-radius: 6px;
@@ -154,7 +154,7 @@ body[data-vault-mode="app"] .vault-overview {
   line-height: 1.4;
   opacity: 0;
   pointer-events: none;
-  transform: translateX(-50%) translateY(-2px);
+  transform: translateY(-2px);
   transition: opacity 100ms ease, transform 100ms ease, visibility 100ms;
   visibility: hidden;
   white-space: normal;
@@ -162,16 +162,8 @@ body[data-vault-mode="app"] .vault-overview {
 .vault-compare-info:hover .vault-compare-tooltip,
 .vault-compare-info:focus .vault-compare-tooltip {
   opacity: 1;
-  transform: translateX(-50%) translateY(0);
-  visibility: visible;
-}
-body[data-vault-mode="app"] .vault-compare-tooltip {
-  left: 0;
-  transform: translateY(-2px);
-}
-body[data-vault-mode="app"] .vault-compare-info:hover .vault-compare-tooltip,
-body[data-vault-mode="app"] .vault-compare-info:focus .vault-compare-tooltip {
   transform: translateY(0);
+  visibility: visible;
 }
 .vault-compare-value { font-variant-numeric: tabular-nums; text-align: right; }
 .vault-compare-track {
@@ -242,12 +234,17 @@ body[data-vault-mode="app"] .vault-compare-info:focus .vault-compare-tooltip {
   white-space: nowrap;
 }
 .vault-button:hover { background: var(--task-soft); }
-.vault-button.primary {
-  border-color: var(--task-accent-surface);
-  background: var(--task-accent-surface);
-  color: var(--task-accent-contrast);
+.vault-button.review-primary {
+  border-color: var(--task-accent-contrast);
+  background: var(--task-accent-contrast);
+  color: #101828;
+  font-weight: 650;
 }
-.vault-button.primary:hover { background: var(--task-accent-hover); }
+.vault-button.review-primary:hover {
+  border-color: color-mix(in srgb, var(--task-accent-contrast) 88%, var(--task-panel));
+  background: color-mix(in srgb, var(--task-accent-contrast) 88%, var(--task-panel));
+  color: #101828;
+}
 .vault-button:disabled { opacity: .5; cursor: default; }
 .vault-icon-button {
   width: var(--vault-control-height);
@@ -286,7 +283,6 @@ body[data-vault-mode="app"] .vault-compare-info:focus .vault-compare-tooltip {
 .vault-button:focus-visible,
 .vault-icon-button:focus-visible,
 .vault-text-button:focus-visible,
-.vault-sharing-switch:focus-visible,
 .vault-rail-add:focus-visible,
 .vault-result-toggle:focus-visible,
 .vault-nav-row:focus-visible,
@@ -298,6 +294,7 @@ body[data-vault-mode="app"] .vault-compare-info:focus .vault-compare-tooltip {
   outline-offset: 2px;
 }
 .vault-scan-state,
+.vault-action-state,
 .vault-result,
 .vault-feedback,
 .vault-cloud-warning {
@@ -309,19 +306,25 @@ body[data-vault-mode="app"] .vault-compare-info:focus .vault-compare-tooltip {
   border-bottom: 1px solid var(--task-border);
   font-size: 12.5px;
 }
-.vault-scan-state {
+.vault-scan-state,
+.vault-action-state {
   position: relative;
   overflow: hidden;
 }
+.vault-action-state { background: color-mix(in srgb, var(--task-accent) 5%, var(--task-panel)); }
 .vault-scan-state.show,
+.vault-action-state.show,
 .vault-result.show,
 .vault-feedback.show,
 .vault-cloud-warning.show { display: flex; }
 .vault-scan-state i,
+.vault-action-state i,
 .vault-result > i { color: var(--task-accent); }
+.vault-action-state strong,
 .vault-result strong { font-weight: 650; }
 .vault-result-detail,
-.vault-scan-detail { color: var(--task-muted); }
+.vault-scan-detail,
+.vault-action-detail { color: var(--task-muted); }
 .vault-result.incomplete {
   display: block;
   flex: 0 0 auto;
@@ -414,7 +417,8 @@ body[data-vault-mode="app"] .vault-compare-info:focus .vault-compare-tooltip {
   overflow-wrap: anywhere;
   white-space: normal;
 }
-.vault-scan-detail {
+.vault-scan-detail,
+.vault-action-detail {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -620,6 +624,7 @@ body[data-vault-mode="app"] .vault-compare-info:focus .vault-compare-tooltip {
   font-size: 11.5px;
 }
 .vault-text-button:hover { color: var(--task-text); }
+.vault-text-button:disabled { cursor: progress; opacity: .55; }
 .vault-pane {
   display: grid;
   min-width: 0;
@@ -687,7 +692,16 @@ body[data-vault-mode="app"] .vault-compare-info:focus .vault-compare-tooltip {
   font-weight: 600;
 }
 .vault-display-mode button:focus-visible { outline-offset: -2px; }
-.vault-toolbar-count { margin-left: auto; color: var(--task-muted); font-size: 11.5px; white-space: nowrap; }
+.vault-toolbar-description {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: var(--task-muted);
+  font-size: 11.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.vault-toolbar-count { color: var(--task-muted); font-size: 11.5px; white-space: nowrap; }
 .vault-table { min-width: 660px; }
 .vault-table-wrap {
   min-height: 0;
@@ -847,53 +861,33 @@ body[data-vault-mode="app"] .vault-compare-info:focus .vault-compare-tooltip {
   justify-content: space-between;
   gap: 12px;
 }
-.vault-status-cell > .vault-text-button { flex: 0 0 auto; }
-.vault-sharing-switch {
-  position: relative;
-  width: 44px;
-  height: 28px;
-  flex: 0 0 44px;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  cursor: pointer;
-}
-.vault-sharing-switch::before {
-  position: absolute;
-  top: 5px;
-  left: 6px;
-  width: 32px;
-  height: 18px;
-  box-sizing: border-box;
-  border: 1px solid var(--task-border-strong);
-  border-radius: 999px;
-  background: var(--task-soft);
-  content: "";
-}
-.vault-sharing-thumb {
-  position: absolute;
-  z-index: 1;
-  top: 8px;
-  left: 9px;
-  width: 12px;
-  height: 12px;
-  border-radius: 50%;
-  background: var(--task-muted);
-  transition: transform 130ms ease-out, background 130ms ease-out;
-}
-.vault-sharing-switch.on::before {
-  border-color: var(--task-text);
-  background: var(--task-text);
-}
-.vault-sharing-switch.on .vault-sharing-thumb {
-  background: var(--task-panel);
-  transform: translateX(14px);
-}
-.vault-sharing-switch:hover::before { border-color: var(--task-muted); }
-.vault-sharing-switch.on:hover::before { background: color-mix(in srgb, var(--task-text) 86%, var(--task-panel)); }
-.vault-sharing-switch:disabled { opacity: .55; cursor: progress; }
+.vault-status-cell > .vault-text-button { min-height: 24px; flex: 0 0 auto; }
 .vault-row-action { justify-self: end; }
-.vault-row-action .vault-text-button { color: var(--task-text); font-size: 11.5px; }
+.vault-row-action .vault-text-button { min-height: 24px; color: var(--task-text); font-size: 11.5px; }
+.vault-status-cell > .vault-text-button,
+.vault-row-action .vault-text-button {
+  padding: 3px 8px;
+  border: 1px solid var(--task-border);
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--task-panel) 95%, var(--task-soft));
+  color: var(--task-text);
+  line-height: 1;
+}
+.vault-status-cell > .vault-text-button:hover:not(:disabled),
+.vault-row-action .vault-text-button:hover:not(:disabled) {
+  border-color: var(--task-border-strong);
+  background: var(--task-soft);
+}
+body.dark .vault-status-cell > .vault-text-button,
+body.dark .vault-row-action .vault-text-button {
+  border-color: color-mix(in srgb, var(--task-text) 24%, transparent);
+  background: color-mix(in srgb, var(--task-text) 7%, var(--task-panel));
+}
+body.dark .vault-status-cell > .vault-text-button:hover:not(:disabled),
+body.dark .vault-row-action .vault-text-button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--task-text) 36%, transparent);
+  background: color-mix(in srgb, var(--task-text) 11%, var(--task-panel));
+}
 .vault-detail {
   padding: 8px var(--vault-inline) 9px 56px;
   border-bottom: 1px solid var(--task-border);
@@ -961,6 +955,8 @@ body[data-vault-mode="app"] .vault-compare-info:focus .vault-compare-tooltip {
   .vault-source-line { grid-template-columns: 44px minmax(0, 1fr); }
   .vault-source-toggle,
   .vault-disclosure { width: 44px; min-height: 44px; flex-basis: 44px; }
+  .vault-status-cell > .vault-text-button,
+  .vault-row-action .vault-text-button { min-height: 44px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .vault-page * { scroll-behavior: auto !important; }
