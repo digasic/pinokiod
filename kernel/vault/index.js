@@ -7,8 +7,8 @@ const Sweeper = require('./sweeper')
 const { walkBatches, statMany } = require('./walker')
 const { fileSnapshot, sameSnapshot, sameContentState } = require('./snapshot')
 const {
-  SIZE_THRESHOLD, TMP_SUFFIX, SHA256_RE, DIR_CONCURRENCY, STAT_CONCURRENCY,
-  HASH_INACTIVITY_MS
+  SIZE_THRESHOLD, CANDIDATE_SIZE_OPTIONS, TMP_SUFFIX, SHA256_RE,
+  DIR_CONCURRENCY, STAT_CONCURRENCY, HASH_INACTIVITY_MS
 } = require('./constants')
 
 // Shared model store engine (spec/requirements/shared-model-store.md).
@@ -171,9 +171,10 @@ class Vault {
       if (this.fileActionProgress === progress) this.fileActionProgress = null
     }
   }
-  startScan(scopeId = null) {
+  startScan(scopeId = null, sizeThreshold = this.sizeThreshold) {
     if (!this.enabled || !this.sweeper) return { started: false, disabled: true }
     if (this.scanPromise) return { started: false, already_running: true }
+    this.sizeThreshold = sizeThreshold
     this.scanError = null
     this.scanScopeId = scopeId
     this.scanPromise = this.runExclusive(() => this.sweeper.scan(scopeId))
@@ -204,11 +205,19 @@ class Vault {
           }
         }
       }
-      case "scan":
+      case "scan": {
         if (payload.scope_id && !this.scanSource(payload.scope_id)) {
           return { error: "That scan location is no longer available." }
         }
-        return this.startScan(payload.scope_id || null)
+        let sizeThreshold = this.sizeThreshold
+        if (payload.candidate_size != null) {
+          if (!CANDIDATE_SIZE_OPTIONS.includes(payload.candidate_size)) {
+            return { error: "Choose a valid minimum file size." }
+          }
+          sizeThreshold = payload.candidate_size
+        }
+        return this.startScan(payload.scope_id || null, sizeThreshold)
+      }
       case "deduplicate":
         if (typeof payload.path === "string" && payload.path) {
           return this.runMutation(() => this.runFileAction({

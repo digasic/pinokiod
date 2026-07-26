@@ -1,5 +1,11 @@
+const CANDIDATE_SIZE_BASE = process.platform === "win32" ? 1024 : 1000
+const CANDIDATE_SIZE_OPTIONS = [10, 50, 100, 500]
+  .map((value) => value * CANDIDATE_SIZE_BASE ** 2)
+  .concat(CANDIDATE_SIZE_BASE ** 3)
+
 module.exports = {
-  SIZE_THRESHOLD: 100 * 1024 * 1024,
+  SIZE_THRESHOLD: CANDIDATE_SIZE_OPTIONS[2],
+  CANDIDATE_SIZE_OPTIONS,
   TMP_SUFFIX: ".pinokio-dedup-tmp",
   SHA256_RE: /^[0-9a-f]{64}$/,
   ENTRY_BATCH_SIZE: 256,

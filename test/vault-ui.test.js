@@ -7,6 +7,7 @@ const crypto = require('crypto')
 const ejs = require('ejs')
 const { JSDOM } = require('jsdom')
 const Vault = require('../kernel/vault')
+const { CANDIDATE_SIZE_OPTIONS } = require('../kernel/vault/constants')
 
 const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex')
 
@@ -65,6 +66,29 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(conv.status, 'converted')
     return { content, hash, a, b }
   }
+
+  test('scan requests accept only supported minimum file sizes', async () => {
+    const { vault } = await makeEnv()
+    let startedWith = null
+    vault.startScan = (scopeId, sizeThreshold) => {
+      startedWith = { scopeId, sizeThreshold }
+      return { started: true }
+    }
+
+    const accepted = await vault.perform('scan', {
+      candidate_size: CANDIDATE_SIZE_OPTIONS[1]
+    })
+    assert.deepStrictEqual(accepted, { started: true })
+    assert.deepStrictEqual(startedWith, {
+      scopeId: null,
+      sizeThreshold: CANDIDATE_SIZE_OPTIONS[1]
+    })
+
+    startedWith = null
+    const rejected = await vault.perform('scan', { candidate_size: 1 })
+    assert.deepStrictEqual(rejected, { error: 'Choose a valid minimum file size.' })
+    assert.strictEqual(startedWith, null)
+  })
 
   test('item 15: undo of a conversion batch restores independent files', async () => {
     const { home, vault } = await makeEnv()
@@ -1090,6 +1114,9 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /\.vault-button\.primary \{[\s\S]*?background:\s*var\(--task-accent-contrast\)[\s\S]*?color:\s*#101828/)
     assert.match(vaultPage, /id="btn-review-result"/)
     assert.match(vaultPage, /class='vault-button' id='btn-scan'/)
+    assert.match(vaultPage, /id='vault-candidate-size'/)
+    assert.match(vaultPage, /candidate_size:\s*candidateSize\(\)/)
+    assert.match(vaultPage, /localStorage\.setItem\(candidateSizeKey/)
     assert.match(vaultPage, /id='vault-storage-details'/)
     assert.match(vaultPage, /fmt\(data\.lifetime_bytes_saved\)/)
     assert.match(vaultPage, /repair_index:\s*"Repair index"/)
@@ -1294,6 +1321,15 @@ describe('vault dashboard backend (phase 4)', () => {
 
     assert.deepStrictEqual(requests, ['/info/dedup?scope_id=app%3AappB'])
     assert.match(dom.window.document.getElementById('btn-scan').textContent, /Scan this app/)
+    const candidateSize = dom.window.document.getElementById('vault-candidate-size')
+    assert.deepStrictEqual([...candidateSize.options].map((option) => option.textContent),
+      ['10 MB+', '50 MB+', '100 MB+', '500 MB+', '1 GB+'])
+    assert.strictEqual(candidateSize.value, '100000000')
+    candidateSize.value = '50000000'
+    candidateSize.dispatchEvent(new dom.window.Event('change', { bubbles: true }))
+    assert.strictEqual(dom.window.localStorage.getItem('pinokio:vault:candidate-size'), '50000000')
+    assert.match(dom.window.document.getElementById('vault-pane-footer').textContent,
+      /Only files 50 MB and larger/)
     assert.strictEqual(dom.window.document.querySelector('[data-source="app:appB"]').getAttribute('aria-current'), 'page')
     assert.strictEqual(dom.window.document.getElementById('btn-add-source'), null)
     assert.strictEqual(dom.window.document.getElementById('btn-repair'), null)

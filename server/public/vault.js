@@ -42,6 +42,7 @@ const COPY = {
   scan_app: "Scan this app",
   scan_again: "Scan again",
   scanning: "Scanning…",
+  minimum_file_size: "Minimum file size to scan",
   scanning_elsewhere: "Another location is being scanned",
   scanning_elsewhere_hint: "This app can be scanned when the current scan finishes.",
   vault_options: "Save space options",
@@ -168,7 +169,7 @@ const COPY = {
   no_activity_hint: "Scans and actions will be recorded here.",
   view_all: "View all files",
   show_all_locations: "Show all locations",
-  tracked_note: "Only files 100 MB and larger appear here. Files keep their current locations.",
+  tracked_note: "Only files {size} and larger appear here. Files keep their current locations.",
   duplicate_note: "Only files waiting for review are shown.",
   reclaimable_note: "These copies are no longer used by any configured location. Deleting them frees disk space.",
   converted: "Deduplicated",
@@ -197,6 +198,11 @@ const statusUrl = (progress = false) => {
   return `/info/dedup${suffix ? `?${suffix}` : ""}`
 }
 const reviewedScanKey = `pinokio:vault:reviewed-scan:${SCOPE_ID || "global"}`
+const candidateSizeKey = "pinokio:vault:candidate-size"
+const candidateSizeBase = document.body.dataset.platform === "win32" ? 1024 : 1000
+const candidateSizeOptions = [10, 50, 100, 500]
+  .map((value) => value * candidateSizeBase ** 2)
+  .concat(candidateSizeBase ** 3)
 
 const state = {
   data: null,
@@ -224,6 +230,10 @@ const esc = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (c
 }[char]))
 const attr = esc
 const fmt = window.PinokioFormatStorageSize
+const candidateSize = () => {
+  const value = Number(el("vault-candidate-size").value)
+  return candidateSizeOptions.includes(value) ? value : candidateSizeOptions[2]
+}
 const countLabel = (count, singular = COPY.file, plural = COPY.files) => `${count} ${count === 1 ? singular : plural}`
 const basename = (value) => String(value || "").split(/[\\/]/).filter(Boolean).pop() || ""
 const dirname = (value) => {
@@ -875,6 +885,7 @@ const renderOverview = () => {
     ? `<i class="fa-solid fa-circle-notch fa-spin"></i>${esc(COPY.scanning)}`
     : `<i class="fa-solid fa-rotate"></i>${esc(last ? COPY.scan_again : (IS_APP_MODE ? COPY.scan_app : COPY.scan))}`
   el("btn-scan").disabled = activeScan
+  el("vault-candidate-size").disabled = activeScan
   const optionsButton = el("btn-vault-options")
   const repairTitle = el("vault-repair-title")
   const repairDescription = el("vault-repair-description")
@@ -1133,7 +1144,9 @@ const render = () => {
   } else {
     el("vault-pane-footer").textContent = state.view === "duplicates"
       ? COPY.duplicate_note
-      : state.view === "reclaimable" ? COPY.reclaimable_note : COPY.tracked_note
+      : state.view === "reclaimable"
+        ? COPY.reclaimable_note
+        : COPY.tracked_note.replace("{size}", fmt(candidateSize()))
   }
 }
 
@@ -1468,7 +1481,11 @@ document.addEventListener("click", async (event) => {
     state.scanProblemsOpen = false
     state.feedback = null
     try {
-      const result = await post({ action: "scan", scope_id: SCOPE_ID })
+      const result = await post({
+        action: "scan",
+        scope_id: SCOPE_ID,
+        candidate_size: candidateSize()
+      })
       if (result.error) throw new Error(result.error)
       await refresh()
     } catch (error) {
@@ -1584,12 +1601,29 @@ document.addEventListener("input", (event) => {
   renderActionProgress()
 })
 document.addEventListener("change", (event) => {
+  if (event.target.id === "vault-candidate-size") {
+    try { localStorage.setItem(candidateSizeKey, String(candidateSize())) } catch (error) {}
+    render()
+    return
+  }
   if (event.target.id !== "vault-status-filter") return
   state.statusFilter = event.target.value
   render()
 })
 
 el("btn-scan").textContent = COPY.scan
+const candidateSizeSelect = el("vault-candidate-size")
+candidateSizeSelect.setAttribute("aria-label", COPY.minimum_file_size)
+candidateSizeSelect.innerHTML = candidateSizeOptions
+  .map((size) => `<option value="${size}">${fmt(size)}+</option>`)
+  .join("")
+candidateSizeSelect.value = String(candidateSizeOptions[2])
+try {
+  const storedCandidateSize = Number(localStorage.getItem(candidateSizeKey))
+  if (candidateSizeOptions.includes(storedCandidateSize)) {
+    candidateSizeSelect.value = String(storedCandidateSize)
+  }
+} catch (error) {}
 const addSourceButton = el("btn-add-source")
 if (addSourceButton) {
   addSourceButton.setAttribute("aria-label", COPY.add_external_folder)
