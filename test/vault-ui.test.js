@@ -1853,6 +1853,94 @@ describe('vault dashboard backend (phase 4)', () => {
     }
   })
 
+  test('large file lists render bounded pages without narrowing Deduplicate all', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
+    })
+    const dom = new JSDOM(html, {
+      url: 'http://localhost/vault/app/appB',
+      runScripts: 'dangerously'
+    })
+    const actions = []
+    const duplicates = Array.from({ length: 501 }, (_, index) => {
+      const name = `file-${String(index).padStart(4, '0')}.bin`
+      return {
+        path: `/pinokio/api/appB/${name}`,
+        relative_path: name,
+        source_id: 'app:appB',
+        source_label: 'appB',
+        size: 1024 + index,
+        shareable: true,
+        match: { path: `/pinokio/api/appA/${name}` }
+      }
+    })
+    const status = {
+      enabled: true,
+      mode: 'link',
+      scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+      last_scan: { ts: Date.now(), bytes_total: 1024 * 501 },
+      tracked_bytes: 1024 * 501,
+      effective_bytes: 1024 * 501,
+      shared_bytes: 0,
+      pending_bytes: duplicates.reduce((sum, item) => sum + item.size, 0),
+      activity_error: null,
+      cloud_sync_warning: null,
+      sources: [{
+        id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
+        display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
+      }],
+      blobs: [],
+      duplicates,
+      excluded: [],
+      events: [],
+      undo_batches: []
+    }
+    dom.window.fetch = async (url, options = {}) => {
+      if (options.method === 'POST') {
+        actions.push(JSON.parse(options.body))
+        return { ok: true, json: async () => ({ converted: 501, bytes_saved: status.pending_bytes }) }
+      }
+      return { ok: true, json: async () => status }
+    }
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    dom.window.document.querySelector('[data-view="duplicates"]').click()
+    const rows = () => [...dom.window.document.querySelectorAll('.vault-table.matches .vault-file-row')]
+    let bulk = dom.window.document.querySelector('[data-deduplicate-all="duplicates"]')
+    assert.strictEqual(rows().length, 500)
+    assert.strictEqual(bulk.textContent, 'Deduplicate 501 files')
+    assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent, '1–500 of 501')
+    assert.strictEqual(dom.window.document.querySelector('[data-page="previous"]').disabled, true)
+    assert.strictEqual(dom.window.document.querySelector('[data-page="next"]').disabled, false)
+
+    dom.window.document.querySelector('[data-page="next"]').click()
+    assert.strictEqual(rows().length, 1)
+    assert.strictEqual(rows()[0].querySelector('.vault-file-name').textContent, 'file-0500.bin')
+    assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent, '501–501 of 501')
+    assert.strictEqual(dom.window.document.querySelector('[data-page="previous"]').disabled, false)
+    assert.strictEqual(dom.window.document.querySelector('[data-page="next"]').disabled, true)
+
+    bulk = dom.window.document.querySelector('[data-deduplicate-all="duplicates"]')
+    assert.strictEqual(bulk.textContent, 'Deduplicate 501 files')
+    bulk.click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    assert.deepStrictEqual(actions[0], {
+      action: 'deduplicate',
+      selection: 'duplicates',
+      scope_id: 'app:appB'
+    })
+
+    const search = dom.window.document.getElementById('vault-search')
+    search.value = 'file-0001.bin'
+    search.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+    assert.strictEqual(rows().length, 1)
+    assert.strictEqual(rows()[0].querySelector('.vault-file-name').textContent, 'file-0001.bin')
+    assert.strictEqual(dom.window.document.querySelector('.vault-pagination'), null)
+    dom.window.close()
+  })
+
   test('app inventory uses explicit sharing actions without ambiguous switches', async () => {
     const views = path.resolve(__dirname, '..', 'server', 'views')
     const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {

@@ -103,6 +103,9 @@ const COPY = {
   display_mode: "Display mode",
   sorted_largest: "sorted largest first",
   sorted_smallest: "sorted smallest first",
+  previous: "Previous",
+  next: "Next",
+  file_pages: "File pages",
   status: "Deduplication status",
   matches: "Matches",
   can_save: "Can save",
@@ -203,6 +206,7 @@ const candidateSizeBase = document.body.dataset.platform === "win32" ? 1024 : 10
 const candidateSizeOptions = [1, 10, 50, 100, 500]
   .map((value) => value * candidateSizeBase ** 2)
   .concat(candidateSizeBase ** 3)
+const PAGE_SIZE = 500
 
 const state = {
   data: null,
@@ -221,7 +225,9 @@ const state = {
   scanProblemsOpen: false,
   feedback: null,
   actionProgress: null,
-  actionRequest: false
+  actionRequest: false,
+  page: 0,
+  pageContext: null
 }
 
 const el = (id) => document.getElementById(id)
@@ -706,8 +712,9 @@ const renderDuplicateGroups = (items) => {
   return [...groups.entries()].sort(sourceSort).map(([sourceId, group]) => {
     const source = sourceById(sourceId)
     const bytes = group.filter((item) => item.shareable).reduce((sum, item) => sum + item.size, 0)
-    const action = source && source.shareable && group.some((item) => item.shareable)
-      ? `<button class="vault-button" type="button" data-deduplicate-scope="${attr(sourceId)}">${esc(COPY.deduplicate)} ${countLabel(group.filter((item) => item.shareable).length)}</button>`
+    const allShareable = scopeDuplicates(sourceId).filter((item) => item.shareable !== false)
+    const action = source && source.shareable && allShareable.length
+      ? `<button class="vault-button" type="button" data-deduplicate-scope="${attr(sourceId)}">${esc(COPY.deduplicate)} ${countLabel(allShareable.length)}</button>`
       : `<span class="vault-unavailable">${esc(COPY.sharing_unavailable)}</span>`
     return `<div class="vault-group-row"><div class="vault-group-main"><div class="vault-group-title"><i class="fa-regular fa-folder"></i><span>${esc(groupTitle(source))}</span></div><div class="vault-group-meta">${countLabel(group.length, COPY.duplicate.toLowerCase(), COPY.duplicates.toLowerCase())} · ${bytes ? fmt(bytes) : COPY.unavailable}</div></div><div class="vault-group-action">${action}</div></div>${[...group].sort((a, b) => compareRows(a, b, (item) => item.relative_path)).map((item) => renderFileRow(item, 0, true)).join("")}`
   }).join("")
@@ -751,10 +758,9 @@ const emptyState = (view) => {
   return `<div class="vault-empty"><div class="vault-empty-inner"><i class="${content[2]}"></i><h3>${esc(content[0])}</h3><p>${esc(content[1])}</p>${view === "duplicates" ? `<button class="vault-button" type="button" data-view="all">${esc(COPY.view_all)}</button>` : view === "all" && !activeScan ? `<button class="vault-button" type="button" id="btn-empty-scan">${esc(scanLabel)}</button>` : ""}</div></div>`
 }
 
-const renderReclaimable = () => {
-  const blobs = state.data.blobs.filter((blob) => blob.orphan)
+const renderReclaimable = (blobs) => {
   if (!blobs.length) return emptyState("reclaimable")
-  return [...blobs].sort((a, b) => compareRows(a, b, (blob) => blob.names[0] ? blob.names[0].path : blob.hash)).map((blob) => `<div class="vault-file-row"><div class="vault-name-cell"><span class="vault-disclosure"></span><i class="fa-regular fa-file vault-name-icon"></i><span class="vault-name-copy"><span class="vault-file-name">${esc(blob.names[0] ? basename(blob.names[0].path) : `${blob.hash.slice(0, 12)}…`)}</span></span></div><span class="vault-size">${fmt(blob.size)}</span><span class="vault-space">${fmt(blob.size)}</span><span class="vault-row-action"><button class="vault-text-button" type="button" data-reclaim="${attr(blob.hash)}">${esc(COPY.reclaim)}</button></span></div>`).join("")
+  return blobs.map((blob) => `<div class="vault-file-row"><div class="vault-name-cell"><span class="vault-disclosure"></span><i class="fa-regular fa-file vault-name-icon"></i><span class="vault-name-copy"><span class="vault-file-name">${esc(blob.names[0] ? basename(blob.names[0].path) : `${blob.hash.slice(0, 12)}…`)}</span></span></div><span class="vault-size">${fmt(blob.size)}</span><span class="vault-space">${fmt(blob.size)}</span><span class="vault-row-action"><button class="vault-text-button" type="button" data-reclaim="${attr(blob.hash)}">${esc(COPY.reclaim)}</button></span></div>`).join("")
 }
 
 const renderActivity = () => {
@@ -794,7 +800,7 @@ const renderTable = (items) => {
   } else if (state.view === "reclaimable") {
     tableClass = "reclaimable"
     headers = [COPY.name, COPY.size, COPY.can_free, ""]
-    body = renderReclaimable()
+    body = renderReclaimable(items)
   } else if (state.view === "activity") {
     tableClass = "activity"
     headers = [COPY.name, COPY.size, COPY.last_scanned, ""]
@@ -813,6 +819,73 @@ const renderTable = (items) => {
     ? `<span class="vault-sort-column" role="columnheader" aria-sort="${state.sizeSort === "desc" ? "descending" : state.sizeSort === "asc" ? "ascending" : "none"}"><button class="vault-sort-button ${state.sizeSort ? "active" : ""}" type="button" data-sort-size aria-label="${attr(sizeSortLabel)}">${esc(header)}<i class="fa-solid ${sizeSortIcon}" aria-hidden="true"></i></button></span>`
     : `<span>${esc(header)}</span>`).join("")
   el("vault-table-wrap").innerHTML = `<div class="vault-table ${tableClass}"><div class="vault-columns">${headerMarkup}</div>${body}</div>`
+}
+
+const orderedItems = (items) => {
+  if (state.view === "activity") return items
+  if (state.view === "reclaimable") {
+    return [...items].sort((a, b) => compareRows(a, b,
+      (blob) => blob.names[0] ? blob.names[0].path : blob.hash))
+  }
+  if (state.displayMode === "files" && supportsDisplayMode()) {
+    return [...items].sort((a, b) => compareRows(a, b, flatLocation))
+  }
+  return [...items].sort((a, b) => {
+    const sourceOrder = state.sourceId ? 0 : sourceSort([a.source_id], [b.source_id])
+    return sourceOrder || compareRows(a, b, (item) => item.relative_path || item.path)
+  })
+}
+
+const pagedItems = (items) => {
+  if (state.view === "activity") {
+    return { items, start: 0, end: items.length, total: items.length, pages: 1 }
+  }
+  const context = JSON.stringify([
+    state.view, state.sourceId, state.query, state.statusFilter,
+    state.displayMode, state.sizeSort
+  ])
+  if (context !== state.pageContext) {
+    state.page = 0
+    state.pageContext = context
+  }
+  const ordered = orderedItems(items)
+  const pages = Math.max(1, Math.ceil(ordered.length / PAGE_SIZE))
+  state.page = Math.max(0, Math.min(state.page, pages - 1))
+  const start = state.page * PAGE_SIZE
+  const end = Math.min(start + PAGE_SIZE, ordered.length)
+  return { items: ordered.slice(start, end), start, end, total: ordered.length, pages }
+}
+
+const paneFooterText = (items) => {
+  if (state.displayMode === "files" && supportsDisplayMode()) {
+    const count = state.view === "shared"
+      ? countLabel(items.length, "deduplicated file", "deduplicated files")
+      : state.view === "independent"
+        ? countLabel(items.length, "file kept separate", "files kept separate")
+        : countLabel(items.length)
+    const order = state.sizeSort === "desc"
+      ? COPY.sorted_largest
+      : state.sizeSort === "asc" ? COPY.sorted_smallest : ""
+    return `${count}${order ? ` · ${order}` : ""}`
+  }
+  if (state.view === "duplicates") return COPY.duplicate_note
+  if (state.view === "reclaimable") return COPY.reclaimable_note
+  return COPY.tracked_note.replace("{size}", fmt(candidateSize()))
+}
+
+const renderPaneFooter = (items, page) => {
+  const footer = el("vault-pane-footer")
+  const message = paneFooterText(items)
+  if (page.pages === 1) {
+    footer.textContent = message
+    return
+  }
+  footer.innerHTML = `<span>${esc(message)}</span>
+    <span class="vault-pagination" role="navigation" aria-label="${attr(COPY.file_pages)}">
+      <button class="vault-text-button" type="button" data-page="previous" ${state.page === 0 ? "disabled" : ""}>${esc(COPY.previous)}</button>
+      <span class="vault-page-range">${page.start + 1}–${page.end} of ${page.total}</span>
+      <button class="vault-text-button" type="button" data-page="next" ${state.page === page.pages - 1 ? "disabled" : ""}>${esc(COPY.next)}</button>
+    </span>`
 }
 
 const renderOverview = () => {
@@ -1131,23 +1204,10 @@ const render = () => {
   renderLocations(items)
   const visible = activeItems(items)
   renderToolbar(visible, items)
-  renderTable(visible)
+  const page = pagedItems(visible)
+  renderTable(page.items)
   renderActionProgress()
-  if (state.displayMode === "files" && supportsDisplayMode()) {
-    const count = state.view === "shared"
-      ? countLabel(visible.length, "deduplicated file", "deduplicated files")
-      : state.view === "independent"
-        ? countLabel(visible.length, "file kept separate", "files kept separate")
-        : countLabel(visible.length)
-    const order = state.sizeSort === "desc" ? COPY.sorted_largest : state.sizeSort === "asc" ? COPY.sorted_smallest : ""
-    el("vault-pane-footer").textContent = `${count}${order ? ` · ${order}` : ""}`
-  } else {
-    el("vault-pane-footer").textContent = state.view === "duplicates"
-      ? COPY.duplicate_note
-      : state.view === "reclaimable"
-        ? COPY.reclaimable_note
-        : COPY.tracked_note.replace("{size}", fmt(candidateSize()))
-  }
+  renderPaneFooter(visible, page)
 }
 
 const scanActive = (scan) => !!(scan && (scan.pending || scan.active || scan.queued > 0))
@@ -1405,6 +1465,10 @@ document.addEventListener("click", async (event) => {
   if (target.id === "btn-dismiss-cloud") {
     try { localStorage.setItem(target.dataset.warningKey, "1") } catch (error) {}
     renderCloudWarning()
+  } else if (target.dataset.page) {
+    state.page += target.dataset.page === "next" ? 1 : -1
+    render()
+    el("vault-table-wrap").scrollTop = 0
   } else if (target.hasAttribute("data-sort-size")) {
     state.sizeSort = state.sizeSort === "desc" ? "asc" : "desc"
     render()
@@ -1597,7 +1661,9 @@ document.addEventListener("input", (event) => {
   state.query = event.target.value
   const items = activeItems(buildItems())
   updateToolbarSummary(items)
-  renderTable(items)
+  const page = pagedItems(items)
+  renderTable(page.items)
+  renderPaneFooter(items, page)
   renderActionProgress()
 })
 document.addEventListener("change", (event) => {
