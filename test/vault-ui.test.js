@@ -76,12 +76,12 @@ describe('vault dashboard backend (phase 4)', () => {
     }
 
     const accepted = await vault.perform('scan', {
-      candidate_size: CANDIDATE_SIZE_OPTIONS[1]
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
     })
     assert.deepStrictEqual(accepted, { started: true })
     assert.deepStrictEqual(startedWith, {
       scopeId: null,
-      sizeThreshold: CANDIDATE_SIZE_OPTIONS[1]
+      sizeThreshold: CANDIDATE_SIZE_OPTIONS[0]
     })
 
     startedWith = null
@@ -1323,7 +1323,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(dom.window.document.getElementById('btn-scan').textContent, /Scan this app/)
     const candidateSize = dom.window.document.getElementById('vault-candidate-size')
     assert.deepStrictEqual([...candidateSize.options].map((option) => option.textContent),
-      ['10 MB+', '50 MB+', '100 MB+', '500 MB+', '1 GB+'])
+      ['1 MB+', '10 MB+', '50 MB+', '100 MB+', '500 MB+', '1 GB+'])
     assert.strictEqual(candidateSize.value, '100000000')
     candidateSize.value = '50000000'
     candidateSize.dispatchEvent(new dom.window.Event('change', { bubbles: true }))

@@ -200,7 +200,7 @@ const statusUrl = (progress = false) => {
 const reviewedScanKey = `pinokio:vault:reviewed-scan:${SCOPE_ID || "global"}`
 const candidateSizeKey = "pinokio:vault:candidate-size"
 const candidateSizeBase = document.body.dataset.platform === "win32" ? 1024 : 1000
-const candidateSizeOptions = [10, 50, 100, 500]
+const candidateSizeOptions = [1, 10, 50, 100, 500]
   .map((value) => value * candidateSizeBase ** 2)
   .concat(candidateSizeBase ** 3)
 
@@ -232,7 +232,7 @@ const attr = esc
 const fmt = window.PinokioFormatStorageSize
 const candidateSize = () => {
   const value = Number(el("vault-candidate-size").value)
-  return candidateSizeOptions.includes(value) ? value : candidateSizeOptions[2]
+  return candidateSizeOptions.includes(value) ? value : candidateSizeOptions[3]
 }
 const countLabel = (count, singular = COPY.file, plural = COPY.files) => `${count} ${count === 1 ? singular : plural}`
 const basename = (value) => String(value || "").split(/[\\/]/).filter(Boolean).pop() || ""
@@ -1617,7 +1617,7 @@ candidateSizeSelect.setAttribute("aria-label", COPY.minimum_file_size)
 candidateSizeSelect.innerHTML = candidateSizeOptions
   .map((size) => `<option value="${size}">${fmt(size)}+</option>`)
   .join("")
-candidateSizeSelect.value = String(candidateSizeOptions[2])
+candidateSizeSelect.value = String(candidateSizeOptions[3])
 try {
   const storedCandidateSize = Number(localStorage.getItem(candidateSizeKey))
   if (candidateSizeOptions.includes(storedCandidateSize)) {
