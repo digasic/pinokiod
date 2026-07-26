@@ -1201,6 +1201,18 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.ok(appTemplate.indexOf("id='save-space-tab'") < appTemplate.indexOf('class="app-autolaunch"'))
     assert.match(globalTemplate, /include\('partials\/vault_workspace', \{ appMode: false \}\)/)
     assert.match(embeddedTemplate, /include\('partials\/vault_workspace', \{ appMode: true \}\)/)
+    const vaultStyles = await fs.promises.readFile(
+      path.resolve(__dirname, '..', 'server', 'public', 'vault.css'), 'utf8')
+    assert.match(vaultStyles, /\.vault-embed-main \.vault-shell \{[\s\S]*?height:\s*100%;[\s\S]*?\}/)
+    const compactStart = vaultStyles.indexOf('@media (max-width: 820px)')
+    const compactEnd = vaultStyles.indexOf('@media (pointer: coarse)', compactStart)
+    assert.ok(compactStart >= 0 && compactEnd > compactStart)
+    const compactStyles = vaultStyles.slice(compactStart, compactEnd)
+    assert.match(compactStyles, /\.vault-embed-main \{ overflow-y: auto; \}/)
+    assert.match(compactStyles, /\.vault-embed-main \.vault-shell \{ height: auto; \}/)
+    const vaultScript = await fs.promises.readFile(
+      path.resolve(__dirname, '..', 'server', 'public', 'vault.js'), 'utf8')
+    assert.match(vaultScript, /el\("vault-explorer"\)\.style\.display = ""/)
 
     const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
       theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'

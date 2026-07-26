@@ -1114,7 +1114,7 @@ const render = () => {
     el("vault-explorer").style.display = "none"
     return
   }
-  el("vault-explorer").style.display = "grid"
+  el("vault-explorer").style.display = ""
   const items = buildItems()
   renderViews(items)
   renderLocations(items)
