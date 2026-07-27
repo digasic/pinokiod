@@ -473,16 +473,26 @@ body[data-vault-mode="app"] .vault-overview {
 .vault-cloud-warning .vault-text-button { margin-left: auto; }
 .vault-cleanup-notice {
   flex: 0 0 auto;
-  background: color-mix(in srgb, var(--task-accent) 5%, var(--task-panel));
+  border-bottom-color: color-mix(in srgb, var(--vault-warning) 45%, var(--task-border));
+  background: color-mix(in srgb, var(--vault-warning) 16%, var(--task-panel));
 }
-.vault-cleanup-notice > i { color: var(--task-accent); }
+.vault-cleanup-notice > i { color: var(--vault-warning); }
 .vault-cleanup-notice strong { flex: 0 0 auto; font-weight: 650; }
 .vault-cleanup-notice-detail {
   min-width: 0;
   flex: 1 1 auto;
-  color: var(--task-muted);
+  color: color-mix(in srgb, var(--task-text) 78%, var(--vault-warning));
 }
-.vault-cleanup-notice .vault-button { flex: 0 0 auto; margin-left: auto; }
+.vault-cleanup-notice .vault-button {
+  flex: 0 0 auto;
+  margin-left: auto;
+  border-color: color-mix(in srgb, var(--vault-warning) 70%, var(--task-border-strong));
+  background: var(--task-panel);
+  font-weight: 650;
+}
+.vault-cleanup-notice .vault-button:hover {
+  background: color-mix(in srgb, var(--vault-warning) 12%, var(--task-panel));
+}
 .vault-explorer {
   display: grid;
   min-height: 0;
