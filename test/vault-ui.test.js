@@ -1135,6 +1135,81 @@ describe('vault dashboard backend (phase 4)', () => {
     }
   })
 
+  test('an older status response cannot replace newer scan progress', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const publicRoot = path.resolve(__dirname, '..', 'server', 'public')
+    const workspace = await ejs.renderFile(
+      path.resolve(views, 'partials', 'vault_workspace.ejs'),
+      { appMode: false }
+    )
+    const baseStatus = {
+      enabled: true,
+      mode: 'link',
+      last_scan: null,
+      bytes_on_disk: 0,
+      bytes_without_sharing: 0,
+      saved_by_sharing: 0,
+      lifetime_bytes_saved: 0,
+      pending_bytes: 0,
+      reclaimable: 0,
+      file_action: null,
+      activity_error: null,
+      cloud_sync_warning: null,
+      sources: [{
+        id: 'pinokio', kind: 'pinokio', label: 'Pinokio', root: '/pinokio',
+        display_path: '/pinokio', parent_id: null, available: true, shareable: true
+      }],
+      blobs: [], duplicates: [], excluded: [], events: [], undo_batches: []
+    }
+    const scan = (queued, currentFile) => ({
+      active: true, pending: false, phase: 'analyzing', scope_id: null,
+      dirs: 4, files: 8, total_files: 8, bytes_total: 8000,
+      hash_total: 937, queued, current_file: currentFile,
+      current_file_bytes: 0, current_file_size: 1000,
+      started: 123
+    })
+    const response = (data) => ({ ok: true, json: async () => data })
+    let requestCount = 0
+    let resolveOlder
+    const olderResponse = new Promise((resolve) => { resolveOlder = resolve })
+    const dom = new JSDOM(
+      `<body data-platform="darwin" data-vault-mode="global">${workspace}</body>`,
+      { url: 'http://localhost/vault', runScripts: 'dangerously' }
+    )
+    dom.window.fetch = async () => {
+      requestCount += 1
+      if (requestCount === 1) {
+        return response(Object.assign({}, baseStatus, {
+          scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null }
+        }))
+      }
+      if (requestCount === 2) return olderResponse
+      return response(Object.assign({}, baseStatus, { scan: scan(115, 'newer.bin') }))
+    }
+    try {
+      const formatter = await fs.promises.readFile(path.resolve(publicRoot, 'storage-size.js'), 'utf8')
+      const source = await fs.promises.readFile(path.resolve(publicRoot, 'vault.js'), 'utf8')
+      dom.window.eval(formatter)
+      dom.window.eval(source.replace(/\nrefresh\(\)\s*$/, '\nwindow.__testVaultRefresh = refresh\nrefresh()'))
+      await new Promise((resolve) => setTimeout(resolve, 25))
+
+      const olderRefresh = dom.window.__testVaultRefresh()
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      const newerRefresh = dom.window.__testVaultRefresh()
+      await newerRefresh
+      assert.strictEqual(dom.window.document.querySelector('.vault-scan-percent').textContent, '87.7%')
+      assert.match(dom.window.document.querySelector('.vault-scan-detail').textContent, /822 of 937 large files checked/)
+
+      resolveOlder(response(Object.assign({}, baseStatus, { scan: scan(204, 'older.bin') })))
+      await olderRefresh
+      assert.strictEqual(dom.window.document.querySelector('.vault-scan-percent').textContent, '87.7%')
+      assert.match(dom.window.document.querySelector('.vault-scan-detail').textContent, /822 of 937 large files checked/)
+      assert.doesNotMatch(dom.window.document.querySelector('.vault-scan-detail').textContent, /older\.bin/)
+    } finally {
+      dom.window.close()
+    }
+  })
+
   test('item 16: vocabulary lint — vault page copy avoids forbidden terms', async () => {
     const forbidden = /hard.?link|junction|symlink|inode|\bblob\b|\bstore\b|\bdedupe\b|\bvault\b/i
     const vaultPage = await vaultPageSource()

@@ -1263,13 +1263,16 @@ const applyFullData = (data) => {
   render()
   return scanning || !!fileAction
 }
+let refreshSequence = 0
 const refresh = async (forceFull = false) => {
+  const sequence = ++refreshSequence
   let delay = null
   try {
     const progressOnly = !forceFull &&
       !!(state.data && (scanActive(state.data.scan) || state.actionProgress))
     if (progressOnly) {
       const progress = await fetchJson(statusUrl(true))
+      if (sequence !== refreshSequence) return
       state.data.scan = progress.scan
       state.data.last_scan = progress.last_scan
       const fileAction = serverFileAction(progress.file_action)
@@ -1281,16 +1284,22 @@ const refresh = async (forceFull = false) => {
         renderActionProgress()
         renderFeedback()
       } else {
-        if (applyFullData(await fetchJson(statusUrl())) || state.scanRequested) delay = 1500
+        const data = await fetchJson(statusUrl())
+        if (sequence !== refreshSequence) return
+        if (applyFullData(data) || state.scanRequested) delay = 1500
       }
     } else {
-      if (applyFullData(await fetchJson(statusUrl())) || state.scanRequested) delay = 1500
+      const data = await fetchJson(statusUrl())
+      if (sequence !== refreshSequence) return
+      if (applyFullData(data) || state.scanRequested) delay = 1500
     }
   } catch (error) {
+    if (sequence !== refreshSequence) return
     state.feedback = { error: true, message: error && error.message ? error.message : String(error) }
     renderFeedback()
     delay = 5000
   } finally {
+    if (sequence !== refreshSequence) return
     clearTimeout(window.__vaultRefresh)
     window.__vaultRefresh = delay == null ? null : setTimeout(refresh, delay)
   }
