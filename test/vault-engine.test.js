@@ -97,6 +97,27 @@ describe('vault engine (phase 1)', () => {
     assert.strictEqual(fs.existsSync(path.resolve(h, 'vault', 'registry.json')), true)
   })
 
+  test('startup verification reports unused private links without deleting them', async () => {
+    const h = await home()
+    const vault = await makeVault(h)
+    const content = crypto.randomBytes(4096)
+    const hash = sha256(content)
+    const file = await writeFile(path.resolve(h, 'api', 'appA', 'unused.bin'), content)
+    await vault.adopt(file, hash, { app: 'appA' })
+    await vault.registry.flush()
+    await fs.promises.unlink(file)
+
+    const fresh = new Vault(fakeKernel(h))
+    await fresh.init({ existingOnly: true })
+    fresh.verificationPending = true
+    await fresh.ensureInitialized()
+
+    assert.strictEqual(fs.existsSync(fresh.storePathFor(hash)), true)
+    assert.strictEqual(fresh.registry.links.has(file), false)
+    assert.strictEqual(fresh.registry.blobs.get(hash).orphan, true)
+    assert.strictEqual((await fresh.status()).reclaimable, content.length)
+  })
+
   test('adopt: metadata-only, store name shares the inode', async () => {
     const h = await home()
     const vault = await makeVault(h)

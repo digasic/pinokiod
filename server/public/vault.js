@@ -12,7 +12,7 @@ const COPY = {
   shared_description: "Files that share disk storage across multiple locations.",
   tracked_description: "Files with no duplicate action required.",
   independent_description: "Duplicate files that remain as separate copies.",
-  reclaimable_description: "Stored copies no longer used by any configured location.",
+  reclaimable_description: "Private links no longer used by any linked file.",
   activity_description: "A history of scans and changes made by Save space.",
   add_external_folder: "Add external folder",
   files_region: "Files",
@@ -154,8 +154,13 @@ const COPY = {
   keep_separate: "Keep separate",
   kept_separate: "Kept separate",
   make_separate: "Make separate",
-  reclaim: "Delete",
-  reclaim_all: "Delete all",
+  reclaim: "Clean up",
+  reclaim_all: "Clean up all",
+  cleanup_ready: "{size} ready to clean up",
+  cleanup_ready_detail: "{count} left after their linked files were deleted.",
+  review_cleanup: "Review cleanup",
+  private_link: "private link",
+  private_links: "private links",
   undo: "Undo",
   identical_contents_at: "Identical contents at",
   no_files: "No files found",
@@ -170,24 +175,25 @@ const COPY = {
   no_tracked_hint: "Files without a duplicate action will appear here after a scan.",
   no_skipped: "Nothing kept separate",
   no_skipped_hint: "Files you keep separate will appear here.",
-  no_reclaimable: "No unused files",
-  no_reclaimable_hint: "Copies no longer used by any configured location will appear here.",
+  no_reclaimable: "No cleanup needed",
+  no_reclaimable_hint: "Private links with no remaining linked files will appear here.",
   no_activity: "No activity yet",
   no_activity_hint: "Scans and actions will be recorded here.",
   view_all: "View all files",
   show_all_locations: "Show all locations",
   tracked_note: "Only files {size} and larger appear here. Files keep their current locations.",
   duplicate_note: "Only files waiting for review are shown.",
-  reclaimable_note: "These copies are no longer used by any configured location. Deleting them frees disk space.",
+  reclaimable_note: "These private links have no remaining linked files. Cleaning them up frees disk space.",
+  activity_note: "Recent scans and Save space actions.",
   converted: "Deduplicated",
   files_left_separate: "{count} remained separate",
   skipped_action: "Kept separate",
   separated: "Separated",
-  reclaimed: "Deleted",
+  reclaimed: "Cleaned up",
   event_convert: "Deduplicated",
   event_found: "Duplicate found",
   event_adopt: "Added",
-  event_reclaim: "Deleted unused file",
+  event_reclaim: "Cleaned up unused link",
   event_undo: "Undid deduplication",
   event_diverged: "Changed by an app — no longer deduplicated",
   event_detach: "Separated",
@@ -344,7 +350,7 @@ const getCounts = (items) => ({
   tracked: items.filter((item) => item.status === "tracked").length,
   independent: items.filter((item) => item.status === "independent").length,
   reclaimable: state.data.blobs.filter((blob) => blob.orphan).length,
-  activity: state.data.events.length
+  activity: activityItems("").length
 })
 
 const sourceCounts = (items) => {
@@ -405,10 +411,22 @@ const eventLabels = {
   skip: COPY.event_skip,
   reshare: COPY.event_reshare
 }
-const activityItems = () => {
-  const query = state.query.toLowerCase()
-  return state.data.events.filter((event) => !query ||
+const activityItems = (queryText = state.query) => {
+  const query = queryText.trim().toLowerCase()
+  const events = state.data.events.filter((event) => !query ||
     `${eventLabels[event.kind] || event.kind} ${event.path || ""}`.toLowerCase().includes(query))
+  const seenBatches = new Set()
+  const eventItems = events.map((event) => {
+    const showUndo = event.kind === "convert" && event.batch_id &&
+      event.undoable !== false && !seenBatches.has(event.batch_id)
+    if (showUndo) seenBatches.add(event.batch_id)
+    return Object.assign({}, event, { activity_type: "event", show_undo: showUndo })
+  })
+  const batchItems = (Array.isArray(state.data.undo_batches) ? state.data.undo_batches : [])
+    .filter((batch) => !seenBatches.has(batch.batch_id) && (!query ||
+      `${COPY.event_convert} ${batch.files || 0} ${COPY.files}`.toLowerCase().includes(query)))
+    .map((batch) => Object.assign({}, batch, { activity_type: "batch" }))
+  return batchItems.concat(eventItems)
 }
 
 const renderViews = (items) => {
@@ -774,30 +792,21 @@ const renderReclaimable = (blobs) => {
   return blobs.map((blob) => `<div class="vault-file-row"><div class="vault-name-cell"><span class="vault-disclosure"></span><i class="fa-regular fa-file vault-name-icon"></i><span class="vault-name-copy"><span class="vault-file-name">${esc(blob.names[0] ? basename(blob.names[0].path) : `${blob.hash.slice(0, 12)}…`)}</span></span></div><span class="vault-size">${fmt(blob.size)}</span><span class="vault-space">${fmt(blob.size)}</span><span class="vault-row-action"><button class="vault-text-button" type="button" data-reclaim="${attr(blob.hash)}">${esc(COPY.reclaim)}</button></span></div>`).join("")
 }
 
-const renderActivity = () => {
-  const events = activityItems()
-  const query = state.query.trim().toLowerCase()
-  const undoBatches = Array.isArray(state.data.undo_batches)
-    ? state.data.undo_batches.filter((batch) => !query ||
-      `${COPY.event_convert} ${batch.files || 0} ${COPY.files}`.toLowerCase().includes(query))
-    : []
-  if (!events.length && !undoBatches.length) return emptyState("activity")
-  const seenBatches = new Set()
-  const eventRows = events.map((event) => {
-    let undo = ""
-    if (event.kind === "convert" && event.batch_id && event.undoable !== false && !seenBatches.has(event.batch_id)) {
-      seenBatches.add(event.batch_id)
-      undo = `<button class="vault-text-button" type="button" data-undo="${attr(event.batch_id)}">${esc(COPY.undo)}</button>`
+const renderActivity = (items) => {
+  if (!items.length) return emptyState("activity")
+  return items.map((item) => {
+    if (item.activity_type === "batch") {
+      return `<div class="vault-file-row"><div class="vault-name-cell"><span class="vault-disclosure"></span><i class="fa-solid fa-wave-square vault-name-icon"></i><span class="vault-name-copy"><span class="vault-file-name vault-event-kind">${esc(COPY.event_convert)}</span><span class="vault-file-path">${esc(countLabel(item.files || 0))}</span></span></div><span class="vault-size">${fmt(item.bytes || 0)}</span><span class="vault-event-time">${item.ts ? esc(new Date(item.ts).toLocaleString()) : "—"}</span><span class="vault-row-action"><button class="vault-text-button" type="button" data-undo="${attr(item.batch_id)}">${esc(COPY.undo)}</button></span></div>`
     }
+    const event = item
+    const undo = event.show_undo
+      ? `<button class="vault-text-button" type="button" data-undo="${attr(event.batch_id)}">${esc(COPY.undo)}</button>`
+      : ""
     const eventPath = event.path
       ? `${event.source_label ? `${event.source_label} / ` : ""}${event.relative_path || event.path}`
       : (event.hash || "").slice(0, 12)
     return `<div class="vault-file-row"><div class="vault-name-cell"><span class="vault-disclosure"></span><i class="fa-solid fa-wave-square vault-name-icon"></i><span class="vault-name-copy"><span class="vault-file-name vault-event-kind">${esc(eventLabels[event.kind] || event.kind)}</span><span class="vault-file-path">${esc(eventPath)}</span></span></div><span class="vault-size">${event.bytes_saved ? fmt(event.bytes_saved) : event.size ? fmt(event.size) : "—"}</span><span class="vault-event-time">${esc(new Date(event.ts).toLocaleString())}</span><span class="vault-row-action">${undo}</span></div>`
   }).join("")
-  const batchRows = undoBatches.filter((batch) => !seenBatches.has(batch.batch_id)).map((batch) =>
-    `<div class="vault-file-row"><div class="vault-name-cell"><span class="vault-disclosure"></span><i class="fa-solid fa-wave-square vault-name-icon"></i><span class="vault-name-copy"><span class="vault-file-name vault-event-kind">${esc(COPY.event_convert)}</span><span class="vault-file-path">${esc(countLabel(batch.files || 0))}</span></span></div><span class="vault-size">${fmt(batch.bytes || 0)}</span><span class="vault-event-time">${batch.ts ? esc(new Date(batch.ts).toLocaleString()) : "—"}</span><span class="vault-row-action"><button class="vault-text-button" type="button" data-undo="${attr(batch.batch_id)}">${esc(COPY.undo)}</button></span></div>`
-  ).join("")
-  return batchRows + eventRows
 }
 
 const renderTable = (items) => {
@@ -815,7 +824,7 @@ const renderTable = (items) => {
   } else if (state.view === "activity") {
     tableClass = "activity"
     headers = [COPY.name, COPY.size, COPY.last_scanned, ""]
-    body = renderActivity()
+    body = renderActivity(items)
   } else if (state.displayMode === "files" && supportsDisplayMode()) {
     tableClass = "flat"
     headers = [COPY.name, COPY.location_column, COPY.size, COPY.status]
@@ -848,9 +857,6 @@ const orderedItems = (items) => {
 }
 
 const pagedItems = (items) => {
-  if (state.view === "activity") {
-    return { items, start: 0, end: items.length, total: items.length, pages: 1 }
-  }
   const context = JSON.stringify([
     state.view, state.sourceId, state.query, state.statusFilter,
     state.displayMode, state.sizeSort
@@ -881,6 +887,7 @@ const paneFooterText = (items) => {
   }
   if (state.view === "duplicates") return COPY.duplicate_note
   if (state.view === "reclaimable") return COPY.reclaimable_note
+  if (state.view === "activity") return COPY.activity_note
   return COPY.tracked_note.replace("{size}", fmt(candidateSize()))
 }
 
@@ -1199,12 +1206,34 @@ const renderCloudWarning = () => {
   warning.innerHTML = `<i class="fa-solid fa-triangle-exclamation"></i><span>${esc(message)}</span><button class="vault-text-button" id="btn-dismiss-cloud" type="button" data-warning-key="${attr(key)}">${esc(COPY.dismiss)}</button>`
 }
 
+const renderCleanupNotice = () => {
+  const notice = el("vault-cleanup-notice")
+  const blobs = state.data && Array.isArray(state.data.blobs) ? state.data.blobs : []
+  const unused = !IS_APP_MODE && state.data && state.data.enabled
+    ? blobs.filter((blob) => blob.orphan)
+    : []
+  if (!unused.length || state.view === "reclaimable") {
+    notice.className = "vault-cleanup-notice"
+    notice.innerHTML = ""
+    return
+  }
+  const bytes = unused.reduce((sum, blob) => sum + (Number(blob.size) || 0), 0)
+  const title = COPY.cleanup_ready.replace("{size}", fmt(bytes))
+  const detail = COPY.cleanup_ready_detail.replace(
+    "{count}",
+    countLabel(unused.length, COPY.private_link, COPY.private_links)
+  )
+  notice.className = "vault-cleanup-notice show"
+  notice.innerHTML = `<i class="fa-solid fa-broom" aria-hidden="true"></i><strong>${esc(title)}</strong><span class="vault-cleanup-notice-detail">${esc(detail)}</span><button class="vault-button" id="btn-review-cleanup" type="button">${esc(COPY.review_cleanup)}<i class="fa-solid fa-chevron-right" aria-hidden="true"></i></button>`
+}
+
 const render = () => {
   if (!state.data) return
   renderOverview()
   renderResult()
   renderFeedback()
   renderCloudWarning()
+  renderCleanupNotice()
   if (!state.data.enabled) {
     el("vault-explorer").style.display = "none"
     return
@@ -1496,8 +1525,8 @@ document.addEventListener("click", async (event) => {
     state.displayMode = target.dataset.displayMode === "files" ? "files" : "folders"
     state.sizeSort = state.displayMode === "files" ? "desc" : null
     render()
-  } else if (target.dataset.view) {
-    state.view = target.dataset.view
+  } else if (target.dataset.view || target.id === "btn-review-cleanup") {
+    state.view = target.dataset.view || "reclaimable"
     state.sourceId = SCOPE_ID
     state.query = ""
     state.statusFilter = "all"

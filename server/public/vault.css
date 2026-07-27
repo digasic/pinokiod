@@ -300,7 +300,8 @@ body[data-vault-mode="app"] .vault-overview {
 .vault-action-state,
 .vault-result,
 .vault-feedback,
-.vault-cloud-warning {
+.vault-cloud-warning,
+.vault-cleanup-notice {
   display: none;
   align-items: center;
   min-height: 38px;
@@ -319,7 +320,8 @@ body[data-vault-mode="app"] .vault-overview {
 .vault-action-state.show,
 .vault-result.show,
 .vault-feedback.show,
-.vault-cloud-warning.show { display: flex; }
+.vault-cloud-warning.show,
+.vault-cleanup-notice.show { display: flex; }
 .vault-scan-state i,
 .vault-action-state i,
 .vault-result > i { color: var(--task-accent); }
@@ -469,6 +471,18 @@ body[data-vault-mode="app"] .vault-overview {
 .vault-cloud-warning { min-height: 34px; background: var(--vault-warning-soft); }
 .vault-cloud-warning > i { color: var(--vault-warning); }
 .vault-cloud-warning .vault-text-button { margin-left: auto; }
+.vault-cleanup-notice {
+  flex: 0 0 auto;
+  background: color-mix(in srgb, var(--task-accent) 5%, var(--task-panel));
+}
+.vault-cleanup-notice > i { color: var(--task-accent); }
+.vault-cleanup-notice strong { flex: 0 0 auto; font-weight: 650; }
+.vault-cleanup-notice-detail {
+  min-width: 0;
+  flex: 1 1 auto;
+  color: var(--task-muted);
+}
+.vault-cleanup-notice .vault-button { flex: 0 0 auto; margin-left: auto; }
 .vault-explorer {
   display: grid;
   min-height: 0;
@@ -952,6 +966,15 @@ body.dark .vault-row-action .vault-text-button:hover:not(:disabled) {
   .vault-result-actions { grid-column: 2; }
   .vault-pane-footer { align-items: flex-start; flex-direction: column; }
   .vault-result.incomplete .vault-button { margin: 0; }
+  .vault-cleanup-notice.show {
+    display: grid;
+    grid-template-columns: 16px minmax(0, 1fr) auto;
+    align-items: center;
+  }
+  .vault-cleanup-notice > i { grid-area: 1 / 1; }
+  .vault-cleanup-notice strong { grid-area: 1 / 2; }
+  .vault-cleanup-notice-detail { grid-area: 2 / 2 / 3 / 4; }
+  .vault-cleanup-notice .vault-button { grid-area: 1 / 3; margin-left: 0; }
 }
 @media (pointer: coarse) {
   .vault-page {

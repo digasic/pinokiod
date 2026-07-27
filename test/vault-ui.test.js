@@ -1344,7 +1344,8 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /pinokio:vault:reviewed-scan/)
     assert.match(vaultPage, /completed \|\| incomplete \|\| \(!state\.scanResult && unreviewed\)/)
     assert.match(vaultPage, /state\.data\.undo_batches/)
-    assert.match(vaultPage, /data-undo="\$\{attr\(batch\.batch_id\)\}"/)
+    assert.match(vaultPage, /data-undo="\$\{attr\(item\.batch_id\)\}"/)
+    assert.match(vaultPage, /data-undo="\$\{attr\(event\.batch_id\)\}"/)
     assert.match(vaultPage, /last_scan && data\.last_scan\.hash_failures/)
     assert.match(vaultPage, /scan_not_analyzed:\s*"could not be analyzed"/)
     assert.match(vaultPage, /\.vault-progress-bar\.determinate \{[\s\S]*?transform:\s*scaleX/)
@@ -1613,13 +1614,21 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(dom.window.document.getElementById('btn-scan').classList.contains('primary'), false)
     assert.match(dom.window.document.getElementById('vault-storage-details').textContent, /Pinokio folder\s*166\.22 GB/)
     assert.match(dom.window.document.getElementById('vault-storage-details').textContent, /Saved by your actions\s*258\.77 GB/)
+    const cleanupNotice = dom.window.document.getElementById('vault-cleanup-notice')
+    assert.strictEqual(cleanupNotice.classList.contains('show'), true)
+    assert.match(cleanupNotice.textContent, /ready to clean up/)
+    assert.match(cleanupNotice.textContent, /1 private link left/)
+    dom.window.document.getElementById('btn-review-cleanup').click()
+    assert.strictEqual(dom.window.document.querySelector('[data-view="reclaimable"]').classList.contains('selected'), true)
+    assert.strictEqual(cleanupNotice.classList.contains('show'), false)
+    dom.window.document.querySelector('[data-view="all"]').click()
     const viewDescriptions = {
       all: 'Every scanned file and its current deduplication status.',
       duplicates: 'Identical files waiting to be deduplicated or kept separate.',
       shared: 'Files that share disk storage across multiple locations.',
       tracked: 'Files with no duplicate action required.',
       independent: 'Duplicate files that remain as separate copies.',
-      reclaimable: 'Stored copies no longer used by any configured location.',
+      reclaimable: 'Private links no longer used by any linked file.',
       activity: 'A history of scans and changes made by Save space.'
     }
     for (const [view, description] of Object.entries(viewDescriptions)) {
@@ -1635,9 +1644,10 @@ describe('vault dashboard backend (phase 4)', () => {
     const unusedView = dom.window.document.querySelector('[data-view="reclaimable"]')
     assert.strictEqual(unusedView.querySelector('.vault-nav-name').textContent, 'Unused files')
     unusedView.click()
-    assert.strictEqual(dom.window.document.getElementById('btn-reclaim-all').textContent, 'Delete all')
-    assert.strictEqual(dom.window.document.querySelector('[data-reclaim]').textContent, 'Delete')
-    assert.match(dom.window.document.getElementById('vault-pane-footer').textContent, /Deleting them frees disk space/)
+    assert.strictEqual(dom.window.document.getElementById('btn-reclaim-all').textContent, 'Clean up all')
+    assert.strictEqual(dom.window.document.querySelector('[data-reclaim]').textContent, 'Clean up')
+    assert.match(dom.window.document.getElementById('vault-pane-footer').textContent,
+      /Cleaning them up frees disk space/)
     dom.window.close()
   })
 
@@ -1680,6 +1690,7 @@ describe('vault dashboard backend (phase 4)', () => {
       ['10 GB', '7 GB'])
     assert.match(dom.window.document.querySelector('.vault-summary-side').textContent,
       /1 GB more can be saved.*Not scanned yet/)
+    assert.strictEqual(dom.window.document.getElementById('vault-cleanup-notice').classList.contains('show'), false)
     dom.window.close()
   })
 
@@ -1712,8 +1723,8 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(source, /headers = \[COPY\.name, COPY\.size, COPY\.can_free, ""\]/)
     assert.match(source, /headers = \[COPY\.name, COPY\.size, COPY\.last_scanned, ""\]/)
     assert.match(source, /reclaimable:\s*"Unused files"/)
-    assert.match(source, /reclaim:\s*"Delete"/)
-    assert.match(source, /reclaim_all:\s*"Delete all"/)
+    assert.match(source, /reclaim:\s*"Clean up"/)
+    assert.match(source, /reclaim_all:\s*"Clean up all"/)
     assert.match(source, /data-sort-size/)
     assert.match(source, /data-display-mode="folders"/)
     assert.match(source, /data-display-mode="files"/)
@@ -2090,6 +2101,79 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(rows().length, 1)
     assert.strictEqual(rows()[0].querySelector('.vault-file-name').textContent, 'tracked-0500.bin')
     assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent, '501–501 of 501')
+    dom.window.close()
+  })
+
+  test('Activity is paginated without repeating a batch undo action', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
+    })
+    const dom = new JSDOM(html, {
+      url: 'http://localhost/vault/app/appB',
+      runScripts: 'dangerously'
+    })
+    const events = Array.from({ length: 501 }, (_, index) => ({
+      kind: 'convert',
+      path: `/pinokio/api/appB/event-${String(index).padStart(4, '0')}.bin`,
+      relative_path: `event-${String(index).padStart(4, '0')}.bin`,
+      source_id: 'app:appB',
+      source_label: 'appB',
+      batch_id: 'batch-large',
+      undoable: index !== 0,
+      bytes_saved: 1024 + index,
+      ts: Date.now() - index
+    }))
+    const status = {
+      enabled: true,
+      mode: 'link',
+      scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+      last_scan: { ts: Date.now(), bytes_total: 1024 * 501 },
+      tracked_bytes: 0,
+      effective_bytes: 0,
+      shared_bytes: 0,
+      pending_bytes: 0,
+      activity_error: null,
+      cloud_sync_warning: null,
+      sources: [{
+        id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
+        display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
+      }],
+      blobs: [],
+      duplicates: [],
+      excluded: [],
+      events,
+      undo_batches: [{
+        batch_id: 'batch-large',
+        files: events.length,
+        bytes: events.reduce((sum, event) => sum + event.bytes_saved, 0),
+        ts: events[0].ts
+      }, {
+        batch_id: 'batch-compacted',
+        files: 2,
+        bytes: 4096,
+        ts: events[events.length - 1].ts - 1
+      }]
+    }
+    dom.window.fetch = async () => ({ ok: true, json: async () => status })
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    const activityView = dom.window.document.querySelector('[data-view="activity"]')
+    assert.strictEqual(activityView.querySelector('.vault-nav-count').textContent, '502')
+    activityView.click()
+
+    const rows = () => [...dom.window.document.querySelectorAll('.vault-table.activity .vault-file-row')]
+    assert.strictEqual(rows().length, 500)
+    assert.strictEqual(dom.window.document.querySelectorAll('[data-undo="batch-large"]').length, 1)
+    assert.strictEqual(dom.window.document.querySelectorAll('[data-undo="batch-compacted"]').length, 1)
+    assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent, '1–500 of 502')
+
+    dom.window.document.querySelector('[data-page="next"]').click()
+    assert.strictEqual(rows().length, 2)
+    assert.strictEqual(dom.window.document.querySelectorAll('[data-undo="batch-large"]').length, 0)
+    assert.strictEqual(dom.window.document.querySelectorAll('[data-undo="batch-compacted"]').length, 0)
+    assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent, '501–502 of 502')
     dom.window.close()
   })
 
