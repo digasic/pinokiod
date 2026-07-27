@@ -10,6 +10,7 @@ const COPY = {
   all_description: "Every scanned file and its current deduplication status.",
   duplicates_description: "Identical files waiting to be deduplicated or kept separate.",
   shared_description: "Files that share disk storage across multiple locations.",
+  tracked_description: "Files with no duplicate action required.",
   independent_description: "Duplicate files that remain as separate copies.",
   reclaimable_description: "Stored copies no longer used by any configured location.",
   activity_description: "A history of scans and changes made by Save space.",
@@ -86,6 +87,7 @@ const COPY = {
   search_all: "Search files",
   search_duplicates: "Search duplicates",
   search_shared: "Search deduplicated files",
+  search_tracked: "Search files with no action needed",
   search_skipped: "Search files kept separate",
   search_activity: "Search activity",
   search_in: "Search in {location}",
@@ -164,6 +166,8 @@ const COPY = {
   no_duplicates_hint: "There are no files waiting for your review.",
   no_shared: "Nothing deduplicated yet",
   no_shared_hint: "Deduplicated files will appear here after you review duplicates.",
+  no_tracked: "No files with no action needed",
+  no_tracked_hint: "Files without a duplicate action will appear here after a scan.",
   no_skipped: "Nothing kept separate",
   no_skipped_hint: "Files you keep separate will appear here.",
   no_reclaimable: "No unused files",
@@ -337,6 +341,7 @@ const getCounts = (items) => ({
   all: items.length,
   duplicates: items.filter((item) => item.status === "duplicate").length,
   shared: items.filter((item) => item.status === "shared").length,
+  tracked: items.filter((item) => item.status === "tracked").length,
   independent: items.filter((item) => item.status === "independent").length,
   reclaimable: state.data.blobs.filter((blob) => blob.orphan).length,
   activity: state.data.events.length
@@ -362,6 +367,7 @@ const activeItems = (items) => {
   let result = items
   if (state.view === "duplicates") result = result.filter((item) => item.status === "duplicate")
   if (state.view === "shared") result = result.filter((item) => item.status === "shared")
+  if (state.view === "tracked") result = result.filter((item) => item.status === "tracked")
   if (state.view === "independent") result = result.filter((item) => item.status === "independent")
   if (state.sourceId) result = result.filter((item) => isDescendantSource(item.source_id, state.sourceId))
   if (state.view === "all" && state.statusFilter !== "all") result = result.filter((item) => item.status === state.statusFilter)
@@ -374,6 +380,7 @@ const viewIcon = {
   all: "fa-regular fa-file-lines",
   duplicates: "fa-regular fa-copy",
   shared: "fa-solid fa-link",
+  tracked: "fa-regular fa-circle-check",
   independent: "fa-solid fa-circle-minus",
   reclaimable: "fa-regular fa-trash-can",
   activity: "fa-solid fa-wave-square"
@@ -382,6 +389,7 @@ const viewLabel = {
   all: COPY.all,
   duplicates: COPY.duplicates,
   shared: COPY.shared,
+  tracked: COPY.tracked,
   independent: COPY.skipped,
   reclaimable: COPY.reclaimable,
   activity: COPY.activity
@@ -407,8 +415,8 @@ const renderViews = (items) => {
   const counts = getCounts(items)
   el("views-label").textContent = COPY.views
   const views = IS_APP_MODE
-    ? ["all", "duplicates", "shared", "independent", "activity"]
-    : ["all", "duplicates", "shared", "independent", "reclaimable", "activity"]
+    ? ["all", "duplicates", "shared", "tracked", "independent", "activity"]
+    : ["all", "duplicates", "shared", "tracked", "independent", "reclaimable", "activity"]
   el("vault-views").innerHTML = views.map((view) => `
     <button class="vault-nav-row ${state.view === view ? "selected" : ""}" type="button" data-view="${view}" ${state.view === view ? 'aria-current="page"' : ""}>
       <i class="${viewIcon[view]}"></i>
@@ -516,12 +524,14 @@ const updateToolbarSummary = (visibleItems) => {
 const searchPlaceholder = () => {
   if (state.view === "duplicates") return COPY.search_duplicates
   if (state.view === "shared") return COPY.search_shared
+  if (state.view === "tracked") return COPY.search_tracked
   if (state.view === "independent") return COPY.search_skipped
   if (state.view === "activity") return COPY.search_activity
   const source = selectedSource()
   return source && source.kind === "app" ? COPY.search_in.replace("{location}", source.label) : COPY.search_all
 }
-const supportsDisplayMode = () => state.view === "all" || state.view === "shared" || state.view === "independent"
+const supportsDisplayMode = () => state.view === "all" || state.view === "shared" ||
+  state.view === "tracked" || state.view === "independent"
 const displayModeControl = () => supportsDisplayMode() ? `<div class="vault-display-mode" role="group" aria-label="${attr(COPY.display_mode)}">
   <button type="button" data-display-mode="folders" aria-pressed="${state.displayMode === "folders"}" class="${state.displayMode === "folders" ? "selected" : ""}">${esc(COPY.folders)}</button>
   <button type="button" data-display-mode="files" aria-pressed="${state.displayMode === "files"}" class="${state.displayMode === "files" ? "selected" : ""}">${esc(COPY.files_mode)}</button>
@@ -750,6 +760,7 @@ const emptyState = (view) => {
       : [COPY.no_files, COPY.no_files_hint, "fa-regular fa-folder-open"],
     duplicates: [COPY.no_duplicates, COPY.no_duplicates_hint, "fa-regular fa-circle-check"],
     shared: [COPY.no_shared, COPY.no_shared_hint, "fa-solid fa-link"],
+    tracked: [COPY.no_tracked, COPY.no_tracked_hint, "fa-regular fa-circle-check"],
     independent: [COPY.no_skipped, COPY.no_skipped_hint, "fa-solid fa-circle-minus"],
     reclaimable: [COPY.no_reclaimable, COPY.no_reclaimable_hint, "fa-regular fa-circle-check"],
     activity: [COPY.no_activity, COPY.no_activity_hint, "fa-solid fa-wave-square"]

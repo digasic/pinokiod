@@ -1617,6 +1617,7 @@ describe('vault dashboard backend (phase 4)', () => {
       all: 'Every scanned file and its current deduplication status.',
       duplicates: 'Identical files waiting to be deduplicated or kept separate.',
       shared: 'Files that share disk storage across multiple locations.',
+      tracked: 'Files with no duplicate action required.',
       independent: 'Duplicate files that remain as separate copies.',
       reclaimable: 'Stored copies no longer used by any configured location.',
       activity: 'A history of scans and changes made by Save space.'
@@ -2013,6 +2014,83 @@ describe('vault dashboard backend (phase 4)', () => {
       await new Promise((resolve) => setTimeout(resolve, 25))
       dom.window.close()
     }
+  })
+
+  test('No action needed is a counted, filtered, paginated file view', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
+    })
+    const dom = new JSDOM(html, {
+      url: 'http://localhost/vault/app/appB',
+      runScripts: 'dangerously'
+    })
+    const blobs = Array.from({ length: 501 }, (_, index) => {
+      const name = `tracked-${String(index).padStart(4, '0')}.bin`
+      return {
+        hash: index.toString(16).padStart(64, '0'),
+        size: 1024 + index,
+        orphan: false,
+        nlink: 2,
+        names: [{
+          path: `/pinokio/api/appB/${name}`,
+          relative_path: name,
+          source_id: 'app:appB',
+          source_label: 'appB',
+          mode: 'link'
+        }]
+      }
+    })
+    const status = {
+      enabled: true,
+      mode: 'link',
+      scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+      last_scan: { ts: Date.now(), bytes_total: 1024 * 502 },
+      tracked_bytes: 1024 * 502,
+      effective_bytes: 1024 * 502,
+      shared_bytes: 0,
+      pending_bytes: 1024,
+      activity_error: null,
+      cloud_sync_warning: null,
+      sources: [{
+        id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
+        display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
+      }],
+      blobs,
+      duplicates: [{
+        path: '/pinokio/api/appB/duplicate.bin',
+        relative_path: 'duplicate.bin',
+        source_id: 'app:appB',
+        source_label: 'appB',
+        size: 1024,
+        shareable: true,
+        match: { path: '/pinokio/api/appA/duplicate.bin' }
+      }],
+      excluded: [],
+      events: [],
+      undo_batches: []
+    }
+    dom.window.fetch = async () => ({ ok: true, json: async () => status })
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    const trackedView = dom.window.document.querySelector('[data-view="tracked"]')
+    assert.strictEqual(trackedView.querySelector('.vault-nav-name').textContent, 'No action needed')
+    assert.strictEqual(trackedView.querySelector('.vault-nav-count').textContent, '501')
+    trackedView.click()
+
+    const rows = () => [...dom.window.document.querySelectorAll('.vault-table .vault-file-row')]
+    assert.strictEqual(rows().length, 500)
+    assert.strictEqual(dom.window.document.getElementById('vault-search').placeholder,
+      'Search files with no action needed')
+    assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent, '1–500 of 501')
+    assert.doesNotMatch(dom.window.document.getElementById('vault-table-wrap').textContent, /duplicate\.bin/)
+
+    dom.window.document.querySelector('[data-page="next"]').click()
+    assert.strictEqual(rows().length, 1)
+    assert.strictEqual(rows()[0].querySelector('.vault-file-name').textContent, 'tracked-0500.bin')
+    assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent, '501–501 of 501')
+    dom.window.close()
   })
 
   test('large file lists render bounded pages without narrowing Deduplicate all', async () => {
