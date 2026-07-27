@@ -290,6 +290,16 @@ const sourcePath = (source) => {
   if (source.kind === "app") return IS_APP_MODE ? (source.display_path || source.root || "") : ""
   return source.display_path || source.root || ""
 }
+const externalLocation = (item) => {
+  const source = sourceById(item.source_id)
+  if (!source || source.kind !== "external") return ""
+  const base = sourcePath(source).replace(/[\\/]+$/, "")
+  const relative = String(item.relative_path || "").replace(/^[\\/]+/, "")
+  if (!base) return relative
+  if (!relative) return base
+  const separator = base.includes("\\") && !base.includes("/") ? "\\" : "/"
+  return `${base}${separator}${separator === "\\" ? relative.replace(/\//g, "\\") : relative}`
+}
 const isDescendantSource = (candidateId, parentId) => {
   if (!parentId) return true
   if (candidateId === parentId) return true
@@ -617,7 +627,7 @@ const sharingControl = (item) => {
 const fileDetail = (item) => {
   if (!state.expandedFiles.has(item.path) || !item.locations || item.locations.length < 2) return ""
   return `<div class="vault-detail"><div class="vault-detail-label">${esc(COPY.identical_contents_at)} ${countLabel(item.locations.length, COPY.location, COPY.locations_lower)}</div>${item.locations.map((location) => `
-    <div class="vault-location-detail"><i class="fa-regular fa-file"></i><span>${esc(location.source_label || "")}${location.relative_path ? ` / ${esc(location.relative_path)}` : ""}</span></div>`).join("")}</div>`
+    <div class="vault-location-detail"><i class="fa-regular fa-file"></i><span>${esc(externalLocation(location) || [location.source_label, location.relative_path].filter(Boolean).join(" / "))}</span></div>`).join("")}</div>`
 }
 
 const renderFileRow = (item, depth = 0, showMatch = false) => {
@@ -714,7 +724,8 @@ const sourceSort = (a, b) => {
   const rank = (source) => source && source.kind === "external" ? 1 : source ? 0 : 2
   return rank(first) - rank(second) || groupTitle(first).localeCompare(groupTitle(second))
 }
-const flatLocation = (item) => [groupTitle(sourceById(item.source_id)), item.relative_path].filter(Boolean).join(" / ")
+const flatLocation = (item) => externalLocation(item) ||
+  [groupTitle(sourceById(item.source_id)), item.relative_path].filter(Boolean).join(" / ")
 const renderFlatFiles = (items) => [...items]
   .sort((a, b) => compareRows(a, b, flatLocation))
   .map((item) => {

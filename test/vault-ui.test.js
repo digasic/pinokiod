@@ -2472,6 +2472,64 @@ describe('vault dashboard backend (phase 4)', () => {
     dom.window.close()
   })
 
+  test('external file rows and expanded matches show the full target path', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'external:api'
+    })
+    const dom = new JSDOM(html, { url: 'http://localhost/vault/app/external%3Aapi', runScripts: 'dangerously' })
+    const targetRoot = '/Volumes/Models/api'
+    const relativePath = 'ideogram/app/comfy_models/model.safetensors'
+    const externalPath = `${targetRoot}/${relativePath}`
+    const status = {
+      enabled: true,
+      mode: 'link',
+      scan: { active: false, pending: false, queued: 0, phase: 'idle', scope_id: null },
+      last_scan: { ts: Date.now(), bytes_total: 4096 },
+      tracked_bytes: 4096,
+      effective_bytes: 2048,
+      shared_bytes: 4096,
+      pending_bytes: 0,
+      activity_error: null,
+      cloud_sync_warning: null,
+      sources: [{
+        id: 'external:api', kind: 'external', label: 'api', root: targetRoot,
+        display_path: '/pinokio/vault/sources/api', target_path: targetRoot,
+        parent_id: null, available: true, shareable: true
+      }],
+      blobs: [{
+        hash: 'a'.repeat(64), size: 4096, orphan: false, nlink: 3,
+        names: [
+          {
+            path: externalPath, relative_path: relativePath,
+            source_id: 'external:api', source_label: 'api', mode: 'link'
+          },
+          {
+            path: `/pinokio/api/appA/${relativePath}`, relative_path: relativePath,
+            source_id: 'app:appA', source_label: 'appA', mode: 'link'
+          }
+        ]
+      }],
+      duplicates: [], excluded: [], events: [], undo_batches: []
+    }
+    dom.window.fetch = async () => ({ ok: true, json: async () => status })
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    dom.window.document.querySelector('[data-view="shared"]').click()
+    assert.strictEqual(
+      dom.window.document.querySelector('.vault-flat-location').textContent,
+      externalPath
+    )
+    dom.window.document.querySelector('[data-expand-file]').click()
+    assert.deepStrictEqual(
+      [...dom.window.document.querySelectorAll('.vault-location-detail span')]
+        .map((node) => node.textContent),
+      [externalPath, `appA / ${relativePath}`]
+    )
+    dom.window.close()
+  })
+
   test('vault route provisions the dev requirements needed by its folder picker', async () => {
     const serverSource = await fs.promises.readFile(path.resolve(__dirname, '..', 'server', 'index.js'), 'utf8')
     const routeStart = serverSource.indexOf('this.app.get("/vault"')
