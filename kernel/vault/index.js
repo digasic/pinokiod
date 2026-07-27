@@ -1712,6 +1712,7 @@ class Vault {
     )
     let bytesOnDisk = 0
     let wouldBe = 0
+    let trackedLogicalBytes = 0
     for (let index = 0; index < blobEntries.length; index++) {
       const [hash, blob] = blobEntries[index]
       const names = namesByHash.get(hash) || []
@@ -1723,6 +1724,7 @@ class Vault {
       const linkedCopy = storeStat || names.some((name) => name.mode === "link") ? 1 : 0
       const physicalCopies = linkedCopy + names.filter((name) => name.mode === "copy").length
       const pendingBytes = pendingBytesByHash.get(hash) || 0
+      trackedLogicalBytes += (size * names.length) + pendingBytes
       bytesOnDisk += (size * physicalCopies) + pendingBytes
       wouldBe += (size * Math.max(physicalCopies, names.length)) + pendingBytes
       const orphan = !!(storeStat && storeStat.nlink === 1)
@@ -1732,6 +1734,22 @@ class Vault {
       }
       blobs.push(publicBlob)
       blobByHash.set(hash, publicBlob)
+    }
+    if (!scopeId) {
+      // The scan total covers every regular file, including files below the
+      // candidate threshold and files the user kept separate. The registry
+      // figures above cover only content tracked by Save space. Add the
+      // remainder to both sides so the global comparison represents the
+      // complete scanned locations instead of silently omitting small files.
+      const lastScan = registry.scanFor()
+      const scannedBytes = lastScan && Number.isFinite(lastScan.bytes_total)
+        ? lastScan.bytes_total
+        : null
+      const untrackedScannedBytes = scannedBytes === null
+        ? 0
+        : Math.max(0, scannedBytes - trackedLogicalBytes)
+      bytesOnDisk += untrackedScannedBytes
+      wouldBe += untrackedScannedBytes
     }
     const duplicates = []
     for (const [p, entry] of registry.duplicates) {

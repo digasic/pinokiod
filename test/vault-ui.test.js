@@ -674,7 +674,8 @@ describe('vault dashboard backend (phase 4)', () => {
     await vault.sweeper.scan()
     const status = await vault.status()
     assert.strictEqual(status.enabled, true)
-    assert.strictEqual(status.bytes_on_disk, content.length)
+    assert.strictEqual(status.bytes_on_disk, content.length * 2)
+    assert.strictEqual(status.bytes_without_sharing, content.length * 2)
     assert.ok(status.last_scan && status.last_scan.files > 0)
     assert.strictEqual(status.excluded.length, 1)
     assert.strictEqual(status.excluded[0].size, content.length)
@@ -702,6 +703,79 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(status.pending_bytes, content.length)
     assert.strictEqual(status.bytes_on_disk, content.length * 2)
     assert.strictEqual(status.bytes_without_sharing, content.length * 2)
+    assert.strictEqual(status.saved_by_sharing, 0)
+  })
+
+  test('global storage metrics include scanned files below the candidate threshold', async () => {
+    const { home, vault } = await makeEnv()
+    const { content } = await makeSharedPair(home, vault)
+    const small = crypto.randomBytes(512)
+    await writeFile(path.resolve(home, 'api', 'appA', 'config.json'), small)
+    await vault.sweeper.scan()
+
+    const status = await vault.status()
+    assert.strictEqual(status.last_scan.bytes_total, (content.length * 2) + small.length)
+    assert.strictEqual(status.bytes_on_disk, content.length + small.length)
+    assert.strictEqual(status.bytes_without_sharing, (content.length * 2) + small.length)
+    assert.strictEqual(status.saved_by_sharing, content.length)
+  })
+
+  test('global storage metrics do not disappear when every scanned file is below the candidate threshold', async () => {
+    const { home, vault } = await makeEnv()
+    const first = crypto.randomBytes(511)
+    const second = crypto.randomBytes(257)
+    await writeFile(path.resolve(home, 'api', 'appA', 'config.json'), first)
+    await writeFile(path.resolve(home, 'api', 'appB', 'notes.txt'), second)
+    await vault.sweeper.scan()
+
+    const status = await vault.status()
+    const total = first.length + second.length
+    assert.strictEqual(status.last_scan.bytes_total, total)
+    assert.strictEqual(status.bytes_on_disk, total)
+    assert.strictEqual(status.bytes_without_sharing, total)
+    assert.strictEqual(status.saved_by_sharing, 0)
+  })
+
+  test('global storage metrics include below-threshold files from external locations', async (t) => {
+    const { home, vault } = await makeEnv()
+    const external = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-ui-size-external-'))
+    homes.push(external)
+    const local = crypto.randomBytes(401)
+    const imported = crypto.randomBytes(607)
+    await writeFile(path.resolve(home, 'api', 'appA', 'local.json'), local)
+    await writeFile(path.resolve(external, 'external.json'), imported)
+    try {
+      await vault.addExternalSource(external)
+    } catch (error) {
+      t.skip(`directory links unavailable: ${error.message}`)
+      return
+    }
+    await vault.sweeper.scan()
+
+    const status = await vault.status()
+    const total = local.length + imported.length
+    assert.strictEqual(status.last_scan.home_bytes_total, local.length)
+    assert.strictEqual(status.last_scan.bytes_total, total)
+    assert.strictEqual(status.bytes_on_disk, total)
+    assert.strictEqual(status.bytes_without_sharing, total)
+    assert.strictEqual(status.saved_by_sharing, 0)
+  })
+
+  test('global storage metrics add unused managed files without double-counting scanned files', async () => {
+    const { home, vault } = await makeEnv()
+    const managed = crypto.randomBytes(4096)
+    const small = crypto.randomBytes(379)
+    const managedPath = await writeFile(path.resolve(home, 'api', 'appA', 'unused.bin'), managed)
+    await vault.adopt(managedPath, sha256(managed), { app: 'appA' })
+    await fs.promises.unlink(managedPath)
+    await writeFile(path.resolve(home, 'api', 'appA', 'settings.json'), small)
+    await vault.sweeper.scan()
+
+    const status = await vault.status()
+    assert.strictEqual(status.last_scan.bytes_total, small.length)
+    assert.strictEqual(status.reclaimable, managed.length)
+    assert.strictEqual(status.bytes_on_disk, managed.length + small.length)
+    assert.strictEqual(status.bytes_without_sharing, managed.length + small.length)
     assert.strictEqual(status.saved_by_sharing, 0)
   })
 
@@ -1086,24 +1160,33 @@ describe('vault dashboard backend (phase 4)', () => {
   test('copy-mode tracking never claims physical sharing savings', async () => {
     const { home, vault } = await makeEnv()
     const content = crypto.randomBytes(4096)
+    const small = crypto.randomBytes(383)
     const hash = sha256(content)
     const first = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), content)
     const second = await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), content)
+    await writeFile(path.resolve(home, 'api', 'appA', 'config.json'), small)
     const firstStat = await fs.promises.stat(first)
     const secondStat = await fs.promises.stat(second)
     vault.registry.addBlob(hash, { size: content.length })
     vault.registry.addLink(first, { hash, app: 'appA', dev: firstStat.dev, ino: firstStat.ino, mode: 'copy' })
     vault.registry.addLink(second, { hash, app: 'appB', dev: secondStat.dev, ino: secondStat.ino, mode: 'copy' })
+    vault.registry.setLastScan({
+      ts: Date.now(),
+      files: 3,
+      bytes_total: (content.length * 2) + small.length,
+      home_bytes_total: (content.length * 2) + small.length
+    })
 
     const status = await vault.status()
-    assert.strictEqual(status.bytes_on_disk, content.length * 2)
+    assert.strictEqual(status.bytes_on_disk, (content.length * 2) + small.length)
+    assert.strictEqual(status.bytes_without_sharing, (content.length * 2) + small.length)
     assert.strictEqual(status.saved_by_sharing, 0)
   })
 
   test('repair is advanced, metrics distinguish detected and explicit savings, and refresh retries', async () => {
     const vaultPage = await vaultPageSource()
     assert.match(vaultPage, /disk_space_saved:\s*"of disk space saved"/)
-    assert.match(vaultPage, /before_help:\s*"Estimated space if every app stored its own copy\."/)
+    assert.match(vaultPage, /before_help:\s*"Estimated size of every scanned location if each app stored its own copy\. File Explorer may count deduplicated files differently\."/)
     assert.match(vaultPage, /nothing_more_to_save:\s*"Nothing else to save"/)
     assert.match(vaultPage, /more_can_be_saved:\s*"\{size\} more can be saved"/)
     assert.match(vaultPage, /fmt\(data\.saved_by_sharing\)/)
@@ -1387,11 +1470,14 @@ describe('vault dashboard backend (phase 4)', () => {
     const formatter = await fs.promises.readFile(
       path.resolve(__dirname, '..', 'server', 'public', 'storage-size.js'), 'utf8')
     dom.window.eval(formatter)
+    const screenshotFolderBytes = 2_002_022_055_452
     assert.strictEqual(dom.window.PinokioFormatStorageSize(7.05e9), '7.05 GB')
     assert.strictEqual(dom.window.PinokioFormatStorageSize(5.3e9), '5.3 GB')
     assert.strictEqual(dom.window.PinokioFormatStorageSize(1024 ** 3), '1.07 GB')
+    assert.strictEqual(dom.window.PinokioFormatStorageSize(screenshotFolderBytes), '2 TB')
     dom.window.document.body.dataset.platform = 'win32'
     assert.strictEqual(dom.window.PinokioFormatStorageSize(1024 ** 3), '1 GB')
+    assert.strictEqual(dom.window.PinokioFormatStorageSize(screenshotFolderBytes), '1.82 TB')
 
     const appView = await fs.promises.readFile(
       path.resolve(__dirname, '..', 'server', 'views', 'app.ejs'), 'utf8')
@@ -1443,7 +1529,8 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-compare-label')].map((node) => node.firstChild.textContent.trim()), ['Before', 'After'])
     assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-compare-value')].map((node) => node.textContent), ['661.75 GB', '404.8 GB'])
     assert.match(dom.window.document.querySelector('.vault-compare-fill.after').getAttribute('style'), /--vault-after-ratio:61\.17%/)
-    assert.strictEqual(dom.window.document.getElementById('vault-before-help').textContent, 'Estimated space if every app stored its own copy.')
+    assert.strictEqual(dom.window.document.getElementById('vault-before-help').textContent,
+      'Estimated size of every scanned location if each app stored its own copy. File Explorer may count deduplicated files differently.')
     assert.strictEqual(dom.window.document.querySelector('.vault-compare-info').getAttribute('tabindex'), '0')
     assert.match(dom.window.document.querySelector('.vault-summary-side').textContent, /13\.31 GB more can be saved/)
     assert.strictEqual(dom.window.document.getElementById('btn-review-metric').textContent, 'Review files')

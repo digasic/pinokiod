@@ -24,7 +24,7 @@ const COPY = {
   disk_space_saved: "of disk space saved",
   saved_for_app: "{size} saved for this app",
   before: "Before",
-  before_help: "Estimated space if every app stored its own copy.",
+  before_help: "Estimated size of every scanned location if each app stored its own copy. File Explorer may count deduplicated files differently.",
   after: "After",
   effective_help: "For deduplicated files, disk usage is divided evenly among every location using them.",
   nothing_more_to_save: "Nothing else to save",
