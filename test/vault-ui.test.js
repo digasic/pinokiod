@@ -33,10 +33,149 @@ const vaultPageSource = async () => {
   return (await Promise.all(files.map((file) => fs.promises.readFile(path.resolve(root, file), 'utf8')))).join('\n')
 }
 
+const statusFixture = (data, requestUrl) => {
+  const url = new URL(String(requestUrl || '/info/dedup'), 'http://localhost')
+  if (!data || !data.enabled || data.inventory ||
+      url.pathname !== '/info/dedup' || url.searchParams.get('progress') === '1') {
+    return data
+  }
+  const sources = Array.isArray(data.sources) ? data.sources : []
+  const sourceMap = new Map(sources.map((source) => [source.id, source]))
+  const sourceIdsFor = (item) => item.source_ids ||
+    (item.source_id ? [item.source_id] : [])
+  const visitSources = (ids, visit) => {
+    const seen = new Set()
+    for (let id of ids) {
+      while (id && !seen.has(id)) {
+        visit(id)
+        seen.add(id)
+        id = sourceMap.get(id) && sourceMap.get(id).parent_id
+      }
+    }
+  }
+  const counts = {
+    all: 0, duplicates: 0, shared: 0, tracked: 0,
+    independent: 0, reclaimable: 0, activity: 0
+  }
+  const sourceCounts = { all: {}, duplicates: {}, independent: {} }
+  const shareableBySource = {}
+  let shareableDuplicates = 0
+  const duplicateLocations = new Set()
+  const records = (data.items || []).map((item) => {
+    const kind = item.activity_type
+      ? 'activity'
+      : item.orphan ? 'reclaimable' : 'file'
+    const record = {
+      item,
+      kind,
+      status: item.status || null,
+      source_ids: sourceIdsFor(item)
+    }
+    if (kind === 'activity') counts.activity += 1
+    else if (kind === 'reclaimable') counts.reclaimable += 1
+    else {
+      counts.all += 1
+      counts[item.status] += 1
+      visitSources(record.source_ids, (id) => {
+        sourceCounts.all[id] = (sourceCounts.all[id] || 0) + 1
+        if (item.status === 'duplicate') {
+          sourceCounts.duplicates[id] = (sourceCounts.duplicates[id] || 0) + 1
+        } else if (item.status === 'independent') {
+          sourceCounts.independent[id] = (sourceCounts.independent[id] || 0) + 1
+        }
+      })
+    }
+    if (item.status === 'duplicate' && item.shareable !== false) {
+      shareableDuplicates += 1
+      visitSources(record.source_ids, (id) => {
+        shareableBySource[id] = (shareableBySource[id] || 0) + 1
+      })
+      record.source_ids.forEach((id) => duplicateLocations.add(id))
+    }
+    return record
+  })
+  const view = url.searchParams.get('view') || 'all'
+  const statusFilter = url.searchParams.get('status_filter') || 'all'
+  const locationId = url.searchParams.get('location_id')
+  const query = String(url.searchParams.get('q') || '').trim().toLowerCase()
+  const inLocation = (sourceId) => {
+    if (!locationId) return true
+    const seen = new Set()
+    while (sourceId && !seen.has(sourceId)) {
+      if (sourceId === locationId) return true
+      seen.add(sourceId)
+      sourceId = sourceMap.get(sourceId) && sourceMap.get(sourceId).parent_id
+    }
+    return false
+  }
+  const selected = records.filter((record) => {
+    if (view === 'all') {
+      if (!record.status) return false
+      if (statusFilter !== 'all' && record.status !== statusFilter) return false
+    } else if (view === 'duplicates' && record.status !== 'duplicate') return false
+    else if (view === 'shared' && record.status !== 'shared') return false
+    else if (view === 'tracked' && record.status !== 'tracked') return false
+    else if (view === 'independent' && record.status !== 'independent') return false
+    else if (view === 'reclaimable' && record.kind !== 'reclaimable') return false
+    else if (view === 'activity' && record.kind !== 'activity') return false
+    if (locationId && !record.source_ids.some(inLocation)) return false
+    if (!query) return true
+    return JSON.stringify(record.item).toLowerCase().includes(query)
+  })
+  const sizeSort = url.searchParams.get('size_sort')
+  if (sizeSort === 'asc' || sizeSort === 'desc') {
+    selected.sort((left, right) => {
+      const difference = (Number(left.item.size) || 0) - (Number(right.item.size) || 0)
+      return sizeSort === 'asc' ? difference : -difference
+    })
+  }
+  const pageSize = Math.max(1, Math.min(500, Number(url.searchParams.get('page_size')) || 500))
+  const pages = Math.max(1, Math.ceil(selected.length / pageSize))
+  const page = Math.max(0, Math.min(Number(url.searchParams.get('page')) || 0, pages - 1))
+  const start = page * pageSize
+  const end = Math.min(start + pageSize, selected.length)
+  const pageRecords = selected.slice(start, end)
+  const currentLocations = new Set(selected
+    .flatMap((record) => record.source_ids))
+  const currentShareableBytes = selected
+    .filter((record) => record.status === 'duplicate' && record.item.shareable)
+    .reduce((sum, record) => sum + (Number(record.item.size) || 0), 0)
+  return Object.assign({}, data, {
+    items: pageRecords.map((record) => record.item),
+    inventory: {
+      view,
+      counts,
+      source_counts: sourceCounts,
+      shareable_by_source: shareableBySource,
+      shareable_duplicates: shareableDuplicates,
+      duplicate_locations: duplicateLocations.size,
+      current: {
+        count: selected.length,
+        locations: currentLocations.size,
+        shareable_bytes: currentShareableBytes
+      },
+      page,
+      page_size: pageSize,
+      start,
+      end,
+      total: selected.length,
+      pages
+    }
+  })
+}
+
 const runVaultScript = async (dom) => {
   const publicRoot = path.resolve(__dirname, '..', 'server', 'public')
   const scripts = await Promise.all(['storage-size.js', 'vault.js']
     .map((file) => fs.promises.readFile(path.resolve(publicRoot, file), 'utf8')))
+  const fetch = dom.window.fetch
+  dom.window.fetch = async (...args) => {
+    const response = await fetch(...args)
+    if (!response || typeof response.json !== 'function') return response
+    return Object.assign({}, response, {
+      json: async () => statusFixture(await response.json(), args[0])
+    })
+  }
   dom.window.eval(scripts.join('\n'))
 }
 
@@ -120,10 +259,15 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(compactedEvents.some((event) => event.batch_id === 'batch-retained.bin'), false)
     await vault.sweeper.scan()
     assert.strictEqual(vault.registry.links.get(b).batch_id, 'batch-retained.bin')
-    const status = await vault.status()
-    assert.deepStrictEqual(status.undo_batches, [{
-      batch_id: 'batch-retained.bin', files: 1, bytes: 4096, ts: null
-    }])
+    const status = await vault.status(null, { view: 'activity' })
+    const batch = status.items.find((item) => item.activity_type === 'batch')
+    assert.deepStrictEqual(batch, {
+      batch_id: 'batch-retained.bin',
+      files: 1,
+      bytes: 4096,
+      ts: null,
+      activity_type: 'batch'
+    })
 
     const result = await vault.undoBatch('batch-retained.bin')
     assert.strictEqual(result.undone, 1)
@@ -172,9 +316,9 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(vault.registry.links.get(b).batch_id, 'batch-new')
     assert.ok((await fs.promises.stat(b)).nlink > 1)
 
-    const status = await vault.status()
-    const oldEvent = status.events.find((event) => event.kind === 'convert' && event.batch_id === 'batch-reconverted.bin')
-    const newEvent = status.events.find((event) => event.kind === 'convert' && event.batch_id === 'batch-new')
+    const status = await vault.status(null, { view: 'activity' })
+    const oldEvent = status.items.find((event) => event.kind === 'convert' && event.batch_id === 'batch-reconverted.bin')
+    const newEvent = status.items.find((event) => event.kind === 'convert' && event.batch_id === 'batch-new')
     assert.strictEqual(oldEvent.undoable, false)
     assert.strictEqual(newEvent.undoable, true)
   })
@@ -677,17 +821,60 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(status.bytes_on_disk, content.length * 2)
     assert.strictEqual(status.bytes_without_sharing, content.length * 2)
     assert.ok(status.last_scan && status.last_scan.files > 0)
-    assert.strictEqual(status.excluded.length, 1)
-    assert.strictEqual(status.excluded[0].size, content.length)
-    assert.strictEqual(status.blobs.length, 1)
-    assert.deepStrictEqual(status.blobs[0].apps, ['appA'])
+    const independent = status.items.find((item) => item.status === 'independent')
+    const tracked = status.items.find((item) => item.status === 'tracked')
+    assert.strictEqual(status.inventory.counts.independent, 1)
+    assert.strictEqual(independent.size, content.length)
+    assert.ok(tracked.locations.some((item) => item.app === 'appA'))
     assert.ok(status.scan && status.scan.active === false)
 
     await fs.promises.rm(path.resolve(home, 'api', 'appB'), { recursive: true })
     await vault.refreshSources()
-    const afterSourceRemoval = await vault.status()
-    assert.strictEqual(afterSourceRemoval.excluded.length, 1, 'user-owned exclusions survive source removal')
-    assert.strictEqual(afterSourceRemoval.excluded[0].size, content.length)
+    const afterSourceRemoval = await vault.status(null, { view: 'independent' })
+    assert.strictEqual(afterSourceRemoval.inventory.counts.independent, 1,
+      'user-owned exclusions survive source removal')
+    assert.strictEqual(afterSourceRemoval.items[0].size, content.length)
+  })
+
+  test('large dashboard inventories return exact counts with bounded server pages', async () => {
+    const { home, vault } = await makeEnv()
+    const content = crypto.randomBytes(4096)
+    await writeFile(path.resolve(home, 'api', 'appA', 'one.bin'), content)
+    await writeFile(path.resolve(home, 'api', 'appB', 'two.bin'), content)
+    await writeFile(path.resolve(home, 'api', 'appC', 'three.bin'), content)
+    await vault.sweeper.scan()
+    const baseline = await vault.status()
+
+    const first = await vault.status(null, {
+      view: 'duplicates',
+      page: 0,
+      page_size: 1
+    })
+    const second = await vault.status(null, {
+      view: 'duplicates',
+      page: 1,
+      page_size: 1
+    })
+    const beyondLast = await vault.status(null, {
+      view: 'duplicates',
+      page: 999,
+      page_size: 1
+    })
+
+    assert.strictEqual(first.inventory.counts.duplicates, 2)
+    assert.strictEqual(first.inventory.total, 2)
+    assert.strictEqual(first.inventory.pages, 2)
+    assert.strictEqual(first.items.length, 1)
+    assert.strictEqual(second.items.length, 1)
+    assert.notStrictEqual(first.items[0].path, second.items[0].path)
+    assert.strictEqual(beyondLast.inventory.page, 1)
+    assert.strictEqual(beyondLast.items.length, 1)
+    assert.strictEqual(beyondLast.items[0].path, second.items[0].path)
+    assert.strictEqual(first.bytes_on_disk, baseline.bytes_on_disk)
+    assert.strictEqual(first.bytes_without_sharing, baseline.bytes_without_sharing)
+    assert.strictEqual(first.saved_by_sharing, baseline.saved_by_sharing)
+    assert.strictEqual(first.pending_bytes, baseline.pending_bytes)
+    assert.doesNotThrow(() => JSON.stringify(first))
   })
 
   test('tracked storage metrics include physical pending duplicates', async () => {
@@ -787,15 +974,13 @@ describe('vault dashboard backend (phase 4)', () => {
     await vault.sweeper.scan()
     const appB = vault.sources().find((source) => source.kind === 'app' && source.app === 'appB')
 
-    const status = await vault.status(appB.id)
+    const status = await vault.status(appB.id, { view: 'duplicates' })
 
     assert.strictEqual(status.scope_id, appB.id)
     assert.deepStrictEqual(status.sources.map((source) => source.id), [appB.id])
     assert.strictEqual(status.sources[0].parent_id, null)
-    assert.deepStrictEqual(status.duplicates.map((item) => item.path), [appBFile])
-    assert.strictEqual(status.blobs.length, 1)
-    assert.deepStrictEqual(new Set(status.blobs[0].names.map((name) => name.path)),
-      new Set([appAFile]))
+    assert.deepStrictEqual(status.items.map((item) => item.path), [appBFile])
+    assert.strictEqual(status.items[0].match.path, appAFile)
     assert.strictEqual(status.pending_bytes, content.length)
     assert.strictEqual(status.tracked_bytes, content.length)
     assert.strictEqual(status.effective_bytes, content.length)
@@ -846,8 +1031,8 @@ describe('vault dashboard backend (phase 4)', () => {
     await vault.adopt(first, hash, { app: 'appA', source_id: appA.id })
     await vault.convert(second, hash, { app: 'appB', source_id: appB.id, batch_id: 'activity-path' })
 
-    const status = await vault.status()
-    const conversion = status.events.find((event) => event.kind === 'convert')
+    const status = await vault.status(null, { view: 'activity' })
+    const conversion = status.items.find((event) => event.kind === 'convert')
     assert.strictEqual(conversion.source_label, 'appB')
     assert.strictEqual(conversion.relative_path, 'models/m.bin')
 
@@ -865,8 +1050,8 @@ describe('vault dashboard backend (phase 4)', () => {
     await fs.promises.rm(path.resolve(home, 'api', 'appA'), { recursive: true, force: true })
     await vault.refreshSources()
 
-    const status = await vault.status()
-    const event = status.events.find((item) => item.kind === 'found')
+    const status = await vault.status(null, { view: 'activity' })
+    const event = status.items.find((item) => item.kind === 'found')
     assert.strictEqual(event.source_label, 'appA')
     assert.strictEqual(event.relative_path, 'models/m.bin')
   })
@@ -877,22 +1062,23 @@ describe('vault dashboard backend (phase 4)', () => {
       await vault.registry.appendEvent({ kind: 'found', index })
     }
 
-    const status = await vault.status()
-    assert.strictEqual(status.events.length, 110)
-    assert.strictEqual(status.events[0].index, 109)
-    assert.strictEqual(status.events[109].index, 0)
+    const status = await vault.status(null, { view: 'activity' })
+    assert.strictEqual(status.items.length, 110)
+    assert.strictEqual(status.items[0].index, 109)
+    assert.strictEqual(status.items[109].index, 0)
   })
 
   test('reclaimAll frees every orphan and nothing else', async () => {
     const { home, vault } = await makeEnv()
     const keep = crypto.randomBytes(4096)
     const drop = crypto.randomBytes(4096)
+    vault.sizeThreshold = 1
     const keptFile = await writeFile(path.resolve(home, 'api', 'appA', 'keep.bin'), keep)
     const droppedFile = await writeFile(path.resolve(home, 'api', 'appA', 'drop.bin'), drop)
     await vault.adopt(keptFile, sha256(keep), { app: 'appA' })
     await vault.adopt(droppedFile, sha256(drop), { app: 'appA' })
     await fs.promises.unlink(droppedFile)
-    await vault.verify()
+    await vault.rebuild()
     const result = await vault.reclaimAll()
     assert.strictEqual(result.reclaimed, 1)
     assert.strictEqual(result.bytes_freed, drop.length)
@@ -906,23 +1092,28 @@ describe('vault dashboard backend (phase 4)', () => {
     const second = crypto.randomBytes(4096)
     const firstHash = sha256(first)
     const secondHash = sha256(second)
+    vault.sizeThreshold = 1
     const firstFile = await writeFile(path.resolve(home, 'api', 'appA', 'first.bin'), first)
     const secondFile = await writeFile(path.resolve(home, 'api', 'appA', 'second.bin'), second)
     await vault.adopt(firstFile, firstHash, { app: 'appA' })
     await vault.adopt(secondFile, secondHash, { app: 'appA' })
     await fs.promises.unlink(firstFile)
     await fs.promises.unlink(secondFile)
-    await vault.verify()
+    await vault.rebuild()
     const realReclaim = vault.reclaim.bind(vault)
     let calls = 0
-    vault.reclaim = async (...args) => {
+    let reclaimedHash
+    let failedHash
+    vault.reclaim = async (hash, ...args) => {
       calls += 1
       if (calls === 2) {
+        failedHash = hash
         const error = new Error('transient unlink failure')
         error.code = 'EIO'
         throw error
       }
-      return realReclaim(...args)
+      reclaimedHash = hash
+      return realReclaim(hash, ...args)
     }
     try {
       await assert.rejects(vault.reclaimAll(), (error) => error.code === 'EIO')
@@ -930,10 +1121,11 @@ describe('vault dashboard backend (phase 4)', () => {
       vault.reclaim = realReclaim
     }
 
-    assert.strictEqual(fs.existsSync(vault.storePathFor(firstHash)), false)
-    assert.strictEqual(vault.registry.blobs.has(firstHash), false)
-    assert.strictEqual(fs.existsSync(vault.storePathFor(secondHash)), true)
-    assert.strictEqual(vault.registry.blobs.has(secondHash), true)
+    assert.deepStrictEqual(new Set([reclaimedHash, failedHash]), new Set([firstHash, secondHash]))
+    assert.strictEqual(fs.existsSync(vault.storePathFor(reclaimedHash)), false)
+    assert.strictEqual(vault.registry.blobs.has(reclaimedHash), false)
+    assert.strictEqual(fs.existsSync(vault.storePathFor(failedHash)), true)
+    assert.strictEqual(vault.registry.blobs.has(failedHash), true)
   })
 
   test('status fails closed on a non-missing store metadata error', async () => {
@@ -1010,30 +1202,33 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.doesNotMatch(vaultPage, /inaccessiblePaths\.map\(esc\)\.join\(" · "\)/)
   })
 
-  test('scan remains active while verification runs', async () => {
+  test('scan remains active while in-memory reconciliation runs without a second verify pass', async () => {
     const { vault } = await makeEnv()
-    const realVerify = vault.verify.bind(vault)
+    const realReconcile = vault.sweeper.reconcileScannedRecords.bind(vault.sweeper)
     let entered
     let release
-    const verifyEntered = new Promise((resolve) => { entered = resolve })
-    const verifyRelease = new Promise((resolve) => { release = resolve })
-    vault.verify = async () => {
+    let verifyCalls = 0
+    const reconcileEntered = new Promise((resolve) => { entered = resolve })
+    const reconcileRelease = new Promise((resolve) => { release = resolve })
+    vault.verify = async () => { verifyCalls += 1 }
+    vault.sweeper.reconcileScannedRecords = async (...args) => {
       entered()
-      await verifyRelease
-      return realVerify()
+      await reconcileRelease
+      return realReconcile(...args)
     }
     assert.strictEqual(vault.startScan().started, true)
     const scan = vault.scanPromise
     try {
-      await verifyEntered
+      await reconcileEntered
       const status = vault.progressStatus().scan
       assert.strictEqual(status.active, true)
-      assert.strictEqual(status.phase, 'verifying')
+      assert.strictEqual(status.phase, 'reconciling')
     } finally {
       release()
       await scan
-      vault.verify = realVerify
+      vault.sweeper.reconcileScannedRecords = realReconcile
     }
+    assert.strictEqual(verifyCalls, 0)
   })
 
   test('scan progress renders each phase with its real determinate state', async () => {
@@ -1059,7 +1254,7 @@ describe('vault dashboard backend (phase 4)', () => {
         id: 'pinokio', kind: 'pinokio', label: 'Pinokio', root: '/pinokio',
         display_path: '/pinokio', parent_id: null, available: true, shareable: true
       }],
-      blobs: [], duplicates: [], excluded: [], events: [], undo_batches: []
+      items: []
     }
     const cases = [
       {
@@ -1085,12 +1280,12 @@ describe('vault dashboard backend (phase 4)', () => {
           hash_total: 4, queued: 3,
           current_file: 'model.bin', current_file_bytes: 500, current_file_size: 1000
         },
-        label: 'Analyzing large files',
+        label: 'Analyzing files',
         value: '37.5'
       },
       {
         scan: {
-          active: true, pending: false, phase: 'verifying', scope_id: null,
+          active: true, pending: false, phase: 'reconciling', scope_id: null,
           dirs: 4, files: 8, total_files: 8, bytes_total: 8000,
           hash_total: 4, queued: 0
         },
@@ -1156,7 +1351,7 @@ describe('vault dashboard backend (phase 4)', () => {
         id: 'pinokio', kind: 'pinokio', label: 'Pinokio', root: '/pinokio',
         display_path: '/pinokio', parent_id: null, available: true, shareable: true
       }],
-      blobs: [], duplicates: [], excluded: [], events: [], undo_batches: []
+      items: []
     }
     const scan = (queued, currentFile) => ({
       active: true, pending: false, phase: 'analyzing', scope_id: null,
@@ -1165,7 +1360,10 @@ describe('vault dashboard backend (phase 4)', () => {
       current_file_bytes: 0, current_file_size: 1000,
       started: 123
     })
-    const response = (data) => ({ ok: true, json: async () => data })
+    const response = (data) => ({
+      ok: true,
+      json: async () => statusFixture(data, '/info/dedup')
+    })
     let requestCount = 0
     let resolveOlder
     const olderResponse = new Promise((resolve) => { resolveOlder = resolve })
@@ -1195,12 +1393,12 @@ describe('vault dashboard backend (phase 4)', () => {
       const newerRefresh = dom.window.__testVaultRefresh()
       await newerRefresh
       assert.strictEqual(dom.window.document.querySelector('.vault-scan-percent').textContent, '87.7%')
-      assert.match(dom.window.document.querySelector('.vault-scan-detail').textContent, /822 of 937 large files checked/)
+      assert.match(dom.window.document.querySelector('.vault-scan-detail').textContent, /822 of 937 files analyzed/)
 
       resolveOlder(response(Object.assign({}, baseStatus, { scan: scan(204, 'older.bin') })))
       await olderRefresh
       assert.strictEqual(dom.window.document.querySelector('.vault-scan-percent').textContent, '87.7%')
-      assert.match(dom.window.document.querySelector('.vault-scan-detail').textContent, /822 of 937 large files checked/)
+      assert.match(dom.window.document.querySelector('.vault-scan-detail').textContent, /822 of 937 files analyzed/)
       assert.doesNotMatch(dom.window.document.querySelector('.vault-scan-detail').textContent, /older\.bin/)
     } finally {
       dom.window.close()
@@ -1276,6 +1474,16 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /Number\(data\.lifetime_bytes_saved\)/)
     assert.match(vaultPage, /Math\.max\(0, sharedNow - freedBytes\)/)
     assert.match(vaultPage, /repair_index:\s*"Repair index"/)
+    assert.match(vaultPage, /repair_required:\s*"The saved index could not be loaded\./)
+    assert.match(vaultPage, /repair_progress:\s*"\{folders\} folders · \{files\} files · \{records\} records checked"/)
+    assert.match(vaultPage, /post\(\{ action:\s*"repair" \}\)/)
+    assert.match(vaultPage, /action:\s*"cancel_repair"/)
+    assert.match(vaultPage, /data-cancel-repair/)
+    assert.match(vaultPage, /state\.data\.repair = progress\.repair/)
+    assert.match(vaultPage, /activeRepairAction\(progress\.repair\)/)
+    assert.match(vaultPage, /activeScan \|\| repairing \|\| repairRequired/)
+    assert.match(vaultPage, /data\.repair\.active \|\| data\.repair\.phase === "queued"/)
+    assert.doesNotMatch(vaultPage, /deduplication records are being verified/)
     assert.match(vaultPage, /<details class='vault-advanced'/)
     assert.doesNotMatch(vaultPage, /id='btn-rebuild'/)
     const refreshBlock = vaultPage.match(/const refresh = async \(forceFull = false\) => \{[\s\S]*?\n\}/)
@@ -1288,8 +1496,8 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /if \(!response\.ok\)/)
     assert.match(vaultPage, /item\.unavailable_reason === "different_disk" \? COPY\.different_disk : COPY\.sharing_unavailable/)
     assert.match(vaultPage, /role='status' aria-live='polite'/)
-    assert.match(vaultPage, /if \(state\.view === "activity"\) return activityItems\(\)/)
-    assert.match(vaultPage, /if \(state\.view === "reclaimable"\) return state\.data\.blobs\.filter/)
+    assert.doesNotMatch(vaultPage, /const activeItems =/)
+    assert.doesNotMatch(vaultPage, /pagedInventory|pagedStatus|legacyStatus/)
     assert.match(vaultPage, /hashTotal - \(scan\.queued \|\| 0\)/)
     assert.doesNotMatch(vaultPage, /item\.saved/)
   })
@@ -1343,7 +1551,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /\.vault-action-state\.show,[\s\S]*?display:\s*flex/)
     assert.match(vaultPage, /pinokio:vault:reviewed-scan/)
     assert.match(vaultPage, /completed \|\| incomplete \|\| \(!state\.scanResult && unreviewed\)/)
-    assert.match(vaultPage, /state\.data\.undo_batches/)
+    assert.match(vaultPage, /item\.activity_type === "batch"/)
     assert.match(vaultPage, /data-undo="\$\{attr\(item\.batch_id\)\}"/)
     assert.match(vaultPage, /data-undo="\$\{attr\(event\.batch_id\)\}"/)
     assert.match(vaultPage, /last_scan && data\.last_scan\.hash_failures/)
@@ -1357,12 +1565,15 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /\.vault-rail \{[\s\S]*?overflow-y:\s*auto[\s\S]*?overscroll-behavior:\s*contain/)
     assert.match(vaultPage, /\.vault-pane \{[\s\S]*?grid-template-rows:\s*auto minmax\(0, 1fr\) auto/)
     assert.doesNotMatch(vaultPage, /vault-pane-head/)
-    assert.match(vaultPage, /const toolbarSummary = \(visibleItems\) =>/)
+    assert.match(vaultPage, /const toolbarSummary = \(\) =>/)
     assert.match(vaultPage, /id="vault-toolbar-summary"/)
     assert.match(vaultPage, /\.vault-table-wrap \{[\s\S]*?overflow:\s*auto[\s\S]*?overscroll-behavior:\s*contain/)
     assert.match(vaultPage, /@media \(pointer:\s*coarse\) \{[\s\S]*?--vault-control-height:\s*44px/)
     assert.match(vaultPage, /aria-expanded=/)
     assert.match(vaultPage, /#vault-locations \{[\s\S]*?flex-direction:\s*column[\s\S]*?justify-content:\s*flex-start[\s\S]*?gap:\s*0/)
+    assert.match(vaultPage, /\.vault-rail-section \{[\s\S]*?padding:\s*12px 0/)
+    assert.match(vaultPage, /\.vault-nav-row \{[\s\S]*?border-radius:\s*0/)
+    assert.match(vaultPage, /\.vault-source-line\.selected \{ background:\s*var\(--vault-selected\); \}/)
     assert.match(vaultPage, /\.vault-source-line\.depth-2 \{ padding-left:\s*24px; \}/)
     assert.match(vaultPage, /vault-source-line depth-\$\{Math\.min\(depth, 2\)\} \$\{pathText \? "has-path" : ""\}/)
   })
@@ -1425,7 +1636,7 @@ describe('vault dashboard backend (phase 4)', () => {
       serverSource.indexOf('this.app.get("/vault"')
     )
     assert.match(infoRoute, /req\.query\.scope_id/)
-    assert.match(infoRoute, /vault\.status\(scopeId\)/)
+    assert.match(infoRoute, /vault\.status\(scopeId,\s*\{/)
     assert.match(infoRoute, /vault\.progressStatus\(scopeId\)/)
   })
 
@@ -1471,19 +1682,26 @@ describe('vault dashboard backend (phase 4)', () => {
             id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
             display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
           }],
-          blobs: [], duplicates: [], excluded: [], events: [], undo_batches: []
+          items: []
         })
       }
     }
     await runVaultScript(dom)
     await new Promise((resolve) => setTimeout(resolve, 25))
 
-    assert.deepStrictEqual(requests, ['/info/dedup?scope_id=app%3AappB'])
+    assert.deepStrictEqual(requests, [
+      '/info/dedup?scope_id=app%3AappB&view=all&location_id=app%3AappB&page=0&page_size=500'
+    ])
     assert.match(dom.window.document.getElementById('btn-scan').textContent, /Scan this app/)
     const candidateSize = dom.window.document.getElementById('vault-candidate-size')
     assert.deepStrictEqual([...candidateSize.options].map((option) => option.textContent),
-      ['1 MB+', '10 MB+', '50 MB+', '100 MB+', '500 MB+', '1 GB+'])
+      ['All files', '1 MB+', '10 MB+', '50 MB+', '100 MB+', '500 MB+', '1 GB+'])
     assert.strictEqual(candidateSize.value, '100000000')
+    candidateSize.value = '0'
+    candidateSize.dispatchEvent(new dom.window.Event('change', { bubbles: true }))
+    assert.strictEqual(dom.window.localStorage.getItem('pinokio:vault:candidate-size'), '0')
+    assert.match(dom.window.document.getElementById('vault-pane-footer').textContent,
+      /All non-empty files appear here/)
     candidateSize.value = '50000000'
     candidateSize.dispatchEvent(new dom.window.Event('change', { bubbles: true }))
     assert.strictEqual(dom.window.localStorage.getItem('pinokio:vault:candidate-size'), '50000000')
@@ -1519,7 +1737,7 @@ describe('vault dashboard backend (phase 4)', () => {
           id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
           display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
         }],
-        blobs: [], duplicates: [], excluded: [], events: [], undo_batches: []
+        items: []
       })
     })
     await runVaultScript(dom)
@@ -1598,8 +1816,7 @@ describe('vault dashboard backend (phase 4)', () => {
           id: 'pinokio', kind: 'pinokio', label: 'Pinokio', root: '/pinokio',
           display_path: '/pinokio', parent_id: null, available: true, shareable: true
         }],
-        blobs: [{ hash: 'c'.repeat(64), size: 2048, orphan: true, nlink: 1, names: [] }],
-        duplicates: [], excluded: [], events: [], undo_batches: []
+        items: [{ hash: 'c'.repeat(64), size: 2048, orphan: true, nlink: 1, names: [] }]
       })
     })
     await runVaultScript(dom)
@@ -1626,9 +1843,11 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(cleanupNotice.textContent, /ready to clean up/)
     assert.match(cleanupNotice.textContent, /1 private link left/)
     dom.window.document.getElementById('btn-review-cleanup').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     assert.strictEqual(dom.window.document.querySelector('[data-view="reclaimable"]').classList.contains('selected'), true)
     assert.strictEqual(cleanupNotice.classList.contains('show'), false)
     dom.window.document.querySelector('[data-view="all"]').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     const viewDescriptions = {
       all: 'Every scanned file and its current deduplication status.',
       duplicates: 'Identical files waiting to be deduplicated or kept separate.',
@@ -1640,17 +1859,20 @@ describe('vault dashboard backend (phase 4)', () => {
     }
     for (const [view, description] of Object.entries(viewDescriptions)) {
       dom.window.document.querySelector(`[data-view="${view}"]`).click()
+      await new Promise((resolve) => setTimeout(resolve, 25))
       const explanation = dom.window.document.querySelector('.vault-toolbar-description')
       assert.strictEqual(explanation.textContent, description)
       assert.strictEqual(explanation.parentElement.id, 'vault-toolbar')
     }
     dom.window.document.querySelector('[data-view="all"]').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     const allDescription = dom.window.document.querySelector('.vault-toolbar-description')
     assert.strictEqual(allDescription.previousElementSibling.classList.contains('vault-display-mode'), true)
     assert.strictEqual(allDescription.nextElementSibling.id, 'vault-toolbar-summary')
     const unusedView = dom.window.document.querySelector('[data-view="reclaimable"]')
     assert.strictEqual(unusedView.querySelector('.vault-nav-name').textContent, 'Unused files')
     unusedView.click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     assert.strictEqual(dom.window.document.getElementById('btn-reclaim-all').textContent, 'Clean up all')
     assert.strictEqual(dom.window.document.querySelector('[data-reclaim]').textContent, 'Clean up')
     assert.match(dom.window.document.getElementById('vault-pane-footer').textContent,
@@ -1684,7 +1906,7 @@ describe('vault dashboard backend (phase 4)', () => {
           id: 'pinokio', kind: 'pinokio', label: 'Pinokio', root: '/pinokio',
           display_path: '/pinokio', parent_id: null, available: true, shareable: true
         }],
-        blobs: [], duplicates: [], excluded: [], events: [], undo_batches: []
+        items: []
       })
     })
     await runVaultScript(dom)
@@ -1760,20 +1982,20 @@ describe('vault dashboard backend (phase 4)', () => {
         id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
         display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
       }],
-      blobs: [],
-      duplicates: [
+      items: [
         {
           path: '/pinokio/api/appB/one.bin', relative_path: 'one.bin',
           source_id: 'app:appB', source_label: 'appB', size: 1024,
-          shareable: true, match: { path: '/pinokio/api/appA/one.bin' }
+          status: 'duplicate', shareable: true,
+          match: { path: '/pinokio/api/appA/one.bin' }
         },
         {
           path: '/pinokio/api/appB/two.bin', relative_path: 'two.bin',
           source_id: 'app:appB', source_label: 'appB', size: 1024,
-          shareable: true, match: { path: '/pinokio/api/appA/two.bin' }
+          status: 'duplicate', shareable: true,
+          match: { path: '/pinokio/api/appA/two.bin' }
         }
-      ],
-      excluded: [], events: [], undo_batches: []
+      ]
     }
     let finishAction
     let holdProgress = false
@@ -1895,7 +2117,7 @@ describe('vault dashboard backend (phase 4)', () => {
             id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
             display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
           }],
-          blobs: [], duplicates: [], excluded: [], events: [], undo_batches: []
+          items: []
         })
       }
     }
@@ -1903,7 +2125,8 @@ describe('vault dashboard backend (phase 4)', () => {
     await new Promise((resolve) => setTimeout(resolve, 25))
 
     const operation = dom.window.document.getElementById('vault-action-state')
-    assert.strictEqual(requests[0], '/info/dedup?scope_id=app%3AappB')
+    assert.strictEqual(requests[0],
+      '/info/dedup?scope_id=app%3AappB&view=all&location_id=app%3AappB&page=0&page_size=500')
     assert.strictEqual(operation.classList.contains('show'), true)
     assert.strictEqual(operation.querySelector('[role="progressbar"]').getAttribute('aria-valuenow'), '1')
     assert.strictEqual(operation.textContent, 'Deduplicating files1 of 2 files')
@@ -1933,18 +2156,19 @@ describe('vault dashboard backend (phase 4)', () => {
         id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
         display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
       }],
-      blobs: [],
-      duplicates: ['one.bin', 'two.bin'].map((name) => ({
+      items: [
+        ...['one.bin', 'two.bin'].map((name) => ({
         path: `/pinokio/api/appB/${name}`, relative_path: name,
         source_id: 'app:appB', source_label: 'appB', size: 1024,
-        shareable: true, match: { path: `/pinokio/api/appA/${name}` }
-      })),
-      excluded: ['kept-one.bin', 'kept-two.bin'].map((name) => ({
-        path: `/pinokio/api/appB/${name}`, relative_path: name,
-        source_id: 'app:appB', source_label: 'appB', size: 1024
-      })),
-      events: [],
-      undo_batches: []
+        status: 'duplicate', shareable: true,
+        match: { path: `/pinokio/api/appA/${name}` }
+        })),
+        ...['kept-one.bin', 'kept-two.bin'].map((name) => ({
+          path: `/pinokio/api/appB/${name}`, relative_path: name,
+          source_id: 'app:appB', source_label: 'appB', size: 1024,
+          status: 'independent'
+        }))
+      ]
     }
     let finishKept
     const keptResponse = new Promise((resolve) => {
@@ -1984,6 +2208,7 @@ describe('vault dashboard backend (phase 4)', () => {
       assert.strictEqual(dom.window.document.querySelector('[data-deduplicate-all]'), null)
       assert.strictEqual(dom.window.document.getElementById('btn-review-metric').classList.contains('primary'), true)
       dom.window.document.querySelector('[data-view="duplicates"]').click()
+      await new Promise((resolve) => setTimeout(resolve, 25))
       let bulk = dom.window.document.querySelector('[data-deduplicate-all="duplicates"]')
       assert.strictEqual(bulk.textContent, 'Deduplicate 2 files')
       assert.strictEqual(bulk.classList.contains('primary'), true)
@@ -2004,9 +2229,11 @@ describe('vault dashboard backend (phase 4)', () => {
       })
 
       dom.window.document.querySelector('[data-view="shared"]').click()
+      await new Promise((resolve) => setTimeout(resolve, 25))
       assert.strictEqual(dom.window.document.querySelector('[data-deduplicate-all]'), null)
       assert.strictEqual(dom.window.document.getElementById('btn-review-metric').classList.contains('primary'), true)
       dom.window.document.querySelector('[data-view="independent"]').click()
+      await new Promise((resolve) => setTimeout(resolve, 25))
       bulk = dom.window.document.querySelector('[data-deduplicate-all="kept-separate"]')
       assert.strictEqual(bulk.textContent, 'Deduplicate 2 files')
       assert.strictEqual(bulk.getAttribute('aria-label'), 'Deduplicate 2 files')
@@ -2043,20 +2270,23 @@ describe('vault dashboard backend (phase 4)', () => {
       url: 'http://localhost/vault/app/appB',
       runScripts: 'dangerously'
     })
-    const blobs = Array.from({ length: 501 }, (_, index) => {
+    const trackedItems = Array.from({ length: 501 }, (_, index) => {
       const name = `tracked-${String(index).padStart(4, '0')}.bin`
+      const location = {
+        path: `/pinokio/api/appB/${name}`,
+        relative_path: name,
+        source_id: 'app:appB',
+        source_label: 'appB',
+        mode: 'link'
+      }
       return {
-        hash: index.toString(16).padStart(64, '0'),
+        path: location.path,
+        relative_path: name,
+        source_id: 'app:appB',
+        source_label: 'appB',
         size: 1024 + index,
-        orphan: false,
-        nlink: 2,
-        names: [{
-          path: `/pinokio/api/appB/${name}`,
-          relative_path: name,
-          source_id: 'app:appB',
-          source_label: 'appB',
-          mode: 'link'
-        }]
+        status: 'tracked',
+        locations: [location]
       }
     })
     const status = {
@@ -2074,19 +2304,16 @@ describe('vault dashboard backend (phase 4)', () => {
         id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
         display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
       }],
-      blobs,
-      duplicates: [{
+      items: [...trackedItems, {
         path: '/pinokio/api/appB/duplicate.bin',
         relative_path: 'duplicate.bin',
         source_id: 'app:appB',
         source_label: 'appB',
         size: 1024,
+        status: 'duplicate',
         shareable: true,
         match: { path: '/pinokio/api/appA/duplicate.bin' }
-      }],
-      excluded: [],
-      events: [],
-      undo_batches: []
+      }]
     }
     dom.window.fetch = async () => ({ ok: true, json: async () => status })
     await runVaultScript(dom)
@@ -2096,6 +2323,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(trackedView.querySelector('.vault-nav-name').textContent, 'No action needed')
     assert.strictEqual(trackedView.querySelector('.vault-nav-count').textContent, '501')
     trackedView.click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
 
     const rows = () => [...dom.window.document.querySelectorAll('.vault-table .vault-file-row')]
     assert.strictEqual(rows().length, 500)
@@ -2105,6 +2333,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.doesNotMatch(dom.window.document.getElementById('vault-table-wrap').textContent, /duplicate\.bin/)
 
     dom.window.document.querySelector('[data-page="next"]').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     assert.strictEqual(rows().length, 1)
     assert.strictEqual(rows()[0].querySelector('.vault-file-name').textContent, 'tracked-0500.bin')
     assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent, '501–501 of 501')
@@ -2146,21 +2375,17 @@ describe('vault dashboard backend (phase 4)', () => {
         id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
         display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
       }],
-      blobs: [],
-      duplicates: [],
-      excluded: [],
-      events,
-      undo_batches: [{
-        batch_id: 'batch-large',
-        files: events.length,
-        bytes: events.reduce((sum, event) => sum + event.bytes_saved, 0),
-        ts: events[0].ts
-      }, {
+      items: events.map((event, index) => Object.assign({}, event, {
+        activity_type: 'event',
+        show_undo: index === 1
+      })).concat({
         batch_id: 'batch-compacted',
         files: 2,
         bytes: 4096,
-        ts: events[events.length - 1].ts - 1
-      }]
+        ts: events[events.length - 1].ts - 1,
+        source_ids: ['app:appB'],
+        activity_type: 'batch'
+      })
     }
     dom.window.fetch = async () => ({ ok: true, json: async () => status })
     await runVaultScript(dom)
@@ -2169,17 +2394,19 @@ describe('vault dashboard backend (phase 4)', () => {
     const activityView = dom.window.document.querySelector('[data-view="activity"]')
     assert.strictEqual(activityView.querySelector('.vault-nav-count').textContent, '502')
     activityView.click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
 
     const rows = () => [...dom.window.document.querySelectorAll('.vault-table.activity .vault-file-row')]
     assert.strictEqual(rows().length, 500)
     assert.strictEqual(dom.window.document.querySelectorAll('[data-undo="batch-large"]').length, 1)
-    assert.strictEqual(dom.window.document.querySelectorAll('[data-undo="batch-compacted"]').length, 1)
+    assert.strictEqual(dom.window.document.querySelectorAll('[data-undo="batch-compacted"]').length, 0)
     assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent, '1–500 of 502')
 
     dom.window.document.querySelector('[data-page="next"]').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     assert.strictEqual(rows().length, 2)
     assert.strictEqual(dom.window.document.querySelectorAll('[data-undo="batch-large"]').length, 0)
-    assert.strictEqual(dom.window.document.querySelectorAll('[data-undo="batch-compacted"]').length, 0)
+    assert.strictEqual(dom.window.document.querySelectorAll('[data-undo="batch-compacted"]').length, 1)
     assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent, '501–502 of 502')
     dom.window.close()
   })
@@ -2221,11 +2448,7 @@ describe('vault dashboard backend (phase 4)', () => {
         id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
         display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
       }],
-      blobs: [],
-      duplicates,
-      excluded: [],
-      events: [],
-      undo_batches: []
+      items: duplicates.map((item) => Object.assign({ status: 'duplicate' }, item))
     }
     dom.window.fetch = async (url, options = {}) => {
       if (options.method === 'POST') {
@@ -2238,6 +2461,7 @@ describe('vault dashboard backend (phase 4)', () => {
     await new Promise((resolve) => setTimeout(resolve, 25))
 
     dom.window.document.querySelector('[data-view="duplicates"]').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     const rows = () => [...dom.window.document.querySelectorAll('.vault-table.matches .vault-file-row')]
     let bulk = dom.window.document.querySelector('[data-deduplicate-all="duplicates"]')
     assert.strictEqual(rows().length, 500)
@@ -2247,6 +2471,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(dom.window.document.querySelector('[data-page="next"]').disabled, false)
 
     dom.window.document.querySelector('[data-page="next"]').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     assert.strictEqual(rows().length, 1)
     assert.strictEqual(rows()[0].querySelector('.vault-file-name').textContent, 'file-0500.bin')
     assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent, '501–501 of 501')
@@ -2266,9 +2491,115 @@ describe('vault dashboard backend (phase 4)', () => {
     const search = dom.window.document.getElementById('vault-search')
     search.value = 'file-0001.bin'
     search.dispatchEvent(new dom.window.Event('input', { bubbles: true }))
+    await new Promise((resolve) => setTimeout(resolve, 300))
     assert.strictEqual(rows().length, 1)
     assert.strictEqual(rows()[0].querySelector('.vault-file-name').textContent, 'file-0001.bin')
     assert.strictEqual(dom.window.document.querySelector('.vault-pagination'), null)
+    dom.window.close()
+  })
+
+  test('server-paged inventories fetch only the selected dashboard page', async () => {
+    const views = path.resolve(__dirname, '..', 'server', 'views')
+    const html = await ejs.renderFile(path.resolve(views, 'vault_app.ejs'), {
+      theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
+    })
+    const dom = new JSDOM(html, {
+      url: 'http://localhost/vault/app/appB',
+      runScripts: 'dangerously'
+    })
+    const requests = []
+    const status = (view = 'all', page = 0) => {
+      const duplicateView = view === 'duplicates'
+      const total = duplicateView ? 200000 : 200100
+      const start = page * 500
+      const count = Math.min(500, Math.max(0, total - start))
+      const items = Array.from({ length: count }, (_, index) => {
+        const number = start + index
+        const name = `${duplicateView ? 'duplicate' : 'file'}-${number}.bin`
+        return {
+          path: `/pinokio/api/appB/${name}`,
+          relative_path: name,
+          source_id: 'app:appB',
+          source_label: 'appB',
+          size: 1024 + number,
+          status: duplicateView ? 'duplicate' : 'tracked',
+          shareable: duplicateView,
+          match: duplicateView ? { path: `/pinokio/api/appA/${name}` } : null
+        }
+      })
+      return {
+        enabled: true,
+        mode: 'link',
+        scan: { active: false, pending: false, queued: 0, phase: 'complete', scope_id: null },
+        last_scan: { ts: 1, bytes_total: 1024 * 200100, hash_failures: 0 },
+        tracked_bytes: 1024 * 200100,
+        effective_bytes: 1024 * 100,
+        shared_bytes: 0,
+        pending_bytes: 1024 * 200000,
+        activity_error: null,
+        cloud_sync_warning: null,
+        sources: [{
+          id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
+          display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
+        }],
+        items,
+        inventory: {
+          view,
+          counts: {
+            all: 200100, duplicates: 200000, shared: 0,
+            tracked: 100, independent: 0, reclaimable: 0, activity: 0
+          },
+          source_counts: {
+            all: { 'app:appB': 200100 },
+            duplicates: { 'app:appB': 200000 },
+            independent: {}
+          },
+          shareable_by_source: { 'app:appB': 200000 },
+          shareable_duplicates: 200000,
+          duplicate_locations: 1,
+          current: {
+            count: total,
+            locations: 1,
+            shareable_bytes: duplicateView ? 1024 * 200000 : 0
+          },
+          page,
+          page_size: 500,
+          start,
+          end: start + count,
+          total,
+          pages: Math.ceil(total / 500)
+        }
+      }
+    }
+    dom.window.fetch = async (url) => {
+      requests.push(String(url))
+      const parsed = new URL(String(url), 'http://localhost')
+      return {
+        ok: true,
+        json: async () => status(
+          parsed.searchParams.get('view') || 'all',
+          Number(parsed.searchParams.get('page')) || 0
+        )
+      }
+    }
+    await runVaultScript(dom)
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    const duplicates = dom.window.document.querySelector('[data-view="duplicates"]')
+    assert.strictEqual(duplicates.querySelector('.vault-nav-count').textContent, '200000')
+    duplicates.click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    assert.match(requests.at(-1), /view=duplicates/)
+    assert.match(requests.at(-1), /page=0/)
+    assert.strictEqual(dom.window.document.querySelectorAll('.vault-table.matches .vault-file-row').length, 500)
+    assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent,
+      '1–500 of 200000')
+
+    dom.window.document.querySelector('[data-page="next"]').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
+    assert.match(requests.at(-1), /page=1/)
+    assert.strictEqual(dom.window.document.querySelector('.vault-page-range').textContent,
+      '501–1000 of 200000')
     dom.window.close()
   })
 
@@ -2302,23 +2633,27 @@ describe('vault dashboard backend (phase 4)', () => {
         id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
         display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
       }],
-      blobs: [{
-        hash: 'a'.repeat(64), size: 1024, orphan: false, nlink: 3,
-        names: [
+      items: [{
+        path: '/pinokio/api/appB/shared.bin',
+        relative_path: 'shared.bin',
+        source_id: 'app:appB',
+        source_label: 'appB',
+        size: 1024,
+        status: 'shared',
+        locations: [
           { path: '/pinokio/api/appB/shared.bin', relative_path: 'shared.bin', source_id: 'app:appB', source_label: 'appB', mode: 'link' },
           { path: '/pinokio/api/appA/shared.bin', relative_path: 'shared.bin', source_id: 'app:appA', source_label: 'appA', mode: 'link' }
         ]
-      }],
-      duplicates: [{
+      }, {
         path: '/pinokio/api/appB/duplicate.bin', relative_path: 'duplicate.bin',
         source_id: 'app:appB', source_label: 'appB', size: 1024,
-        shareable: true, match: { path: '/pinokio/api/appA/duplicate.bin' }
-      }],
-      excluded: [{
+        status: 'duplicate', shareable: true,
+        match: { path: '/pinokio/api/appA/duplicate.bin' }
+      }, {
         path: '/pinokio/api/appB/own.bin', relative_path: 'own.bin',
-        source_id: 'app:appB', source_label: 'appB', size: 1024
-      }],
-      events: [], undo_batches: []
+        source_id: 'app:appB', source_label: 'appB', size: 1024,
+        status: 'independent'
+      }]
     }
     dom.window.fetch = async (url, options = {}) => {
       if (options.method === 'POST') {
@@ -2399,9 +2734,14 @@ describe('vault dashboard backend (phase 4)', () => {
       theme: 'light', platform: 'darwin', agent: 'electron', scope_id: 'app:appB'
     })
     const dom = new JSDOM(html, { url: 'http://localhost/vault/app/appB', runScripts: 'dangerously' })
-    const sharedBlob = (hash, size, name) => ({
-      hash, size, orphan: false, nlink: 3,
-      names: [
+    const sharedItem = (size, name) => ({
+      path: `/pinokio/api/appB/${name}`,
+      relative_path: name,
+      source_id: 'app:appB',
+      source_label: 'appB',
+      size,
+      status: 'shared',
+      locations: [
         { path: `/pinokio/api/appB/${name}`, relative_path: name, source_id: 'app:appB', source_label: 'appB', mode: 'link' },
         { path: `/pinokio/api/appA/${name}`, relative_path: name, source_id: 'app:appA', source_label: 'appA', mode: 'link' }
       ]
@@ -2421,17 +2761,17 @@ describe('vault dashboard backend (phase 4)', () => {
         id: 'app:appB', kind: 'app', label: 'appB', root: '/pinokio/api/appB',
         display_path: '/pinokio/api/appB', parent_id: null, available: true, shareable: true
       }],
-      blobs: [
-        sharedBlob('a'.repeat(64), 1024, 'a-small/a-small.bin'),
-        sharedBlob('b'.repeat(64), 4096, 'z-large/z-large.bin')
-      ],
-      duplicates: [], excluded: [], events: [], undo_batches: []
+      items: [
+        sharedItem(1024, 'a-small/a-small.bin'),
+        sharedItem(4096, 'z-large/z-large.bin')
+      ]
     }
     dom.window.fetch = async () => ({ ok: true, json: async () => status })
     await runVaultScript(dom)
     await new Promise((resolve) => setTimeout(resolve, 25))
 
     dom.window.document.querySelector('[data-view="shared"]').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     const names = () => [...dom.window.document.querySelectorAll('.vault-file-row:not(.directory) .vault-file-name')]
       .map((node) => node.textContent)
     const directories = () => [...dom.window.document.querySelectorAll('.vault-file-row.directory .vault-file-name')]
@@ -2454,6 +2794,7 @@ describe('vault dashboard backend (phase 4)', () => {
       '2 deduplicated files · sorted largest first')
 
     sort().click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     assert.deepStrictEqual(names(), ['a-small.bin', 'z-large.bin'])
     assert.strictEqual(sort().getAttribute('aria-label'), 'Sort by size, largest first')
     assert.strictEqual(sort().parentElement.getAttribute('aria-sort'), 'ascending')
@@ -2461,11 +2802,13 @@ describe('vault dashboard backend (phase 4)', () => {
       '2 deduplicated files · sorted smallest first')
 
     sort().click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     assert.deepStrictEqual(names(), ['z-large.bin', 'a-small.bin'])
     assert.strictEqual(sort().getAttribute('aria-label'), 'Sort by size, smallest first')
     assert.strictEqual(sort().parentElement.getAttribute('aria-sort'), 'descending')
 
     mode('folders').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     assert.strictEqual(mode('folders').getAttribute('aria-pressed'), 'true')
     assert.strictEqual(mode('files').getAttribute('aria-pressed'), 'false')
     assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-columns > span')]
@@ -2474,6 +2817,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(sort(), null)
 
     mode('files').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     assert.deepStrictEqual(names(), ['z-large.bin', 'a-small.bin'])
     assert.strictEqual(sort().parentElement.getAttribute('aria-sort'), 'descending')
     dom.window.close()
@@ -2504,9 +2848,14 @@ describe('vault dashboard backend (phase 4)', () => {
         display_path: '/pinokio/vault/sources/api', target_path: targetRoot,
         parent_id: null, available: true, shareable: true
       }],
-      blobs: [{
-        hash: 'a'.repeat(64), size: 4096, orphan: false, nlink: 3,
-        names: [
+      items: [{
+        path: externalPath,
+        relative_path: relativePath,
+        source_id: 'external:api',
+        source_label: 'api',
+        size: 4096,
+        status: 'shared',
+        locations: [
           {
             path: externalPath, relative_path: relativePath,
             source_id: 'external:api', source_label: 'api', mode: 'link'
@@ -2516,14 +2865,14 @@ describe('vault dashboard backend (phase 4)', () => {
             source_id: 'app:appA', source_label: 'appA', mode: 'link'
           }
         ]
-      }],
-      duplicates: [], excluded: [], events: [], undo_batches: []
+      }]
     }
     dom.window.fetch = async () => ({ ok: true, json: async () => status })
     await runVaultScript(dom)
     await new Promise((resolve) => setTimeout(resolve, 25))
 
     dom.window.document.querySelector('[data-view="shared"]').click()
+    await new Promise((resolve) => setTimeout(resolve, 25))
     assert.strictEqual(
       dom.window.document.querySelector('.vault-flat-location').textContent,
       externalPath

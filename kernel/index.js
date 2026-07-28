@@ -1217,21 +1217,12 @@ class Kernel {
       await this.git.loadCheckpoints()
       console.timeEnd("git.loadCheckpoints")
 
-      // Shared model store: registry verification only at startup — never a
-      // discovery walk (spec/requirements/shared-model-store.md, trigger 5).
+      // Shared model store: startup reads only the enable flag. Registry and
+      // filesystem initialization are deferred until a Vault page or action
+      // calls ensureInitialized().
       this.vault = new Vault(this)
       if (this.homedir) {
-        this.vault.ready = this.vault.init({ existingOnly: true }).then(async (result) => {
-          if (result && result.enabled && this.vault.initialized) {
-            this.vault.verificationPending = true
-            await this.vault.runExclusive(async () => {
-              await this.vault.verify()
-              await this.vault.registry.flush()
-            })
-            this.vault.verificationPending = false
-          }
-          return result
-        }).catch((err) => {
+        this.vault.ready = this.vault.init({ deferStorage: true }).catch((err) => {
           // Keep an enabled Vault retryable after transient registry or
           // filesystem errors. A genuinely disabled Vault already has
           // enabled=false from its environment check.

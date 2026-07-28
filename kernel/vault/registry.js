@@ -5,6 +5,11 @@ const { SHA256_RE } = require('./constants')
 
 const isMissingError = (error) => !!(error && (error.code === "ENOENT" || error.code === "ENOTDIR"))
 const isRecord = (value) => !!(value && typeof value === "object" && !Array.isArray(value))
+const SNAPSHOT_SECTIONS = ["blobs", "links", "scan_index", "duplicates", "excluded"]
+const SNAPSHOT_GENERATION_RE = /^registry-[0-9a-f]{24}$/
+const SNAPSHOT_SHARD_ENTRIES = 10000
+const SNAPSHOT_SHARD_THRESHOLD = 100000
+const SCAN_MARK = Symbol("vault-scan-mark")
 const unsafeRegistryPath = (filePath) => {
   const error = new Error(`Storage index path is not safe: ${filePath}`)
   error.code = "EVAULTPATH"
@@ -39,6 +44,9 @@ class Registry {
     this.compactEvery = 500
     this.maxEventBytesPerEntry = 4096
     this.eventsSinceCompact = 0
+    this.snapshotGeneration = null
+    this.snapshotShardEntries = SNAPSHOT_SHARD_ENTRIES
+    this.snapshotShardThreshold = SNAPSHOT_SHARD_THRESHOLD
   }
   reset() {
     this.blobs = new Map()      // hash -> { size, first_seen, source_urls, verified_at, orphan }
@@ -53,6 +61,38 @@ class Registry {
     this.pathsByIno = new Map() // "dev:ino" -> Set(paths), for bounded group updates
     this.eventsCache = null
     this.eventError = null
+    this.snapshotGeneration = null
+    this.currentScanToken = null
+    this.currentScanAffectedHashes = null
+  }
+  beginScanPresence() {
+    const token = Symbol("vault-scan")
+    this.currentScanToken = token
+    this.currentScanAffectedHashes = new Set()
+    return token
+  }
+  endScanPresence(token) {
+    if (this.currentScanToken === token) {
+      this.currentScanToken = null
+      this.currentScanAffectedHashes = null
+    }
+  }
+  markCurrentScan(entry) {
+    if (entry && this.currentScanToken) entry[SCAN_MARK] = this.currentScanToken
+    return entry
+  }
+  seenInScan(entry, token) {
+    return !!(entry && token && entry[SCAN_MARK] === token)
+  }
+  noteCurrentScanHash(hash) {
+    if (hash && this.currentScanAffectedHashes) {
+      this.currentScanAffectedHashes.add(hash)
+    }
+  }
+  affectedScanHashes(token) {
+    return this.currentScanToken === token && this.currentScanAffectedHashes
+      ? this.currentScanAffectedHashes
+      : new Set()
   }
   async rootDirectory(create = false) {
     let st = await lstatIfPresent(this.root)
@@ -135,6 +175,155 @@ class Registry {
       }
     }
   }
+  sectionMap(section) {
+    if (section === "scan_index") return this.scanIndex
+    return this[section]
+  }
+  async generationDirectory(name, create = false) {
+    if (!SNAPSHOT_GENERATION_RE.test(String(name || ""))) {
+      throw unsafeRegistryPath(String(name || "registry generation"))
+    }
+    const target = path.resolve(this.root, name)
+    if (path.dirname(target) !== path.resolve(this.root)) throw unsafeRegistryPath(target)
+    if (create) {
+      await this.rootDirectory(true)
+      await fs.promises.mkdir(target, { mode: 0o700 })
+    }
+    const st = await lstatIfPresent(target)
+    if (!st || !st.isDirectory()) throw unsafeRegistryPath(target)
+    return { path: target, stat: st }
+  }
+  async writeSnapshotShard(directory, directoryStat, section, index, entries) {
+    const fileName = `${section}-${String(index).padStart(6, "0")}.json`
+    const target = path.resolve(directory, fileName)
+    await this.atomicWrite(target, JSON.stringify(entries))
+    const [currentDirectory, shard] = await Promise.all([
+      lstatIfPresent(directory),
+      lstatIfPresent(target)
+    ])
+    if (!currentDirectory || !currentDirectory.isDirectory() ||
+        currentDirectory.dev !== directoryStat.dev || currentDirectory.ino !== directoryStat.ino ||
+        !shard || !shard.isFile()) {
+      throw unsafeRegistryPath(target)
+    }
+  }
+  async writeShardedSnapshot() {
+    let generation
+    let directory
+    let directoryStat
+    for (let attempt = 0; attempt < 3; attempt++) {
+      generation = `registry-${crypto.randomBytes(12).toString("hex")}`
+      try {
+        const created = await this.generationDirectory(generation, true)
+        directory = created.path
+        directoryStat = created.stat
+        break
+      } catch (error) {
+        if (!error || error.code !== "EEXIST" || attempt === 2) throw error
+      }
+    }
+    if (!directory) throw unsafeRegistryPath(this.root)
+    const shardCounts = {}
+    let committed = false
+    try {
+      for (const section of SNAPSHOT_SECTIONS) {
+        const entries = []
+        let shardIndex = 0
+        for (const entry of this.sectionMap(section)) {
+          entries.push(entry)
+          if (entries.length < this.snapshotShardEntries) continue
+          await this.writeSnapshotShard(
+            directory, directoryStat, section, shardIndex++, entries.splice(0))
+        }
+        if (entries.length) {
+          await this.writeSnapshotShard(
+            directory, directoryStat, section, shardIndex++, entries)
+        }
+        shardCounts[section] = shardIndex
+      }
+      const manifest = {
+        version: 2,
+        generation,
+        shard_entries: this.snapshotShardEntries,
+        shards: shardCounts,
+        last_scan: this.lastScan,
+        source_scans: Object.fromEntries(this.sourceScans),
+        totals: this.totals
+      }
+      await this.atomicWrite(this.snapshotPath, JSON.stringify(manifest))
+      committed = true
+      const previousGeneration = this.snapshotGeneration
+      this.snapshotGeneration = generation
+      if (previousGeneration && previousGeneration !== generation) {
+        await this.removeSnapshotGeneration(previousGeneration).catch(() => {})
+      }
+    } catch (error) {
+      if (!committed) await this.removeSnapshotGeneration(generation).catch(() => {})
+      throw error
+    }
+  }
+  async removeSnapshotGeneration(name) {
+    if (!SNAPSHOT_GENERATION_RE.test(String(name || ""))) return
+    const target = path.resolve(this.root, name)
+    if (path.dirname(target) !== path.resolve(this.root)) return
+    const st = await lstatIfPresent(target)
+    if (!st) return
+    if (!st.isDirectory()) {
+      if (st.isSymbolicLink()) await fs.promises.unlink(target)
+      return
+    }
+    await fs.promises.rm(target, { recursive: true, force: false })
+  }
+  async *snapshotEntries(json, section) {
+    if (json.version !== 2) {
+      for (const entry of Object.entries(json[section] || {})) yield entry
+      return
+    }
+    const generation = json.generation
+    const shards = json.shards
+    const count = shards && shards[section]
+    if (!Number.isSafeInteger(count) || count < 0 || count > 100000) {
+      const error = new Error("Storage index shard manifest is invalid.")
+      error.code = "EVAULTCORRUPT"
+      throw error
+    }
+    let directory
+    let directoryStat
+    try {
+      const generationInfo = await this.generationDirectory(generation, false)
+      directory = generationInfo.path
+      directoryStat = generationInfo.stat
+    } catch (error) {
+      if (error && error.code === "EVAULTPATH") error.code = "EVAULTCORRUPT"
+      throw error
+    }
+    for (let index = 0; index < count; index++) {
+      const target = path.resolve(
+        directory, `${section}-${String(index).padStart(6, "0")}.json`)
+      let parsed
+      try {
+        parsed = JSON.parse(await this.readFile(target))
+      } catch (error) {
+        if (error && (["ENOENT", "ENOTDIR", "EVAULTPATH"].includes(error.code) ||
+            error.name === "SyntaxError")) {
+          error.code = "EVAULTCORRUPT"
+        }
+        throw error
+      }
+      const currentDirectory = await lstatIfPresent(directory)
+      if (!currentDirectory || !currentDirectory.isDirectory() ||
+          currentDirectory.dev !== directoryStat.dev ||
+          currentDirectory.ino !== directoryStat.ino ||
+          !Array.isArray(parsed)) {
+        const error = new Error("Storage index shard is invalid.")
+        error.code = "EVAULTCORRUPT"
+        throw error
+      }
+      for (const entry of parsed) {
+        if (Array.isArray(entry) && entry.length === 2) yield entry
+      }
+    }
+  }
   async appendFile(filePath, contents) {
     await this.rootDirectory(true)
     let before
@@ -199,6 +388,8 @@ class Registry {
     }
     // A path has exactly one derived classification. Registering a physical
     // name always clears an older pending-duplicate classification first.
+    const previousDuplicate = this.duplicates.get(filePath)
+    if (previousDuplicate) this.noteCurrentScanHash(previousDuplicate.hash)
     this.duplicates.delete(filePath)
     const next = Object.assign({ created: Date.now(), mode: "link" }, entry)
     const sameTrackedFile = previous && previous.hash === next.hash &&
@@ -206,7 +397,9 @@ class Registry {
     if (next.batch_id === undefined && sameTrackedFile && previous.batch_id) {
       next.batch_id = previous.batch_id
     }
+    this.markCurrentScan(next)
     this.links.set(filePath, next)
+    this.markCurrentScan(this.scanIndex.get(filePath))
     if (entry.dev !== undefined && entry.ino !== undefined) {
       const key = this.inoKey(entry.dev, entry.ino)
       this.byIno.set(key, entry.hash)
@@ -217,18 +410,22 @@ class Registry {
   }
   setDuplicate(filePath, entry, scanEntry = null) {
     const previous = this.duplicates.get(filePath) || null
+    if (previous && previous.hash !== entry.hash) this.noteCurrentScanHash(previous.hash)
     this.removeLink(filePath)
+    this.markCurrentScan(entry)
     this.duplicates.set(filePath, entry)
-    if (scanEntry) this.scanIndex.set(filePath, scanEntry)
+    if (scanEntry) this.scanIndex.set(filePath, this.markCurrentScan(scanEntry))
     this.schedulePersist()
     return previous
   }
   setScanEntry(filePath, entry) {
-    this.scanIndex.set(filePath, entry)
+    this.scanIndex.set(filePath, this.markCurrentScan(entry))
     this.schedulePersist()
   }
   untrack(filePath) {
     const hadLink = this.links.has(filePath)
+    const duplicate = this.duplicates.get(filePath)
+    if (duplicate) this.noteCurrentScanHash(duplicate.hash)
     const hadDuplicate = this.duplicates.delete(filePath)
     const hadIndex = this.scanIndex.delete(filePath)
     if (hadLink) this.removeLink(filePath)
@@ -248,6 +445,7 @@ class Registry {
   removeLink(filePath) {
     const entry = this.links.get(filePath)
     if (entry) {
+      this.noteCurrentScanHash(entry.hash)
       this.links.delete(filePath)
       this.removeIno(entry.dev, entry.ino, filePath)
       this.schedulePersist()
@@ -302,8 +500,8 @@ class Registry {
     this.pathsByIno = state.pathsByIno
     this.schedulePersist()
   }
-  // Returns { corrupt: true } when the snapshot exists but cannot be parsed,
-  // so the caller can rebuild from disk instead of blocking startup.
+  // Returns { corrupt: true } when the snapshot cannot be parsed so the caller
+  // can require an explicit Repair Index without modifying stored files.
   async load() {
     this.reset()
     let raw
@@ -323,53 +521,59 @@ class Registry {
     if (!isRecord(json)) {
       return { corrupt: true, existed: true }
     }
-    for (const [k, v] of Object.entries(json.blobs || {})) {
-      if (SHA256_RE.test(k) && isRecord(v)) {
-        this.blobs.set(k, Object.assign({}, v, {
-          size: Number.isFinite(v.size) && v.size >= 0 ? v.size : 0,
-          source_urls: Array.isArray(v.source_urls)
-            ? v.source_urls.filter((url) => typeof url === "string")
-            : []
-        }))
+    try {
+      for await (const [k, v] of this.snapshotEntries(json, "blobs")) {
+        if (SHA256_RE.test(k) && isRecord(v)) {
+          this.blobs.set(k, Object.assign({}, v, {
+            size: Number.isFinite(v.size) && v.size >= 0 ? v.size : 0,
+            source_urls: Array.isArray(v.source_urls)
+              ? v.source_urls.filter((url) => typeof url === "string")
+              : []
+          }))
+        }
       }
-    }
-    for (const [k, v] of Object.entries(json.links || {})) {
-      if (!isRecord(v) || !SHA256_RE.test(v.hash) ||
-          !Number.isFinite(v.dev) || !Number.isFinite(v.ino)) continue
-      const link = Object.assign({}, v, { mode: v.mode === "copy" ? "copy" : "link" })
-      this.links.set(k, link)
-      if (link.dev !== undefined && link.ino !== undefined) {
-        const key = this.inoKey(link.dev, link.ino)
-        this.byIno.set(key, link.hash)
-        if (!this.pathsByIno.has(key)) this.pathsByIno.set(key, new Set())
-        this.pathsByIno.get(key).add(k)
+      for await (const [k, v] of this.snapshotEntries(json, "links")) {
+        if (!isRecord(v) || !SHA256_RE.test(v.hash) ||
+            !Number.isFinite(v.dev) || !Number.isFinite(v.ino)) continue
+        const link = Object.assign({}, v, { mode: v.mode === "copy" ? "copy" : "link" })
+        this.links.set(k, link)
+        if (link.dev !== undefined && link.ino !== undefined) {
+          const key = this.inoKey(link.dev, link.ino)
+          this.byIno.set(key, link.hash)
+          if (!this.pathsByIno.has(key)) this.pathsByIno.set(key, new Set())
+          this.pathsByIno.get(key).add(k)
+        }
       }
-    }
-    for (const [k, v] of Object.entries(json.scan_index || {})) {
-      if (isRecord(v) && (!v.hash || SHA256_RE.test(v.hash)) &&
-          [v.size, v.mtime, v.ctime, v.dev, v.ino].every(Number.isFinite)) {
-        this.scanIndex.set(k, v)
+      for await (const [k, v] of this.snapshotEntries(json, "scan_index")) {
+        if (isRecord(v) && (!v.hash || SHA256_RE.test(v.hash)) &&
+            [v.size, v.mtime, v.ctime, v.dev, v.ino].every(Number.isFinite)) {
+          this.scanIndex.set(k, v)
+        }
       }
-    }
-    for (const [k, v] of Object.entries(json.duplicates || {})) {
-      if (isRecord(v) && SHA256_RE.test(v.hash) && !this.links.has(k)) {
-        this.duplicates.set(k, Object.assign({}, v, {
+      for await (const [k, v] of this.snapshotEntries(json, "duplicates")) {
+        if (isRecord(v) && SHA256_RE.test(v.hash) && !this.links.has(k)) {
+          this.duplicates.set(k, Object.assign({}, v, {
+            size: Number.isFinite(v.size) && v.size >= 0 ? v.size : 0
+          }))
+        }
+      }
+      for await (const [k, v] of this.snapshotEntries(json, "excluded")) {
+        if (!isRecord(v)) continue
+        const linked = this.links.get(k)
+        if (linked) {
+          this.links.delete(k)
+          this.removeIno(linked.dev, linked.ino, k)
+        }
+        this.duplicates.delete(k)
+        this.scanIndex.delete(k)
+        this.excluded.set(k, Object.assign({}, v, {
           size: Number.isFinite(v.size) && v.size >= 0 ? v.size : 0
         }))
       }
-    }
-    for (const [k, v] of Object.entries(json.excluded || {})) {
-      if (!isRecord(v)) continue
-      const linked = this.links.get(k)
-      if (linked) {
-        this.links.delete(k)
-        this.removeIno(linked.dev, linked.ino, k)
-      }
-      this.duplicates.delete(k)
-      this.scanIndex.delete(k)
-      this.excluded.set(k, Object.assign({}, v, {
-        size: Number.isFinite(v.size) && v.size >= 0 ? v.size : 0
-      }))
+    } catch (error) {
+      if (!error || error.code !== "EVAULTCORRUPT") throw error
+      this.reset()
+      return { corrupt: true, existed: true }
     }
     if (isRecord(json.last_scan)) {
       this.lastScan = json.last_scan
@@ -380,6 +584,7 @@ class Registry {
     if (json.totals && Number.isFinite(json.totals.lifetime_bytes_saved)) {
       this.totals = { lifetime_bytes_saved: Math.max(0, json.totals.lifetime_bytes_saved) }
     }
+    this.snapshotGeneration = json.version === 2 ? json.generation : null
     return { corrupt: false, existed: true }
   }
   beginBatch() {
@@ -414,7 +619,10 @@ class Registry {
       this.persistTimer = null
     }
     this.persistDirty = false
-    const json = {
+    const entryCount = SNAPSHOT_SECTIONS.reduce(
+      (sum, section) => sum + this.sectionMap(section).size, 0)
+    const useShards = entryCount > this.snapshotShardThreshold
+    const json = useShards ? null : {
       version: 1,
       blobs: Object.fromEntries(this.blobs),
       links: Object.fromEntries(this.links),
@@ -426,7 +634,16 @@ class Registry {
       totals: this.totals
     }
     const write = async () => {
+      if (useShards) {
+        await this.writeShardedSnapshot()
+        return
+      }
       await this.atomicWrite(this.snapshotPath, JSON.stringify(json))
+      const previousGeneration = this.snapshotGeneration
+      this.snapshotGeneration = null
+      if (previousGeneration) {
+        await this.removeSnapshotGeneration(previousGeneration).catch(() => {})
+      }
     }
     const pending = this.flushPromise.then(write, write)
     this.flushPromise = pending.catch(() => {})

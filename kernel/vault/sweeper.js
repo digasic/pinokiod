@@ -3,7 +3,10 @@ const path = require('path')
 const fastq = require('fastq')
 const { walkBatches, statMany } = require('./walker')
 const { fileSnapshot, sameSnapshot, sameContentState } = require('./snapshot')
-const { SHA256_RE, TMP_SUFFIX, DIR_CONCURRENCY, STAT_CONCURRENCY, HASH_QUEUE_LIMIT } = require('./constants')
+const {
+  SHA256_RE, TMP_SUFFIX, DIR_CONCURRENCY, STAT_CONCURRENCY, HASH_QUEUE_LIMIT,
+  MAX_INDEXED_SCAN_FILES, isCandidateFileSize
+} = require('./constants')
 
 const isMissingError = (error) => !!(error && (error.code === "ENOENT" || error.code === "ENOTDIR"))
 const isAccessError = (error) => !!(error && (error.code === "EACCES" || error.code === "EPERM"))
@@ -30,7 +33,7 @@ const readFileNoFollow = async (filePath) => {
 // Manual scan engine (spec/requirements/shared-model-store.md).
 // Scans run ONLY when the user asks — there are no automatic triggers.
 // The walk is generic: every regular file counts toward folder totals, and
-// every file >= the size threshold is a candidate. No name heuristics.
+// every non-empty file meeting the size threshold is a candidate. No name heuristics.
 // A scan never creates a Vault hardlink or replaces a source path. New content
 // is recorded as an independent copy; a managed store name is created only
 // after the user explicitly asks to deduplicate a matching file.
@@ -45,19 +48,25 @@ class Sweeper {
     this.statConcurrency = vault.statConcurrency || STAT_CONCURRENCY
     this.dirConcurrency = vault.dirConcurrency || DIR_CONCURRENCY
     this.hashQueueLimit = vault.hashQueueLimit || HASH_QUEUE_LIMIT
+    this.maxIndexedScanFiles = vault.maxIndexedScanFiles || MAX_INDEXED_SCAN_FILES
     this.hashCapacityWaiters = []
     this.metadataBaseCache = new Map()
     this.hashJobsByIno = new Map()
     this.completedHashesByIno = new Map()
+    this.deferredSingletons = new Map()
+    this.deferSingletons = false
+    this.foundEventsRecorded = 0
     this.inaccessiblePaths = new Set()
   }
   idleState() {
     return {
       active: false, phase: "idle", dirs: 0, files: 0, bytes_total: 0,
       counted_dirs: 0, counted_files: 0, total_files: null,
-      home_bytes_total: 0, source_bytes: {}, source_files: {}, source_hash_failures: {}, scope_id: null,
+      home_bytes_total: 0, source_bytes: {}, source_files: {}, source_hash_failures: {},
+      source_unindexed_unique_files: {}, scope_id: null,
       candidates: 0, hashed: 0, hash_total: 0, hash_bytes: 0, queued: 0,
       inode_reuses: 0, unstable_hashes: 0, hash_failures: 0,
+      unindexed_unique_files: 0,
       inaccessible: 0, inaccessible_paths: [],
       started: null, duration_ms: null,
       count_duration_ms: null, walk_duration_ms: null, hash_wait_duration_ms: null,
@@ -74,19 +83,28 @@ class Sweeper {
     this.metadataBaseCache.clear()
     this.hashJobsByIno.clear()
     this.completedHashesByIno.clear()
+    this.deferredSingletons.clear()
+    this.deferSingletons = false
+    this.foundEventsRecorded = 0
     this.inaccessiblePaths.clear()
     this.vault.registry.beginBatch()
+    const scanToken = this.vault.registry.beginScanPresence()
     let completed = false
     let incomplete = false
     try {
       await this.vault.refreshSources()
-      if (!scopeId) this.vault.reconcileConfiguredSources()
       const scanRoots = this.vault.scanRoots(scopeId)
       if (!scanRoots.length) throw new Error("That scan location is no longer available.")
       const countStarted = Date.now()
       for (const source of scanRoots) await this.countFiles(source.root)
       this.state.count_duration_ms = Date.now() - countStarted
       this.state.total_files = this.state.counted_files
+      // An "All files" scan can cover millions of paths.
+      // Keep duplicate and managed groups, but hold a single occurrence only
+      // in this temporary map so unique files do not multiply across the
+      // blobs, links, and scan-index registries.
+      this.deferSingletons = this.vault.sizeThreshold === 0 &&
+        this.state.counted_files > this.maxIndexedScanFiles
       this.state.phase = "discovering"
       const walkStarted = Date.now()
       for (const source of scanRoots) {
@@ -100,6 +118,20 @@ class Sweeper {
       const hashWaitStarted = Date.now()
       await this.settle()
       this.state.hash_wait_duration_ms = Date.now() - hashWaitStarted
+      this.state.unindexed_unique_files = this.deferredSingletons.size
+      for (const deferred of this.deferredSingletons.values()) {
+        const source = this.vault.sourceForPath(deferred.filePath, deferred.preferredSourceId)
+        const sourceId = source ? source.id : (deferred.preferredSourceId || "pinokio")
+        this.state.source_unindexed_unique_files[sourceId] =
+          (this.state.source_unindexed_unique_files[sourceId] || 0) + 1
+      }
+      // Release scan-only path and inode indexes before the final registry
+      // reconciliation and snapshot allocate their own working state.
+      this.metadataBaseCache.clear()
+      this.hashJobsByIno.clear()
+      this.completedHashesByIno.clear()
+      this.deferredSingletons.clear()
+      this.deferSingletons = false
       const scanMeta = {
         dirs: this.state.dirs,
         files: this.state.files,
@@ -108,6 +140,8 @@ class Sweeper {
         source_bytes: Object.assign({}, this.state.source_bytes),
         source_files: Object.assign({}, this.state.source_files),
         source_hash_failures: Object.assign({}, this.state.source_hash_failures),
+        source_unindexed_unique_files: Object.assign(
+          {}, this.state.source_unindexed_unique_files),
         candidates: this.state.candidates,
         hashed: this.state.hashed,
         hash_total: this.state.hash_total,
@@ -115,23 +149,17 @@ class Sweeper {
         inode_reuses: this.state.inode_reuses,
         unstable_hashes: this.state.unstable_hashes,
         hash_failures: this.state.hash_failures,
+        unindexed_unique_files: this.state.unindexed_unique_files,
         count_duration_ms: this.state.count_duration_ms,
         walk_duration_ms: this.state.walk_duration_ms,
         hash_wait_duration_ms: this.state.hash_wait_duration_ms,
         hash_duration_ms: this.state.hash_duration_ms
       }
-      // Refresh dead-name and orphan state from filesystem identity after
-      // every completed discovery pass, as required by the Vault contract.
-      this.state.phase = "verifying"
-      await this.vault.verify({
-        includePath: scopeId
-          ? (filePath) => isPathWithin(scanRoots[0].root, filePath)
-          : undefined,
-        reconcile: !scopeId,
-        verifyBlobs: !scopeId,
-        preservePath: (filePath) => this.isInaccessible(filePath),
-        onAccessError: (error, filePath) => this.recordInaccessible(error, filePath),
-        repairStores: false
+      // The scan already validated every file it visited. Reconcile stale
+      // records from those observations without a second filesystem pass.
+      this.state.phase = "reconciling"
+      await this.reconcileScannedRecords(scanRoots, scanToken, {
+        reconcileSources: !scopeId
       })
       this.state.duration_ms = Date.now() - this.state.started
       incomplete = this.state.inaccessible > 0
@@ -151,6 +179,8 @@ class Sweeper {
               walk_duration_ms: scanMeta.walk_duration_ms,
               hash_wait_duration_ms: scanMeta.hash_wait_duration_ms,
               files: scanMeta.source_files[sourceId] || 0,
+              unindexed_unique_files:
+                scanMeta.source_unindexed_unique_files[sourceId] || 0,
               bytes_total: bytes,
               home_bytes_total: 0,
               hash_failures: scanMeta.source_hash_failures[sourceId] || 0,
@@ -169,8 +199,12 @@ class Sweeper {
       // state alive when the next manual scan starts.
       await this.settle().catch(() => {})
       await this.vault.registry.eventPromise
+      this.metadataBaseCache.clear()
       this.hashJobsByIno.clear()
       this.completedHashesByIno.clear()
+      this.deferredSingletons.clear()
+      this.deferSingletons = false
+      this.vault.registry.endScanPresence(scanToken)
       this.state.active = false
       this.state.phase = completed ? (incomplete ? "incomplete" : "complete") : "failed"
       await this.vault.registry.endBatch({ flush: true })
@@ -195,7 +229,11 @@ class Sweeper {
     return true
   }
   isInaccessible(filePath) {
-    return [...this.inaccessiblePaths].some((target) => isPathWithin(target, filePath))
+    if (!this.inaccessiblePaths.size) return false
+    for (const target of this.inaccessiblePaths) {
+      if (isPathWithin(target, filePath)) return true
+    }
+    return false
   }
   async countFiles(root) {
     const vaultRoot = this.vault.root
@@ -212,6 +250,106 @@ class Sweeper {
   }
   async settle() {
     await this.hashQueue.drained()
+  }
+  async reconcileScannedRecords(scanRoots, scanToken, options = {}) {
+    const registry = this.vault.registry
+    const included = (filePath) => scanRoots.some((source) =>
+      isPathWithin(source.root, filePath))
+    const stale = (filePath, entry) => {
+      if (options.reconcileSources &&
+          !this.vault.sourceForPath(filePath, entry && entry.source_id)) return true
+      return included(filePath) && !this.isInaccessible(filePath) &&
+        !registry.seenInScan(entry, scanToken)
+    }
+    let checked = 0
+    const checkpoint = () => {
+      checked += 1
+      return checked % 10000 === 0
+        ? new Promise((resolve) => setImmediate(resolve))
+        : null
+    }
+    // Remove stale scan-index entries first because untracking one also clears
+    // its derived link/duplicate classification.
+    for (const [filePath, entry] of registry.scanIndex) {
+      if (stale(filePath, entry)) registry.untrack(filePath)
+      const pause = checkpoint()
+      if (pause) await pause
+    }
+    const linkedHashes = new Set()
+    for (const [filePath, entry] of registry.links) {
+      if (stale(filePath, entry)) {
+        registry.untrack(filePath)
+      } else {
+        linkedHashes.add(entry.hash)
+      }
+      const pause = checkpoint()
+      if (pause) await pause
+    }
+    const duplicateCounts = new Map()
+    const currentDuplicates = new Map()
+    for (const [filePath, entry] of registry.duplicates) {
+      if (stale(filePath, entry)) {
+        registry.untrack(filePath)
+      } else {
+        duplicateCounts.set(entry.hash, (duplicateCounts.get(entry.hash) || 0) + 1)
+        if (included(filePath) && registry.seenInScan(entry, scanToken) &&
+            !currentDuplicates.has(entry.hash)) {
+          currentDuplicates.set(entry.hash, [filePath, entry])
+        }
+      }
+      const pause = checkpoint()
+      if (pause) await pause
+    }
+
+    const storeStats = new Map()
+    const storeStat = async (hash) => {
+      if (!storeStats.has(hash)) {
+        storeStats.set(hash, await this.vault.storeStatIfPresent(
+          this.vault.storePathFor(hash)
+        ))
+      }
+      return storeStats.get(hash)
+    }
+    // A scan can encounter a persisted content group whose store anchor is
+    // gone and whose remaining names are all pending. Promote one name using
+    // the snapshot just captured by this scan; no second path stat is needed.
+    for (const [hash, [filePath, entry]] of currentDuplicates) {
+      if (linkedHashes.has(hash) || !registry.blobs.has(hash) || await storeStat(hash)) continue
+      const snapshot = registry.scanIndex.get(filePath)
+      if (!snapshot || snapshot.hash !== hash) continue
+      registry.addLink(filePath, {
+        hash,
+        app: entry.app || null,
+        source_id: entry.source_id || null,
+        dev: snapshot.dev,
+        ino: snapshot.ino,
+        mode: "copy"
+      })
+      linkedHashes.add(hash)
+      duplicateCounts.set(hash, Math.max(0, (duplicateCounts.get(hash) || 0) - 1))
+    }
+
+    // Refresh only content groups whose names changed during this scan. This
+    // replaces the old full-vault verification pass with bounded store checks
+    // tied directly to observed mutations.
+    const affectedHashes = registry.affectedScanHashes(scanToken)
+    for (const hash of currentDuplicates.keys()) affectedHashes.add(hash)
+    for (const hash of affectedHashes) {
+      const blob = registry.blobs.get(hash)
+      if (!blob) continue
+      if (linkedHashes.has(hash)) {
+        blob.orphan = false
+        continue
+      }
+      const st = await storeStat(hash)
+      if (st && st.isFile()) {
+        blob.orphan = st.nlink === 1
+        blob.verified_at = Date.now()
+      } else if (!(duplicateCounts.get(hash) > 0)) {
+        registry.removeBlob(hash)
+      }
+    }
+    registry.schedulePersist()
   }
   async walk(root, preferredSourceId = null) {
     const vaultRoot = this.vault.root
@@ -283,7 +421,7 @@ class Sweeper {
       registry.untrack(filePath)
       return
     }
-    if (st.size < this.vault.sizeThreshold) {
+    if (!isCandidateFileSize(st.size, this.vault.sizeThreshold)) {
       await this.untrackBelowThreshold(filePath, st, { app: appName, source_id: sourceId })
       return
     }
@@ -464,7 +602,7 @@ class Sweeper {
   // Hash known: record the first physical copy without adding a filesystem
   // name. Other byte-identical inodes are pending until the user approves
   // deduplication.
-  async classify(filePath, st, hash, preferredSourceId = null) {
+  async classify(filePath, st, hash, preferredSourceId = null, force = false) {
     const registry = this.vault.registry
     try {
       const current = await fs.promises.lstat(filePath)
@@ -499,7 +637,10 @@ class Sweeper {
       }
       if (removedStaleStore) this.invalidateLinkedInode(priorHash, st.dev, st.ino)
       else registry.untrack(filePath)
-      this.vault.recordEvent({ kind: "diverged", hash: priorHash, path: filePath, app: appName, source_id: sourceId, size: st.size })
+      await this.vault.recordEvent({
+        kind: "diverged", hash: priorHash, path: filePath,
+        app: appName, source_id: sourceId, size: st.size
+      })
       if (removedStaleStore) {
         // Removing the stale store name changes ctime on this inode. Refresh
         // the trusted snapshot before classification, but reject any content change.
@@ -520,6 +661,42 @@ class Sweeper {
       if (!isMissingError(error)) throw error
     }
     const registered = registry.links.get(filePath)
+    if (this.deferSingletons && !force && !storeStat && !registry.blobs.has(hash) && !registered) {
+      const first = this.deferredSingletons.get(hash)
+      if (!first) {
+        this.deferredSingletons.set(hash, {
+          filePath,
+          expected: fileSnapshot(st),
+          preferredSourceId
+        })
+        return
+      }
+      this.deferredSingletons.delete(hash)
+      let firstStat = null
+      try {
+        firstStat = await fs.promises.lstat(first.filePath)
+      } catch (error) {
+        if (!isMissingError(error)) throw error
+      }
+      if (!firstStat || !firstStat.isFile() || !sameContentState(first.expected, firstStat)) {
+        this.deferredSingletons.set(hash, {
+          filePath,
+          expected: fileSnapshot(st),
+          preferredSourceId
+        })
+        return
+      }
+      await this.classify(first.filePath, firstStat, hash, first.preferredSourceId, true)
+      if (!registry.blobs.has(hash)) {
+        this.deferredSingletons.set(hash, {
+          filePath,
+          expected: fileSnapshot(st),
+          preferredSourceId
+        })
+        return
+      }
+      return this.classify(filePath, st, hash, preferredSourceId, true)
+    }
     if (registered && registered.mode === "copy" &&
         registered.hash === hash && registered.dev === st.dev && registered.ino === st.ino) {
       registry.addLink(filePath, {
@@ -559,7 +736,13 @@ class Sweeper {
       dev: st.dev, ino: st.ino, mtime: st.mtimeMs, ctime: st.ctimeMs
     }, scanEntry)
     if (!previous || previous.hash !== hash) {
-      this.vault.recordEvent({ kind: "found", hash, path: filePath, app: appName, source_id: sourceId, size: st.size })
+      if (this.foundEventsRecorded < registry.maxEvents) {
+        this.foundEventsRecorded += 1
+        await this.vault.recordEvent({
+          kind: "found", hash, path: filePath, app: appName,
+          source_id: sourceId, size: st.size
+        })
+      }
     }
   }
   updateScanIndex(filePath, st, hash, sourceId = null) {
@@ -590,7 +773,7 @@ class Sweeper {
       this.state.source_bytes[sourceKey] = (this.state.source_bytes[sourceKey] || 0) + st.size
       if (!preferredSourceId) this.state.home_bytes_total += st.size
       if (!SHA256_RE.test(name)) continue
-      if (st.size < this.vault.sizeThreshold) {
+      if (!isCandidateFileSize(st.size, this.vault.sizeThreshold)) {
         await this.untrackBelowThreshold(full, st, { app: appName, source_id: sourceId })
         continue
       }

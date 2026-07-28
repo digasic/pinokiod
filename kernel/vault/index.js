@@ -8,19 +8,18 @@ const { walkBatches, statMany } = require('./walker')
 const { fileSnapshot, sameSnapshot, sameContentState } = require('./snapshot')
 const {
   SIZE_THRESHOLD, CANDIDATE_SIZE_OPTIONS, TMP_SUFFIX, SHA256_RE,
-  DIR_CONCURRENCY, STAT_CONCURRENCY, HASH_INACTIVITY_MS
+  DIR_CONCURRENCY, STAT_CONCURRENCY, HASH_INACTIVITY_MS, isCandidateFileSize
 } = require('./constants')
 
 // Shared model store engine (spec/requirements/shared-model-store.md).
 // Store + registry + volume probe + hashing + adopt/convert/verify, plus the
 // user-facing operations behind the vault dashboard (detach, undo, reclaim).
-// Nothing here runs automatically except startup verify; discovery happens
-// only through the user's manual scan.
+// Startup restores persisted state only. Discovery happens through a manual
+// scan, while full filesystem/index reconstruction is an explicit repair.
 
 const NO_LINK_CODES = new Set(["EXDEV", "ENOTSUP", "ENOSYS"])
 const LOCK_CODES = new Set(["EBUSY", "EPERM", "EACCES"])
 const isMissingError = (error) => !!(error && (error.code === "ENOENT" || error.code === "ENOTDIR"))
-const isAccessError = (error) => !!(error && (error.code === "EACCES" || error.code === "EPERM"))
 const lstatIfPresent = async (filePath) => {
   try {
     return await fs.promises.lstat(filePath)
@@ -70,6 +69,89 @@ const sameFileMetadata = (left, right) => {
 }
 
 const sourceId = (kind, name) => `${kind}:${encodeURIComponent(name)}`
+const STATUS_PAGE_SIZE = 500
+const STATUS_VIEWS = new Set([
+  "all", "duplicates", "shared", "tracked", "independent", "reclaimable", "activity"
+])
+const STATUS_FILTERS = new Set(["all", "duplicate", "shared", "tracked", "independent"])
+const REPAIR_DIR_CONCURRENCY = 1
+const REPAIR_STAT_CONCURRENCY = 4
+const REPAIR_YIELD_EVERY = 64
+const REPAIR_YIELD_MS = 5
+const boundedInteger = (value, fallback, minimum, maximum) => {
+  const parsed = Number(value)
+  if (!Number.isSafeInteger(parsed)) return fallback
+  return Math.max(minimum, Math.min(maximum, parsed))
+}
+const repairCancelledError = () => {
+  const error = new Error("Index repair was cancelled.")
+  error.code = "EVAULTCANCELLED"
+  return error
+}
+
+class BoundedPage {
+  constructor(page, pageSize, compare) {
+    this.page = page
+    this.pageSize = pageSize
+    this.keep = Math.max(pageSize, (page + 1) * pageSize)
+    this.compare = compare
+    this.items = []
+    this.tail = []
+    this.total = 0
+  }
+  add(item) {
+    if (!this.compare) {
+      if (this.total >= this.page * this.pageSize &&
+          this.total < (this.page + 1) * this.pageSize) {
+        this.items.push(item)
+      }
+      if (this.tail.length < this.pageSize) this.tail.push(item)
+      else this.tail[this.total % this.pageSize] = item
+      this.total += 1
+      return
+    }
+    this.total += 1
+    this.items.push(item)
+    if (this.items.length >= this.keep * 2) {
+      this.items.sort(this.compare)
+      this.items.length = this.keep
+    }
+  }
+  result() {
+    if (!this.compare) {
+      const pages = Math.max(1, Math.ceil(this.total / this.pageSize))
+      const page = Math.min(this.page, pages - 1)
+      const start = page * this.pageSize
+      const tailStart = this.total < this.pageSize ? 0 : this.total % this.pageSize
+      const tail = tailStart
+        ? this.tail.slice(tailStart).concat(this.tail.slice(0, tailStart))
+        : this.tail
+      return {
+        items: page === this.page ? this.items : tail,
+        page,
+        page_size: this.pageSize,
+        start,
+        end: Math.min(start + this.pageSize, this.total),
+        total: this.total,
+        pages
+      }
+    }
+    this.items.sort(this.compare)
+    if (this.items.length > this.keep) this.items.length = this.keep
+    const pages = Math.max(1, Math.ceil(this.total / this.pageSize))
+    const page = Math.min(this.page, pages - 1)
+    const start = page * this.pageSize
+    return {
+      items: this.items.slice(start, start + this.pageSize),
+      page,
+      page_size: this.pageSize,
+      start,
+      end: Math.min(start + this.pageSize, this.total),
+      total: this.total,
+      pages
+    }
+  }
+}
 
 class Vault {
   constructor(kernel) {
@@ -92,10 +174,16 @@ class Vault {
     this._sourceBases = new Map()
     this.operationTail = Promise.resolve()
     this.initializationPromise = null
-    this.verificationPending = false
     this.scanError = null
     this.scanScopeId = null
     this.fileActionProgress = null
+    this.repairPromise = null
+    this.repairRequired = false
+    this.repairDirConcurrency = REPAIR_DIR_CONCURRENCY
+    this.repairStatConcurrency = REPAIR_STAT_CONCURRENCY
+    this.repairYieldEvery = REPAIR_YIELD_EVERY
+    this.repairYieldMs = REPAIR_YIELD_MS
+    this.repairState = this.idleRepairState()
   }
   get root() {
     return path.resolve(this.kernel.homedir, "vault")
@@ -208,9 +296,118 @@ class Vault {
       if (this.fileActionProgress === progress) this.fileActionProgress = null
     }
   }
+  idleRepairState() {
+    return {
+      active: false,
+      phase: "idle",
+      roots_total: 0,
+      roots_completed: 0,
+      directories_checked: 0,
+      files_checked: 0,
+      records_checked: 0,
+      current_location: null,
+      cancel_requested: false,
+      started: null,
+      duration_ms: null,
+      error: null,
+      persistence_warning: false
+    }
+  }
+  repairCheckpoint(progress, updates = {}) {
+    if (!progress) return
+    if (updates.phase) progress.phase = updates.phase
+    if (updates.current_location !== undefined) {
+      progress.current_location = updates.current_location
+    }
+    for (const key of ["roots_completed", "directories_checked", "files_checked", "records_checked"]) {
+      if (updates[key]) progress[key] += updates[key]
+    }
+    if (progress.cancel_requested) throw repairCancelledError()
+    progress.work_since_yield = (progress.work_since_yield || 0) +
+      Math.max(1, Number(updates.work) || 1)
+    if (progress.work_since_yield < this.repairYieldEvery) return
+    progress.work_since_yield = 0
+    return new Promise((resolve) => setTimeout(resolve, this.repairYieldMs))
+      .then(() => {
+        if (progress.cancel_requested) throw repairCancelledError()
+      })
+  }
+  startRepair() {
+    if (!this.enabled || !this.registry) return { started: false, disabled: true }
+    if (this.scanPromise || (this.sweeper && this.sweeper.state.active)) {
+      return { started: false, error: "Wait for the current scan to finish before repairing the index." }
+    }
+    if (this.fileActionProgress) {
+      return { started: false, error: "Wait for the current file action to finish before repairing the index." }
+    }
+    if (this.repairPromise) return { started: false, already_running: true }
+    const progress = Object.assign(this.idleRepairState(), {
+      kind: "repair",
+      active: false,
+      phase: "queued",
+      roots_total: this.scanRoots().length,
+      started: Date.now()
+    })
+    this.repairState = progress
+    this.repairPromise = this.runExclusive(async () => {
+      progress.active = true
+      progress.phase = "vault"
+      try {
+        if (progress.cancel_requested) throw repairCancelledError()
+        await this.rebuild(undefined, {
+          flush: false,
+          progress
+        })
+        if (progress.cancel_requested) throw repairCancelledError()
+        try {
+          await this.registry.flush()
+        } catch (error) {
+          progress.persistence_warning = true
+        }
+        this.repairRequired = false
+        progress.phase = "complete"
+      } catch (error) {
+        if (error && error.code === "EVAULTCANCELLED") {
+          progress.phase = "cancelled"
+        } else {
+          progress.phase = "failed"
+          progress.error = error && error.message ? error.message : String(error)
+        }
+      } finally {
+        progress.active = false
+        progress.current_location = null
+        progress.duration_ms = Date.now() - progress.started
+        delete progress.work_since_yield
+      }
+    }).finally(() => {
+      this.repairPromise = null
+    })
+    this.repairPromise.catch(() => {})
+    return {
+      started: true,
+      repair: this.repairStatus()
+    }
+  }
+  cancelRepair() {
+    if (!this.repairPromise) {
+      return { cancel_requested: false, active: false }
+    }
+    this.repairState.cancel_requested = true
+    return {
+      cancel_requested: true,
+      active: !!this.repairState.active,
+      queued: !this.repairState.active
+    }
+  }
   startScan(scopeId = null, sizeThreshold = this.sizeThreshold) {
     if (!this.enabled || !this.sweeper) return { started: false, disabled: true }
+    if (this.repairRequired) {
+      return { started: false, error: "Repair Index is required before scanning." }
+    }
     if (this.scanPromise) return { started: false, already_running: true }
+    if (this.repairPromise) {
+      return { started: false, error: "Wait for the index repair to finish before scanning." }
+    }
     this.sizeThreshold = sizeThreshold
     this.scanError = null
     this.scanScopeId = scopeId
@@ -229,6 +426,10 @@ class Vault {
   async perform(action, payload = {}) {
     if (!this.enabled) return { error: "Save space is disabled." }
     await this.ensureInitialized()
+    if (this.repairRequired &&
+        action !== "repair" && action !== "cancel_repair") {
+      return { error: "Repair Index is required before using Save space." }
+    }
     switch (action) {
       case "add_source": {
         const result = await this.runExclusive(() => this.addExternalSource(payload.path))
@@ -303,14 +504,9 @@ class Vault {
       case "reclaim_all":
         return this.runMutation(() => this.reclaimAll())
       case "repair":
-      case "rebuild":
-        if (this.scanPromise || (this.sweeper && this.sweeper.state.active)) {
-          return { error: "Wait for the current scan to finish before repairing the index." }
-        }
-        return this.runMutation(async () => {
-          await this.rebuild(undefined, { flush: false })
-          return { done: true }
-        })
+        return this.startRepair()
+      case "cancel_repair":
+        return this.cancelRepair()
       case "undo":
         return this.runMutation(() => this.undoBatch(payload.batch_id))
       case "detach":
@@ -589,83 +785,37 @@ class Vault {
   async init(options = {}) {
     this.enabled = await this.isEnabled()
     if (!this.enabled) return { enabled: false }
-    if (options.existingOnly) {
-      try {
-        await fs.promises.stat(this.root)
-      } catch (error) {
-        if (error && error.code === "ENOENT") return { enabled: true, fresh: true }
-        throw error
-      }
-    }
+    if (options.deferStorage) return { enabled: true }
     return this.initializeStorage()
   }
   async initializeStorage() {
     if (this.initialized) return { enabled: true, mode: this.mode }
+    const existingBlobRoot = await this.directoryIfSafe(this.blobRoot)
     await this.ensureDirectory(this.root)
     await this.ensureDirectory(this.blobRoot)
     this.registry = new Registry(this.root)
     this.mode = await this.probe(this.root)
     await this.refreshSources()
     const loaded = await this.registry.load()
-    const missingWithBlobs = !loaded.existed && await this.hasStoredBlobs()
-    if (loaded.corrupt || missingWithBlobs) {
-      await this.rebuild(undefined, { preserveState: false })
-    }
+    const missingExistingRegistry = !loaded.existed && !!existingBlobRoot
+    this.repairRequired = !!(loaded.corrupt || missingExistingRegistry)
     this.sweeper = new Sweeper(this)
     this.initialized = true
     return {
       enabled: true,
-      mode: this.mode,
-      corrupt_recovered: !!loaded.corrupt,
-      missing_recovered: missingWithBlobs
+      mode: this.mode
     }
   }
   async ensureInitialized() {
     if (!this.enabled) return { enabled: false }
-    if (this.initialized && !this.verificationPending) return { enabled: true, mode: this.mode }
+    if (this.initialized) return { enabled: true, mode: this.mode }
     if (!this.initializationPromise) {
-      this.initializationPromise = (async () => {
-        const result = this.initialized
-          ? { enabled: true, mode: this.mode }
-          : await this.initializeStorage()
-        await this.runExclusive(async () => {
-          await this.verify()
-          await this.registry.flush()
+      this.initializationPromise = this.initializeStorage()
+        .finally(() => {
+          this.initializationPromise = null
         })
-        this.verificationPending = false
-        return result
-      })().catch((error) => {
-        if (this.initialized) this.verificationPending = true
-        throw error
-      }).finally(() => {
-        this.initializationPromise = null
-      })
     }
     return this.initializationPromise
-  }
-  async hasStoredBlobs() {
-    let shards = []
-    try {
-      shards = await fs.promises.readdir(this.blobRoot, { withFileTypes: true })
-    } catch (error) {
-      if (isMissingError(error)) return false
-      throw error
-    }
-    for (const shard of shards) {
-      if (!shard.isDirectory() || !/^[0-9a-f]{2}$/.test(shard.name)) continue
-      const shardPath = path.resolve(this.blobRoot, shard.name)
-      const shardStat = await this.directoryIfSafe(shardPath)
-      if (!shardStat) continue
-      let names = []
-      try {
-        names = await fs.promises.readdir(shardPath)
-      } catch (error) {
-        if (isMissingError(error)) continue
-        throw error
-      }
-      if (names.some((name) => SHA256_RE.test(name) && name.startsWith(shard.name))) return true
-    }
-    return false
   }
   // Capability probe: temp file + node:fs.link + nlink check. Once per volume.
   async probe(dir) {
@@ -1363,194 +1513,6 @@ class Vault {
       ? { status: "reclaimed", bytes_freed: st.size, remove_hash: true }
       : { status: "reclaimed", bytes_freed: st.size }
   }
-  // Startup registry verification (trigger 5): bounded by registry size,
-  // never a discovery walk. Prunes dead links, flags orphans, removes stray
-  // conversion tmp files, re-adopts blobs whose store name was deleted.
-  async verify(options = {}) {
-    if (!this.enabled || !this.registry) return
-    const preservePath = options.preservePath || (() => false)
-    const includePath = options.includePath || (() => true)
-    const handleAccessError = (error, filePath) => !!(
-      isAccessError(error) && options.onAccessError && options.onAccessError(error, filePath)
-    )
-    if (options.reconcile !== false) this.reconcileConfiguredSources()
-    for (const [linkPath, entry] of [...this.registry.links]) {
-      if (!includePath(linkPath)) continue
-      if (preservePath(linkPath)) continue
-      try {
-        const source = this.sourceForPath(linkPath, entry.source_id)
-        const managedPath = source && await this.canonicalPathIsWithinSource(linkPath, source, { strictErrors: true })
-        if (!managedPath) {
-          this.registry.untrack(linkPath)
-          continue
-        }
-        const st = await lstatIfPresent(linkPath)
-        if (!st || !st.isFile() || st.ino !== entry.ino || st.dev !== entry.dev) {
-          this.registry.untrack(linkPath)
-        }
-      } catch (error) {
-        if (!handleAccessError(error, linkPath)) throw error
-      }
-    }
-    for (const [dupPath, entry] of [...this.registry.duplicates]) {
-      if (!includePath(dupPath)) continue
-      if (preservePath(dupPath)) continue
-      let valid = false
-      try {
-        const source = this.sourceForPath(dupPath, entry.source_id)
-        const st = await lstatIfPresent(dupPath)
-        valid = !!(source && st && st.isFile() &&
-          await this.canonicalPathIsWithinSource(dupPath, source, { strictErrors: true }))
-      } catch (error) {
-        if (handleAccessError(error, dupPath)) continue
-        throw error
-      }
-      if (!valid) {
-        this.registry.untrack(dupPath)
-        continue
-      }
-      const storeStat = await this.storeStatIfPresent(this.storePathFor(entry.hash))
-      if (storeStat && storeStat.isFile()) {
-        await unlinkIfSame(dupPath + TMP_SUFFIX, storeStat)
-      }
-    }
-    if (options.verifyBlobs === false) {
-      this.registry.schedulePersist()
-      return
-    }
-    const linksByHash = new Map()
-    for (const [linkPath, entry] of this.registry.links) {
-      if (!linksByHash.has(entry.hash)) linksByHash.set(entry.hash, [])
-      linksByHash.get(entry.hash).push([linkPath, entry])
-    }
-    const invalidBlobs = new Set()
-    for (const [hash, blob] of [...this.registry.blobs]) {
-      const storePath = this.storePathFor(hash)
-      const st = await this.storeStatIfPresent(storePath)
-      if (!st) {
-        const names = linksByHash.get(hash) || []
-        const copyNames = names.filter(([, entry]) => entry.mode === "copy")
-        let inaccessibleName = false
-        if (!names.length) {
-          for (const [duplicatePath, duplicate] of this.registry.duplicates) {
-            if (duplicate.hash !== hash) continue
-            if (preservePath(duplicatePath)) {
-              inaccessibleName = true
-              continue
-            }
-            let source
-            let expected
-            let duplicateStat
-            try {
-              source = this.sourceForPath(duplicatePath, duplicate.source_id)
-              expected = this.registry.scanIndex.get(duplicatePath)
-              duplicateStat = await lstatIfPresent(duplicatePath)
-              if (source && duplicateStat && duplicateStat.isFile() &&
-                  !await this.canonicalPathIsWithinSource(
-                    duplicatePath, source, { strictErrors: true })) {
-                continue
-              }
-            } catch (error) {
-              if (!handleAccessError(error, duplicatePath)) throw error
-              inaccessibleName = true
-              continue
-            }
-            if (!source || !expected || expected.hash !== hash ||
-                !duplicateStat || !duplicateStat.isFile() ||
-                !sameSnapshot(expected, duplicateStat)) {
-              continue
-            }
-            const entry = {
-              hash, app: duplicate.app || null, source_id: source.id,
-              dev: duplicateStat.dev, ino: duplicateStat.ino, mode: "copy"
-            }
-            this.registry.addLink(duplicatePath, entry)
-            copyNames.push([duplicatePath, entry])
-            break
-          }
-        }
-        if (options.repairStores === false && names.some(([, entry]) => entry.mode === "link")) {
-          blob.orphan = false
-          blob.verified_at = null
-          continue
-        }
-        // Deleting a name changes ctime, so trusted re-adoption compares the
-        // preserved identity, size, and mtime. Changed or legacy-unsnapshotted
-        // content waits for the next explicit scan instead of being assigned a
-        // stale hash filename during startup.
-        let readopted = false
-        for (const [linkPath, entry] of names) {
-          if (entry.mode !== "link") continue
-          if (preservePath(linkPath)) {
-            inaccessibleName = true
-            continue
-          }
-          let source
-          let linkStat
-          try {
-            source = this.sourceForPath(linkPath, entry.source_id)
-            if (!source || !await this.canonicalPathIsWithinSource(linkPath, source, { strictErrors: true })) continue
-            linkStat = await lstatIfPresent(linkPath)
-          } catch (error) {
-            if (!handleAccessError(error, linkPath)) throw error
-            inaccessibleName = true
-            continue
-          }
-          const expected = this.registry.scanIndex.get(linkPath)
-          if (!linkStat || !expected || expected.hash !== hash ||
-              entry.dev !== linkStat.dev || entry.ino !== linkStat.ino ||
-              !sameContentState(expected, linkStat)) continue
-          const before = fileSnapshot(linkStat)
-          let created = false
-          try {
-            await this.storeStatIfPresent(storePath, { createParent: true })
-            await fs.promises.link(linkPath, storePath)
-            created = true
-          } catch (error) {
-            if (!error || error.code !== "EEXIST") throw error
-            const currentStore = await this.storeStatIfPresent(storePath)
-            const currentLink = await lstatIfPresent(linkPath)
-            if (!currentStore || !sameContentState(before, currentLink) ||
-                currentStore.dev !== linkStat.dev || currentStore.ino !== linkStat.ino) continue
-          }
-          const [currentLink, currentStore] = await Promise.all([
-            lstatIfPresent(linkPath),
-            this.storeStatIfPresent(storePath)
-          ])
-          if (!sameContentState(before, currentLink) || !currentStore ||
-              currentStore.dev !== linkStat.dev || currentStore.ino !== linkStat.ino) {
-            const ownsStoreName = created && currentStore && (
-              (currentStore.dev === linkStat.dev && currentStore.ino === linkStat.ino) ||
-              (currentLink && currentStore.dev === currentLink.dev && currentStore.ino === currentLink.ino)
-            )
-            if (ownsStoreName) await fs.promises.unlink(storePath)
-            continue
-          }
-          await this.refreshLinkSnapshots(hash, linkStat.dev, linkStat.ino)
-          readopted = true
-          break
-        }
-        // On a volume without file sharing support, copy-mode names are the
-        // durable content group. They remain useful for duplicate discovery
-        // even though there is no canonical file in the vault tree.
-        if (readopted || copyNames.length || inaccessibleName) {
-          blob.orphan = false
-          blob.verified_at = inaccessibleName && !readopted ? null : Date.now()
-        } else {
-          invalidBlobs.add(hash)
-        }
-        continue
-      }
-      if (!st.isFile()) {
-        invalidBlobs.add(hash)
-        continue
-      }
-      blob.orphan = st.nlink === 1
-      blob.verified_at = Date.now()
-    }
-    this.registry.removeBlobs(invalidBlobs)
-    this.registry.schedulePersist()
-  }
   // Rebuild derived state from disk: store filenames are hashes, stat gives
   // nlink, and (dev, ino) matching re-associates app paths. The replacement
   // maps are assembled off to the side and swapped in only after the walk so
@@ -1559,15 +1521,21 @@ class Vault {
     if (!this.enabled) return
     const registry = this.registry
     const preserveState = options.preserveState !== false
+    await this.refreshSources()
+    const walkRoots = roots
+      ? roots.map((root) => typeof root === "string" ? { root, source_id: null } : root)
+      : this.scanRoots()
+    const progress = options.progress || null
+    if (progress) progress.roots_total = walkRoots.length
     const preserved = preserveState ? {
-      blobs: new Map(registry.blobs),
-      links: new Map(registry.links),
-      excluded: new Map(registry.excluded),
-      totals: Object.assign({}, registry.totals),
-      lastScan: registry.lastScan ? Object.assign({}, registry.lastScan) : null,
-      sourceScans: new Map([...registry.sourceScans].map(([id, scan]) => [id, Object.assign({}, scan)])),
-      duplicates: new Map(registry.duplicates),
-      scanIndex: new Map(registry.scanIndex)
+      blobs: registry.blobs,
+      links: registry.links,
+      excluded: registry.excluded,
+      totals: registry.totals,
+      lastScan: registry.lastScan,
+      sourceScans: registry.sourceScans,
+      duplicates: registry.duplicates,
+      scanIndex: registry.scanIndex
     } : null
     const rebuiltBlobs = new Map()
     const rebuiltLinks = new Map()
@@ -1592,6 +1560,12 @@ class Vault {
         throw error
       }
       for (const name of names) {
+        const repairPause = this.repairCheckpoint(progress, {
+          phase: "vault",
+          current_location: path.resolve(this.blobRoot, shard, name),
+          records_checked: 1
+        })
+        if (repairPause) await repairPause
         if (!SHA256_RE.test(name) || !name.startsWith(shard)) continue
         try {
           const st = await fs.promises.lstat(path.resolve(this.blobRoot, shard, name))
@@ -1610,17 +1584,28 @@ class Vault {
         }
       }
     }
-    await this.refreshSources()
-    const walkRoots = roots
-      ? roots.map((root) => typeof root === "string" ? { root, source_id: null } : root)
-      : this.scanRoots()
     for (const entry of walkRoots) {
+      let repairPause = this.repairCheckpoint(progress, {
+        phase: "filesystem",
+        current_location: entry.root
+      })
+      if (repairPause) await repairPause
       await this.walkForInoMatch(
         entry.root,
         storeInoToHash,
         entry.source_id === "pinokio" ? null : entry.source_id,
-        rebuiltLinks
+        rebuiltLinks,
+        {
+          progress,
+          dirConcurrency: this.repairDirConcurrency,
+          statConcurrency: this.repairStatConcurrency
+        }
       )
+      repairPause = this.repairCheckpoint(progress, {
+        roots_completed: 1,
+        current_location: entry.root
+      })
+      if (repairPause) await repairPause
     }
     const rebuiltDuplicates = new Map()
     const rebuiltScanIndex = new Map()
@@ -1629,6 +1614,12 @@ class Vault {
       // Copy-mode content has no store inode to rediscover. Preserve only names
       // whose exact scan snapshot still proves the recorded content group.
       for (const [linkPath, link] of preserved.links) {
+        const repairPause = this.repairCheckpoint(progress, {
+          phase: "records",
+          current_location: linkPath,
+          records_checked: 1
+        })
+        if (repairPause) await repairPause
         if (link.mode !== "copy" || preserved.excluded.has(linkPath)) continue
         const blob = preserved.blobs.get(link.hash)
         const expected = preserved.scanIndex.get(linkPath)
@@ -1637,7 +1628,7 @@ class Vault {
             !await this.canonicalPathIsWithinSource(linkPath, source, { strictErrors: true })) continue
         try {
           const st = await fs.promises.lstat(linkPath)
-          if (!st.isFile() || st.size < this.sizeThreshold ||
+          if (!st.isFile() || !isCandidateFileSize(st.size, this.sizeThreshold) ||
               link.dev !== st.dev || link.ino !== st.ino ||
               !sameSnapshot(expected, st)) continue
           if (!rebuiltBlobs.has(link.hash)) {
@@ -1663,6 +1654,12 @@ class Vault {
       // was hashed. Repair itself never hashes, so unverified names are left
       // without a scan-index entry and the next manual scan hashes them once.
       for (const [linkPath, link] of rebuiltLinks) {
+        const repairPause = this.repairCheckpoint(progress, {
+          phase: "records",
+          current_location: linkPath,
+          records_checked: 1
+        })
+        if (repairPause) await repairPause
         const expected = preserved.scanIndex.get(linkPath)
         if (!expected || expected.hash !== link.hash) continue
         try {
@@ -1673,6 +1670,12 @@ class Vault {
         }
       }
       for (const [linkPath, link] of rebuiltLinks) {
+        const repairPause = this.repairCheckpoint(progress, {
+          phase: "records",
+          current_location: linkPath,
+          records_checked: 1
+        })
+        if (repairPause) await repairPause
         if (!trustedHashes.has(link.hash)) continue
         try {
           const st = await fs.promises.lstat(linkPath)
@@ -1686,6 +1689,12 @@ class Vault {
         }
       }
       for (const [duplicatePath, duplicate] of preserved.duplicates) {
+        const repairPause = this.repairCheckpoint(progress, {
+          phase: "records",
+          current_location: duplicatePath,
+          records_checked: 1
+        })
+        if (repairPause) await repairPause
         if (preserved.excluded.has(duplicatePath) || rebuiltLinks.has(duplicatePath) ||
             !rebuiltBlobs.has(duplicate.hash) || !trustedHashes.has(duplicate.hash) ||
             !this.sourceForPath(duplicatePath, duplicate.source_id)) continue
@@ -1710,13 +1719,29 @@ class Vault {
         }
       }
       for (const excludedPath of preserved.excluded.keys()) {
+        const repairPause = this.repairCheckpoint(progress, {
+          phase: "records",
+          current_location: excludedPath,
+          records_checked: 1
+        })
+        if (repairPause) await repairPause
         rebuiltLinks.delete(excludedPath)
         rebuiltScanIndex.delete(excludedPath)
       }
     }
+    const repairPause = this.repairCheckpoint(progress, {
+      phase: "publishing",
+      current_location: null
+    })
+    if (repairPause) await repairPause
     const rebuiltByIno = new Map()
     const rebuiltPathsByIno = new Map()
     for (const [linkPath, entry] of rebuiltLinks) {
+      const repairPause = this.repairCheckpoint(progress, {
+        phase: "publishing",
+        current_location: linkPath
+      })
+      if (repairPause) await repairPause
       const key = registry.inoKey(entry.dev, entry.ino)
       rebuiltByIno.set(key, entry.hash)
       if (!rebuiltPathsByIno.has(key)) rebuiltPathsByIno.set(key, new Set())
@@ -1736,21 +1761,31 @@ class Vault {
     })
     if (options.flush !== false) await registry.flush()
   }
-  async walkForInoMatch(root, storeInoToHash, preferredSourceId = null, outputLinks = null) {
+  async walkForInoMatch(
+    root,
+    storeInoToHash,
+    preferredSourceId = null,
+    outputLinks = null,
+    options = {}
+  ) {
     const vaultRoot = path.resolve(this.root)
+    const dirConcurrency = options.dirConcurrency || this.dirConcurrency
+    const statConcurrency = options.statConcurrency || this.statConcurrency
+    const progress = options.progress || null
     for await (const batch of walkBatches(root, {
-      concurrency: this.dirConcurrency,
+      concurrency: dirConcurrency,
+      statConcurrency,
       skipDirectory: (full) => full === vaultRoot,
       strictErrors: true
     })) {
       const files = batch.flatMap((group) => group.files.map((file) => file.path))
-      const stats = await statMany(files, this.statConcurrency, null, {
+      const stats = await statMany(files, statConcurrency, null, {
         strictErrors: true,
         followSymlinks: false
       })
       for (let index = 0; index < files.length; index++) {
         const st = stats[index]
-        if (!st || !st.isFile() || st.size < this.sizeThreshold) continue
+        if (!st || !st.isFile() || !isCandidateFileSize(st.size, this.sizeThreshold)) continue
         const hash = storeInoToHash.get(`${st.dev}:${st.ino}`)
         if (hash) {
           const source = this.sourceForPath(files[index], preferredSourceId)
@@ -1769,6 +1804,14 @@ class Vault {
           else this.registry.addLink(files[index], link)
         }
       }
+      const repairPause = this.repairCheckpoint(progress, {
+        phase: "filesystem",
+        current_location: batch.length ? batch[batch.length - 1].dir : root,
+        directories_checked: batch.filter((group) => group.firstChunk).length,
+        files_checked: files.length,
+        work: Math.max(1, files.length)
+      })
+      if (repairPause) await repairPause
     }
   }
   cloudSyncProvider() {
@@ -1779,12 +1822,112 @@ class Vault {
     return null
   }
   // Global state for the vault page and the health endpoint. Answered from
-  // memory + one stat per blob and occupied shard; never a walk.
-  async status(scopeId = null) {
+  // memory + one stat per blob and occupied shard; never a discovery walk.
+  // Large inventories are filtered and paged before they cross the HTTP
+  // boundary, because neither Express nor a browser can safely materialize a
+  // multi-hundred-megabyte JSON string.
+  async status(scopeId = null, options = {}) {
     if (!this.enabled || !this.registry) return { enabled: false }
     const registry = this.registry
     const scope = scopeId ? this.scanSource(scopeId) : null
     if (scopeId && !scope) throw new Error("That location is no longer available.")
+    const view = STATUS_VIEWS.has(options.view) ? options.view : "all"
+    const statusFilter = STATUS_FILTERS.has(options.status_filter)
+      ? options.status_filter
+      : "all"
+    const sizeSort = options.size_sort === "asc" || options.size_sort === "desc"
+      ? options.size_sort
+      : null
+    const query = String(options.query || "").slice(0, 500).trim().toLowerCase()
+    const pageSize = boundedInteger(options.page_size, STATUS_PAGE_SIZE, 1, STATUS_PAGE_SIZE)
+    const requestedPage = boundedInteger(options.page, 0, 0, 10000)
+    const requestedLocation = typeof options.location_id === "string"
+      ? options.location_id
+      : null
+    const sourceMap = new Map(this._sources.map((source) => [source.id, source]))
+    const locationId = requestedLocation && sourceMap.has(requestedLocation)
+      ? requestedLocation
+      : null
+    const isInLocation = (candidateId) => {
+      if (!locationId) return true
+      let currentId = candidateId
+      const seen = new Set()
+      while (currentId && !seen.has(currentId)) {
+        if (currentId === locationId) return true
+        seen.add(currentId)
+        const current = sourceMap.get(currentId)
+        currentId = current ? current.parent_id : null
+      }
+      return false
+    }
+    const sourceLabelCache = new Map()
+    const sourceLabel = (id) => {
+      if (sourceLabelCache.has(id)) return sourceLabelCache.get(id)
+      const labels = []
+      let current = sourceMap.get(id)
+      const seen = new Set()
+      while (current && !seen.has(current.id)) {
+        labels.unshift(current.label || "")
+        seen.add(current.id)
+        current = current.parent_id ? sourceMap.get(current.parent_id) : null
+      }
+      const label = labels.join(" / ")
+      sourceLabelCache.set(id, label)
+      return label
+    }
+    const compare = sizeSort
+      ? (left, right) => {
+        const difference = (Number(left.size) || 0) - (Number(right.size) || 0)
+        if (difference) return sizeSort === "asc" ? difference : -difference
+        return left.sort_key.localeCompare(right.sort_key)
+      }
+      : null
+    const selected = new BoundedPage(requestedPage, pageSize, compare)
+    const filteredLocations = new Set()
+    let filteredShareableBytes = 0
+    const matchesCurrent = (record) => {
+      if (view === "all") {
+        if (!record.status) return false
+        if (statusFilter !== "all" && record.status !== statusFilter) return false
+      } else if (view === "duplicates" && record.status !== "duplicate") return false
+      else if (view === "shared" && record.status !== "shared") return false
+      else if (view === "tracked" && record.status !== "tracked") return false
+      else if (view === "independent" && record.status !== "independent") return false
+      else if (view === "reclaimable" && record.kind !== "reclaimable") return false
+      else if (view === "activity" && record.kind !== "activity") return false
+      const recordSourceIds = record.source_ids ||
+        (record.source_id ? [record.source_id] : [])
+      if (locationId && !recordSourceIds.some(isInLocation)) return false
+      if (query && !record.search.includes(query)) return false
+      return true
+    }
+    const addCurrent = (record) => {
+      if (!matchesCurrent(record)) return
+      selected.add(record)
+      for (const sourceId of record.source_ids ||
+        (record.source_id ? [record.source_id] : [])) {
+        filteredLocations.add(sourceId)
+      }
+      if (record.status === "duplicate" && record.shareable) {
+        filteredShareableBytes += Number(record.size) || 0
+      }
+    }
+    const counts = {
+      all: 0, duplicates: 0, shared: 0, tracked: 0,
+      independent: 0, reclaimable: 0, activity: 0
+    }
+    const sourceCounts = { all: {}, duplicates: {}, independent: {} }
+    const shareableBySource = {}
+    const countSource = (target, id) => {
+      let currentId = id
+      const seen = new Set()
+      while (currentId && !seen.has(currentId)) {
+        target[currentId] = (target[currentId] || 0) + 1
+        seen.add(currentId)
+        const current = sourceMap.get(currentId)
+        currentId = current ? current.parent_id : null
+      }
+    }
     const scopeHashes = scopeId ? new Set() : null
     if (scopeHashes) {
       for (const entry of registry.links.values()) {
@@ -1794,9 +1937,6 @@ class Vault {
         if (entry.source_id === scopeId) scopeHashes.add(entry.hash)
       }
     }
-    const blobs = []
-    const blobByHash = new Map()
-    const storeStats = new Map()
     const namesByHash = new Map()
     const undoBatchMap = new Map()
     for (const [linkPath, entry] of registry.links) {
@@ -1809,20 +1949,28 @@ class Vault {
       }, location))
       if (entry.batch_id && (!scopeId || entry.source_id === scopeId)) {
         if (!undoBatchMap.has(entry.batch_id)) {
-          undoBatchMap.set(entry.batch_id, { batch_id: entry.batch_id, files: 0, bytes: 0, ts: null })
+          undoBatchMap.set(entry.batch_id, {
+            batch_id: entry.batch_id, files: 0, bytes: 0, ts: null,
+            source_ids: new Set()
+          })
         }
         const batch = undoBatchMap.get(entry.batch_id)
         const blob = registry.blobs.get(entry.hash)
         batch.files += 1
         batch.bytes += blob && Number.isFinite(blob.size) ? blob.size : 0
+        if (entry.source_id) batch.source_ids.add(entry.source_id)
       }
     }
     const pendingBytesByHash = new Map()
     for (const entry of registry.duplicates.values()) {
       if (scopeId && entry.source_id !== scopeId) continue
-      pendingBytesByHash.set(entry.hash, (pendingBytesByHash.get(entry.hash) || 0) + (entry.size || 0))
+      pendingBytesByHash.set(
+        entry.hash,
+        (pendingBytesByHash.get(entry.hash) || 0) + (entry.size || 0)
+      )
     }
-    const blobEntries = [...registry.blobs].filter(([hash]) => !scopeHashes || scopeHashes.has(hash))
+    const blobEntries = [...registry.blobs]
+      .filter(([hash]) => !scopeHashes || scopeHashes.has(hash))
     if (!await this.directoryIfSafe(this.root) || !await this.directoryIfSafe(this.blobRoot)) {
       throw unsafeStoragePath(this.blobRoot)
     }
@@ -1835,15 +1983,19 @@ class Vault {
       null,
       { strictErrors: true, followSymlinks: false }
     )
+    const blobByHash = new Map()
+    const storeStats = new Map()
     let bytesOnDisk = 0
     let wouldBe = 0
     let trackedLogicalBytes = 0
+    let reclaimable = 0
     for (let index = 0; index < blobEntries.length; index++) {
       const [hash, blob] = blobEntries[index]
       const names = namesByHash.get(hash) || []
       const apps = new Set(names.map((name) => name.app).filter(Boolean))
-      const storeStat = blobStats[index] && blobStats[index].isFile() ? blobStats[index] : null
-      const nlink = storeStat ? storeStat.nlink : null
+      const storeStat = blobStats[index] && blobStats[index].isFile()
+        ? blobStats[index]
+        : null
       storeStats.set(hash, storeStat)
       const size = blob.size || 0
       const linkedCopy = storeStat || names.some((name) => name.mode === "link") ? 1 : 0
@@ -1860,19 +2012,13 @@ class Vault {
       bytesOnDisk += (size * physicalCopies) + pendingBytes
       wouldBe += (size * Math.max(physicalCopies, names.length)) + pendingBytes
       const orphan = !!(storeStat && storeStat.nlink === 1)
-      const publicBlob = {
-        hash, size: blob.size || 0, orphan, nlink,
+      if (orphan) reclaimable += size
+      blobByHash.set(hash, {
+        hash, size, orphan, nlink: storeStat ? storeStat.nlink : null,
         names, apps: [...apps], source_urls: blob.source_urls || []
-      }
-      blobs.push(publicBlob)
-      blobByHash.set(hash, publicBlob)
+      })
     }
     if (!scopeId) {
-      // The scan total covers every regular file, including files below the
-      // candidate threshold and files the user kept separate. The registry
-      // figures above cover only content tracked by Save space. Add the
-      // remainder to both sides so the global comparison represents the
-      // complete scanned locations instead of silently omitting small files.
       const lastScan = registry.scanFor()
       const scannedBytes = lastScan && Number.isFinite(lastScan.bytes_total)
         ? lastScan.bytes_total
@@ -1883,16 +2029,38 @@ class Vault {
       bytesOnDisk += untrackedScannedBytes
       wouldBe += untrackedScannedBytes
     }
-    const duplicates = []
-    for (const [p, entry] of registry.duplicates) {
+    for (const [linkPath, entry] of registry.links) {
       if (scopeId && entry.source_id !== scopeId) continue
-      const location = this.locationForPath(p, entry.source_id)
-      const source = this.sourceForPath(p, location.source_id)
-      const index = registry.scanIndex.get(p)
+      const blob = blobByHash.get(entry.hash)
+      if (!blob) continue
+      const name = blob.names.find((candidate) => candidate.path === linkPath)
+      if (!name) continue
+      const linkedNames = blob.names.filter((candidate) => candidate.mode === "link")
+      const status = entry.mode === "link" && linkedNames.length > 1 ? "shared" : "tracked"
+      counts.all += 1
+      counts[status] += 1
+      countSource(sourceCounts.all, entry.source_id)
+      const label = sourceLabel(entry.source_id)
+      addCurrent({
+        kind: "file", status, path: linkPath, source_id: entry.source_id,
+        hash: entry.hash, size: blob.size, name, blob,
+        sort_key: sizeSort ? `${label}\u0000${linkPath}` : "",
+        search: query ? `${linkPath} ${label}`.toLowerCase() : ""
+      })
+    }
+    let duplicateBytes = 0
+    let shareableDuplicateBytes = 0
+    let shareableDuplicates = 0
+    const duplicateLocations = new Set()
+    for (const [duplicatePath, entry] of registry.duplicates) {
+      if (scopeId && entry.source_id !== scopeId) continue
+      const index = registry.scanIndex.get(duplicatePath)
       const storeStat = storeStats.get(entry.hash)
       const blob = blobByHash.get(entry.hash)
+      const source = this.sourceForPath(duplicatePath, entry.source_id)
       const compatibleName = blob && blob.names.find((name) =>
-        name.path !== p && (!index || index.dev === undefined || name.dev === index.dev))
+        name.path !== duplicatePath &&
+        (!index || index.dev === undefined || name.dev === index.dev))
       const compatibleStore = storeStat &&
         (!index || index.dev === undefined || index.dev === storeStat.dev)
       const shareable = !!(source && source.shareable && !entry.unavailable_reason &&
@@ -1904,84 +2072,213 @@ class Vault {
           ? "different_disk"
           : "unsupported_disk"
       }
-      const match = blob ? blob.names.find((name) => name.path !== p) || null : null
-      duplicates.push(Object.assign({
-        path: p, hash: entry.hash, size: entry.size || 0, app: entry.app || null,
-        shareable, unavailable_reason: unavailableReason, match
-      }, location))
+      counts.all += 1
+      counts.duplicates += 1
+      countSource(sourceCounts.all, entry.source_id)
+      countSource(sourceCounts.duplicates, entry.source_id)
+      duplicateBytes += Number(entry.size) || 0
+      if (shareable) {
+        shareableDuplicates += 1
+        shareableDuplicateBytes += Number(entry.size) || 0
+        countSource(shareableBySource, entry.source_id)
+        if (entry.source_id) duplicateLocations.add(entry.source_id)
+      }
+      const label = sourceLabel(entry.source_id)
+      addCurrent({
+        kind: "duplicate", status: "duplicate", path: duplicatePath,
+        source_id: entry.source_id, entry, blob, shareable,
+        unavailable_reason: unavailableReason,
+        match: blob ? blob.names.find((name) => name.path !== duplicatePath) || null : null,
+        size: entry.size || 0,
+        sort_key: sizeSort ? `${label}\u0000${duplicatePath}` : "",
+        search: query ? `${duplicatePath} ${label}`.toLowerCase() : ""
+      })
+    }
+    let excludedBytes = 0
+    for (const [excludedPath, entry] of registry.excluded) {
+      if (scopeId && entry.source_id !== scopeId) continue
+      counts.all += 1
+      counts.independent += 1
+      countSource(sourceCounts.all, entry.source_id)
+      countSource(sourceCounts.independent, entry.source_id)
+      excludedBytes += Number(entry.size) || 0
+      const label = sourceLabel(entry.source_id)
+      addCurrent({
+        kind: "excluded", status: "independent", path: excludedPath,
+        source_id: entry.source_id, entry, size: Number(entry.size) || 0,
+        sort_key: sizeSort ? `${label}\u0000${excludedPath}` : "",
+        search: query ? `${excludedPath} ${label}`.toLowerCase() : ""
+      })
+    }
+    for (const blob of blobByHash.values()) {
+      if (!blob.orphan || scopeId) continue
+      counts.reclaimable += 1
+      const label = blob.names[0] ? blob.names[0].path : blob.hash
+      addCurrent({
+        kind: "reclaimable", status: null, source_id: null,
+        blob, size: blob.size, sort_key: label.toLowerCase(),
+        search: label.toLowerCase()
+      })
     }
     const events = (await registry.readEvents()).reverse()
       .filter((event) => !scopeId || event.source_id === scopeId)
       .map((event) => {
-      const currentLocation = event.path ? this.locationForPath(event.path, event.source_id) : null
-      const fallbackLocation = currentLocation && currentLocation.source_id
-        ? currentLocation
-        : (event.path ? { relative_path: event.path } : {})
-      const publicEvent = Object.assign({}, fallbackLocation, event)
-      if (event.kind === "convert" && event.batch_id && event.path) {
-        const current = registry.links.get(event.path)
-        publicEvent.undoable = !!(current && (
-          current.batch_id === event.batch_id ||
-          (!current.batch_id && current.hash === event.hash)
-        ))
-        const batch = undoBatchMap.get(event.batch_id)
-        if (batch && Number.isFinite(event.ts)) {
-          batch.ts = Math.max(batch.ts || 0, event.ts)
+        const currentLocation = event.path
+          ? this.locationForPath(event.path, event.source_id)
+          : null
+        const fallbackLocation = currentLocation && currentLocation.source_id
+          ? currentLocation
+          : (event.path ? { relative_path: event.path } : {})
+        const publicEvent = Object.assign({}, fallbackLocation, event)
+        if (event.kind === "convert" && event.batch_id && event.path) {
+          const current = registry.links.get(event.path)
+          publicEvent.undoable = !!(current && (
+            current.batch_id === event.batch_id ||
+            (!current.batch_id && current.hash === event.hash)
+          ))
+          const batch = undoBatchMap.get(event.batch_id)
+          if (batch && Number.isFinite(event.ts)) {
+            batch.ts = Math.max(batch.ts || 0, event.ts)
+          }
+        }
+        return publicEvent
+      })
+    const seenBatches = new Set()
+    const activity = events.map((event) => {
+      const showUndo = event.kind === "convert" && event.batch_id &&
+        event.undoable !== false && !seenBatches.has(event.batch_id)
+      if (showUndo) seenBatches.add(event.batch_id)
+      return {
+        item: Object.assign({}, event, {
+          activity_type: "event", show_undo: showUndo
+        }),
+        source_ids: event.source_id ? [event.source_id] : []
+      }
+    })
+    for (const batch of undoBatchMap.values()) {
+      if (!seenBatches.has(batch.batch_id)) {
+        activity.push({
+          item: {
+            batch_id: batch.batch_id,
+            files: batch.files,
+            bytes: batch.bytes,
+            ts: batch.ts,
+            activity_type: "batch"
+          },
+          source_ids: [...batch.source_ids]
+        })
+      }
+    }
+    counts.activity = activity.length
+    activity.forEach(({ item, source_ids }, order) => {
+      const eventPath = item.path || item.batch_id || ""
+      addCurrent({
+        kind: "activity", status: null, source_id: item.source_id || null,
+        source_ids,
+        item, order, size: item.bytes || item.bytes_saved || item.size || 0,
+        sort_key: String(order).padStart(8, "0"),
+        search: `${item.kind || "convert"} ${eventPath}`.toLowerCase()
+      })
+    })
+    const page = selected.result()
+    const items = page.items.map((record) => {
+      if (record.kind === "file") {
+        return {
+          path: record.path,
+          relative_path: record.name.relative_path || path.basename(record.path),
+          source_id: record.name.source_id,
+          source_label: record.name.source_label,
+          size: record.size,
+          status: record.status,
+          locations: record.blob.names
         }
       }
-      return publicEvent
+      if (record.kind === "duplicate") {
+        return Object.assign({
+          path: record.path,
+          hash: record.entry.hash,
+          size: record.size,
+          app: record.entry.app || null,
+          status: "duplicate",
+          shareable: record.shareable,
+          unavailable_reason: record.unavailable_reason,
+          match: record.match
+        }, this.locationForPath(record.path, record.entry.source_id))
+      }
+      if (record.kind === "excluded") {
+        return Object.assign({
+          path: record.path,
+          ts: record.entry.ts || null,
+          size: record.size,
+          status: "independent"
+        }, this.locationForPath(record.path, record.entry.source_id))
+      }
+      if (record.kind === "reclaimable") return record.blob
+      return record.item
     })
-    const undoBatches = [...undoBatchMap.values()].sort((a, b) =>
-      (b.ts || 0) - (a.ts || 0) || a.batch_id.localeCompare(b.batch_id))
-    const scan = this.scanStatus()
-    const excluded = []
-    for (const [p, meta] of registry.excluded) {
-      if (scopeId && meta.source_id !== scopeId) continue
-      excluded.push(Object.assign({
-        path: p,
-        ts: meta.ts || null,
-        size: Number(meta.size) || 0
-      }, this.locationForPath(p, meta.source_id)))
-    }
-    const publicSources = this._sources.filter((source) => !scopeId || source.id === scopeId).map((source) => ({
-      id: source.id, kind: source.kind, label: source.label, root: source.root,
-      display_path: source.kind === "pinokio" ? source.root : (source.mount_path || source.root),
-      target_path: source.kind === "external" ? source.root : null,
-      parent_id: scopeId ? null : source.parent_id, app: source.app || null,
-      available: source.available !== false, shareable: source.kind === "virtual" ? null : !!source.shareable,
-      removable: source.kind === "external" && source.configured === true
-    }))
+    const publicSources = this._sources
+      .filter((source) => !scopeId || source.id === scopeId)
+      .map((source) => ({
+        id: source.id, kind: source.kind, label: source.label, root: source.root,
+        display_path: source.kind === "pinokio"
+          ? source.root
+          : (source.mount_path || source.root),
+        target_path: source.kind === "external" ? source.root : null,
+        parent_id: scopeId ? null : source.parent_id,
+        app: source.app || null,
+        available: source.available !== false,
+        shareable: source.kind === "virtual" ? null : !!source.shareable,
+        removable: source.kind === "external" && source.configured === true
+      }))
     const result = {
       enabled: true,
       mode: this.mode,
-      scan,
+      scan: this.scanStatus(),
+      repair: this.repairStatus(),
       last_scan: registry.scanFor(scopeId),
       bytes_on_disk: bytesOnDisk,
       bytes_without_sharing: wouldBe,
       saved_by_sharing: wouldBe - bytesOnDisk,
       lifetime_bytes_saved: registry.totals.lifetime_bytes_saved,
-      reclaimable: blobs.filter((b) => b.orphan).reduce((sum, b) => sum + b.size, 0),
-      pending_bytes: duplicates.filter((d) => d.shareable).reduce((sum, d) => sum + d.size, 0),
+      reclaimable,
+      pending_bytes: shareableDuplicateBytes,
       file_action: this.fileActionStatus(scopeId),
       activity_error: registry.eventError,
       cloud_sync_warning: this.cloudSyncProvider(),
-      sources: publicSources, blobs, duplicates, excluded, events,
-      undo_batches: undoBatches
+      sources: publicSources,
+      items,
+      inventory: {
+        view,
+        counts,
+        source_counts: sourceCounts,
+        shareable_by_source: shareableBySource,
+        shareable_duplicates: shareableDuplicates,
+        duplicate_locations: duplicateLocations.size,
+        current: {
+          count: page.total,
+          locations: filteredLocations.size,
+          shareable_bytes: filteredShareableBytes
+        },
+        page: page.page,
+        page_size: page.page_size,
+        start: page.start,
+        end: page.end,
+        total: page.total,
+        pages: page.pages
+      }
     }
     if (scopeId) {
-      const duplicateBytes = duplicates.reduce((sum, item) => sum + item.size, 0)
-      const excludedBytes = excluded.reduce((sum, item) => sum + item.size, 0)
       let linkedBytes = 0
       let effectiveLinkedBytes = 0
       let sharedBytes = 0
-      for (const blob of blobs) {
+      for (const blob of blobByHash.values()) {
         const scopedNames = blob.names.filter((name) => name.source_id === scopeId)
         const scopedLinks = scopedNames.filter((name) => name.mode === "link").length
         const scopedCopies = scopedNames.length - scopedLinks
         const registeredLinks = blob.names.filter((name) => name.mode === "link").length
-        // The store name is one hardlink but not a user-visible location.
-        // Registry count prevents stale filesystem metadata from over-attributing the inode.
-        const filesystemLinks = Number.isFinite(blob.nlink) ? Math.max(0, blob.nlink - 1) : 0
+        const filesystemLinks = Number.isFinite(blob.nlink)
+          ? Math.max(0, blob.nlink - 1)
+          : 0
         const sharingLocations = Math.max(1, registeredLinks, filesystemLinks)
         linkedBytes += blob.size * scopedNames.length
         effectiveLinkedBytes += (blob.size * scopedCopies) +
@@ -2018,6 +2315,11 @@ class Vault {
       error: this.scanError
     })
   }
+  repairStatus() {
+    return Object.assign({}, this.repairState || this.idleRepairState(), {
+      required: this.repairRequired
+    })
+  }
   fileActionStatus(scopeId = null) {
     const progress = this.fileActionProgress
     if (!progress) return null
@@ -2034,6 +2336,7 @@ class Vault {
     return {
       enabled: !!this.enabled,
       scan: this.scanStatus(),
+      repair: this.repairStatus(),
       file_action: this.fileActionStatus(scopeId),
       last_scan: this.registry ? this.registry.scanFor(scopeId) : null
     }

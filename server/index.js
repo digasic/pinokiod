@@ -15761,7 +15761,15 @@ class Server {
         res.json(vault.progressStatus(scopeId))
         return
       }
-      res.json(await vault.status(scopeId))
+      res.json(await vault.status(scopeId, {
+        view: req.query && req.query.view,
+        location_id: req.query && req.query.location_id,
+        query: req.query && req.query.q,
+        status_filter: req.query && req.query.status_filter,
+        size_sort: req.query && req.query.size_sort,
+        page: req.query && req.query.page,
+        page_size: req.query && req.query.page_size
+      }))
     }))
     this.app.get("/vault", ex(async (req, res) => {
       const vault = this.kernel.vault

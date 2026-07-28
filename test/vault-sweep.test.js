@@ -130,6 +130,55 @@ describe('vault manual scan (phase 3)', () => {
     assert.strictEqual(vault.sweeper.state.total_files, 2, 'scan progress uses an exact pre-count')
   })
 
+  test('All files scans every non-empty regular file and ignores empty files', async () => {
+    const { home, vault } = await makeEnv()
+    vault.sizeThreshold = 0
+    const first = await writeFile(path.resolve(home, 'api', 'appA', 'tiny.txt'), 'x')
+    const second = await writeFile(path.resolve(home, 'api', 'appB', 'tiny.txt'), 'x')
+    const empty = await writeFile(path.resolve(home, 'api', 'appA', 'empty.txt'), '')
+
+    const result = await vault.sweeper.scan()
+
+    assert.strictEqual(result.candidates, 2)
+    assert.ok(vault.registry.scanIndex.has(first))
+    assert.ok(vault.registry.scanIndex.has(second))
+    assert.strictEqual(vault.registry.scanIndex.has(empty), false)
+    assert.strictEqual(vault.registry.duplicates.size, 1)
+    assert.ok(vault.registry.duplicates.has(first) || vault.registry.duplicates.has(second))
+    assert.strictEqual((await fs.promises.stat(first)).nlink, 1)
+    assert.strictEqual((await fs.promises.stat(second)).nlink, 1)
+  })
+
+  test('large All files scans retain duplicate groups without indexing unique files', async () => {
+    const { home, vault } = await makeEnv()
+    vault.sizeThreshold = 0
+    vault.sweeper.maxIndexedScanFiles = 3
+    const duplicate = Buffer.from('same')
+    const first = await writeFile(path.resolve(home, 'api', 'appA', 'first.txt'), duplicate)
+    const second = await writeFile(path.resolve(home, 'api', 'appB', 'second.txt'), duplicate)
+    const unique = await Promise.all(['a', 'b', 'c'].map((value) =>
+      writeFile(path.resolve(home, 'api', 'appA', `unique-${value}.txt`), value)))
+
+    const result = await vault.sweeper.scan()
+
+    assert.strictEqual(result.candidates, 5)
+    assert.strictEqual(vault.registry.links.has(first) || vault.registry.links.has(second), true)
+    assert.strictEqual(vault.registry.duplicates.has(first) || vault.registry.duplicates.has(second), true)
+    for (const file of unique) {
+      assert.strictEqual(vault.registry.links.has(file), false)
+      assert.strictEqual(vault.registry.scanIndex.has(file), false)
+    }
+    assert.strictEqual(vault.registry.lastScan.unindexed_unique_files, 3)
+    assert.strictEqual(
+      vault.registry.scanFor('app:appA').unindexed_unique_files,
+      3
+    )
+    assert.deepStrictEqual(
+      [await fs.promises.stat(first), await fs.promises.stat(second)].map((st) => st.nlink),
+      [1, 1]
+    )
+  })
+
   test('an app-scoped scan walks only that app and preserves unrelated registry state', async () => {
     const { home, vault } = await makeEnv()
     const content = crypto.randomBytes(4096)
@@ -152,7 +201,7 @@ describe('vault manual scan (phase 3)', () => {
     assert.strictEqual(result.bytes_total, content.length)
     assert.deepStrictEqual(vault.registry.lastScan, globalScan, 'app scan does not replace global totals')
     assert.strictEqual(vault.registry.duplicates.has(appBFile), true,
-      'scoped verification does not reconcile another app')
+      'scoped reconciliation does not touch another app')
     assert.strictEqual(vault.registry.links.has(appAFile), true)
     assert.strictEqual(vault.registry.scanFor(appA.id).files, 1)
     assert.strictEqual(vault.registry.scanFor(appA.id).bytes_total, content.length)
@@ -295,9 +344,9 @@ describe('vault manual scan (phase 3)', () => {
     assert.strictEqual(vault.registry.scanIndex.has(canonicalNestedFile), false, 'nested directory link was not followed')
     assert.strictEqual((await fs.promises.stat(local)).nlink, 1)
 
-    const status = await vault.status()
+    const status = await vault.status(null, { view: 'duplicates' })
     assert.strictEqual(status.sources.some((item) => item.kind === 'external'), false)
-    assert.strictEqual(status.duplicates.some((item) => item.path === canonicalImported), false)
+    assert.strictEqual(status.items.some((item) => item.path === canonicalImported), false)
     assert.strictEqual(status.last_scan.home_bytes_total, content.length, 'Pinokio metric excludes external files')
     assert.strictEqual(status.last_scan.bytes_total, content.length)
   })
@@ -343,12 +392,12 @@ describe('vault manual scan (phase 3)', () => {
       JSON.parse(await fs.promises.readFile(vault.externalSourcesPath, 'utf8')).paths,
       []
     )
-    const status = await vault.status()
+    const status = await vault.status(null, { view: 'duplicates' })
     assert.strictEqual(vault.registry.links.has(canonicalImported), false)
     assert.strictEqual(vault.registry.duplicates.has(canonicalImported), false)
     assert.strictEqual(vault.registry.scanIndex.has(canonicalImported), false)
     assert.strictEqual(status.sources.some((source) => source.kind === 'external'), false)
-    assert.strictEqual(status.duplicates.some((item) => item.path === canonicalImported), false)
+    assert.strictEqual(status.items.some((item) => item.path === canonicalImported), false)
     assert.deepStrictEqual(await fs.promises.readFile(imported), content)
   })
 
@@ -660,21 +709,21 @@ describe('vault manual scan (phase 3)', () => {
     assert.strictEqual(vault.sweeper.state.phase, 'failed')
   })
 
-  test('a verification failure does not publish a completed scan timestamp', async () => {
+  test('a reconciliation failure does not publish a completed scan timestamp', async () => {
     const { home, vault } = await makeEnv()
     await writeFile(path.resolve(home, 'api', 'appA', 'first.txt'), 'x')
     await vault.sweeper.scan()
     const before = JSON.parse(JSON.stringify(vault.registry.lastScan))
-    const realVerify = vault.verify.bind(vault)
-    vault.verify = async () => {
-      const error = new Error('temporary verification failure')
+    const realReconcile = vault.sweeper.reconcileScannedRecords.bind(vault.sweeper)
+    vault.sweeper.reconcileScannedRecords = async () => {
+      const error = new Error('temporary reconciliation failure')
       error.code = 'EIO'
       throw error
     }
     try {
       await assert.rejects(vault.sweeper.scan(), (error) => error && error.code === 'EIO')
     } finally {
-      vault.verify = realVerify
+      vault.sweeper.reconcileScannedRecords = realReconcile
     }
 
     assert.deepStrictEqual(vault.registry.lastScan, before)

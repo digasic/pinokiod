@@ -85,19 +85,21 @@ describe('vault engine (phase 1)', () => {
     assert.strictEqual(fs.existsSync(path.resolve(h, 'vault')), false)
   })
 
-  test('existing-only startup leaves a fresh install untouched until Vault is opened', async () => {
+  test('deferred startup does not load or create Vault storage', async () => {
     const h = await home()
     const vault = new Vault(fakeKernel(h))
 
-    const startup = await vault.init({ existingOnly: true })
-
-    assert.deepStrictEqual(startup, { enabled: true, fresh: true })
+    assert.deepStrictEqual(await vault.init({ deferStorage: true }), { enabled: true })
+    assert.strictEqual(vault.initialized, false)
+    assert.strictEqual(vault.registry, null)
     assert.strictEqual(fs.existsSync(path.resolve(h, 'vault')), false)
+
     await vault.ensureInitialized()
-    assert.strictEqual(fs.existsSync(path.resolve(h, 'vault', 'registry.json')), true)
+    assert.strictEqual(vault.initialized, true)
+    assert.ok(vault.registry)
   })
 
-  test('startup verification reports unused private links without deleting them', async () => {
+  test('explicit initialization restores the persisted index without verifying filesystem records', async () => {
     const h = await home()
     const vault = await makeVault(h)
     const content = crypto.randomBytes(4096)
@@ -108,14 +110,40 @@ describe('vault engine (phase 1)', () => {
     await fs.promises.unlink(file)
 
     const fresh = new Vault(fakeKernel(h))
-    await fresh.init({ existingOnly: true })
-    fresh.verificationPending = true
+    await fresh.init()
     await fresh.ensureInitialized()
 
     assert.strictEqual(fs.existsSync(fresh.storePathFor(hash)), true)
+    assert.strictEqual(fresh.registry.links.has(file), true)
+    const kernelSource = await fs.promises.readFile(
+      path.resolve(__dirname, '..', 'kernel', 'index.js'),
+      'utf8'
+    )
+    assert.match(kernelSource, /this\.vault\.init\(\{ deferStorage: true \}\)/)
+    assert.doesNotMatch(kernelSource, /this\.vault\.init\(\{ existingOnly: true \}\)/)
+    assert.doesNotMatch(kernelSource, /this\.vault\.verify\s*\(/)
+
+    await fresh.rebuild()
+
     assert.strictEqual(fresh.registry.links.has(file), false)
     assert.strictEqual(fresh.registry.blobs.get(hash).orphan, true)
     assert.strictEqual((await fresh.status()).reclaimable, content.length)
+  })
+
+  test('repeated scans reuse one non-persisted presence marker per record', async () => {
+    const h = await home()
+    const registry = new Registry(path.resolve(h, 'vault'))
+    const entry = { hash: 'a'.repeat(64) }
+
+    for (let index = 0; index < 5; index += 1) {
+      const token = registry.beginScanPresence()
+      registry.markCurrentScan(entry)
+      assert.strictEqual(registry.seenInScan(entry, token), true)
+      registry.endScanPresence(token)
+    }
+
+    assert.strictEqual(Object.getOwnPropertySymbols(entry).length, 1)
+    assert.strictEqual(JSON.stringify(entry), JSON.stringify({ hash: 'a'.repeat(64) }))
   })
 
   test('adopt: explicit store anchor shares the inode without copying bytes', async () => {
@@ -323,7 +351,7 @@ describe('vault engine (phase 1)', () => {
     assert.strictEqual(fs.existsSync(duplicate + Vault.TMP_SUFFIX), false)
   })
 
-  test('item 5: simulated crash between link and rename leaves target intact; verify cleans stray tmp', async () => {
+  test('item 5: conversion resumes its own temporary link after a simulated crash', async () => {
     const h = await home()
     const vault = await makeVault(h)
     const content = crypto.randomBytes(4096)
@@ -343,13 +371,16 @@ describe('vault engine (phase 1)', () => {
     // temporary name already shares the stored file's identity.
     await fs.promises.link(vault.storePathFor(hash), duplicate + Vault.TMP_SUFFIX)
     assert.deepStrictEqual(await fs.promises.readFile(duplicate), content)
-    await vault.verify()
+    assert.strictEqual((await vault.convert(duplicate, hash, {
+      app: 'appB',
+      source_id: source.id
+    })).status, 'converted')
     assert.strictEqual(fs.existsSync(duplicate + Vault.TMP_SUFFIX), false)
     assert.deepStrictEqual(await fs.promises.readFile(duplicate), content)
-    assert.ok(vault.registry.duplicates.has(duplicate))
+    assert.ok(vault.registry.links.has(duplicate))
   })
 
-  test('conversion and verification never delete an unrelated reserved-suffix file', async () => {
+  test('conversion never deletes an unrelated reserved-suffix file', async () => {
     const h = await home()
     const vault = await makeVault(h)
     const content = crypto.randomBytes(4096)
@@ -362,200 +393,6 @@ describe('vault engine (phase 1)', () => {
 
     assert.strictEqual((await vault.convert(duplicate, hash)).status, 'conflict')
     assert.strictEqual(await fs.promises.readFile(tmp, 'utf8'), 'user data')
-
-    const registeredTmp = original + Vault.TMP_SUFFIX
-    await writeFile(registeredTmp, 'other user data')
-    await vault.verify()
-    assert.strictEqual(await fs.promises.readFile(registeredTmp, 'utf8'), 'other user data')
-  })
-
-  test('verification preserves a copy-mode hardlink using the reserved suffix', async () => {
-    const h = await home()
-    const vault = await makeVault(h)
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const file = await writeFile(path.resolve(h, 'api', 'appA', 'm.bin'), content)
-    await vault.refreshSources()
-    const source = vault.sources().find((item) => item.kind === 'app' && item.app === 'appA')
-    const st = await fs.promises.lstat(file)
-    vault.registry.addBlob(hash, { size: st.size })
-    vault.registry.addLink(file, {
-      hash, app: 'appA', source_id: source.id,
-      dev: st.dev, ino: st.ino, mode: 'copy'
-    })
-    const suffix = file + Vault.TMP_SUFFIX
-    await fs.promises.link(file, suffix)
-
-    await vault.verify()
-
-    assert.strictEqual(fs.existsSync(suffix), true)
-    assert.strictEqual(vault.registry.links.has(file), true)
-  })
-
-  test('verify: orphan detection via nlink, dead link pruning, store re-adoption', async () => {
-    const h = await home()
-    const vault = await makeVault(h)
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const a = await writeFile(path.resolve(h, 'api', 'appA', 'm.bin'), content)
-    await vault.adopt(a, hash, { app: 'appA' })
-
-    // Delete the app copy: blob becomes an orphan, link is pruned.
-    await fs.promises.unlink(a)
-    await vault.verify()
-    assert.strictEqual(vault.registry.links.has(a), false)
-    assert.strictEqual(vault.registry.blobs.get(hash).orphan, true)
-
-    // Recreate the content as a NEW inode: adopt refuses (duplicate), convert
-    // links it. Then delete the STORE name: verify re-adopts from the link.
-    const b = await writeFile(path.resolve(h, 'api', 'appB', 'm.bin'), content)
-    assert.strictEqual((await vault.adopt(b, hash, { app: 'appB' })).status, 'duplicate')
-    assert.strictEqual((await vault.convert(b, hash, { app: 'appB' })).status, 'converted')
-    await fs.promises.unlink(vault.storePathFor(hash))
-    await vault.verify()
-    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), true)
-    const st = await fs.promises.stat(b)
-    assert.strictEqual(st.nlink, 2)
-  })
-
-  test('verification preserves registry intent after a transient canonical-path failure', async () => {
-    const h = await home()
-    const vault = await makeVault(h)
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const file = await writeFile(path.resolve(h, 'api', 'appA', 'm.bin'), content)
-    await vault.adopt(file, hash, { app: 'appA' })
-    vault.registry.links.get(file).batch_id = 'keep-batch'
-    const realRealpath = fs.promises.realpath
-    fs.promises.realpath = async (target, options) => {
-      if (path.resolve(String(target)) === file) {
-        const error = new Error('temporary canonical-path failure')
-        error.code = 'EIO'
-        throw error
-      }
-      return realRealpath(target, options)
-    }
-    try {
-      await assert.rejects(vault.verify(), (error) => error && error.code === 'EIO')
-    } finally {
-      fs.promises.realpath = realRealpath
-    }
-
-    assert.strictEqual(vault.registry.links.get(file).batch_id, 'keep-batch')
-    assert.ok(vault.registry.blobs.has(hash))
-    assert.deepStrictEqual(await fs.promises.readFile(file), content)
-  })
-
-  test('verify re-adopts a trusted linked name when a copy-mode name also exists', async () => {
-    const h = await home()
-    const vault = await makeVault(h)
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const linked = await writeFile(path.resolve(h, 'api', 'appA', 'm.bin'), content)
-    const copied = await writeFile(path.resolve(h, 'api', 'appB', 'm.bin'), content)
-    await vault.adopt(linked, hash, { app: 'appA' })
-    const copiedStat = await fs.promises.stat(copied)
-    vault.registry.addLink(copied, {
-      hash, app: 'appB', dev: copiedStat.dev, ino: copiedStat.ino, mode: 'copy'
-    })
-    await fs.promises.unlink(vault.storePathFor(hash))
-
-    await vault.verify()
-
-    const storeStat = await fs.promises.stat(vault.storePathFor(hash))
-    const linkedStat = await fs.promises.stat(linked)
-    assert.strictEqual(storeStat.ino, linkedStat.ino)
-    assert.strictEqual(storeStat.dev, linkedStat.dev)
-    assert.strictEqual(vault.registry.blobs.get(hash).orphan, false)
-  })
-
-  test('verify never re-adopts a path outside the configured scan sources', async (t) => {
-    const h = await home()
-    const external = await home()
-    const vault = await makeVault(h)
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const managed = await writeFile(path.resolve(h, 'api', 'appA', 'm.bin'), content)
-    const outside = path.resolve(external, 'm.bin')
-    await vault.adopt(managed, hash, { app: 'appA' })
-    try {
-      await fs.promises.link(vault.storePathFor(hash), outside)
-    } catch (error) {
-      if (error.code === 'EXDEV' || error.code === 'ENOTSUP') {
-        t.skip(`hardlinks unavailable across test paths: ${error.message}`)
-        return
-      }
-      throw error
-    }
-    const outsideStat = await fs.promises.stat(outside)
-    vault.registry.addLink(outside, {
-      hash, source_id: 'external:removed', dev: outsideStat.dev, ino: outsideStat.ino, mode: 'link'
-    })
-    vault.registry.scanIndex.set(outside, {
-      hash, dev: outsideStat.dev, ino: outsideStat.ino, size: outsideStat.size,
-      mtime: outsideStat.mtimeMs, ctime: outsideStat.ctimeMs
-    })
-    await fs.promises.unlink(managed)
-    await fs.promises.unlink(vault.storePathFor(hash))
-
-    await vault.verify()
-
-    assert.deepStrictEqual(await fs.promises.readFile(outside), content)
-    assert.strictEqual((await fs.promises.stat(outside)).nlink, 1)
-    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
-    assert.strictEqual(vault.registry.links.has(outside), false)
-    assert.strictEqual(vault.registry.blobs.has(hash), false)
-  })
-
-  test('verify never re-adopts changed bytes under a stale hash filename', async () => {
-    const h = await home()
-    const vault = await makeVault(h)
-    const original = Buffer.from('original-content')
-    const changed = Buffer.from('modified-content')
-    const hash = sha256(original)
-    const file = await writeFile(path.resolve(h, 'api', 'appA', 'm.bin'), original)
-    await vault.adopt(file, hash, { app: 'appA' })
-    await fs.promises.unlink(vault.storePathFor(hash))
-    await fs.promises.writeFile(file, changed)
-    const future = new Date(Date.now() + 2000)
-    await fs.promises.utimes(file, future, future)
-
-    await vault.verify()
-
-    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
-    assert.strictEqual(vault.registry.blobs.has(hash), false)
-    assert.deepStrictEqual(await fs.promises.readFile(file), changed)
-  })
-
-  test('verify rejects a source replaced during store re-adoption', async () => {
-    const h = await home()
-    const vault = await makeVault(h)
-    const original = Buffer.alloc(4096, 1)
-    const replacement = Buffer.alloc(4096, 2)
-    const hash = sha256(original)
-    const file = await writeFile(path.resolve(h, 'api', 'appA', 'm.bin'), original)
-    const storePath = vault.storePathFor(hash)
-    await vault.adopt(file, hash, { app: 'appA' })
-    await fs.promises.unlink(storePath)
-    const realLink = fs.promises.link
-    fs.promises.link = async (source, target) => {
-      if (source === file && target === storePath) {
-        const writerPath = file + '.writer-replacement'
-        await fs.promises.writeFile(writerPath, replacement)
-        await fs.promises.rename(writerPath, file)
-      }
-      return realLink(source, target)
-    }
-    try {
-      await vault.verify()
-    } finally {
-      fs.promises.link = realLink
-    }
-
-    assert.deepStrictEqual(await fs.promises.readFile(file), replacement)
-    assert.strictEqual(fs.existsSync(storePath), false)
-    assert.strictEqual(vault.registry.blobs.has(hash), false)
-    assert.strictEqual(vault.registry.links.has(file), false)
   })
 
   test('reclaim: refuses while in use, frees orphans', async () => {
@@ -826,7 +663,7 @@ describe('vault engine (phase 1)', () => {
     assert.ok(vault.registry.duplicates.has(pending))
   })
 
-  test('item 9: registry deleted => rebuild reproduces blobs, links, orphans from disk', async () => {
+  test('missing registry requires explicit Repair Index before rebuilding from disk', async () => {
     const h = await home()
     const vault = await makeVault(h)
     // Rebuild's ino-match walk only considers files >= SIZE_THRESHOLD, so
@@ -844,8 +681,20 @@ describe('vault engine (phase 1)', () => {
     await fs.promises.unlink(path.resolve(vault.root, 'registry.json')).catch(() => {})
     await fs.promises.unlink(path.resolve(vault.root, 'events.ndjson')).catch(() => {})
     const fresh = new Vault(fakeKernel(h))
-    const initResult = await fresh.init()
-    assert.strictEqual(initResult.missing_recovered, true)
+    await fresh.init()
+    assert.strictEqual(fresh.repairStatus().required, true)
+    assert.strictEqual((await fresh.status()).repair.required, true)
+    assert.strictEqual(fresh.registry.blobs.size, 0)
+    assert.match(fresh.startScan().error, /Repair Index/)
+    assert.match((await fresh.perform('scan')).error, /Repair Index/)
+
+    const started = await fresh.perform('repair')
+    const repairPromise = fresh.repairPromise
+    assert.strictEqual(started.started, true)
+    await repairPromise
+
+    assert.strictEqual(fresh.repairStatus().required, false)
+    assert.strictEqual((await fresh.status()).repair.required, false)
     assert.ok(fresh.registry.blobs.has(hash))
     assert.ok(fresh.registry.blobs.has(orphanHash))
     assert.strictEqual(fresh.registry.blobs.get(orphanHash).orphan, true)
@@ -859,7 +708,7 @@ describe('vault engine (phase 1)', () => {
     )
   })
 
-  test('item 9: torn events line tolerated; corrupt registry.json triggers rebuild, not failure', async () => {
+  test('corrupt registry waits for explicit Repair Index instead of rebuilding at startup', async () => {
     const h = await home()
     const vault = await makeVault(h)
     const content = crypto.randomBytes(4096)
@@ -876,7 +725,13 @@ describe('vault engine (phase 1)', () => {
     const fresh = new Vault(fakeKernel(h))
     const result = await fresh.init()
     assert.strictEqual(result.enabled, true)
-    assert.strictEqual(result.corrupt_recovered, true)
+    assert.strictEqual(fresh.repairStatus().required, true)
+    assert.strictEqual(fresh.registry.blobs.size, 0)
+
+    await fresh.perform('repair')
+    await fresh.repairPromise
+
+    assert.strictEqual(fresh.repairStatus().required, false)
     assert.ok(fresh.registry.blobs.has(hash))
   })
 
@@ -895,8 +750,9 @@ describe('vault engine (phase 1)', () => {
     const result = await fresh.init()
     const events = await fresh.registry.readEvents()
 
-    assert.strictEqual(result.corrupt_recovered, true)
-    assert.strictEqual(fresh.registry.blobs.has(hash), true)
+    assert.strictEqual(result.enabled, true)
+    assert.strictEqual(fresh.repairStatus().required, true)
+    assert.strictEqual(fresh.registry.blobs.has(hash), false)
     assert.deepStrictEqual(events.map((event) => event.kind), ['found'])
   })
 
@@ -961,6 +817,63 @@ describe('vault engine (phase 1)', () => {
     const snapshot = JSON.parse(await fs.promises.readFile(path.resolve(vault.root, 'registry.json'), 'utf8'))
     assert.ok(snapshot.blobs[sha256(content)])
     assert.strictEqual(fs.existsSync(path.resolve(vault.root, 'registry.json.tmp')), false)
+  })
+
+  test('large registry snapshots persist and reload through bounded JSON shards', async () => {
+    const h = await home()
+    const vault = await makeVault(h)
+    const content = crypto.randomBytes(4096)
+    const hash = sha256(content)
+    const file = await writeFile(path.resolve(h, 'api', 'appA', 'm.bin'), content)
+    await vault.adopt(file, hash, { app: 'appA' })
+    vault.registry.snapshotShardThreshold = 1
+    vault.registry.snapshotShardEntries = 1
+
+    await vault.registry.flush()
+
+    const manifest = JSON.parse(
+      await fs.promises.readFile(vault.registry.snapshotPath, 'utf8'))
+    assert.strictEqual(manifest.version, 2)
+    assert.match(manifest.generation, /^registry-[0-9a-f]{24}$/)
+    assert.ok(manifest.shards.blobs > 0)
+    assert.ok(manifest.shards.links > 0)
+    const reloaded = new Registry(vault.root)
+    const loaded = await reloaded.load()
+    assert.deepStrictEqual(loaded, { corrupt: false, existed: true })
+    assert.strictEqual(reloaded.blobs.get(hash).size, content.length)
+    assert.strictEqual(reloaded.links.get(file).hash, hash)
+  })
+
+  test('an incomplete sharded snapshot never replaces the last committed registry', async () => {
+    const h = await home()
+    const vault = await makeVault(h)
+    const firstHash = 'a'.repeat(64)
+    const secondHash = 'b'.repeat(64)
+    vault.registry.addBlob(firstHash, { size: 1 })
+    await vault.registry.flush()
+    vault.registry.addBlob(secondHash, { size: 2 })
+    vault.registry.snapshotShardThreshold = 1
+    const realAtomicWrite = vault.registry.atomicWrite.bind(vault.registry)
+    vault.registry.atomicWrite = async (target, contents) => {
+      if (path.resolve(target) === vault.registry.snapshotPath) {
+        const error = new Error('manifest write failed')
+        error.code = 'EIO'
+        throw error
+      }
+      return realAtomicWrite(target, contents)
+    }
+
+    await assert.rejects(vault.registry.flush(), (error) => error && error.code === 'EIO')
+
+    const reloaded = new Registry(vault.root)
+    const loaded = await reloaded.load()
+    assert.deepStrictEqual(loaded, { corrupt: false, existed: true })
+    assert.strictEqual(reloaded.blobs.has(firstHash), true)
+    assert.strictEqual(reloaded.blobs.has(secondHash), false)
+    assert.deepStrictEqual(
+      (await fs.promises.readdir(vault.root)).filter((name) => /^registry-[0-9a-f]{24}$/.test(name)),
+      []
+    )
   })
 
   test('a failed registry flush stays dirty and retries the in-memory state', async () => {
@@ -1274,22 +1187,47 @@ describe('vault engine (phase 1)', () => {
     assert.strictEqual(vault.progressStatus().file_action, null)
   })
 
-  test('verification keeps copy-mode content groups without a managed file', async () => {
+  test('Repair Index runs in the background, reports progress, and can be cancelled', async () => {
     const h = await home()
     const vault = await makeVault(h)
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const file = await writeFile(path.resolve(h, 'api', 'appA', 'model.bin'), content)
-    const st = await fs.promises.stat(file)
-    vault.registry.addBlob(hash, { size: content.length })
-    vault.registry.addLink(file, { hash, app: 'appA', dev: st.dev, ino: st.ino, mode: 'copy' })
+    let entered
+    let release
+    const repairEntered = new Promise((resolve) => { entered = resolve })
+    const repairRelease = new Promise((resolve) => { release = resolve })
+    vault.rebuild = async (_roots, options) => {
+      await vault.repairCheckpoint(options.progress, {
+        phase: 'filesystem',
+        directories_checked: 3,
+        files_checked: 12,
+        records_checked: 4,
+        current_location: path.resolve(h, 'api', 'appA')
+      })
+      entered()
+      await repairRelease
+      await vault.repairCheckpoint(options.progress)
+    }
 
-    await vault.verify()
+    const started = await vault.perform('repair')
+    const repairPromise = vault.repairPromise
+    await repairEntered
 
-    assert.ok(vault.registry.blobs.has(hash))
-    assert.ok(vault.registry.links.has(file))
-    assert.strictEqual(vault.registry.blobs.get(hash).orphan, false)
-    assert.strictEqual((await vault.reclaim(hash)).status, 'unavailable')
+    assert.strictEqual(started.started, true)
+    const active = vault.progressStatus()
+    assert.strictEqual(active.file_action, null)
+    assert.strictEqual(active.repair.phase, 'filesystem')
+    assert.strictEqual(active.repair.directories_checked, 3)
+    assert.strictEqual(active.repair.files_checked, 12)
+    assert.strictEqual(active.repair.records_checked, 4)
+    assert.match(vault.startScan().error, /repair/i)
+
+    const cancelled = await vault.perform('cancel_repair')
+    assert.strictEqual(cancelled.cancel_requested, true)
+    release()
+    await repairPromise
+
+    assert.strictEqual(vault.progressStatus().file_action, null)
+    assert.strictEqual(vault.repairStatus().phase, 'cancelled')
+    assert.strictEqual(vault.repairStatus().active, false)
   })
 
   test('manual repair preserves verified copy-mode content groups', async () => {
@@ -1314,6 +1252,38 @@ describe('vault engine (phase 1)', () => {
     assert.strictEqual(vault.registry.scanIndex.get(file).hash, hash)
     assert.deepStrictEqual(vault.registry.lastScan, { ts: 123, files: 1 })
     assert.deepStrictEqual(await fs.promises.readFile(file), content)
+  })
+
+  test('Repair Index rebuilds globally with reduced filesystem concurrency', async () => {
+    const h = await home()
+    const vault = await makeVault(h)
+    vault.sizeThreshold = 1
+    const firstContent = crypto.randomBytes(4096)
+    const secondContent = crypto.randomBytes(4096)
+    const firstHash = sha256(firstContent)
+    const secondHash = sha256(secondContent)
+    const first = await writeFile(path.resolve(h, 'api', 'appA', 'first.bin'), firstContent)
+    const second = await writeFile(path.resolve(h, 'api', 'appB', 'second.bin'), secondContent)
+    await vault.adopt(first, firstHash, { app: 'appA' })
+    await vault.adopt(second, secondHash, { app: 'appB' })
+    await fs.promises.unlink(first)
+    const walkOptions = []
+    const realWalk = vault.walkForInoMatch.bind(vault)
+    vault.walkForInoMatch = (...args) => {
+      walkOptions.push(args[4])
+      return realWalk(...args)
+    }
+    const progress = Object.assign(vault.idleRepairState(), { kind: 'repair' })
+
+    await vault.rebuild(undefined, { progress })
+
+    assert.strictEqual(vault.registry.links.has(first), false)
+    assert.strictEqual(vault.registry.links.get(second).hash, secondHash)
+    assert.strictEqual(progress.roots_total, 1)
+    assert.strictEqual(progress.roots_completed, 1)
+    assert.ok(walkOptions.length > 0)
+    assert.ok(walkOptions.every((options) =>
+      options.dirConcurrency === 1 && options.statConcurrency === 4))
   })
 
   test('manual index repair preserves user decisions, history, and pending review state', async () => {
