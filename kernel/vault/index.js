@@ -103,8 +103,8 @@ class Vault {
   get blobRoot() {
     return path.resolve(this.root, "sha256")
   }
-  get sourceRoot() {
-    return path.resolve(this.root, "sources")
+  get externalSourcesPath() {
+    return path.resolve(this.root, "external-sources.json")
   }
   storePathFor(hash) {
     if (typeof hash !== "string" || !SHA256_RE.test(hash)) {
@@ -128,6 +128,43 @@ class Vault {
     st = await this.directoryIfSafe(directory)
     if (!st) throw unsafeStoragePath(directory)
     return st
+  }
+  async readExternalSourcePaths() {
+    let raw
+    try {
+      raw = await this.registry.readFile(this.externalSourcesPath)
+    } catch (error) {
+      if (isMissingError(error)) return []
+      throw error
+    }
+    let parsed
+    try {
+      parsed = JSON.parse(raw)
+    } catch (error) {
+      throw new Error("External folder settings are invalid.")
+    }
+    if (!parsed || !Array.isArray(parsed.paths)) {
+      throw new Error("External folder settings are invalid.")
+    }
+    const paths = []
+    for (const value of parsed.paths) {
+      if (typeof value !== "string" || !path.isAbsolute(value.trim())) continue
+      const resolved = path.resolve(value.trim())
+      if (!paths.some((existing) => samePath(existing, resolved))) paths.push(resolved)
+    }
+    return paths
+  }
+  async writeExternalSourcePaths(folderPaths) {
+    const paths = []
+    for (const value of folderPaths) {
+      if (typeof value !== "string" || !path.isAbsolute(value.trim())) continue
+      const resolved = path.resolve(value.trim())
+      if (!paths.some((existing) => samePath(existing, resolved))) paths.push(resolved)
+    }
+    await this.registry.atomicWrite(
+      this.externalSourcesPath,
+      JSON.stringify({ paths }, null, 2)
+    )
   }
   async storeStatIfPresent(storePath, options = {}) {
     if (!isPathWithin(this.blobRoot, storePath)) throw unsafeStoragePath(storePath)
@@ -205,6 +242,11 @@ class Vault {
           }
         }
       }
+      case "remove_source":
+        if (typeof payload.source_id !== "string" || !payload.source_id) {
+          return { error: "Choose an external folder to remove." }
+        }
+        return this.runMutation(() => this.removeExternalSource(payload.source_id))
       case "scan": {
         if (payload.scope_id && !this.scanSource(payload.scope_id)) {
           return { error: "That scan location is no longer available." }
@@ -313,34 +355,6 @@ class Vault {
       return source
     }
 
-    const seenExternalRoots = new Set()
-    const addExternalEntries = async (importRoot, idPrefix = "") => {
-      let entries = []
-      try {
-        entries = await fs.promises.readdir(importRoot, { withFileTypes: true })
-      } catch (error) {
-        if (!isMissingError(error)) throw error
-      }
-      for (const entry of entries) {
-        if (!entry.isSymbolicLink()) continue
-        const mountPath = path.resolve(importRoot, entry.name)
-        try {
-          const root = await fs.promises.realpath(mountPath)
-          const st = await fs.promises.stat(root)
-          if (!st.isDirectory()) continue
-          const canonical = path.resolve(root)
-          if (seenExternalRoots.has(canonical)) continue
-          seenExternalRoots.add(canonical)
-          sources.push(await decorate({
-            id: sourceId("external", `${idPrefix}${entry.name}`), kind: "external", label: entry.name,
-            root: canonical, mount_path: mountPath, parent_id: "external"
-          }))
-        } catch (error) {
-          if (!isMissingError(error)) throw error
-        }
-      }
-    }
-
     let apiEntries = []
     try {
       apiEntries = await fs.promises.readdir(apiRoot, { withFileTypes: true })
@@ -356,9 +370,15 @@ class Vault {
         }))
       }
     }
-    await addExternalEntries(apiRoot)
-    if (await this.directoryIfSafe(this.sourceRoot)) {
-      await addExternalEntries(this.sourceRoot, "vault:")
+    for (const configuredPath of await this.readExternalSourcePaths()) {
+      sources.push(await decorate({
+        id: sourceId("external", configuredPath),
+        kind: "external",
+        label: path.basename(configuredPath) || configuredPath,
+        root: configuredPath,
+        parent_id: "external",
+        configured: true
+      }))
     }
 
     let homeEntries = []
@@ -421,49 +441,38 @@ class Vault {
       return { created: false, source: existing }
     }
 
-    const importRoot = this.sourceRoot
-    await this.ensureDirectory(importRoot)
-    const baseLabel = path.basename(canonical) || "external-folder"
-    let mountPath = null
-    for (let index = 1; index < 10000; index++) {
-      const label = index === 1 ? baseLabel : `${baseLabel}-${index}`
-      const candidate = path.resolve(importRoot, label)
-      try {
-        await fs.promises.symlink(canonical, candidate, this.kernel.platform === "win32" ? "junction" : "dir")
-        mountPath = candidate
-        break
-      } catch (error) {
-        if (error && error.code === "EEXIST") continue
-        if (error && (error.code === "EACCES" || error.code === "EPERM")) {
-          throw new Error("Pinokio does not have permission to add that folder.")
-        }
-        throw new Error("Pinokio could not add that folder.")
-      }
+    const configuredPaths = await this.readExternalSourcePaths()
+    configuredPaths.push(canonical)
+    await this.writeExternalSourcePaths(configuredPaths)
+    await this.refreshSources()
+    const source = this._sources.find((item) =>
+      item.kind === "external" && item.configured && samePath(item.root, canonical))
+    if (!source) {
+      throw new Error("The folder could not be added. Restart Pinokio and try again.")
     }
-    if (!mountPath) throw new Error("Pinokio could not create a unique name for that folder.")
+    return { created: true, source }
+  }
+  async removeExternalSource(sourceIdToRemove) {
+    await this.refreshSources()
+    const source = this._sources.find((item) =>
+      item.id === sourceIdToRemove && item.kind === "external" && item.configured)
+    if (!source) return { error: "That external folder is no longer configured." }
 
-    try {
-      await this.refreshSources()
-      const source = this._sources.find((item) => item.kind === "external" && item.mount_path && samePath(item.mount_path, mountPath))
-      if (!source) throw new Error("The folder could not be added. Restart Pinokio and try again.")
-      return { created: true, source }
-    } catch (error) {
-      // Adding a source is transactional. Roll back only the exact directory
-      // link created above; preserve any path an external writer replaced.
-      try {
-        const [mounted, target] = await Promise.all([
-          fs.promises.lstat(mountPath),
-          fs.promises.realpath(mountPath)
-        ])
-        if (mounted.isSymbolicLink() && samePath(target, canonical)) {
-          await fs.promises.unlink(mountPath)
-        }
-      } catch {
-        // The original error remains authoritative; an unverified path is
-        // deliberately preserved rather than deleted.
-      }
-      throw error
+    const configuredPaths = await this.readExternalSourcePaths()
+    const remaining = configuredPaths.filter((folderPath) => !samePath(folderPath, source.root))
+    if (remaining.length === configuredPaths.length) {
+      return { error: "That external folder is no longer configured." }
     }
+    await this.writeExternalSourcePaths(remaining)
+    await this.refreshSources()
+    this.reconcileConfiguredSources()
+    for (const [filePath, entry] of [...this.registry.excluded]) {
+      if (entry.source_id === source.id) this.registry.excluded.delete(filePath)
+    }
+    this.registry.sourceScans.delete(source.id)
+    this.registry.lastScan = null
+    this.registry.schedulePersist()
+    return { removed: true, source_id: source.id, label: source.label }
   }
   sourceForPath(filePath, preferredId) {
     let cursor = path.resolve(filePath)
@@ -1062,6 +1071,58 @@ class Vault {
       return !!(runningPath && isPathWithin(appRoot, runningPath))
     })
   }
+  storeCandidateIndex() {
+    const index = new Map()
+    for (const [filePath, entry] of this.registry.links) {
+      if (!index.has(entry.hash)) index.set(entry.hash, new Map())
+      const byDevice = index.get(entry.hash)
+      if (!byDevice.has(entry.dev)) byDevice.set(entry.dev, [])
+      byDevice.get(entry.dev).push([filePath, entry])
+    }
+    return index
+  }
+  async ensureStoreForHash(hash, dev, indexedCandidates = null) {
+    const storePath = this.storePathFor(hash)
+    const existing = await this.storeStatIfPresent(storePath)
+    if (existing && existing.isFile()) return { status: "ready" }
+
+    let locked = false
+    let stale = false
+    const candidates = indexedCandidates || [...this.registry.links].filter(([, entry]) =>
+      entry.hash === hash && (dev === undefined || entry.dev === dev))
+    for (const [filePath, entry] of candidates) {
+      const source = this.sourceForPath(filePath, entry.source_id)
+      if (!source || !source.shareable ||
+          !await this.canonicalPathIsWithinSource(filePath, source)) {
+        continue
+      }
+      if (this.sourceAppIsRunning(source)) {
+        locked = true
+        continue
+      }
+      const expected = this.registry.scanIndex.get(filePath)
+      const current = await lstatIfPresent(filePath)
+      if (!expected || expected.hash !== hash || !current || !current.isFile() ||
+          !sameSnapshot(expected, current)) {
+        this.registry.untrack(filePath)
+        stale = true
+        continue
+      }
+      const result = await this.adopt(filePath, hash, {
+        app: source.kind === "app" ? source.app : (entry.app || null),
+        source_id: source.id,
+        expected: fileSnapshot(current)
+      })
+      if (result.status === "adopted" || result.status === "already" ||
+          result.status === "duplicate") {
+        return { status: "ready" }
+      }
+      if (result.status === "stale") stale = true
+      else if (result.status === "copy-mode") return { status: "unavailable" }
+    }
+    if (locked) return { status: "locked" }
+    return { status: stale ? "stale" : "no-blob" }
+  }
   async deduplicateFile(filePath, options = {}) {
     if (!this.enabled || typeof filePath !== "string" || !filePath) {
       return { status: this.enabled ? "not-found" : "disabled" }
@@ -1094,6 +1155,11 @@ class Vault {
     }
     if (!this.registry.blobs.has(hashed.hash)) return { status: "no-match" }
     if (!await this.canonicalPathIsWithinSource(targetPath, source)) return { status: "stale" }
+    const indexedCandidates = options.storeCandidates
+      ? (options.storeCandidates.get(hashed.hash)?.get(after.dev) || [])
+      : null
+    const prepared = await this.ensureStoreForHash(hashed.hash, after.dev, indexedCandidates)
+    if (prepared.status !== "ready") return prepared
     const current = await lstatIfPresent(targetPath)
     if (!sameSnapshot(fileSnapshot(after), current)) return { status: "stale" }
 
@@ -1138,9 +1204,13 @@ class Vault {
       incompatible: 0, unavailable: 0, failed: 0
     }
     const batch = options.batch_id || `batch-${crypto.randomUUID()}`
+    const storeCandidates = this.storeCandidateIndex()
     for (const filePath of paths) {
       try {
-        const result = await this.deduplicateExcludedFile(filePath, { batch_id: batch })
+        const result = await this.deduplicateExcludedFile(filePath, {
+          batch_id: batch,
+          storeCandidates
+        })
         if (result.status === "converted" || result.status === "already") {
           summary.converted += 1
           summary.bytes_saved += result.bytes_saved || 0
@@ -1186,6 +1256,7 @@ class Vault {
     const summary = { converted: 0, bytes_saved: 0, locked: 0, stale: 0, incompatible: 0, unavailable: 0, failed: 0 }
     const staleHashes = new Set()
     const entries = [...registry.duplicates]
+    const storeCandidates = this.storeCandidateIndex()
     const matchesScope = (currentSource) => currentSource && currentSource.shareable &&
       (includeDescendants ? this.sourceIsWithinScope(currentSource, scopeId) : currentSource.id === scopeId)
     if (options.progress) {
@@ -1221,6 +1292,16 @@ class Vault {
         continue
       }
       try {
+        const indexedCandidates = storeCandidates.get(entry.hash)?.get(expected.dev) || []
+        const prepared = await this.ensureStoreForHash(entry.hash, expected.dev, indexedCandidates)
+        if (prepared.status !== "ready") {
+          if (prepared.status === "locked") summary.locked += 1
+          else if (prepared.status === "stale") summary.stale += 1
+          else if (prepared.status === "unavailable") summary.unavailable += 1
+          else summary.failed += 1
+          completeProgress()
+          continue
+        }
         const result = await this.convert(filePath, entry.hash, {
           app: currentSource.kind === "app" ? currentSource.app : (entry.app || null),
           source_id: currentSource.id,
@@ -1349,12 +1430,55 @@ class Vault {
       if (!st) {
         const names = linksByHash.get(hash) || []
         const copyNames = names.filter(([, entry]) => entry.mode === "copy")
+        let inaccessibleName = false
+        if (!names.length) {
+          for (const [duplicatePath, duplicate] of this.registry.duplicates) {
+            if (duplicate.hash !== hash) continue
+            if (preservePath(duplicatePath)) {
+              inaccessibleName = true
+              continue
+            }
+            let source
+            let expected
+            let duplicateStat
+            try {
+              source = this.sourceForPath(duplicatePath, duplicate.source_id)
+              expected = this.registry.scanIndex.get(duplicatePath)
+              duplicateStat = await lstatIfPresent(duplicatePath)
+              if (source && duplicateStat && duplicateStat.isFile() &&
+                  !await this.canonicalPathIsWithinSource(
+                    duplicatePath, source, { strictErrors: true })) {
+                continue
+              }
+            } catch (error) {
+              if (!handleAccessError(error, duplicatePath)) throw error
+              inaccessibleName = true
+              continue
+            }
+            if (!source || !expected || expected.hash !== hash ||
+                !duplicateStat || !duplicateStat.isFile() ||
+                !sameSnapshot(expected, duplicateStat)) {
+              continue
+            }
+            const entry = {
+              hash, app: duplicate.app || null, source_id: source.id,
+              dev: duplicateStat.dev, ino: duplicateStat.ino, mode: "copy"
+            }
+            this.registry.addLink(duplicatePath, entry)
+            copyNames.push([duplicatePath, entry])
+            break
+          }
+        }
+        if (options.repairStores === false && names.some(([, entry]) => entry.mode === "link")) {
+          blob.orphan = false
+          blob.verified_at = null
+          continue
+        }
         // Deleting a name changes ctime, so trusted re-adoption compares the
         // preserved identity, size, and mtime. Changed or legacy-unsnapshotted
         // content waits for the next explicit scan instead of being assigned a
         // stale hash filename during startup.
         let readopted = false
-        let inaccessibleName = false
         for (const [linkPath, entry] of names) {
           if (entry.mode !== "link") continue
           if (preservePath(linkPath)) {
@@ -1680,7 +1804,8 @@ class Vault {
       if (!namesByHash.has(entry.hash)) namesByHash.set(entry.hash, [])
       const location = this.locationForPath(linkPath, entry.source_id)
       namesByHash.get(entry.hash).push(Object.assign({
-        path: linkPath, app: entry.app || null, mode: entry.mode
+        path: linkPath, app: entry.app || null, mode: entry.mode,
+        dev: entry.dev, ino: entry.ino
       }, location))
       if (entry.batch_id && (!scopeId || entry.source_id === scopeId)) {
         if (!undoBatchMap.has(entry.batch_id)) {
@@ -1722,7 +1847,14 @@ class Vault {
       storeStats.set(hash, storeStat)
       const size = blob.size || 0
       const linkedCopy = storeStat || names.some((name) => name.mode === "link") ? 1 : 0
-      const physicalCopies = linkedCopy + names.filter((name) => name.mode === "copy").length
+      const copyInodes = new Set(names.filter((name) => name.mode === "copy").map((name) =>
+        name.dev !== undefined && name.ino !== undefined
+          ? `${name.dev}:${name.ino}`
+          : `path:${name.path}`))
+      for (const name of names) {
+        if (name.mode === "link") copyInodes.delete(`${name.dev}:${name.ino}`)
+      }
+      const physicalCopies = linkedCopy + copyInodes.size
       const pendingBytes = pendingBytesByHash.get(hash) || 0
       trackedLogicalBytes += (size * names.length) + pendingBytes
       bytesOnDisk += (size * physicalCopies) + pendingBytes
@@ -1758,15 +1890,20 @@ class Vault {
       const source = this.sourceForPath(p, location.source_id)
       const index = registry.scanIndex.get(p)
       const storeStat = storeStats.get(entry.hash)
-      const shareable = !!(source && source.shareable && storeStat && !entry.unavailable_reason &&
-        (!index || index.dev === undefined || index.dev === storeStat.dev))
+      const blob = blobByHash.get(entry.hash)
+      const compatibleName = blob && blob.names.find((name) =>
+        name.path !== p && (!index || index.dev === undefined || name.dev === index.dev))
+      const compatibleStore = storeStat &&
+        (!index || index.dev === undefined || index.dev === storeStat.dev)
+      const shareable = !!(source && source.shareable && !entry.unavailable_reason &&
+        (compatibleStore || compatibleName))
       let unavailableReason = entry.unavailable_reason || null
       if (!shareable && !unavailableReason) {
-        unavailableReason = source && storeStat && index && index.dev !== undefined && index.dev !== storeStat.dev
+        unavailableReason = source && storeStat && index &&
+          index.dev !== undefined && index.dev !== storeStat.dev
           ? "different_disk"
           : "unsupported_disk"
       }
-      const blob = blobByHash.get(entry.hash)
       const match = blob ? blob.names.find((name) => name.path !== p) || null : null
       duplicates.push(Object.assign({
         path: p, hash: entry.hash, size: entry.size || 0, app: entry.app || null,
@@ -1811,7 +1948,8 @@ class Vault {
       display_path: source.kind === "pinokio" ? source.root : (source.mount_path || source.root),
       target_path: source.kind === "external" ? source.root : null,
       parent_id: scopeId ? null : source.parent_id, app: source.app || null,
-      available: source.available !== false, shareable: source.kind === "virtual" ? null : !!source.shareable
+      available: source.available !== false, shareable: source.kind === "virtual" ? null : !!source.shareable,
+      removable: source.kind === "external" && source.configured === true
     }))
     const result = {
       enabled: true,

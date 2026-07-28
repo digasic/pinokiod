@@ -110,14 +110,16 @@ describe('vault manual scan (phase 3)', () => {
     assert.deepStrictEqual(found, [path.resolve(linkRoot, 'nested', 'file.bin')])
   })
 
-  test('scan discovers, hashes, adopts — and records folder totals', async () => {
+  test('scan discovers and hashes without creating filesystem links', async () => {
     const { home, vault } = await makeEnv()
     const content = crypto.randomBytes(4096)
     const file = await writeFile(path.resolve(home, 'api', 'appA', 'models', 'm.safetensors'), content)
     await writeFile(path.resolve(home, 'api', 'appA', 'small.txt'), 'tiny')
     const result = await vault.sweeper.scan()
-    assert.strictEqual((await fs.promises.stat(file)).nlink, 2)
-    assert.ok(vault.registry.blobs.has(sha256(content)))
+    const hash = sha256(content)
+    assert.strictEqual((await fs.promises.stat(file)).nlink, 1)
+    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
+    assert.strictEqual(vault.registry.links.get(file).mode, 'copy')
     assert.ok(result.bytes_total >= content.length + 4, 'folder total includes small files')
     assert.ok(vault.registry.lastScan && vault.registry.lastScan.bytes_total === result.bytes_total)
     assert.ok(vault.registry.lastScan.duration_ms >= 0, 'scan duration is measured')
@@ -173,7 +175,8 @@ describe('vault manual scan (phase 3)', () => {
     await vault.sweeper.scan()
 
     const nlinks = [a, b, hfBlob].map((p) => fs.statSync(p).nlink)
-    assert.strictEqual(nlinks.filter((n) => n === 2).length, 1, 'exactly one copy adopted')
+    assert.deepStrictEqual(nlinks, [1, 1, 1], 'scan creates no hidden or shared links')
+    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
     assert.strictEqual(vault.registry.duplicates.size, 2, 'other two are pending, not converted')
     const events = await vault.registry.readEvents()
     assert.strictEqual(events.filter((e) => e.kind === 'convert').length, 0, 'no conversion without a click')
@@ -198,7 +201,8 @@ describe('vault manual scan (phase 3)', () => {
     const inVenv = await writeFile(
       path.resolve(home, 'api', 'appA', 'coreml_venv', 'lib', 'site-packages', 'lib.dylib'), content)
     await vault.sweeper.scan()
-    assert.strictEqual((await fs.promises.stat(inVenv)).nlink, 2, 'adopted despite venv-ish path')
+    assert.strictEqual((await fs.promises.stat(inVenv)).nlink, 1)
+    assert.ok(vault.registry.scanIndex.has(inVenv), 'venv-ish paths are still indexed')
   })
 
   test('a direct Hugging Face blob that shrinks below the threshold is untracked', async () => {
@@ -224,7 +228,7 @@ describe('vault manual scan (phase 3)', () => {
     const real = await writeFile(path.resolve(home, 'api', 'appA', 'models', 'real.bin'), crypto.randomBytes(4096))
     await fs.promises.symlink(path.resolve(home, 'api', 'appA'), path.resolve(home, 'api', 'appA', 'loop'))
     await vault.sweeper.scan()
-    assert.strictEqual((await fs.promises.stat(real)).nlink, 2)
+    assert.strictEqual((await fs.promises.stat(real)).nlink, 1)
   })
 
   test('a file replaced by a symlink during inspection is never followed', async (t) => {
@@ -265,7 +269,7 @@ describe('vault manual scan (phase 3)', () => {
     assert.strictEqual((await fs.promises.stat(outside)).nlink, 1)
   })
 
-  test('top-level linked imports are scanned as external sources while nested links stay skipped', async (t) => {
+  test('top-level api links are not adopted as external sources', async (t) => {
     const { home, vault } = await makeEnv()
     const external = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-external-'))
     const nested = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-external-nested-'))
@@ -286,22 +290,20 @@ describe('vault manual scan (phase 3)', () => {
     const source = vault.sources().find((item) => item.kind === 'external' && item.label === 'linked-models')
     const canonicalImported = path.resolve(await fs.promises.realpath(external), 'models', 'm.bin')
     const canonicalNestedFile = path.resolve(await fs.promises.realpath(nested), 'should-not-scan.bin')
-    assert.ok(source, 'linked import becomes an external source')
-    assert.strictEqual(source.parent_id, 'external')
-    assert.ok(vault.registry.scanIndex.has(canonicalImported), 'external root was scanned')
+    assert.strictEqual(source, undefined, 'api links are not Vault configuration')
+    assert.strictEqual(vault.registry.scanIndex.has(canonicalImported), false)
     assert.strictEqual(vault.registry.scanIndex.has(canonicalNestedFile), false, 'nested directory link was not followed')
-    assert.strictEqual(vault.registry.duplicates.get(canonicalImported).source_id, source.id)
-    assert.strictEqual((await fs.promises.stat(local)).nlink, 2)
+    assert.strictEqual((await fs.promises.stat(local)).nlink, 1)
 
     const status = await vault.status()
-    assert.ok(status.sources.some((item) => item.id === source.id && item.kind === 'external'))
-    assert.strictEqual(status.duplicates.find((item) => item.path === canonicalImported).source_id, source.id)
+    assert.strictEqual(status.sources.some((item) => item.kind === 'external'), false)
+    assert.strictEqual(status.duplicates.some((item) => item.path === canonicalImported), false)
     assert.strictEqual(status.last_scan.home_bytes_total, content.length, 'Pinokio metric excludes external files')
-    assert.strictEqual(status.last_scan.source_bytes[source.id], content.length, 'external totals remain attributable')
+    assert.strictEqual(status.last_scan.bytes_total, content.length)
   })
 
-  test('adding an external source creates one persistent import without starting a scan', async () => {
-    const { home, vault } = await makeEnv()
+  test('adding and removing an external source persists only its path and never creates a link', async () => {
+    const { home, vault, kernel } = await makeEnv()
     const external = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-added-external-'))
     homes.push(external)
     const content = crypto.randomBytes(4096)
@@ -312,27 +314,42 @@ describe('vault manual scan (phase 3)', () => {
     assert.strictEqual(added.source.kind, 'external')
     assert.strictEqual(added.source.parent_id, 'external')
     assert.strictEqual(vault.registry.scanIndex.size, 0, 'adding a source never scans it')
-    assert.strictEqual((await fs.promises.lstat(added.source.mount_path)).isSymbolicLink(), true)
-    assert.strictEqual(path.dirname(added.source.mount_path), path.resolve(home, 'vault', 'sources'))
+    assert.strictEqual(added.source.root, path.resolve(await fs.promises.realpath(external)))
+    assert.strictEqual(added.source.mount_path, undefined)
+    assert.deepStrictEqual(
+      JSON.parse(await fs.promises.readFile(vault.externalSourcesPath, 'utf8')).paths,
+      [added.source.root]
+    )
+    assert.strictEqual(fs.existsSync(path.resolve(home, 'vault', 'sources')), false)
     assert.deepStrictEqual(await fs.promises.readdir(path.resolve(home, 'api')), [],
-      'a scan-only external source never enters global app discovery')
+      'adding a Vault source never creates an api link')
 
     const repeated = await vault.addExternalSource(external)
     assert.strictEqual(repeated.created, false, 'the same physical folder is not imported twice')
     assert.strictEqual(vault.sources().filter((source) => source.kind === 'external').length, 1)
 
+    const fresh = new Vault(kernel)
+    await fresh.init()
+    assert.ok(fresh.sources().some((source) =>
+      source.kind === 'external' && source.root === added.source.root))
+
     await vault.sweeper.scan()
     const canonicalImported = path.resolve(await fs.promises.realpath(imported))
     assert.ok(vault.registry.scanIndex.has(canonicalImported))
 
-    await fs.promises.unlink(added.source.mount_path)
-    await vault.sweeper.scan()
+    const removed = await vault.perform('remove_source', { source_id: added.source.id })
+    assert.strictEqual(removed.removed, true)
+    assert.deepStrictEqual(
+      JSON.parse(await fs.promises.readFile(vault.externalSourcesPath, 'utf8')).paths,
+      []
+    )
     const status = await vault.status()
     assert.strictEqual(vault.registry.links.has(canonicalImported), false)
     assert.strictEqual(vault.registry.duplicates.has(canonicalImported), false)
     assert.strictEqual(vault.registry.scanIndex.has(canonicalImported), false)
     assert.strictEqual(status.sources.some((source) => source.kind === 'external'), false)
     assert.strictEqual(status.duplicates.some((item) => item.path === canonicalImported), false)
+    assert.deepStrictEqual(await fs.promises.readFile(imported), content)
   })
 
   test('nested external sources are walked once and attributed to the deepest source', async () => {
@@ -393,7 +410,7 @@ describe('vault manual scan (phase 3)', () => {
     const realStat = fs.promises.stat
     let externalStats = 0
     fs.promises.stat = async (target, options) => {
-      if (path.resolve(String(target)) === path.resolve(canonicalExternal) && ++externalStats === 2) {
+      if (path.resolve(String(target)) === path.resolve(canonicalExternal) && ++externalStats === 1) {
         const error = new Error('temporary external metadata failure')
         error.code = 'EIO'
         throw error
@@ -452,39 +469,71 @@ describe('vault manual scan (phase 3)', () => {
     assert.strictEqual(vault.registry.lastScan.files, 2)
   })
 
-  test('a failed source refresh rolls back only the import it just created', async () => {
+  test('an inaccessible duplicate is preserved when its representative disappears', async () => {
+    const { home, vault } = await makeEnv()
+    const content = crypto.randomBytes(4096)
+    const hash = sha256(content)
+    const first = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
+    const second = await writeFile(path.resolve(home, 'api', 'appB', 'model.bin'), content)
+    await vault.sweeper.scan()
+
+    const representative = [first, second].find((filePath) => vault.registry.links.has(filePath))
+    const pending = [first, second].find((filePath) => vault.registry.duplicates.has(filePath))
+    await fs.promises.unlink(representative)
+
+    const realLstat = fs.promises.lstat
+    fs.promises.lstat = async (target, options) => {
+      if (path.resolve(String(target)) === pending) {
+        const error = new Error('permission denied')
+        error.code = 'EACCES'
+        throw error
+      }
+      return realLstat(target, options)
+    }
+    try {
+      const result = await vault.sweeper.scan()
+      assert.strictEqual(result.incomplete, true)
+    } finally {
+      fs.promises.lstat = realLstat
+    }
+
+    assert.strictEqual(vault.registry.links.has(representative), false)
+    assert.strictEqual(vault.registry.duplicates.has(pending), true)
+    assert.strictEqual(vault.registry.blobs.has(hash), true)
+    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
+  })
+
+  test('a failed external-source settings write creates no configuration', async () => {
     const { vault } = await makeEnv()
     const external = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-add-rollback-'))
     homes.push(external)
-    const importRoot = vault.sourceRoot
-    const realReaddir = fs.promises.readdir
-    let importReads = 0
-    fs.promises.readdir = async (target, options) => {
-      if (path.resolve(target) === importRoot && ++importReads === 1) {
+    const realAtomicWrite = vault.registry.atomicWrite
+    vault.registry.atomicWrite = async (target, contents) => {
+      if (path.resolve(target) === vault.externalSourcesPath) {
         const error = new Error('transient read failure')
         error.code = 'EIO'
         throw error
       }
-      return realReaddir(target, options)
+      return realAtomicWrite.call(vault.registry, target, contents)
     }
     try {
       await assert.rejects(vault.addExternalSource(external), (error) => error.code === 'EIO')
     } finally {
-      fs.promises.readdir = realReaddir
+      vault.registry.atomicWrite = realAtomicWrite
     }
 
-    assert.deepStrictEqual(await fs.promises.readdir(importRoot), [])
+    assert.strictEqual(fs.existsSync(vault.externalSourcesPath), false)
     assert.strictEqual(vault.sources().some((source) => source.kind === 'external'), false)
   })
 
-  test('excluded paths are respected: no adoption, no pending, no re-listing', async () => {
+  test('excluded paths are respected: no anchor, no pending, no re-listing', async () => {
     const { home, vault } = await makeEnv()
     const content = crypto.randomBytes(4096)
     const a = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), content)
     const b = await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), content)
     vault.registry.excluded.set(b, { ts: Date.now() })
     await vault.sweeper.scan()
-    assert.strictEqual((await fs.promises.stat(a)).nlink, 2)
+    assert.strictEqual((await fs.promises.stat(a)).nlink, 1)
     assert.strictEqual((await fs.promises.stat(b)).nlink, 1)
     assert.strictEqual(vault.registry.duplicates.has(b), false)
   })
@@ -703,6 +752,26 @@ describe('vault manual scan (phase 3)', () => {
     assert.strictEqual(vault.registry.links.get(b).hash, sha256(content))
   })
 
+  test('repair preserves pre-existing hardlinks without creating a store anchor', async () => {
+    const { home, vault } = await makeEnv()
+    const content = crypto.randomBytes(4096)
+    const hash = sha256(content)
+    const a = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
+    const b = path.resolve(home, 'api', 'appB', 'model.bin')
+    await fs.promises.mkdir(path.dirname(b), { recursive: true })
+    await fs.promises.link(a, b)
+    await vault.sweeper.scan()
+    await vault.sweeper.scan()
+
+    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
+    await vault.rebuild()
+
+    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
+    assert.strictEqual((await fs.promises.stat(a)).nlink, 2)
+    assert.strictEqual(vault.registry.links.get(a).mode, 'copy')
+    assert.strictEqual(vault.registry.links.get(b).mode, 'copy')
+  })
+
   test('an inode discovered after its hash job completes reuses the completed digest', async () => {
     const { home, vault } = await makeEnv()
     const content = crypto.randomBytes(4096)
@@ -849,7 +918,7 @@ describe('vault manual scan (phase 3)', () => {
       `commit123\n"${hash}"\n${future}\n`)
     await vault.sweeper.scan()
     assert.strictEqual(vault.registry.lastScan.hashed, 0, 'hash harvested, not computed')
-    assert.strictEqual((await fs.promises.stat(file)).nlink, 2)
+    assert.strictEqual((await fs.promises.stat(file)).nlink, 1)
     assert.ok(vault.registry.blobs.has(hash))
   })
 
@@ -991,30 +1060,17 @@ describe('vault manual scan (phase 3)', () => {
     assert.strictEqual(vault.registry.lastScan.hashed, 2)
   })
 
-  test('copy-mode content remains tracked without becoming its own duplicate', async () => {
+  test('a scanned representative remains tracked without becoming its own duplicate', async () => {
     const { home, vault } = await makeEnv()
     const file = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), Buffer.alloc(4096, 9))
-    const realLink = fs.promises.link
-    fs.promises.link = async (source, target) => {
-      if (target.startsWith(vault.blobRoot)) {
-        const error = new Error('unsupported')
-        error.code = 'EXDEV'
-        throw error
-      }
-      return realLink(source, target)
-    }
-    try {
-      await vault.sweeper.scan()
-      await vault.sweeper.scan()
-    } finally {
-      fs.promises.link = realLink
-    }
+    await vault.sweeper.scan()
+    await vault.sweeper.scan()
 
     assert.strictEqual(vault.registry.links.get(file).mode, 'copy')
     assert.strictEqual(vault.registry.duplicates.has(file), false)
   })
 
-  test('changing one copy-mode file preserves other copies in the original content group', async () => {
+  test('changing one scanned representative preserves other copies in the original content group', async () => {
     const { home, vault } = await makeEnv()
     const original = Buffer.alloc(4096, 9)
     const changed = Buffer.alloc(4096, 10)
@@ -1022,22 +1078,9 @@ describe('vault manual scan (phase 3)', () => {
     const second = await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), original)
     const originalHash = sha256(original)
     const changedHash = sha256(changed)
-    const realLink = fs.promises.link
-    fs.promises.link = async (source, target) => {
-      if (target.startsWith(vault.blobRoot)) {
-        const error = new Error('unsupported')
-        error.code = 'EXDEV'
-        throw error
-      }
-      return realLink(source, target)
-    }
-    try {
-      await vault.sweeper.scan()
-      await fs.promises.writeFile(first, changed)
-      await vault.sweeper.scan()
-    } finally {
-      fs.promises.link = realLink
-    }
+    await vault.sweeper.scan()
+    await fs.promises.writeFile(first, changed)
+    await vault.sweeper.scan()
 
     assert.strictEqual(vault.registry.links.get(first).hash, changedHash)
     assert.strictEqual(vault.registry.links.get(second).hash, originalHash)
@@ -1080,7 +1123,7 @@ describe('vault manual scan (phase 3)', () => {
     assert.strictEqual(vault.registry.links.get(shared).hash, sha256(changed))
   })
 
-  test('a copy-mode-only content record cannot prevent later local adoption', async () => {
+  test('a scanned copy is adopted only when deduplication is explicitly requested', async () => {
     const { home, vault } = await makeEnv()
     const content = Buffer.alloc(4096, 10)
     const hash = sha256(content)
@@ -1090,13 +1133,54 @@ describe('vault manual scan (phase 3)', () => {
 
     await vault.sweeper.scan()
 
-    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), true)
+    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
     const linked = [first, second].filter((filePath) => vault.registry.links.has(filePath))
     const pending = [first, second].filter((filePath) => vault.registry.duplicates.has(filePath))
     assert.strictEqual(linked.length, 1)
     assert.strictEqual(pending.length, 1)
-    assert.strictEqual(vault.registry.links.get(linked[0]).mode, 'link')
+    assert.strictEqual(vault.registry.links.get(linked[0]).mode, 'copy')
     assert.strictEqual(vault.registry.duplicates.get(pending[0]).hash, hash)
+
+    const pendingSource = vault.registry.duplicates.get(pending[0]).source_id
+    const result = await vault.perform('deduplicate', { scope_id: pendingSource })
+    assert.strictEqual(result.converted, 1)
+    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), true)
+    assert.strictEqual((await fs.promises.stat(first)).ino, (await fs.promises.stat(second)).ino)
+  })
+
+  test('Deduplicate all indexes store candidates once for every content group', async () => {
+    const { home, vault } = await makeEnv()
+    for (let index = 0; index < 3; index++) {
+      const content = Buffer.alloc(4096, index + 20)
+      await writeFile(path.resolve(home, 'api', 'appA', `model-${index}.bin`), content)
+      await writeFile(path.resolve(home, 'api', 'appB', `model-${index}.bin`), content)
+    }
+    await vault.sweeper.scan()
+
+    const realIndex = vault.storeCandidateIndex.bind(vault)
+    const realEnsure = vault.ensureStoreForHash.bind(vault)
+    let indexBuilds = 0
+    let indexedLookups = 0
+    vault.storeCandidateIndex = () => {
+      indexBuilds += 1
+      return realIndex()
+    }
+    vault.ensureStoreForHash = async (hash, dev, candidates) => {
+      assert.ok(Array.isArray(candidates))
+      indexedLookups += 1
+      return realEnsure(hash, dev, candidates)
+    }
+    let result
+    try {
+      result = await vault.perform('deduplicate', { selection: 'duplicates' })
+    } finally {
+      vault.storeCandidateIndex = realIndex
+      vault.ensureStoreForHash = realEnsure
+    }
+
+    assert.strictEqual(result.converted, 3)
+    assert.strictEqual(indexBuilds, 1)
+    assert.strictEqual(indexedLookups, 3)
   })
 
   test('a repaired linked inode without a trustworthy snapshot is hashed once', async () => {

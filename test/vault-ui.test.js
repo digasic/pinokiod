@@ -813,22 +813,19 @@ describe('vault dashboard backend (phase 4)', () => {
     const { home, vault } = await makeEnv()
     const shared = crypto.randomBytes(4096)
     const small = crypto.randomBytes(512)
-    const hash = sha256(shared)
     const appAFile = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), shared)
-    const appBFile = await writeFile(path.resolve(home, 'api', 'appB', 'model.bin'), shared)
-    const appCFile = await writeFile(path.resolve(home, 'api', 'appC', 'model.bin'), shared)
+    await writeFile(path.resolve(home, 'api', 'appB', 'model.bin'), shared)
+    await writeFile(path.resolve(home, 'api', 'appC', 'model.bin'), shared)
     await writeFile(path.resolve(home, 'api', 'appA', 'config.bin'), small)
     await vault.sweeper.scan()
     const sources = Object.fromEntries(vault.sources()
       .filter((source) => source.kind === 'app')
       .map((source) => [source.app, source]))
 
-    assert.strictEqual((await vault.convert(appBFile, hash, {
-      app: 'appB', source_id: sources.appB.id
-    })).status, 'converted')
-    assert.strictEqual((await vault.convert(appCFile, hash, {
-      app: 'appC', source_id: sources.appC.id
-    })).status, 'converted')
+    const appBResult = await vault.perform('deduplicate', { scope_id: sources.appB.id })
+    const appCResult = await vault.perform('deduplicate', { scope_id: sources.appC.id })
+    assert.strictEqual(appBResult.converted, 1)
+    assert.strictEqual(appCResult.converted, 1)
 
     const status = await vault.status(sources.appA.id)
     assert.strictEqual(status.last_scan.bytes_total, shared.length + small.length)
@@ -1264,7 +1261,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /before_help:\s*"Estimated size of every scanned location if each app stored its own copy\. File Explorer may count deduplicated files differently\."/)
     assert.match(vaultPage, /nothing_more_to_save:\s*"Nothing else to save"/)
     assert.match(vaultPage, /more_can_be_saved:\s*"\{size\} more can be saved"/)
-    assert.match(vaultPage, /fmt\(data\.saved_by_sharing\)/)
+    assert.match(vaultPage, /Number\(data\.saved_by_sharing\)/)
     assert.match(vaultPage, /Number\(data\.bytes_without_sharing\)/)
     assert.match(vaultPage, /Number\(data\.bytes_on_disk\)/)
     assert.match(vaultPage, /Number\(data\.pending_bytes\)/)
@@ -1276,7 +1273,8 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /candidate_size:\s*candidateSize\(\)/)
     assert.match(vaultPage, /localStorage\.setItem\(candidateSizeKey/)
     assert.match(vaultPage, /id='vault-storage-details'/)
-    assert.match(vaultPage, /fmt\(data\.lifetime_bytes_saved\)/)
+    assert.match(vaultPage, /Number\(data\.lifetime_bytes_saved\)/)
+    assert.match(vaultPage, /Math\.max\(0, sharedNow - freedBytes\)/)
     assert.match(vaultPage, /repair_index:\s*"Repair index"/)
     assert.match(vaultPage, /<details class='vault-advanced'/)
     assert.doesNotMatch(vaultPage, /id='btn-rebuild'/)
@@ -1333,6 +1331,8 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.match(vaultPage, /id='btn-add-source'/)
     assert.match(vaultPage, /<script src="\/Socket\.js"><\/script>/)
     assert.match(vaultPage, /action:\s*"add_source"/)
+    assert.match(vaultPage, /action:\s*"remove_source"/)
+    assert.match(vaultPage, /remove_external_folder:\s*"Remove from Locations"/)
     assert.match(vaultPage, /identical_contents_at:\s*"Identical contents at"/)
     assert.doesNotMatch(vaultPage, /Matching locations/)
     assert.match(vaultPage, /scan_waiting:\s*"Waiting for scan results"/)
@@ -1526,6 +1526,10 @@ describe('vault dashboard backend (phase 4)', () => {
     await new Promise((resolve) => setTimeout(resolve, 25))
 
     assert.strictEqual(dom.window.document.querySelector('.vault-summary-value').textContent, '4.51 GB saved for this app')
+    assert.deepStrictEqual(
+      [...dom.window.document.querySelectorAll('.vault-compare-label')].map((node) => node.firstChild.textContent.trim()),
+      ['Before', 'After']
+    )
     assert.deepStrictEqual([...dom.window.document.querySelectorAll('.vault-compare-value')].map((node) => node.textContent), ['7.09 GB', '2.58 GB'])
     assert.match(dom.window.document.querySelector('.vault-compare-fill.after').getAttribute('style'), /--vault-after-ratio:36\.36%/)
     assert.strictEqual(dom.window.document.getElementById('vault-after-help').textContent,
@@ -1613,7 +1617,10 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(dom.window.document.getElementById('btn-review-metric').classList.contains('primary'), true)
     assert.strictEqual(dom.window.document.getElementById('btn-scan').classList.contains('primary'), false)
     assert.match(dom.window.document.getElementById('vault-storage-details').textContent, /Pinokio folder\s*166\.22 GB/)
-    assert.match(dom.window.document.getElementById('vault-storage-details').textContent, /Saved by your actions\s*258\.77 GB/)
+    assert.match(dom.window.document.getElementById('vault-storage-details').textContent, /Kept deduplicated\s*256\.95 GB/)
+    // lifetime (241) exceeds live sharing (239.3) here, so the clamp keeps
+    // the pre-existing figure at zero instead of going negative.
+    assert.match(dom.window.document.getElementById('vault-storage-details').textContent, /Already shared before Save space\s*0 B/)
     const cleanupNotice = dom.window.document.getElementById('vault-cleanup-notice')
     assert.strictEqual(cleanupNotice.classList.contains('show'), true)
     assert.match(cleanupNotice.textContent, /ready to clean up/)
@@ -2588,7 +2595,7 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.doesNotMatch(actionRoute, /convertPending|runExclusive/)
   })
 
-  test('a stale external source id cannot authorize files outside its current target', async (t) => {
+  test('a stale external source id cannot authorize files outside its current target', async () => {
     const { home, vault } = await makeEnv()
     const firstTarget = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-scope-old-'))
     const secondTarget = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-scope-new-'))
@@ -2597,16 +2604,8 @@ describe('vault dashboard backend (phase 4)', () => {
     const hash = sha256(content)
     const original = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
     const outside = await writeFile(path.resolve(firstTarget, 'model.bin'), content)
-    const mount = path.resolve(home, 'api', 'external-models')
-    try {
-      await fs.promises.symlink(firstTarget, mount, process.platform === 'win32' ? 'junction' : 'dir')
-    } catch (error) {
-      t.skip(`directory links unavailable: ${error.message}`)
-      return
-    }
-    await vault.refreshSources()
+    const externalSource = (await vault.addExternalSource(firstTarget)).source
     const originalSource = vault.sources().find((source) => source.kind === 'app' && source.app === 'appA')
-    const externalSource = vault.sources().find((source) => source.kind === 'external' && source.label === 'external-models')
     await vault.adopt(original, hash, { app: 'appA', source_id: originalSource.id })
     const outsideStat = await fs.promises.stat(outside)
     vault.registry.duplicates.set(outside, {
@@ -2614,12 +2613,12 @@ describe('vault dashboard backend (phase 4)', () => {
       dev: outsideStat.dev, ino: outsideStat.ino,
       mtime: outsideStat.mtimeMs, ctime: outsideStat.ctimeMs
     })
-    await fs.promises.unlink(mount)
-    await fs.promises.symlink(secondTarget, mount, process.platform === 'win32' ? 'junction' : 'dir')
+    await vault.writeExternalSourcePaths([secondTarget])
+    await vault.refreshSources()
 
     const result = await vault.perform('deduplicate', { scope_id: externalSource.id })
 
-    assert.strictEqual(result.converted, 0)
+    assert.match(result.error, /no longer available/i)
     assert.strictEqual((await fs.promises.stat(outside)).nlink, 1)
     assert.ok(vault.registry.duplicates.has(outside))
   })
@@ -2768,16 +2767,13 @@ describe('vault dashboard backend (phase 4)', () => {
     assert.strictEqual(vault.registry.links.has(pending), false)
   })
 
-  test('status separates app, Pinokio folder, and external source metadata', async (t) => {
+  test('status separates app, Pinokio folder, and external source metadata', async () => {
     const { home, vault } = await makeEnv()
-    const external = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-ui-external-'))
-    homes.push(external)
-    try {
-      await fs.promises.symlink(external, path.resolve(home, 'api', 'linked-models'), process.platform === 'win32' ? 'junction' : 'dir')
-    } catch (error) {
-      t.skip(`directory links unavailable: ${error.message}`)
-      return
-    }
+    const externalParent = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-ui-external-'))
+    const external = path.resolve(externalParent, 'linked-models')
+    homes.push(externalParent)
+    await fs.promises.mkdir(external)
+    await vault.addExternalSource(external)
     await fs.promises.mkdir(path.resolve(home, 'api', 'local-app'), { recursive: true })
     await fs.promises.mkdir(path.resolve(home, 'cache'), { recursive: true })
     await vault.refreshSources()
@@ -2785,6 +2781,8 @@ describe('vault dashboard backend (phase 4)', () => {
     const byKind = new Map(status.sources.map((source) => [source.id, source]))
     assert.ok([...byKind.values()].some((source) => source.kind === 'app' && source.label === 'local-app' && source.parent_id === 'apps'))
     assert.ok([...byKind.values()].some((source) => source.kind === 'folder' && source.label === 'cache' && source.parent_id === 'pinokio'))
-    assert.ok([...byKind.values()].some((source) => source.kind === 'external' && source.label === 'linked-models' && source.parent_id === 'external'))
+    assert.ok([...byKind.values()].some((source) =>
+      source.kind === 'external' && source.label === 'linked-models' &&
+      source.parent_id === 'external' && source.removable === true))
   })
 })

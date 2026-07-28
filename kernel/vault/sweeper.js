@@ -31,9 +31,9 @@ const readFileNoFollow = async (filePath) => {
 // Scans run ONLY when the user asks — there are no automatic triggers.
 // The walk is generic: every regular file counts toward folder totals, and
 // every file >= the size threshold is a candidate. No name heuristics.
-// A scan never converts anything: it adopts new content (adds a vault name,
-// which mutates nothing) and lists byte-identical copies as pending, for the
-// user to deduplicate explicitly.
+// A scan never creates a Vault hardlink or replaces a source path. New content
+// is recorded as an independent copy; a managed store name is created only
+// after the user explicitly asks to deduplicate a matching file.
 
 class Sweeper {
   constructor(vault) {
@@ -130,7 +130,8 @@ class Sweeper {
         reconcile: !scopeId,
         verifyBlobs: !scopeId,
         preservePath: (filePath) => this.isInaccessible(filePath),
-        onAccessError: (error, filePath) => this.recordInaccessible(error, filePath)
+        onAccessError: (error, filePath) => this.recordInaccessible(error, filePath),
+        repairStores: false
       })
       this.state.duration_ms = Date.now() - this.state.started
       incomplete = this.state.inaccessible > 0
@@ -293,7 +294,9 @@ class Sweeper {
       const cached = registry.scanIndex.get(filePath)
       const unchanged = cached && cached.hash === inoHash && sameSnapshot(cached, st)
       if (unchanged) {
-        registry.addLink(filePath, { hash: inoHash, app: appName, source_id: sourceId, dev: st.dev, ino: st.ino, mode: "link" })
+        const registered = registry.links.get(filePath)
+        const mode = registered && registered.mode === "copy" ? "copy" : "link"
+        registry.addLink(filePath, { hash: inoHash, app: appName, source_id: sourceId, dev: st.dev, ino: st.ino, mode })
         return
       }
     }
@@ -426,8 +429,7 @@ class Sweeper {
         }
         // Same (device, inode) is physical identity, not a content guess.
         // Size and mtime also prevent applying a completed digest after an
-        // in-place mutation. ctime is omitted here because adoption itself
-        // adds a name and therefore legitimately changes inode metadata.
+        // in-place content change.
         if (!sameContentState(fileSnapshot(primaryStat), st)) continue
         await this.classify(name.filePath, st, hash, name.source_id)
       }
@@ -459,14 +461,13 @@ class Sweeper {
       }
     }
   }
-  // hash known → adopt if new content; otherwise a byte-identical copy:
-  // ALWAYS pending, never converted by a scan.
+  // Hash known: record the first physical copy without adding a filesystem
+  // name. Other byte-identical inodes are pending until the user approves
+  // deduplication.
   async classify(filePath, st, hash, preferredSourceId = null) {
     const registry = this.vault.registry
     try {
       const current = await fs.promises.lstat(filePath)
-      // A sibling name of the same inode may already have been adopted in
-      // this hash job, which changes ctime but not identity or content.
       if (!sameContentState(fileSnapshot(st), current)) {
         registry.untrack(filePath)
         this.state.unstable_hashes += 1
@@ -501,7 +502,7 @@ class Sweeper {
       this.vault.recordEvent({ kind: "diverged", hash: priorHash, path: filePath, app: appName, source_id: sourceId, size: st.size })
       if (removedStaleStore) {
         // Removing the stale store name changes ctime on this inode. Refresh
-        // the trusted snapshot before adoption, but reject any content change.
+        // the trusted snapshot before classification, but reject any content change.
         const current = await fs.promises.lstat(filePath)
         if (!sameContentState(fileSnapshot(st), current)) {
           registry.untrack(filePath)
@@ -527,29 +528,25 @@ class Sweeper {
       this.updateScanIndex(filePath, st, hash, sourceId)
       return
     }
-    if (!storeStat && ((source && source.shareable) || !registry.blobs.has(hash) || (registered &&
-        registered.hash === hash && registered.dev === st.dev && registered.ino === st.ino))) {
-      const adopted = await this.vault.adopt(filePath, hash, {
-        app: appName,
-        source_id: sourceId,
-        expected: fileSnapshot(st)
-      })
-      if (adopted.status === "stale") {
-        registry.untrack(filePath)
-        this.state.unstable_hashes += 1
-        return
-      }
-      if (adopted.status !== "duplicate") {
-        return
-      }
-      try {
-        storeStat = await this.vault.storeStatIfPresent(storePath)
-      } catch (error) {
-        if (!isMissingError(error)) throw error
-      }
-    }
     if (storeStat && storeStat.dev === st.dev && storeStat.ino === st.ino) {
       registry.addLink(filePath, { hash, app: appName, source_id: sourceId, dev: st.dev, ino: st.ino, mode: "link" })
+      this.updateScanIndex(filePath, st, hash, sourceId)
+      return
+    }
+    if (!storeStat && registered && registered.mode === "link" &&
+        registered.hash === hash && registered.dev === st.dev && registered.ino === st.ino) {
+      registry.addLink(filePath, {
+        hash, app: appName, source_id: sourceId, dev: st.dev, ino: st.ino,
+        mode: "link", batch_id: registered.batch_id || null
+      })
+      this.updateScanIndex(filePath, st, hash, sourceId)
+      return
+    }
+    if (!storeStat && (priorHash === hash || !registry.blobs.has(hash))) {
+      registry.addBlob(hash, { size: st.size })
+      registry.addLink(filePath, {
+        hash, app: appName, source_id: sourceId, dev: st.dev, ino: st.ino, mode: "copy"
+      })
       this.updateScanIndex(filePath, st, hash, sourceId)
       return
     }

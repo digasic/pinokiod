@@ -20,6 +20,9 @@ const COPY = {
   external_added: "Added to Locations. Run a scan when you’re ready.",
   external_exists: "That folder is already in Locations.",
   external_other_disk: "Added to Locations. It can be scanned, but files on this disk cannot be deduplicated with files in your Pinokio folder.",
+  remove_external_folder: "Remove from Locations",
+  remove_external_confirm: "Remove “{name}” from Locations? This does not delete or modify any files.",
+  external_removed: "Removed from Locations. No files were changed.",
   pinokio_folder: "Pinokio folder",
   save_space: "Save space",
   disk_space_saved: "of disk space saved",
@@ -36,7 +39,8 @@ const COPY = {
   find_savings: "Scan to find duplicate files and save disk space",
   find_app_savings: "Scan this app to find duplicate files and save disk space",
   storage_details: "Storage details",
-  saved_by_actions: "Saved by your actions",
+  kept_deduplicated: "Kept deduplicated",
+  already_shared: "Already shared before Save space",
   last_scanned: "Last scanned",
   never: "Never",
   scan: "Scan now",
@@ -164,7 +168,7 @@ const COPY = {
   undo: "Undo",
   identical_contents_at: "Identical contents at",
   no_files: "No files found",
-  no_files_hint: "Run a scan to find large files. Scanning never changes them.",
+  no_files_hint: "Run a scan to find large files. Scanning never links files together or replaces them.",
   scan_waiting: "Waiting for scan results",
   scan_waiting_hint: "Files will appear here when this scan finishes.",
   no_duplicates: "No duplicates to review",
@@ -528,6 +532,9 @@ const batchAction = (source) => {
   if (!source.shareable || !shareable.length) return `<div class="vault-pane-action-note">${esc(COPY.sharing_unavailable)}</div>`
   return `<button class="vault-button" type="button" data-deduplicate-scope="${attr(source.id)}">${esc(COPY.deduplicate)} ${countLabel(shareable.length)}</button>`
 }
+const removeSourceAction = (source) => source && source.removable
+  ? `<button class="vault-button" type="button" data-remove-source="${attr(source.id)}">${esc(COPY.remove_external_folder)}</button>`
+  : ""
 
 const toolbarSummary = (visibleItems) => {
   if (state.view === "duplicates") {
@@ -586,7 +593,8 @@ const renderToolbar = (visibleItems, allItems) => {
     ${displayModeControl()}
     ${descriptionMarkup}
     <span class="vault-toolbar-count" id="vault-toolbar-summary">${esc(toolbarSummary(visibleItems))}</span>
-    ${state.view === "all" ? batchAction(source) : bulkDeduplicationAction(allItems)}`
+    ${state.view === "all" ? batchAction(source) : bulkDeduplicationAction(allItems)}
+    ${removeSourceAction(source)}`
 }
 
 const statusMarkup = (item) => {
@@ -939,10 +947,12 @@ const renderOverview = () => {
         (!!last || beforeBytes > 0 || afterBytes > 0 || Number(data.pending_bytes) > 0)
     const afterRatio = beforeBytes ? Math.min(100, (afterBytes / beforeBytes) * 100) : 0
     const pendingBytes = Math.max(0, Number(data.pending_bytes) || 0)
+    const freedBytes = Math.max(0, Number(data.lifetime_bytes_saved) || 0)
+    const sharedNow = Math.max(0, Number(data.saved_by_sharing) || 0)
     const headline = hasComparison
       ? (IS_APP_MODE
           ? COPY.saved_for_app.replace("{size}", fmt(Math.max(0, beforeBytes - afterBytes)))
-          : `${fmt(data.saved_by_sharing)} ${COPY.disk_space_saved}`)
+          : `${fmt(sharedNow)} ${COPY.disk_space_saved}`)
       : (IS_APP_MODE ? COPY.find_app_savings : COPY.find_savings)
     const help = IS_APP_MODE ? COPY.effective_help : COPY.before_help
     const helpId = IS_APP_MODE ? "vault-after-help" : "vault-before-help"
@@ -976,10 +986,14 @@ const renderOverview = () => {
     const storageDetails = !IS_APP_MODE && el("vault-storage-details")
     if (storageDetails) {
       const homeBytes = last ? (last.home_bytes_total == null ? last.bytes_total : last.home_bytes_total) : null
+      // Clamped because deleting linked files later shrinks the live sharing
+      // total without touching the lifetime counter.
+      const alreadyShared = Math.max(0, sharedNow - freedBytes)
       storageDetails.innerHTML = `<div class="vault-advanced-title">${esc(COPY.storage_details)}</div>
         <dl class="vault-storage-list">
           <div><dt>${esc(COPY.pinokio_folder)}</dt><dd>${homeBytes == null ? "—" : fmt(homeBytes)}</dd></div>
-          <div><dt>${esc(COPY.saved_by_actions)}</dt><dd>${fmt(data.lifetime_bytes_saved)}</dd></div>
+          <div><dt>${esc(COPY.kept_deduplicated)}</dt><dd>${fmt(sharedNow)}</dd></div>
+          <div><dt>${esc(COPY.already_shared)}</dt><dd>${fmt(alreadyShared)}</dd></div>
         </dl>`
     }
   }
@@ -1568,6 +1582,18 @@ document.addEventListener("click", async (event) => {
     if (state.expandedFiles.has(file)) state.expandedFiles.delete(file)
     else state.expandedFiles.add(file)
     render()
+  } else if (target.dataset.removeSource) {
+    const source = sourceById(target.dataset.removeSource)
+    if (!source) return
+    const message = COPY.remove_external_confirm.replace("{name}", source.label)
+    if (!window.confirm(message)) return
+    await runAction({
+      action: "remove_source",
+      source_id: source.id
+    }, () => {
+      state.sourceId = null
+      return COPY.external_removed
+    })
   } else if (target.id === "btn-add-source") {
     target.disabled = true
     try {

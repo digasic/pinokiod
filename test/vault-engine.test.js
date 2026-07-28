@@ -118,7 +118,7 @@ describe('vault engine (phase 1)', () => {
     assert.strictEqual((await fresh.status()).reclaimable, content.length)
   })
 
-  test('adopt: metadata-only, store name shares the inode', async () => {
+  test('adopt: explicit store anchor shares the inode without copying bytes', async () => {
     const h = await home()
     const vault = await makeVault(h)
     const content = crypto.randomBytes(4096)
@@ -1235,6 +1235,7 @@ describe('vault engine (phase 1)', () => {
     vault.sourceForPath = () => source
     vault.sourceAppIsRunning = () => false
     vault.canonicalPathIsWithinSource = async () => true
+    vault.ensureStoreForHash = async () => ({ status: 'ready' })
     vault.registry.duplicates = new Map([
       ['/models/one.bin', { hash: 'a'.repeat(64), dev: 1, ino: 1, mtime: 1, ctime: 1 }],
       ['/models/two.bin', { hash: 'b'.repeat(64), dev: 1, ino: 2, mtime: 1, ctime: 1 }]
