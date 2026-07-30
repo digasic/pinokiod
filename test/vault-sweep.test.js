@@ -1,1367 +1,894 @@
-const { test, describe, after } = require('node:test')
-const assert = require('node:assert')
-const fs = require('fs')
-const os = require('os')
-const path = require('path')
-const crypto = require('crypto')
-const Vault = require('../kernel/vault')
-const Registry = require('../kernel/vault/registry')
-const { walkBatches } = require('../kernel/vault/walker')
+const { after, describe, test } = require("node:test")
+const assert = require("node:assert/strict")
+const crypto = require("node:crypto")
+const fs = require("node:fs")
+const os = require("node:os")
+const path = require("node:path")
+const Vault = require("../kernel/vault")
+const RegistryCore = require("../kernel/vault/registry_core")
 
-const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex')
+const homes = []
+const vaults = []
 
-const writeFile = async (p, content) => {
-  await fs.promises.mkdir(path.dirname(p), { recursive: true })
-  await fs.promises.writeFile(p, content)
-  return p
+const sha256 = (contents) => crypto.createHash("sha256")
+  .update(contents).digest("hex")
+
+const write = async (filePath, contents) => {
+  await fs.promises.mkdir(path.dirname(filePath), { recursive: true })
+  await fs.promises.writeFile(filePath, contents)
+  return filePath
 }
 
-describe('vault manual scan (phase 3)', () => {
-  let homes = []
-  const makeEnv = async () => {
-    const home = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-scan-'))
-    homes.push(home)
-    await fs.promises.mkdir(path.resolve(home, 'api'), { recursive: true })
-    const kernel = {
-      homedir: home,
-      platform: process.platform,
-      path: (...args) => path.resolve(home, ...args)
-    }
-    const vault = new Vault(kernel)
-    await vault.init()
-    vault.sizeThreshold = 1024
-    kernel.vault = vault
-    return { home, vault, kernel }
+const makeVault = async (threshold = 1) => {
+  const home = await fs.promises.mkdtemp(
+    path.join(os.tmpdir(), "pinokio-vault-scan-"))
+  homes.push(home)
+  await fs.promises.mkdir(path.join(home, "api"), { recursive: true })
+  const kernel = { homedir: home, platform: process.platform }
+  const vault = new Vault(kernel)
+  kernel.vault = vault
+  await vault.init()
+  vault.sizeThreshold = threshold
+  vaults.push(vault)
+  return { home, vault }
+}
+
+const close = async (vault) => {
+  if (vault.worker) await vault.worker.terminate().catch(() => {})
+  if (vault.registry) await vault.registry.close()
+}
+
+after(async () => {
+  for (const vault of vaults) await close(vault)
+  for (const home of homes) {
+    await fs.promises.rm(home, { recursive: true, force: true })
+      .catch(() => {})
   }
-  after(async () => {
-    for (const h of homes) {
-      await fs.promises.rm(h, { recursive: true, force: true }).catch(() => {})
-    }
-  })
+})
 
-  test('directory traversal yields bounded entry chunks without skipping nested files', async () => {
-    const root = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-walk-'))
-    homes.push(root)
-    const expected = []
-    for (let index = 0; index < 7; index++) {
-      expected.push(await writeFile(path.resolve(root, `dir-${index % 2}`, `file-${index}.bin`), String(index)))
-    }
-    const found = []
-    let dirs = 0
-    for await (const batch of walkBatches(root, { concurrency: 2, entryBatchSize: 2 })) {
-      for (const group of batch) {
-        if (group.entries) assert.ok(group.entries.length <= 2)
-        if (group.firstChunk) dirs += 1
-        found.push(...group.files.map((file) => file.path))
-      }
-    }
-    assert.deepStrictEqual(found.sort(), expected.sort())
-    assert.strictEqual(dirs, 3)
-  })
-
-  test('directory traversal resolves unknown entry types before deciding whether to recurse', async () => {
-    const root = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-walk-unknown-'))
-    homes.push(root)
-    const expected = await writeFile(path.resolve(root, 'nested', 'file.bin'), 'data')
-    const realOpendir = fs.promises.opendir
-    fs.promises.opendir = async (dir, options) => {
-      const handle = await realOpendir(dir, options)
-      if (path.resolve(dir) !== root) return handle
-      return {
-        read: async () => {
-          const entry = await handle.read()
-          if (!entry || entry.name !== 'nested') return entry
-          return {
-            name: entry.name,
-            isDirectory: () => false,
-            isFile: () => false,
-            isSymbolicLink: () => false
-          }
-        },
-        close: () => handle.close()
-      }
-    }
-    const found = []
-    try {
-      for await (const batch of walkBatches(root, { concurrency: 2, entryBatchSize: 2 })) {
-        found.push(...batch.flatMap((group) => group.files.map((file) => file.path)))
-      }
-    } finally {
-      fs.promises.opendir = realOpendir
-    }
-    assert.deepStrictEqual(found, [expected])
-  })
-
-  test('directory traversal follows only an explicitly configured symlink root', async (t) => {
-    const realRoot = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-walk-real-'))
-    const linkRoot = path.resolve(os.tmpdir(), `pinokio-walk-link-${crypto.randomUUID()}`)
-    homes.push(realRoot, linkRoot)
-    await writeFile(path.resolve(realRoot, 'nested', 'file.bin'), 'data')
-    try {
-      await fs.promises.symlink(realRoot, linkRoot, process.platform === 'win32' ? 'junction' : 'dir')
-    } catch (error) {
-      t.skip(`directory links unavailable: ${error.message}`)
-      return
-    }
-    const found = []
-    for await (const batch of walkBatches(linkRoot)) {
-      found.push(...batch.flatMap((group) => group.files.map((file) => file.path)))
-    }
-    assert.deepStrictEqual(found, [path.resolve(linkRoot, 'nested', 'file.bin')])
-  })
-
-  test('scan discovers and hashes without creating filesystem links', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const file = await writeFile(path.resolve(home, 'api', 'appA', 'models', 'm.safetensors'), content)
-    await writeFile(path.resolve(home, 'api', 'appA', 'small.txt'), 'tiny')
-    const result = await vault.sweeper.scan()
-    const hash = sha256(content)
-    assert.strictEqual((await fs.promises.stat(file)).nlink, 1)
-    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
-    assert.strictEqual(vault.registry.links.get(file).mode, 'copy')
-    assert.ok(result.bytes_total >= content.length + 4, 'folder total includes small files')
-    assert.ok(vault.registry.lastScan && vault.registry.lastScan.bytes_total === result.bytes_total)
-    assert.ok(vault.registry.lastScan.duration_ms >= 0, 'scan duration is measured')
-    assert.ok(vault.registry.lastScan.count_duration_ms >= 0, 'count duration is measured')
-    assert.ok(vault.registry.lastScan.walk_duration_ms >= 0, 'walk duration is measured')
-    assert.ok(vault.registry.lastScan.hash_duration_ms >= 0, 'hash duration is measured')
-    assert.strictEqual(vault.registry.lastScan.hash_total, 1, 'hash work has a determinate total after walking')
-    assert.strictEqual(vault.sweeper.state.total_files, 2, 'scan progress uses an exact pre-count')
-  })
-
-  test('All files scans every non-empty regular file and ignores empty files', async () => {
-    const { home, vault } = await makeEnv()
-    vault.sizeThreshold = 0
-    const first = await writeFile(path.resolve(home, 'api', 'appA', 'tiny.txt'), 'x')
-    const second = await writeFile(path.resolve(home, 'api', 'appB', 'tiny.txt'), 'x')
-    const empty = await writeFile(path.resolve(home, 'api', 'appA', 'empty.txt'), '')
+describe("Save Space scans", () => {
+  test("a scan reads files without creating anchors or hardlinks", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const first = await write(
+      path.join(home, "api", "one", "model.bin"), contents)
+    const second = await write(
+      path.join(home, "api", "two", "model.bin"), contents)
+    const before = await Promise.all(
+      [first, second].map((filePath) => fs.promises.stat(filePath)))
 
     const result = await vault.sweeper.scan()
 
-    assert.strictEqual(result.candidates, 2)
-    assert.ok(vault.registry.scanIndex.has(first))
-    assert.ok(vault.registry.scanIndex.has(second))
-    assert.strictEqual(vault.registry.scanIndex.has(empty), false)
-    assert.strictEqual(vault.registry.duplicates.size, 1)
-    assert.ok(vault.registry.duplicates.has(first) || vault.registry.duplicates.has(second))
-    assert.strictEqual((await fs.promises.stat(first)).nlink, 1)
-    assert.strictEqual((await fs.promises.stat(second)).nlink, 1)
-  })
-
-  test('large All files scans retain duplicate groups without indexing unique files', async () => {
-    const { home, vault } = await makeEnv()
-    vault.sizeThreshold = 0
-    vault.sweeper.maxIndexedScanFiles = 3
-    const duplicate = Buffer.from('same')
-    const first = await writeFile(path.resolve(home, 'api', 'appA', 'first.txt'), duplicate)
-    const second = await writeFile(path.resolve(home, 'api', 'appB', 'second.txt'), duplicate)
-    const unique = await Promise.all(['a', 'b', 'c'].map((value) =>
-      writeFile(path.resolve(home, 'api', 'appA', `unique-${value}.txt`), value)))
-
-    const result = await vault.sweeper.scan()
-
-    assert.strictEqual(result.candidates, 5)
-    assert.strictEqual(vault.registry.links.has(first) || vault.registry.links.has(second), true)
-    assert.strictEqual(vault.registry.duplicates.has(first) || vault.registry.duplicates.has(second), true)
-    for (const file of unique) {
-      assert.strictEqual(vault.registry.links.has(file), false)
-      assert.strictEqual(vault.registry.scanIndex.has(file), false)
-    }
-    assert.strictEqual(vault.registry.lastScan.unindexed_unique_files, 3)
-    assert.strictEqual(
-      vault.registry.scanFor('app:appA').unindexed_unique_files,
-      3
+    assert.equal(result.incomplete, false)
+    assert.equal(await vault.registry.countFiles(), 2)
+    assert.equal(await vault.registry.countFiles(["duplicate"]), 1)
+    assert.deepEqual(
+      await Promise.all([first, second].map(async (filePath) => {
+        const stat = await fs.promises.stat(filePath)
+        return { ino: stat.ino, nlink: stat.nlink }
+      })),
+      before.map((stat) => ({ ino: stat.ino, nlink: stat.nlink }))
     )
-    assert.deepStrictEqual(
-      [await fs.promises.stat(first), await fs.promises.stat(second)].map((st) => st.nlink),
-      [1, 1]
-    )
+    assert.deepEqual(await fs.promises.readdir(vault.blobRoot), [])
   })
 
-  test('an app-scoped scan walks only that app and preserves unrelated registry state', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const appAFile = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
-    const appBFile = await writeFile(path.resolve(home, 'api', 'appB', 'model.bin'), content)
-    await fs.promises.mkdir(path.resolve(home, 'api', 'emptyApp'))
-    await vault.sweeper.scan()
-    const appA = vault.sources().find((source) => source.kind === 'app' && source.app === 'appA')
-    const emptyApp = vault.sources().find((source) => source.kind === 'app' && source.app === 'emptyApp')
-    assert.ok(appA)
-    assert.strictEqual(vault.registry.scanFor(emptyApp.id).files, 0,
-      'a global scan refreshes the baseline for an empty app')
-    assert.strictEqual(vault.registry.duplicates.has(appBFile), true)
-    const globalScan = JSON.parse(JSON.stringify(vault.registry.lastScan))
-
-    await fs.promises.unlink(appBFile)
-    const result = await vault.sweeper.scan(appA.id)
-
-    assert.strictEqual(result.files, 1)
-    assert.strictEqual(result.bytes_total, content.length)
-    assert.deepStrictEqual(vault.registry.lastScan, globalScan, 'app scan does not replace global totals')
-    assert.strictEqual(vault.registry.duplicates.has(appBFile), true,
-      'scoped reconciliation does not touch another app')
-    assert.strictEqual(vault.registry.links.has(appAFile), true)
-    assert.strictEqual(vault.registry.scanFor(appA.id).files, 1)
-    assert.strictEqual(vault.registry.scanFor(appA.id).bytes_total, content.length)
-    await vault.registry.flush()
-    const snapshot = JSON.parse(await fs.promises.readFile(vault.registry.snapshotPath, 'utf8'))
-    assert.strictEqual(snapshot.source_scans[appA.id].bytes_total, content.length)
-    const reloaded = new Registry(vault.root)
-    await reloaded.load()
-    assert.strictEqual(reloaded.scanFor(appA.id).bytes_total, content.length)
-  })
-
-  test('scans NEVER convert: every byte-identical copy is pending, even in HF caches', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const a = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), content)
-    const b = await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), content)
-    const hfBlob = await writeFile(
-      path.resolve(home, 'api', 'appC', 'cache', 'HF_HOME', 'hub', 'models--org--m', 'blobs', hash), content)
-    await vault.sweeper.scan()
-
-    const nlinks = [a, b, hfBlob].map((p) => fs.statSync(p).nlink)
-    assert.deepStrictEqual(nlinks, [1, 1, 1], 'scan creates no hidden or shared links')
-    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
-    assert.strictEqual(vault.registry.duplicates.size, 2, 'other two are pending, not converted')
-    const events = await vault.registry.readEvents()
-    assert.strictEqual(events.filter((e) => e.kind === 'convert').length, 0, 'no conversion without a click')
-    assert.ok(events.some((e) => e.kind === 'found'))
-
-    let converted = 0
-    for (const scopeId of new Set([...vault.registry.duplicates.values()].map((entry) => entry.source_id))) {
-      const summary = await vault.perform('deduplicate', { scope_id: scopeId })
-      converted += summary.converted
-    }
-    assert.strictEqual(converted, 2)
-    assert.strictEqual((await fs.promises.stat(a)).ino, (await fs.promises.stat(b)).ino)
-
-    await vault.sweeper.scan()
-    assert.strictEqual(vault.registry.lastScan.hashed, 0,
-      'Vault-authored inode and ctime changes refresh the exact scan snapshots')
-  })
-
-  test('no name heuristics: files inside venv-like folders are found', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const inVenv = await writeFile(
-      path.resolve(home, 'api', 'appA', 'coreml_venv', 'lib', 'site-packages', 'lib.dylib'), content)
-    await vault.sweeper.scan()
-    assert.strictEqual((await fs.promises.stat(inVenv)).nlink, 1)
-    assert.ok(vault.registry.scanIndex.has(inVenv), 'venv-ish paths are still indexed')
-  })
-
-  test('a direct Hugging Face blob that shrinks below the threshold is untracked', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const file = await writeFile(
-      path.resolve(home, 'api', 'appA', 'cache', 'models--org--model', 'blobs', hash), content)
-    await vault.sweeper.scan()
-    assert.strictEqual(vault.registry.links.has(file), true)
-
-    await fs.promises.truncate(file, 512)
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.links.has(file), false)
-    assert.strictEqual(vault.registry.scanIndex.has(file), false)
-    assert.strictEqual(vault.registry.blobs.has(hash), false)
-    assert.strictEqual((await fs.promises.stat(file)).size, 512)
-  })
-
-  test('symlinked dirs and files are skipped; cycles cannot hang the walk', async () => {
-    const { home, vault } = await makeEnv()
-    const real = await writeFile(path.resolve(home, 'api', 'appA', 'models', 'real.bin'), crypto.randomBytes(4096))
-    await fs.promises.symlink(path.resolve(home, 'api', 'appA'), path.resolve(home, 'api', 'appA', 'loop'))
-    await vault.sweeper.scan()
-    assert.strictEqual((await fs.promises.stat(real)).nlink, 1)
-  })
-
-  test('a file replaced by a symlink during inspection is never followed', async (t) => {
-    const { home, vault } = await makeEnv()
-    const outsideRoot = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-scan-race-outside-'))
-    homes.push(outsideRoot)
-    const outside = await writeFile(path.resolve(outsideRoot, 'outside.bin'), crypto.randomBytes(4096))
-    const outsideHash = sha256(await fs.promises.readFile(outside))
-    const candidate = await writeFile(path.resolve(home, 'api', 'appA', 'candidate.bin'), crypto.randomBytes(4096))
-    const realLstat = fs.promises.lstat
-    let replaced = false
-    fs.promises.lstat = async (target, options) => {
-      if (!replaced && path.resolve(target) === candidate) {
-        replaced = true
-        await fs.promises.unlink(candidate)
-        try {
-          await fs.promises.symlink(outside, candidate, 'file')
-        } catch (error) {
-          if (error.code === 'EPERM' || error.code === 'EACCES') {
-            await fs.promises.copyFile(outside, candidate)
-            t.skip(`file symlinks unavailable: ${error.message}`)
-          } else {
-            throw error
-          }
-        }
-      }
-      return realLstat(target, options)
-    }
-    try {
-      await vault.sweeper.scan()
-    } finally {
-      fs.promises.lstat = realLstat
-    }
-    if (!replaced || !(await realLstat(candidate)).isSymbolicLink()) return
-
-    assert.strictEqual(vault.registry.scanIndex.has(candidate), false)
-    assert.strictEqual(vault.registry.blobs.has(outsideHash), false)
-    assert.strictEqual((await fs.promises.stat(outside)).nlink, 1)
-  })
-
-  test('top-level api links are not adopted as external sources', async (t) => {
-    const { home, vault } = await makeEnv()
-    const external = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-external-'))
-    const nested = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-external-nested-'))
-    homes.push(external, nested)
-    const content = crypto.randomBytes(4096)
-    const local = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), content)
-    const imported = await writeFile(path.resolve(external, 'models', 'm.bin'), content)
-    const nestedFile = await writeFile(path.resolve(nested, 'should-not-scan.bin'), crypto.randomBytes(4096))
-    try {
-      await fs.promises.symlink(external, path.resolve(home, 'api', 'linked-models'), process.platform === 'win32' ? 'junction' : 'dir')
-      await fs.promises.symlink(nested, path.resolve(external, 'nested-link'), process.platform === 'win32' ? 'junction' : 'dir')
-    } catch (error) {
-      t.skip(`directory links unavailable: ${error.message}`)
-      return
-    }
-
-    await vault.sweeper.scan()
-    const source = vault.sources().find((item) => item.kind === 'external' && item.label === 'linked-models')
-    const canonicalImported = path.resolve(await fs.promises.realpath(external), 'models', 'm.bin')
-    const canonicalNestedFile = path.resolve(await fs.promises.realpath(nested), 'should-not-scan.bin')
-    assert.strictEqual(source, undefined, 'api links are not Vault configuration')
-    assert.strictEqual(vault.registry.scanIndex.has(canonicalImported), false)
-    assert.strictEqual(vault.registry.scanIndex.has(canonicalNestedFile), false, 'nested directory link was not followed')
-    assert.strictEqual((await fs.promises.stat(local)).nlink, 1)
-
-    const status = await vault.status(null, { view: 'duplicates' })
-    assert.strictEqual(status.sources.some((item) => item.kind === 'external'), false)
-    assert.strictEqual(status.items.some((item) => item.path === canonicalImported), false)
-    assert.strictEqual(status.last_scan.home_bytes_total, content.length, 'Pinokio metric excludes external files')
-    assert.strictEqual(status.last_scan.bytes_total, content.length)
-  })
-
-  test('adding and removing an external source persists only its path and never creates a link', async () => {
-    const { home, vault, kernel } = await makeEnv()
-    const external = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-added-external-'))
-    homes.push(external)
-    const content = crypto.randomBytes(4096)
-    const imported = await writeFile(path.resolve(external, 'models', 'added.bin'), content)
-
-    const added = await vault.addExternalSource(external)
-    assert.strictEqual(added.created, true)
-    assert.strictEqual(added.source.kind, 'external')
-    assert.strictEqual(added.source.parent_id, 'external')
-    assert.strictEqual(vault.registry.scanIndex.size, 0, 'adding a source never scans it')
-    assert.strictEqual(added.source.root, path.resolve(await fs.promises.realpath(external)))
-    assert.strictEqual(added.source.mount_path, undefined)
-    assert.deepStrictEqual(
-      JSON.parse(await fs.promises.readFile(vault.externalSourcesPath, 'utf8')).paths,
-      [added.source.root]
-    )
-    assert.strictEqual(fs.existsSync(path.resolve(home, 'vault', 'sources')), false)
-    assert.deepStrictEqual(await fs.promises.readdir(path.resolve(home, 'api')), [],
-      'adding a Vault source never creates an api link')
-
-    const repeated = await vault.addExternalSource(external)
-    assert.strictEqual(repeated.created, false, 'the same physical folder is not imported twice')
-    assert.strictEqual(vault.sources().filter((source) => source.kind === 'external').length, 1)
-
-    const fresh = new Vault(kernel)
-    await fresh.init()
-    assert.ok(fresh.sources().some((source) =>
-      source.kind === 'external' && source.root === added.source.root))
-
-    await vault.sweeper.scan()
-    const canonicalImported = path.resolve(await fs.promises.realpath(imported))
-    assert.ok(vault.registry.scanIndex.has(canonicalImported))
-
-    const removed = await vault.perform('remove_source', { source_id: added.source.id })
-    assert.strictEqual(removed.removed, true)
-    assert.deepStrictEqual(
-      JSON.parse(await fs.promises.readFile(vault.externalSourcesPath, 'utf8')).paths,
-      []
-    )
-    const status = await vault.status(null, { view: 'duplicates' })
-    assert.strictEqual(vault.registry.links.has(canonicalImported), false)
-    assert.strictEqual(vault.registry.duplicates.has(canonicalImported), false)
-    assert.strictEqual(vault.registry.scanIndex.has(canonicalImported), false)
-    assert.strictEqual(status.sources.some((source) => source.kind === 'external'), false)
-    assert.strictEqual(status.items.some((item) => item.path === canonicalImported), false)
-    assert.deepStrictEqual(await fs.promises.readFile(imported), content)
-  })
-
-  test('nested external sources are walked once and attributed to the deepest source', async () => {
-    const { vault } = await makeEnv()
-    const parent = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-external-parent-'))
-    const child = path.resolve(parent, 'child')
-    homes.push(parent)
-    const content = crypto.randomBytes(4096)
-    await writeFile(path.resolve(child, 'model.bin'), content)
-    const parentSource = (await vault.addExternalSource(parent)).source
-    const childSource = (await vault.addExternalSource(child)).source
-
-    const roots = vault.scanRoots()
-    assert.strictEqual(roots.some((root) => root.source_id === parentSource.id), true)
-    assert.strictEqual(roots.some((root) => root.source_id === childSource.id), false)
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.lastScan.files, 1)
-    assert.strictEqual(vault.registry.lastScan.bytes_total, content.length)
-    assert.strictEqual(vault.registry.lastScan.source_bytes[childSource.id], content.length)
-  })
-
-  test('a transient source-enumeration error preserves the last complete source map', async () => {
-    const { home, vault } = await makeEnv()
-    await fs.promises.mkdir(path.resolve(home, 'api', 'appA'), { recursive: true })
-    await vault.refreshSources()
-    const before = vault.sources().map((source) => source.id)
-    const apiRoot = path.resolve(home, 'api')
-    const realReaddir = fs.promises.readdir
-    fs.promises.readdir = async (target, options) => {
-      if (path.resolve(target) === apiRoot) {
-        const error = new Error('transient read failure')
-        error.code = 'EIO'
-        throw error
-      }
-      return realReaddir(target, options)
-    }
-    try {
-      await assert.rejects(vault.refreshSources(), (error) => error.code === 'EIO')
-    } finally {
-      fs.promises.readdir = realReaddir
-    }
-
-    assert.deepStrictEqual(vault.sources().map((source) => source.id), before)
-    assert.ok(vault.sources().some((source) => source.kind === 'app' && source.app === 'appA'))
-  })
-
-  test('a transient external-source metadata error fails the scan without publishing an incomplete result', async () => {
-    const { vault } = await makeEnv()
-    const external = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-external-metadata-'))
-    homes.push(external)
-    await writeFile(path.resolve(external, 'model.bin'), crypto.randomBytes(4096))
-    await vault.addExternalSource(external)
-    await vault.sweeper.scan()
-    const beforeScan = JSON.parse(JSON.stringify(vault.registry.lastScan))
-    const beforeSources = vault.sources().map((source) => source.id)
-    const canonicalExternal = await fs.promises.realpath(external)
-    const realStat = fs.promises.stat
-    let externalStats = 0
-    fs.promises.stat = async (target, options) => {
-      if (path.resolve(String(target)) === path.resolve(canonicalExternal) && ++externalStats === 1) {
-        const error = new Error('temporary external metadata failure')
-        error.code = 'EIO'
-        throw error
-      }
-      return realStat(target, options)
-    }
-    try {
-      await assert.rejects(vault.sweeper.scan(), (error) => error && error.code === 'EIO')
-    } finally {
-      fs.promises.stat = realStat
-    }
-
-    assert.deepStrictEqual(vault.registry.lastScan, beforeScan)
-    assert.deepStrictEqual(vault.sources().map((source) => source.id), beforeSources)
-    assert.strictEqual(vault.sweeper.state.phase, 'failed')
-  })
-
-  test('an access-denied subtree is skipped without erasing its records or exact scan totals', async () => {
-    const { home, vault } = await makeEnv()
-    const deniedDir = path.resolve(home, 'api', 'appA', 'private')
-    const deniedFile = await writeFile(path.resolve(deniedDir, 'model.bin'), crypto.randomBytes(4096))
-    await vault.sweeper.scan()
-    const beforeScan = JSON.parse(JSON.stringify(vault.registry.lastScan))
-    assert.strictEqual(vault.registry.links.has(deniedFile), true)
-
-    const accessibleFile = await writeFile(
-      path.resolve(home, 'api', 'appB', 'model.bin'),
-      crypto.randomBytes(4096)
-    )
-    const realLstat = fs.promises.lstat
-    fs.promises.lstat = async (target, options) => {
-      if (path.resolve(String(target)) === deniedDir) {
-        const error = new Error('permission denied')
-        error.code = 'EACCES'
-        throw error
-      }
-      return realLstat(target, options)
-    }
-    try {
-      const result = await vault.sweeper.scan()
-      assert.strictEqual(result.incomplete, true)
-    } finally {
-      fs.promises.lstat = realLstat
-    }
-
-    assert.strictEqual(vault.sweeper.state.phase, 'incomplete')
-    assert.strictEqual(vault.sweeper.state.inaccessible, 1)
-    assert.deepStrictEqual(vault.sweeper.state.inaccessible_paths, [deniedDir])
-    assert.deepStrictEqual(vault.registry.lastScan, beforeScan, 'partial counters never replace exact totals')
-    assert.strictEqual(vault.registry.links.has(deniedFile), true, 'prior record under denied subtree survives')
-    assert.strictEqual(vault.registry.links.has(accessibleFile), true, 'accessible paths are still scanned')
-
-    await vault.sweeper.scan()
-    assert.strictEqual(vault.sweeper.state.phase, 'complete')
-    assert.strictEqual(vault.sweeper.state.inaccessible, 0)
-    assert.strictEqual(vault.registry.lastScan.files, 2)
-  })
-
-  test('an inaccessible duplicate is preserved when its representative disappears', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const first = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
-    const second = await writeFile(path.resolve(home, 'api', 'appB', 'model.bin'), content)
-    await vault.sweeper.scan()
-
-    const representative = [first, second].find((filePath) => vault.registry.links.has(filePath))
-    const pending = [first, second].find((filePath) => vault.registry.duplicates.has(filePath))
-    await fs.promises.unlink(representative)
-
-    const realLstat = fs.promises.lstat
-    fs.promises.lstat = async (target, options) => {
-      if (path.resolve(String(target)) === pending) {
-        const error = new Error('permission denied')
-        error.code = 'EACCES'
-        throw error
-      }
-      return realLstat(target, options)
-    }
-    try {
-      const result = await vault.sweeper.scan()
-      assert.strictEqual(result.incomplete, true)
-    } finally {
-      fs.promises.lstat = realLstat
-    }
-
-    assert.strictEqual(vault.registry.links.has(representative), false)
-    assert.strictEqual(vault.registry.duplicates.has(pending), true)
-    assert.strictEqual(vault.registry.blobs.has(hash), true)
-    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
-  })
-
-  test('a failed external-source settings write creates no configuration', async () => {
-    const { vault } = await makeEnv()
-    const external = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-add-rollback-'))
-    homes.push(external)
-    const realAtomicWrite = vault.registry.atomicWrite
-    vault.registry.atomicWrite = async (target, contents) => {
-      if (path.resolve(target) === vault.externalSourcesPath) {
-        const error = new Error('transient read failure')
-        error.code = 'EIO'
-        throw error
-      }
-      return realAtomicWrite.call(vault.registry, target, contents)
-    }
-    try {
-      await assert.rejects(vault.addExternalSource(external), (error) => error.code === 'EIO')
-    } finally {
-      vault.registry.atomicWrite = realAtomicWrite
-    }
-
-    assert.strictEqual(fs.existsSync(vault.externalSourcesPath), false)
-    assert.strictEqual(vault.sources().some((source) => source.kind === 'external'), false)
-  })
-
-  test('excluded paths are respected: no anchor, no pending, no re-listing', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const a = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), content)
-    const b = await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), content)
-    vault.registry.excluded.set(b, { ts: Date.now() })
-    await vault.sweeper.scan()
-    assert.strictEqual((await fs.promises.stat(a)).nlink, 1)
-    assert.strictEqual((await fs.promises.stat(b)).nlink, 1)
-    assert.strictEqual(vault.registry.duplicates.has(b), false)
-  })
-
-  test('steady-state rescan performs zero content hashes', async () => {
-    const { home, vault } = await makeEnv()
-    await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), crypto.randomBytes(4096))
-    await vault.sweeper.scan()
-    const priorFiles = vault.registry.lastScan.files
-    await vault.sweeper.scan()
-    assert.strictEqual(vault.registry.lastScan.hashed, 0)
-    assert.strictEqual(vault.sweeper.state.total_files, priorFiles, 'every scan uses a fresh exact file count')
-  })
-
-  test('a completed scan refreshes dead names and orphan state', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const file = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
-    await vault.adopt(file, hash, { app: 'appA' })
-    await fs.promises.unlink(file)
-
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.links.has(file), false)
-    assert.strictEqual(vault.registry.blobs.get(hash).orphan, true)
-  })
-
-  test('scan-derived state is persisted once at the end of a scan', async () => {
-    const { home, vault } = await makeEnv()
-    await Promise.all(Array.from({ length: 8 }, (_, index) =>
-      writeFile(path.resolve(home, 'api', 'appA', `model-${index}.bin`), crypto.randomBytes(4096))))
-    const realFlush = vault.registry.flush.bind(vault.registry)
-    let flushes = 0
-    vault.registry.flush = async (...args) => {
-      flushes += 1
-      return realFlush(...args)
-    }
-    vault.registry.schedulePersist()
-
-    await vault.sweeper.scan()
-
-    assert.strictEqual(flushes, 1)
-  })
-
-  test('a first scan counts the exact file total before processing begins', async () => {
-    const { home, vault } = await makeEnv()
-    const dir = path.resolve(home, 'api', 'appA')
-    await Promise.all(Array.from({ length: 600 }, (_, index) =>
-      writeFile(path.resolve(dir, `small-${index}.txt`), 'x')))
-
-    const sweeper = vault.sweeper
-    const realWalk = sweeper.walk.bind(sweeper)
-    let beforeWalk = null
-    sweeper.walk = async (...args) => {
-      beforeWalk = {
-        phase: sweeper.state.phase,
-        total: sweeper.state.total_files,
-        counted: sweeper.state.counted_files
-      }
-      return realWalk(...args)
-    }
-    try {
-      await sweeper.scan()
-    } finally {
-      sweeper.walk = realWalk
-    }
-
-    assert.deepStrictEqual(beforeWalk, { phase: 'discovering', total: 600, counted: 600 })
-    assert.strictEqual(sweeper.state.files, 600)
-  })
-
-  test('a changed tree receives a new exact progress total', async () => {
-    const { home, vault } = await makeEnv()
-    const dir = path.resolve(home, 'api', 'appA')
-    await writeFile(path.resolve(dir, 'first.txt'), 'x')
-    await vault.sweeper.scan()
-    await writeFile(path.resolve(dir, 'second.txt'), 'x')
-
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.sweeper.state.files, 2)
-    assert.strictEqual(vault.sweeper.state.total_files, 2)
-  })
-
-  test('a stale previous scan count is never reused as the current exact progress total', async () => {
-    const { home, vault } = await makeEnv()
-    await writeFile(path.resolve(home, 'api', 'appA', 'first.txt'), 'x')
-    vault.registry.lastScan = {
-      files: 100,
-      duration_ms: 1000,
-      walk_duration_ms: 800
-    }
-
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.sweeper.state.files, 1)
-    assert.strictEqual(vault.sweeper.state.total_files, 1)
-  })
-
-  test('a transient metadata failure fails the scan without replacing its last complete result', async () => {
-    const { home, vault } = await makeEnv()
-    await writeFile(path.resolve(home, 'api', 'appA', 'first.txt'), 'x')
-    await vault.sweeper.scan()
-    const before = JSON.parse(JSON.stringify(vault.registry.lastScan))
-    const unreadable = await writeFile(path.resolve(home, 'api', 'appA', 'second.txt'), 'x')
-    const realLstat = fs.promises.lstat
-    fs.promises.lstat = async (target, options) => {
-      if (path.resolve(String(target)) === unreadable) {
-        const error = new Error('temporary metadata failure')
-        error.code = 'EIO'
-        throw error
-      }
-      return realLstat(target, options)
-    }
-    try {
-      await assert.rejects(vault.sweeper.scan(), (error) => error && error.code === 'EIO')
-    } finally {
-      fs.promises.lstat = realLstat
-    }
-
-    assert.deepStrictEqual(vault.registry.lastScan, before)
-    assert.strictEqual(vault.sweeper.state.active, false)
-    assert.strictEqual(vault.sweeper.state.phase, 'failed')
-  })
-
-  test('a reconciliation failure does not publish a completed scan timestamp', async () => {
-    const { home, vault } = await makeEnv()
-    await writeFile(path.resolve(home, 'api', 'appA', 'first.txt'), 'x')
-    await vault.sweeper.scan()
-    const before = JSON.parse(JSON.stringify(vault.registry.lastScan))
-    const realReconcile = vault.sweeper.reconcileScannedRecords.bind(vault.sweeper)
-    vault.sweeper.reconcileScannedRecords = async () => {
-      const error = new Error('temporary reconciliation failure')
-      error.code = 'EIO'
-      throw error
-    }
-    try {
-      await assert.rejects(vault.sweeper.scan(), (error) => error && error.code === 'EIO')
-    } finally {
-      vault.sweeper.reconcileScannedRecords = realReconcile
-    }
-
-    assert.deepStrictEqual(vault.registry.lastScan, before)
-    assert.strictEqual(vault.sweeper.state.phase, 'failed')
-  })
-
-  test('file metadata inspection uses bounded concurrency without changing results', async () => {
-    const { home, vault } = await makeEnv()
-    const dir = path.resolve(home, 'api', 'bulk')
-    await Promise.all(Array.from({ length: 48 }, (_, index) =>
-      writeFile(path.resolve(dir, `dir-${index}`, 'small.txt'), 'x')))
-    const realLstat = fs.promises.lstat
-    let active = 0
-    let maximum = 0
-    fs.promises.lstat = async (target) => {
-      if (String(target).startsWith(dir + path.sep)) {
-        active += 1
-        maximum = Math.max(maximum, active)
-        await new Promise((resolve) => setTimeout(resolve, 3))
-        try {
-          return await realLstat(target)
-        } finally {
-          active -= 1
-        }
-      }
-      return realLstat(target)
-    }
-    try {
-      await vault.sweeper.scan()
-    } finally {
-      fs.promises.lstat = realLstat
-    }
-    assert.ok(maximum > 1, `expected concurrent metadata reads, saw ${maximum}`)
-    assert.ok(maximum <= vault.statConcurrency, `metadata concurrency exceeded its bound: ${maximum}`)
-    assert.strictEqual(vault.registry.lastScan.files >= 48, true)
-  })
-
-  test('content hashing applies backpressure to keep the pending queue bounded', async () => {
-    const { home, vault } = await makeEnv()
-    await Promise.all(Array.from({ length: 8 }, (_, index) =>
-      writeFile(path.resolve(home, 'api', 'appA', `model-${index}.bin`), crypto.randomBytes(4096))))
-    vault.sweeper.hashQueueLimit = 2
-    const realHashFile = vault.hashFile.bind(vault)
-    let maximumQueued = 0
+  test("hash-looking cache paths and metadata never replace byte hashing", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const expected = sha256(contents)
+    const misleading = "0".repeat(64)
+    const cacheFile = await write(path.join(
+      home, "api", "cache", "HF_HOME", "hub", "models--owner--model",
+      "blobs", misleading
+    ), contents)
+    const ordinary = await write(
+      path.join(home, "api", "app", "model.bin"), contents)
+    let hashes = 0
+    const hashFile = vault.hashFile.bind(vault)
     vault.hashFile = async (...args) => {
-      maximumQueued = Math.max(maximumQueued, vault.sweeper.state.queued)
-      await new Promise((resolve) => setTimeout(resolve, 3))
-      return realHashFile(...args)
+      hashes += 1
+      return hashFile(...args)
     }
-
-    try {
-      await vault.sweeper.scan()
-    } finally {
-      vault.hashFile = realHashFile
-    }
-
-    assert.ok(maximumQueued <= 2, `hash queue exceeded its bound: ${maximumQueued}`)
-    assert.strictEqual(vault.registry.lastScan.hashed, 8)
-  })
-
-  test('multiple names for one inode share one exact hash job', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const a = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
-    const b = path.resolve(home, 'api', 'appB', 'model.bin')
-    await fs.promises.mkdir(path.dirname(b), { recursive: true })
-    await fs.promises.link(a, b)
 
     await vault.sweeper.scan()
 
-    assert.strictEqual(vault.registry.lastScan.hashed, 1, 'physical content was hashed once')
-    assert.strictEqual(vault.registry.lastScan.inode_reuses, 1, 'second name reused the inode hash job')
-    assert.strictEqual(vault.registry.duplicates.size, 0, 'existing hard links are already shared')
-    assert.strictEqual(vault.registry.links.get(a).hash, sha256(content))
-    assert.strictEqual(vault.registry.links.get(b).hash, sha256(content))
+    assert.equal(hashes, 2)
+    assert.equal((await vault.registry.getFile(cacheFile)).hash, expected)
+    assert.equal((await vault.registry.getFile(ordinary)).hash, expected)
+    assert.notEqual(expected, misleading)
   })
 
-  test('repair preserves pre-existing hardlinks without creating a store anchor', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const a = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
-    const b = path.resolve(home, 'api', 'appB', 'model.bin')
-    await fs.promises.mkdir(path.dirname(b), { recursive: true })
-    await fs.promises.link(a, b)
-    await vault.sweeper.scan()
-    await vault.sweeper.scan()
-
-    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
-    await vault.rebuild()
-
-    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
-    assert.strictEqual((await fs.promises.stat(a)).nlink, 2)
-    assert.strictEqual(vault.registry.links.get(a).mode, 'copy')
-    assert.strictEqual(vault.registry.links.get(b).mode, 'copy')
-  })
-
-  test('an inode discovered after its hash job completes reuses the completed digest', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const a = await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
-    const b = path.resolve(home, 'api', 'appB', 'model.bin')
-    await fs.promises.mkdir(path.dirname(b), { recursive: true })
-    await fs.promises.link(a, b)
-    const realConsiderStat = vault.sweeper.considerStat.bind(vault.sweeper)
-    let candidates = 0
-    vault.sweeper.considerStat = async (...args) => {
-      const result = await realConsiderStat(...args)
-      candidates += 1
-      if (candidates === 1) await vault.sweeper.settle()
-      return result
-    }
-
-    try {
-      await vault.sweeper.scan()
-    } finally {
-      vault.sweeper.considerStat = realConsiderStat
-    }
-
-    assert.strictEqual(vault.registry.lastScan.hashed, 1)
-    assert.strictEqual(vault.registry.lastScan.inode_reuses, 1)
-    assert.strictEqual(vault.registry.links.get(a).hash, sha256(content))
-    assert.strictEqual(vault.registry.links.get(b).hash, sha256(content))
-  })
-
-  test('a file changed during hashing never publishes the stale digest', async () => {
-    const { home, vault } = await makeEnv()
-    const original = crypto.randomBytes(4096)
-    const oldHash = sha256(original)
-    const file = await writeFile(path.resolve(home, 'api', 'appA', 'changing.bin'), original)
-    const realHashFile = vault.hashFile.bind(vault)
-    vault.hashFile = async (target) => {
-      const result = await realHashFile(target)
-      await fs.promises.writeFile(target, crypto.randomBytes(original.length))
-      const future = new Date(Date.now() + 2000)
-      await fs.promises.utimes(target, future, future)
-      return result
-    }
-
-    try {
-      await vault.sweeper.scan()
-    } finally {
-      vault.hashFile = realHashFile
-    }
-
-    assert.strictEqual(vault.registry.lastScan.unstable_hashes, 1)
-    assert.strictEqual(vault.registry.blobs.has(oldHash), false, 'stale digest was discarded')
-    assert.strictEqual(vault.registry.scanIndex.has(file), false, 'unstable path remains unclassified')
-    assert.strictEqual((await fs.promises.stat(file)).nlink, 1, 'unstable file was not adopted')
-  })
-
-  test('a file read failure is counted without aborting the scan', async () => {
-    const { home, vault } = await makeEnv()
-    const file = await writeFile(path.resolve(home, 'api', 'appA', 'unreadable.bin'), crypto.randomBytes(4096))
-    const realHashFile = vault.hashFile.bind(vault)
-    vault.hashFile = async () => {
-      const error = new Error('temporary read failure')
-      error.code = 'EIO'
-      throw error
-    }
-
-    try {
-      await vault.sweeper.scan()
-    } finally {
-      vault.hashFile = realHashFile
-    }
-
-    assert.strictEqual(vault.registry.lastScan.hash_total, 1)
-    assert.strictEqual(vault.registry.lastScan.hashed, 0)
-    assert.strictEqual(vault.registry.lastScan.hash_failures, 1)
-    assert.strictEqual(vault.registry.scanIndex.has(file), false)
-  })
-
-  test('scan status reports byte progress for the large file being hashed', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    await writeFile(path.resolve(home, 'api', 'appA', 'model.bin'), content)
-    const realHashFile = vault.hashFile.bind(vault)
-    let progress
-    vault.hashFile = async (target, options) => {
-      options.onProgress(1024)
-      progress = vault.scanStatus()
-      return realHashFile(target, options)
-    }
-
-    try {
-      await vault.sweeper.scan()
-    } finally {
-      vault.hashFile = realHashFile
-    }
-
-    assert.strictEqual(progress.current_file, 'model.bin')
-    assert.strictEqual(progress.current_file_bytes, 1024)
-    assert.strictEqual(progress.current_file_size, content.length)
-  })
-
-  test('a timed-out file read is skipped and the scan continues', async () => {
-    const { home, vault } = await makeEnv()
-    await writeFile(path.resolve(home, 'api', 'appA', 'first.bin'), crypto.randomBytes(4096))
-    await writeFile(path.resolve(home, 'api', 'appA', 'second.bin'), crypto.randomBytes(4096))
-    const realHashFile = vault.hashFile.bind(vault)
-    let hashCalls = 0
+  test("unchanged byte hashes are cached and one inode gets one hash job", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const first = await write(
+      path.join(home, "api", "one", "model.bin"), contents)
+    const second = await write(
+      path.join(home, "api", "two", "model.bin"), contents)
+    let hashes = 0
+    const hashFile = vault.hashFile.bind(vault)
     vault.hashFile = async (...args) => {
-      if (hashCalls++ === 0) {
-        const error = new Error('hash read timed out')
-        error.code = 'ETIMEDOUT'
-        throw error
-      }
-      return realHashFile(...args)
+      hashes += 1
+      return hashFile(...args)
     }
 
-    try {
-      await vault.sweeper.scan()
-    } finally {
-      vault.hashFile = realHashFile
+    await vault.sweeper.scan()
+    assert.equal(hashes, 2)
+    hashes = 0
+    await vault.sweeper.scan()
+    assert.equal(hashes, 0)
+
+    await fs.promises.writeFile(second, crypto.randomBytes(contents.length))
+    await vault.sweeper.scan()
+    assert.equal(hashes, 1)
+    assert.equal(await vault.registry.countFiles(["duplicate"]), 0)
+
+    const linked = path.join(home, "api", "three", "model.bin")
+    await fs.promises.mkdir(path.dirname(linked), { recursive: true })
+    await fs.promises.link(first, linked)
+    await fs.promises.unlink(second)
+    await vault.registry.clearFiles()
+    hashes = 0
+    await vault.sweeper.scan()
+    assert.equal(hashes, 1)
+    assert.equal((await vault.registry.getFile(first)).status, "linked")
+    assert.equal((await vault.registry.getFile(linked)).status, "linked")
+  })
+
+  test("All files excludes empty files and retains more than one page", async () => {
+    const { home, vault } = await makeVault(0)
+    const root = path.join(home, "api", "many")
+    const paths = []
+    for (let index = 1; index <= 520; index++) {
+      paths.push(await write(
+        path.join(root, `${String(index).padStart(3, "0")}.bin`),
+        Buffer.alloc(index, index % 251)
+      ))
     }
-
-    assert.strictEqual(vault.sweeper.state.phase, 'complete')
-    assert.strictEqual(vault.registry.lastScan.hash_total, 2)
-    assert.strictEqual(vault.registry.lastScan.hash_failures, 1)
-    assert.strictEqual(vault.registry.lastScan.hashed, 1)
-  })
-
-  test('conversion tmp files are never candidates', async () => {
-    const { home, vault } = await makeEnv()
-    const stray = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin.pinokio-dedup-tmp'), crypto.randomBytes(4096))
-    await vault.sweeper.scan()
-    assert.strictEqual(vault.registry.scanIndex.has(stray), false)
-    assert.strictEqual((await fs.promises.stat(stray)).nlink, 1)
-  })
-
-  test('hf --local-dir metadata provides hashes without content reads', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const dir = path.resolve(home, 'api', 'appA', 'ckpt')
-    const file = await writeFile(path.resolve(dir, 'model.safetensors'), content)
-    const future = (Date.now() + 60000) / 1000
-    await writeFile(
-      path.resolve(dir, '.cache', 'huggingface', 'model.safetensors.metadata'),
-      `commit123\n"${hash}"\n${future}\n`)
-    await vault.sweeper.scan()
-    assert.strictEqual(vault.registry.lastScan.hashed, 0, 'hash harvested, not computed')
-    assert.strictEqual((await fs.promises.stat(file)).nlink, 1)
-    assert.ok(vault.registry.blobs.has(hash))
-  })
-
-  test('hf --local-dir metadata older than the file always falls back to content hashing', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const staleHash = hash === 'a'.repeat(64) ? 'b'.repeat(64) : 'a'.repeat(64)
-    const dir = path.resolve(home, 'api', 'appA', 'ckpt')
-    const file = await writeFile(path.resolve(dir, 'model.safetensors'), content)
-    const fileStat = await fs.promises.stat(file)
-    const staleTimestamp = (fileStat.mtimeMs - 500) / 1000
-    await writeFile(
-      path.resolve(dir, '.cache', 'huggingface', 'model.safetensors.metadata'),
-      `commit123\n"${staleHash}"\n${staleTimestamp}\n`
-    )
+    const empty = await write(path.join(root, "empty.bin"), Buffer.alloc(0))
 
     await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.lastScan.hashed, 1)
-    assert.ok(vault.registry.blobs.has(hash))
-    assert.strictEqual(vault.registry.blobs.has(staleHash), false)
-  })
-
-  test('linked hf metadata is never followed for hash-free classification', {
-    skip: process.platform === 'win32'
-  }, async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const actualHash = sha256(content)
-    const forgedHash = actualHash === 'a'.repeat(64) ? 'b'.repeat(64) : 'a'.repeat(64)
-    const dir = path.resolve(home, 'api', 'appA', 'ckpt')
-    await writeFile(path.resolve(dir, 'model.safetensors'), content)
-    const outside = await writeFile(path.resolve(home, 'forged.metadata'),
-      `commit123\n"${forgedHash}"\n${(Date.now() + 60000) / 1000}\n`)
-    const metadata = path.resolve(dir, '.cache', 'huggingface', 'model.safetensors.metadata')
-    await fs.promises.mkdir(path.dirname(metadata), { recursive: true })
-    await fs.promises.symlink(outside, metadata)
-
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.lastScan.hashed, 1)
-    assert.strictEqual(vault.registry.blobs.has(actualHash), true)
-    assert.strictEqual(vault.registry.blobs.has(forgedHash), false)
-  })
-
-  test('hash-free metadata outside an external source cannot classify its files', async () => {
-    const { vault } = await makeEnv()
-    const parent = await fs.promises.mkdtemp(path.resolve(os.tmpdir(), 'pinokio-metadata-scope-'))
-    homes.push(parent)
-    const external = path.resolve(parent, 'external')
-    const content = crypto.randomBytes(4096)
-    const actualHash = sha256(content)
-    const forgedHash = actualHash === 'a'.repeat(64) ? 'b'.repeat(64) : 'a'.repeat(64)
-    const file = await writeFile(path.resolve(external, 'model.bin'), content)
-    await writeFile(
-      path.resolve(parent, '.cache', 'huggingface', 'external', 'model.bin.metadata'),
-      `commit123\n"${forgedHash}"\n${(Date.now() + 60000) / 1000}\n`
-    )
-    await vault.addExternalSource(external)
-    const canonicalFile = path.resolve(await fs.promises.realpath(file))
-
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.scanIndex.get(canonicalFile).hash, actualHash)
-    assert.strictEqual(vault.registry.blobs.has(actualHash), true)
-    assert.strictEqual(vault.registry.blobs.has(forgedHash), false)
-  })
-
-  test('a changed pending path transitions to exactly one new classification', async () => {
-    const { home, vault } = await makeEnv()
-    const original = Buffer.alloc(4096, 1)
-    const changed = Buffer.alloc(4096, 2)
-    await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), original)
-    await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), original)
-    await vault.sweeper.scan()
-    const pending = [...vault.registry.duplicates.keys()][0]
-
-    await fs.promises.writeFile(pending, changed)
-    const future = new Date(Date.now() + 2000)
-    await fs.promises.utimes(pending, future, future)
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.duplicates.has(pending), false)
-    assert.strictEqual(vault.registry.links.get(pending).hash, sha256(changed))
-    assert.strictEqual(vault.registry.scanIndex.get(pending).hash, sha256(changed))
-  })
-
-  test('a changed pending path updates to a different existing content group', async () => {
-    const { home, vault } = await makeEnv()
-    const first = Buffer.alloc(4096, 3)
-    const second = Buffer.alloc(4096, 4)
-    await writeFile(path.resolve(home, 'api', 'appA', 'a.bin'), first)
-    await writeFile(path.resolve(home, 'api', 'appB', 'a.bin'), first)
-    await writeFile(path.resolve(home, 'api', 'appC', 'b.bin'), second)
-    await vault.sweeper.scan()
-    const pending = [...vault.registry.duplicates.keys()][0]
-
-    await fs.promises.writeFile(pending, second)
-    const future = new Date(Date.now() + 2000)
-    await fs.promises.utimes(pending, future, future)
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.links.has(pending), false)
-    assert.strictEqual(vault.registry.duplicates.get(pending).hash, sha256(second))
-    assert.strictEqual(vault.registry.scanIndex.get(pending).hash, sha256(second))
-  })
-
-  test('files below the threshold and deleted files leave no derived scan state', async () => {
-    const { home, vault } = await makeEnv()
-    const content = Buffer.alloc(4096, 5)
-    await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), content)
-    await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), content)
-    await vault.sweeper.scan()
-    const pending = [...vault.registry.duplicates.keys()][0]
-    const linked = [...vault.registry.links.keys()].find((filePath) => filePath !== pending)
-
-    await fs.promises.writeFile(pending, Buffer.alloc(128, 6))
-    await fs.promises.unlink(linked)
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.duplicates.has(pending), false)
-    assert.strictEqual(vault.registry.scanIndex.has(pending), false)
-    assert.strictEqual(vault.registry.links.has(linked), false)
-    assert.strictEqual(vault.registry.scanIndex.has(linked), false)
-  })
-
-  test('HF hash-free ingestion falls back to the generic walker for every other entry', async () => {
-    const { home, vault } = await makeEnv()
-    const blobDir = path.resolve(home, 'api', 'appA', 'cache', 'models--org--model', 'blobs')
-    const ordinary = await writeFile(path.resolve(blobDir, 'model.bin'), Buffer.alloc(4096, 7))
-    const nested = await writeFile(path.resolve(blobDir, 'nested', 'model.bin'), Buffer.alloc(4096, 8))
-
-    await vault.sweeper.scan()
-
-    assert.ok(vault.registry.scanIndex.has(ordinary))
-    assert.ok(vault.registry.scanIndex.has(nested))
-    assert.strictEqual(vault.registry.lastScan.candidates, 2)
-    assert.strictEqual(vault.registry.lastScan.hashed, 2)
-  })
-
-  test('a scanned representative remains tracked without becoming its own duplicate', async () => {
-    const { home, vault } = await makeEnv()
-    const file = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), Buffer.alloc(4096, 9))
-    await vault.sweeper.scan()
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.links.get(file).mode, 'copy')
-    assert.strictEqual(vault.registry.duplicates.has(file), false)
-  })
-
-  test('changing one scanned representative preserves other copies in the original content group', async () => {
-    const { home, vault } = await makeEnv()
-    const original = Buffer.alloc(4096, 9)
-    const changed = Buffer.alloc(4096, 10)
-    const first = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), original)
-    const second = await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), original)
-    const originalHash = sha256(original)
-    const changedHash = sha256(changed)
-    await vault.sweeper.scan()
-    await fs.promises.writeFile(first, changed)
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.links.get(first).hash, changedHash)
-    assert.strictEqual(vault.registry.links.get(second).hash, originalHash)
-    assert.strictEqual(vault.registry.links.get(second).mode, 'copy')
-    assert.strictEqual(vault.registry.blobs.has(originalHash), true)
-  })
-
-  test('changing a shared inode preserves an unchanged copy-mode name of the old content', async () => {
-    const { home, vault } = await makeEnv()
-    const original = Buffer.alloc(4096, 11)
-    const changed = Buffer.alloc(4096, 12)
-    const originalHash = sha256(original)
-    const shared = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), original)
-    const copied = await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), original)
-    await vault.adopt(shared, originalHash, { app: 'appA' })
-    const copiedStat = await fs.promises.lstat(copied)
-    vault.registry.addLink(copied, {
-      hash: originalHash,
-      app: 'appB',
-      dev: copiedStat.dev,
-      ino: copiedStat.ino,
-      mode: 'copy'
+    const firstPage = await vault.status(null, {
+      view: "all", page: 0, page_size: 500
     })
-    vault.registry.scanIndex.set(copied, {
-      hash: originalHash,
-      size: copiedStat.size,
-      dev: copiedStat.dev,
-      ino: copiedStat.ino,
-      mtime: copiedStat.mtimeMs,
-      ctime: copiedStat.ctimeMs,
-      source_id: null
+    const secondPage = await vault.status(null, {
+      view: "all",
+      page: 1,
+      page_size: 500,
+      cursor: firstPage.inventory.next_cursor
     })
 
-    await fs.promises.writeFile(shared, changed)
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.links.get(copied).hash, originalHash)
-    assert.strictEqual(vault.registry.links.get(copied).mode, 'copy')
-    assert.strictEqual(vault.registry.blobs.has(originalHash), true)
-    assert.strictEqual(vault.registry.links.get(shared).hash, sha256(changed))
+    assert.equal(await vault.registry.countFiles(), paths.length)
+    assert.equal(await vault.registry.getFile(empty), null)
+    assert.equal(firstPage.inventory.total, paths.length)
+    assert.equal(firstPage.items.length, 500)
+    assert.ok(firstPage.inventory.next_cursor)
+    assert.equal(firstPage.inventory.has_next, true)
+    assert.equal(secondPage.items.length, 20)
+    assert.equal(secondPage.inventory.has_next, false)
+    assert.equal(new Set(firstPage.items.map((item) => item.path)
+      .concat(secondPage.items.map((item) => item.path))).size, paths.length)
   })
 
-  test('a scanned copy is adopted only when deduplication is explicitly requested', async () => {
-    const { home, vault } = await makeEnv()
-    const content = Buffer.alloc(4096, 10)
-    const hash = sha256(content)
-    vault.registry.addBlob(hash, { size: content.length })
-    const first = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), content)
-    const second = await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), content)
-
-    await vault.sweeper.scan()
-
-    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), false)
-    const linked = [first, second].filter((filePath) => vault.registry.links.has(filePath))
-    const pending = [first, second].filter((filePath) => vault.registry.duplicates.has(filePath))
-    assert.strictEqual(linked.length, 1)
-    assert.strictEqual(pending.length, 1)
-    assert.strictEqual(vault.registry.links.get(linked[0]).mode, 'copy')
-    assert.strictEqual(vault.registry.duplicates.get(pending[0]).hash, hash)
-
-    const pendingSource = vault.registry.duplicates.get(pending[0]).source_id
-    const result = await vault.perform('deduplicate', { scope_id: pendingSource })
-    assert.strictEqual(result.converted, 1)
-    assert.strictEqual(fs.existsSync(vault.storePathFor(hash)), true)
-    assert.strictEqual((await fs.promises.stat(first)).ino, (await fs.promises.stat(second)).ino)
-  })
-
-  test('Deduplicate all indexes store candidates once for every content group', async () => {
-    const { home, vault } = await makeEnv()
+  test("All files sends only matching size groups to hash work", async () => {
+    const { home, vault } = await makeVault(0)
+    const root = path.join(home, "api", "windows")
+    for (let index = 1; index <= 300; index++) {
+      await write(
+        path.join(root, `unique-${String(index).padStart(3, "0")}.bin`),
+        Buffer.alloc(index, index % 251)
+      )
+    }
+    const repeated = crypto.randomBytes(2048)
     for (let index = 0; index < 3; index++) {
-      const content = Buffer.alloc(4096, index + 20)
-      await writeFile(path.resolve(home, 'api', 'appA', `model-${index}.bin`), content)
-      await writeFile(path.resolve(home, 'api', 'appB', `model-${index}.bin`), content)
+      await write(path.join(root, `repeated-${index}.bin`), repeated)
     }
+
+    const workCalls = []
+    const hashWorkBatch = vault.registry.hashWorkBatch.bind(vault.registry)
+    vault.registry.hashWorkBatch = async (runId, cursor, limit) => {
+      const rows = await hashWorkBatch(runId, cursor, limit)
+      workCalls.push({ cursor, rows: rows.length })
+      assert.ok(rows.length <= 128)
+      return rows
+    }
+    let hashes = 0
+    const hashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (...args) => {
+      hashes += 1
+      return hashFile(...args)
+    }
+
     await vault.sweeper.scan()
 
-    const realIndex = vault.storeCandidateIndex.bind(vault)
-    const realEnsure = vault.ensureStoreForHash.bind(vault)
-    let indexBuilds = 0
-    let indexedLookups = 0
-    vault.storeCandidateIndex = () => {
-      indexBuilds += 1
-      return realIndex()
+    assert.equal(hashes, 3)
+    assert.deepEqual(workCalls.map((call) => call.rows), [3, 0])
+    assert.equal(workCalls[0].cursor, null)
+    for (const call of workCalls.slice(1)) {
+      assert.ok(call.cursor)
+      assert.equal(typeof call.cursor.path, "string")
     }
-    vault.ensureStoreForHash = async (hash, dev, candidates) => {
-      assert.ok(Array.isArray(candidates))
-      indexedLookups += 1
-      return realEnsure(hash, dev, candidates)
-    }
-    let result
+  })
+
+  test("hash work excludes unhashed unique-size rows", async () => {
+    const root = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "pinokio-vault-registry-"))
+    homes.push(root)
+    const registry = new RegistryCore(root)
+    await registry.load()
     try {
-      result = await vault.perform('deduplicate', { selection: 'duplicates' })
+      const runId = registry.beginScan()
+      const rows = []
+      for (let index = 0; index < 10000; index++) {
+        rows.push({
+          path: path.join(root, "files", `cached-${index}.bin`),
+          size: index + 1,
+          mtime: 1,
+          ctime: 1,
+          dev: 1,
+          ino: index + 1,
+          nlink: 1,
+          mode: 0o100644,
+          uid: 501,
+          gid: 20
+        })
+      }
+      rows.push({
+        path: path.join(root, "files", "uncached.bin"),
+        size: 10000,
+        mtime: 1,
+        ctime: 1,
+        dev: 1,
+        ino: 20000,
+        nlink: 1,
+        mode: 0o100644,
+        uid: 501,
+        gid: 20
+      })
+      assert.equal(registry.stageFiles(runId, rows).changes, rows.length)
+
+      const plan = registry.database.prepare(`
+        EXPLAIN QUERY PLAN
+        SELECT *
+        FROM scan_files
+        WHERE run_id = ?
+          AND hash IS NULL
+          AND hash_attempted = 0
+          AND hash_needed = 1
+        ORDER BY size, dev, ino, path
+        LIMIT 128
+      `).all(runId)
+      assert.match(
+        plan.map((row) => row.detail).join("\n"),
+        /scan_files_hash_work_idx/
+      )
+
+      const batch = registry.hashWorkBatch(runId)
+      assert.equal(batch.length, 2)
+      assert.deepEqual(
+        new Set(batch.map((row) => row.path)),
+        new Set([
+          path.join(root, "files", "cached-9999.bin"),
+          path.join(root, "files", "uncached.bin")
+        ])
+      )
     } finally {
-      vault.storeCandidateIndex = realIndex
-      vault.ensureStoreForHash = realEnsure
+      registry.close()
+    }
+  })
+
+  test("active progress uses cached scan data without waiting for SQLite", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "one", "model.bin"), contents)
+    await write(path.join(home, "api", "two", "model.bin"), contents)
+    await vault.sweeper.scan()
+    const lastScan = await vault.scanForScope(null)
+    const scanFor = vault.registry.scanFor
+    let registryRead = false
+    vault.registry.scanFor = async () => {
+      registryRead = true
+      throw new Error("progress must not query SQLite")
     }
 
-    assert.strictEqual(result.converted, 3)
-    assert.strictEqual(indexBuilds, 1)
-    assert.strictEqual(indexedLookups, 3)
-  })
-
-  test('a repaired linked inode without a trustworthy snapshot is hashed once', async () => {
-    const { home, vault } = await makeEnv()
-    const original = Buffer.alloc(4096, 10)
-    const changed = Buffer.alloc(4096, 11)
-    const file = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), original)
-    await vault.sweeper.scan()
-    const oldHash = sha256(original)
-
-    await fs.promises.writeFile(file, changed)
-    await vault.rebuild()
-    assert.strictEqual(vault.registry.scanIndex.has(file), false, 'Repair leaves changed content unverified')
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.lastScan.hashed, 1)
-    assert.strictEqual(vault.registry.blobs.has(oldHash), false)
-    assert.ok(vault.registry.blobs.has(sha256(changed)))
-    assert.strictEqual(vault.registry.scanIndex.get(file).hash, sha256(changed))
-  })
-
-  test('scan-cache identity includes the filesystem device', async () => {
-    const { home, vault } = await makeEnv()
-    const file = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), Buffer.alloc(4096, 12))
-    await vault.sweeper.scan()
-    vault.registry.scanIndex.get(file).dev = `other:${vault.registry.scanIndex.get(file).dev}`
-
-    await vault.sweeper.scan()
-
-    assert.strictEqual(vault.registry.lastScan.hashed, 1)
-  })
-
-  test('an unrelated unresolved action does not block app conversion', async () => {
-    const { home, vault, kernel } = await makeEnv()
-    const content = Buffer.alloc(4096, 13)
-    await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), content)
-    await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), content)
-    await vault.sweeper.scan()
-    const pending = [...vault.registry.duplicates.values()][0]
-    kernel.api = { running: { 'custom-action-id': true } }
-
-    const result = await vault.perform('deduplicate', { scope_id: pending.source_id })
-
-    assert.strictEqual(result.converted, 1)
-  })
-
-  test('a custom running id blocks only the app that owns its script path', async () => {
-    const { home, vault, kernel } = await makeEnv()
-    const content = Buffer.alloc(4096, 14)
-    await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), content)
-    await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), content)
-    await vault.sweeper.scan()
-    const pending = [...vault.registry.duplicates.values()][0]
-    const source = vault.sources().find((item) => item.id === pending.source_id)
-    kernel.api = {
-      running: { 'custom-action-id': true },
-      running_paths: { 'custom-action-id': path.resolve(source.root, 'start.js') }
+    let progress
+    try {
+      progress = await vault.progressStatus()
+    } finally {
+      vault.registry.scanFor = scanFor
     }
 
-    const result = await vault.perform('deduplicate', { scope_id: pending.source_id })
-
-    assert.match(result.error, /running script/i)
-    assert.strictEqual(vault.registry.duplicates.size, 1)
+    assert.equal(registryRead, false)
+    assert.equal(progress.last_scan.ts, lastScan.ts)
   })
 
-  test('in-place mutation propagates to all names; scan detects divergence and evicts', async () => {
-    const { home, vault } = await makeEnv()
-    const original = crypto.randomBytes(4096)
-    const oldHash = sha256(original)
-    const a = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), original)
-    await vault.adopt(a, oldHash, { app: 'appA' })
-    const b = path.resolve(home, 'api', 'appB', 'm.bin')
-    await writeFile(b, original)
-    await vault.convert(b, oldHash, { app: 'appB' })
-    await vault.sweeper.scan()
+  test("scan staging is temporary and publication rebuilds summaries", async () => {
+    const root = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "pinokio-vault-registry-"))
+    homes.push(root)
+    const registry = new RegistryCore(root)
+    await registry.load()
+    try {
+      assert.equal(
+        registry.database.pragma("journal_mode", { simple: true }),
+        "delete"
+      )
+      assert.equal(registry.database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM main.sqlite_master
+        WHERE type = 'table' AND name GLOB 'scan_*'
+      `).get().count, 0)
+      assert.equal(registry.database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM sqlite_temp_master
+        WHERE type = 'table' AND name GLOB 'scan_*'
+      `).get().count, 4)
 
-    const mutated = crypto.randomBytes(4096)
-    await fs.promises.writeFile(b, mutated)
-    assert.deepStrictEqual(await fs.promises.readFile(a), mutated, 'in-place writes propagate to every name')
+      const runId = registry.beginScan()
+      const entries = []
+      for (let index = 1; index <= 1000; index++) {
+        entries.push({
+          path: path.join(root, "files", `${index}.bin`),
+          size: index,
+          mtime: 1,
+          ctime: 1,
+          dev: 1,
+          ino: index,
+          nlink: 1,
+          mode: 0o100644,
+          uid: 501,
+          gid: 20,
+          source_id: "source"
+        })
+      }
+      registry.stageFiles(runId, entries)
+      registry.publishScan(runId, ["source"], {
+        scope_id: "",
+        files: entries.length,
+        bytes_total: entries.reduce((sum, entry) => sum + entry.size, 0),
+        candidates: entries.length
+      }, 1, true)
 
-    await vault.sweeper.scan()
-    assert.strictEqual(vault.registry.blobs.has(oldHash), false, 'stale blob evicted')
-    assert.strictEqual(fs.existsSync(vault.storePathFor(oldHash)), false)
-    assert.ok(vault.registry.blobs.has(sha256(mutated)))
-    const events = await vault.registry.readEvents()
-    assert.ok(events.some((e) => e.kind === 'diverged' && e.hash === oldHash))
+      assert.deepEqual(registry.database.prepare(`
+        SELECT status, file_count
+        FROM file_summaries
+      `).all(), [{ status: "reference", file_count: entries.length }])
+      assert.equal(registry.database.prepare(`
+        SELECT COUNT(*) AS count FROM inode_summaries
+      `).get().count, 0)
+      assert.equal(registry.database.prepare(`
+        SELECT COUNT(*) AS count FROM files
+      `).get().count, entries.length)
+
+      const samplePath = entries[0].path
+      registry.database.prepare(`
+        UPDATE files SET updated_at = 123 WHERE path = ?
+      `).run(samplePath)
+      const secondRunId = registry.beginScan()
+      registry.stageFiles(secondRunId, entries)
+      registry.publishScan(secondRunId, ["source"], {
+        scope_id: "",
+        files: entries.length,
+        bytes_total: entries.reduce((sum, entry) => sum + entry.size, 0),
+        candidates: entries.length
+      }, 1, true)
+      assert.equal(registry.database.prepare(`
+        SELECT updated_at FROM files WHERE path = ?
+      `).get(samplePath).updated_at, 123)
+    } finally {
+      registry.close()
+    }
   })
 
-  test('scan of a 10k-entry folder at steady state finishes fast with zero reads', async () => {
-    const { home, vault } = await makeEnv()
-    const dir = path.resolve(home, 'api', 'bigapp', 'stuff')
-    await fs.promises.mkdir(dir, { recursive: true })
-    const tiny = Buffer.from('x')
-    await Promise.all(Array.from({ length: 10000 }, (_, i) =>
-      fs.promises.writeFile(path.resolve(dir, `f${i}.txt`), tiny)))
-    await vault.sweeper.scan()
-    const started = Date.now()
-    await vault.sweeper.scan()
-    const elapsed = Date.now() - started
-    assert.ok(elapsed < 2000, `steady-state rescan took ${elapsed}ms`)
-    assert.strictEqual(vault.registry.lastScan.hashed, 0)
+  test("a cached inode hash is reused inside a bounded hash batch", async () => {
+    const root = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "pinokio-vault-inode-cache-"))
+    homes.push(root)
+    const registry = new RegistryCore(root)
+    await registry.load()
+    try {
+      const first = path.join(root, "files", "first.bin")
+      const second = path.join(root, "files", "second.bin")
+      const hash = "a".repeat(64)
+      const snapshot = {
+        size: 100,
+        mtime: 1,
+        ctime: 1,
+        dev: 1,
+        ino: 2,
+        nlink: 2,
+        mode: 0o100644,
+        uid: 501,
+        gid: 20,
+        source_id: "source"
+      }
+      registry.upsertFile({
+        path: first,
+        hash,
+        ...snapshot,
+        status: "linked"
+      })
+      const runId = registry.beginScan()
+      assert.equal(registry.stageFiles(runId, [
+        { path: first, ...snapshot },
+        { path: second, ...snapshot }
+      ]).changes, 2)
+
+      const batch = registry.hashWorkBatch(runId)
+      assert.equal(batch.length, 1)
+      assert.equal(batch[0].path, second)
+      assert.equal(batch[0].reusable_hash, hash)
+      assert.equal(
+        registry.setStageInodeHash(runId, 1, 2, hash).changes,
+        1
+      )
+      assert.equal(registry.database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM scan_files
+        WHERE run_id = ? AND hash = ?
+      `).get(runId, hash).count, 2)
+      assert.equal(registry.database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM scan_files
+        WHERE run_id = ? AND status = 'linked'
+      `).get(runId).count, 2)
+    } finally {
+      registry.close()
+    }
   })
 
-  test('locked conversions stay pending and can be retried', async () => {
-    const { home, vault } = await makeEnv()
-    const content = crypto.randomBytes(4096)
-    const hash = sha256(content)
-    const a = await writeFile(path.resolve(home, 'api', 'appA', 'm.bin'), content)
-    await vault.adopt(a, hash, { app: 'appA' })
-    const b = await writeFile(path.resolve(home, 'api', 'appB', 'm.bin'), content)
-    await vault.refreshSources()
-    const appB = vault.sources().find((source) => source.kind === 'app' && source.app === 'appB')
-    const pendingStat = await fs.promises.stat(b)
-    vault.registry.duplicates.set(b, {
-      hash, size: content.length, app: 'appB', source_id: appB.id,
-      dev: pendingStat.dev, ino: pendingStat.ino,
-      mtime: pendingStat.mtimeMs, ctime: pendingStat.ctimeMs
+  test("location pages merge bounded source streams in size order", async () => {
+    const { home, vault } = await makeVault(0)
+    const sizes = [10, 30, 50, 20, 40, 60]
+    for (const [index, size] of sizes.entries()) {
+      const app = index < 3 ? "one" : "two"
+      await write(
+        path.join(home, "api", app, `${index}.bin`),
+        Buffer.alloc(size, index + 1)
+      )
+    }
+
+    await vault.sweeper.scan()
+    const firstPage = await vault.status(null, {
+      view: "all",
+      location_id: "apps",
+      size_sort: "desc",
+      page_size: 3
+    })
+    const secondPage = await vault.status(null, {
+      view: "all",
+      location_id: "apps",
+      size_sort: "desc",
+      page_size: 3,
+      page: 1,
+      cursor: firstPage.inventory.next_cursor
     })
 
-    const realConvert = vault.convert.bind(vault)
-    let calls = 0
-    vault.convert = async (...args) => {
-      calls += 1
-      if (calls === 1) return { status: 'locked' }
-      return realConvert(...args)
+    assert.equal(firstPage.inventory.total, 6)
+    assert.deepEqual(firstPage.items.map((item) => item.size), [60, 50, 40])
+    assert.deepEqual(secondPage.items.map((item) => item.size), [30, 20, 10])
+    assert.equal(secondPage.inventory.has_next, false)
+  })
+
+  test("completed scans remove deleted and newly out-of-threshold paths", async () => {
+    const { home, vault } = await makeVault(0)
+    const contents = crypto.randomBytes(4096)
+    const first = await write(
+      path.join(home, "api", "one", "model.bin"), contents)
+    const second = await write(
+      path.join(home, "api", "two", "model.bin"), contents)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    assert.equal((await vault.perform("detach", {
+      path: duplicate.path
+    })).status, "not-found")
+    await fs.promises.unlink(duplicate.path)
+
+    vault.sizeThreshold = contents.length * 2
+    await vault.sweeper.scan()
+
+    assert.equal(await vault.registry.getFile(duplicate.path), null)
+    assert.equal(await vault.registry.getFile(
+      duplicate.path === first ? second : first), null)
+  })
+
+  test("a global scan removes rows for an app that no longer exists", async () => {
+    const { home, vault } = await makeVault()
+    const appRoot = path.join(home, "api", "removed-app")
+    const filePath = await write(
+      path.join(appRoot, "model.bin"), crypto.randomBytes(4096))
+    await vault.sweeper.scan()
+    assert.ok(await vault.registry.getFile(filePath))
+
+    await fs.promises.rm(appRoot, { recursive: true })
+    await vault.sweeper.scan()
+
+    assert.equal(await vault.registry.getFile(filePath), null)
+  })
+
+  test("failed and cancelled scans preserve the previous generation", async () => {
+    const { home, vault } = await makeVault()
+    const original = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "one", "model.bin"), original)
+    await write(path.join(home, "api", "two", "model.bin"), original)
+    await vault.sweeper.scan()
+    const previousScan = await vault.registry.scanFor()
+    const previousPaths = [...await vault.registry.files()].map((row) => row.path)
+
+    const added = crypto.randomBytes(5000)
+    const failing = await write(
+      path.join(home, "api", "three", "new.bin"), added)
+    await write(path.join(home, "api", "four", "new.bin"), added)
+    const hashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath, options) => {
+      if (filePath === failing) {
+        const error = new Error("unreadable")
+        error.code = "EACCES"
+        throw error
+      }
+      return hashFile(filePath, options)
     }
-    const first = await vault.perform('deduplicate', { scope_id: appB.id })
-    assert.strictEqual(first.locked, 1)
-    assert.ok(vault.registry.duplicates.has(b), 'still pending after lock')
-    const second = await vault.perform('deduplicate', { scope_id: appB.id })
-    vault.convert = realConvert
-    assert.strictEqual(second.converted, 1)
-    assert.strictEqual((await fs.promises.stat(b)).ino, (await fs.promises.stat(a)).ino)
+    const incomplete = await vault.sweeper.scan()
+    assert.equal(incomplete.incomplete, true)
+    assert.equal((await vault.registry.scanFor()).ts, previousScan.ts)
+    assert.deepEqual(
+      [...await vault.registry.files()].map((row) => row.path),
+      previousPaths
+    )
+
+    vault.hashFile = hashFile
+    let release
+    let entered
+    const enteredHash = new Promise((resolve) => { entered = resolve })
+    const gate = new Promise((resolve) => { release = resolve })
+    vault.hashFile = async (...args) => {
+      entered()
+      await gate
+      return hashFile(...args)
+    }
+    const pending = vault.sweeper.scan()
+    await enteredHash
+    vault.sweeper.cancel()
+    release()
+    const cancelled = await pending
+    assert.equal(cancelled.cancelled, true)
+    assert.equal((await vault.registry.scanFor()).ts, previousScan.ts)
+    assert.deepEqual(
+      [...await vault.registry.files()].map((row) => row.path),
+      previousPaths
+    )
+  })
+
+  test("an unavailable configured root cannot publish a partial global scan", async () => {
+    const { vault } = await makeVault()
+    const external = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "pinokio-vault-unavailable-"))
+    homes.push(external)
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(external, "one.bin"), contents)
+    await write(path.join(external, "two.bin"), contents)
+    await vault.addExternalSource(external)
+    await vault.sweeper.scan()
+    const previousScan = await vault.registry.scanFor()
+    const previousPaths = [...await vault.registry.files()].map((row) => row.path)
+
+    await fs.promises.rm(external, { recursive: true })
+    await assert.rejects(
+      vault.sweeper.scan(),
+      /configured scan location is unavailable/i
+    )
+
+    assert.equal((await vault.registry.scanFor()).ts, previousScan.ts)
+    assert.deepEqual(
+      [...await vault.registry.files()].map((row) => row.path),
+      previousPaths
+    )
+  })
+
+  test("a root disappearing after source refresh fails without publishing", async () => {
+    const { vault } = await makeVault()
+    const external = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "pinokio-vault-disappearing-"))
+    homes.push(external)
+    await write(path.join(external, "model.bin"), crypto.randomBytes(4096))
+    await vault.addExternalSource(external)
+    await vault.sweeper.scan()
+    const previousScan = await vault.registry.scanFor()
+    const previousPaths = [...await vault.registry.files()].map((row) => row.path)
+    const refreshSources = vault.refreshSources.bind(vault)
+    vault.refreshSources = async () => {
+      const sources = await refreshSources()
+      await fs.promises.rm(external, { recursive: true })
+      return sources
+    }
+
+    await assert.rejects(vault.sweeper.scan(), (error) =>
+      error && (error.code === "ENOENT" || error.code === "ENOTDIR"))
+
+    assert.equal((await vault.registry.scanFor()).ts, previousScan.ts)
+    assert.deepEqual(
+      [...await vault.registry.files()].map((row) => row.path),
+      previousPaths
+    )
+  })
+
+  test("a missing database is rebuilt by a normal scan, including managed links below the threshold", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "one", "model.bin"), contents)
+    await write(path.join(home, "api", "two", "model.bin"), contents)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    await vault.perform("deduplicate", { path: duplicate.path })
+    const managedPath = duplicate.path
+
+    await close(vault)
+    await fs.promises.unlink(path.join(home, "vault", "registry.sqlite3"))
+    const replacement = new Vault({ homedir: home, platform: process.platform })
+    await replacement.init()
+    replacement.sizeThreshold = contents.length * 2
+    vaults.push(replacement)
+    assert.equal(await replacement.registry.countFiles(), 0)
+
+    await replacement.sweeper.scan()
+
+    const rebuilt = await replacement.registry.getFile(managedPath)
+    assert.ok(rebuilt)
+    assert.equal(rebuilt.status, "linked")
+    assert.equal(rebuilt.hash, sha256(contents))
+  })
+
+  test("managed links remain tracked below the threshold if their anchor was removed externally", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "one", "model.bin"), contents)
+    await write(path.join(home, "api", "two", "model.bin"), contents)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    await vault.perform("deduplicate", { path: duplicate.path })
+    await fs.promises.unlink(vault.storePathFor(duplicate.hash))
+    vault.sizeThreshold = contents.length * 2
+
+    await vault.sweeper.scan()
+
+    assert.equal(await vault.registry.countFiles(["linked"]), 2)
+    assert.equal((await vault.registry.getFile(duplicate.path)).status, "linked")
+    assert.equal((await vault.registry.getContent(duplicate.hash)).anchor_present, 0)
+  })
+
+  test("metadata-incompatible copies are visible but not counted as actionable", async (t) => {
+    if (process.platform === "win32") {
+      t.skip("POSIX permission metadata is required")
+      return
+    }
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const first = await write(
+      path.join(home, "api", "one", "model.bin"), contents)
+    const second = await write(
+      path.join(home, "api", "two", "model.bin"), contents)
+    await fs.promises.chmod(first, 0o600)
+    await fs.promises.chmod(second, 0o644)
+
+    await vault.sweeper.scan()
+    const unavailable = [...await vault.registry.files({
+      statuses: ["unavailable"]
+    })]
+    const status = await vault.status(null, { view: "duplicates" })
+
+    assert.equal(unavailable.length, 1)
+    assert.equal(unavailable[0].unavailable_reason, "metadata")
+    assert.equal(status.inventory.counts.duplicates, 1)
+    assert.equal(status.inventory.shareable_duplicates, 0)
+    assert.equal(status.pending_bytes, 0)
+
+    const before = await fs.promises.stat(unavailable[0].path)
+    assert.equal((await vault.perform("detach", {
+      path: unavailable[0].path
+    })).status, "not-found")
+    assert.equal(
+      (await fs.promises.stat(unavailable[0].path)).ino,
+      before.ino
+    )
+    assert.equal(
+      (await vault.registry.getFile(unavailable[0].path)).status,
+      "unavailable"
+    )
+  })
+
+  test("metadata-incompatible copies stay unavailable beside existing hardlinks", async (t) => {
+    if (process.platform === "win32") {
+      t.skip("POSIX permission metadata is required")
+      return
+    }
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const first = await write(
+      path.join(home, "api", "one", "model.bin"), contents)
+    const second = path.join(home, "api", "two", "model.bin")
+    await fs.promises.mkdir(path.dirname(second), { recursive: true })
+    await fs.promises.link(first, second)
+    const incompatible = await write(
+      path.join(home, "api", "three", "model.bin"), contents)
+    await fs.promises.chmod(first, 0o600)
+    await fs.promises.chmod(incompatible, 0o644)
+
+    await vault.sweeper.scan()
+    const status = await vault.status(null, { view: "duplicates" })
+
+    assert.equal((await vault.registry.getFile(incompatible)).status, "unavailable")
+    assert.equal(
+      (await vault.registry.getFile(incompatible)).unavailable_reason,
+      "metadata"
+    )
+    assert.equal(status.inventory.shareable_duplicates, 0)
+    assert.equal(status.pending_bytes, 0)
+  })
+
+  test("the largest compatible metadata group remains actionable", async (t) => {
+    if (process.platform === "win32") {
+      t.skip("POSIX permission metadata is required")
+      return
+    }
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const incompatible = await write(
+      path.join(home, "api", "a", "model.bin"), contents)
+    const compatibleOne = await write(
+      path.join(home, "api", "b", "model.bin"), contents)
+    const compatibleTwo = await write(
+      path.join(home, "api", "c", "model.bin"), contents)
+    await fs.promises.chmod(incompatible, 0o600)
+    await fs.promises.chmod(compatibleOne, 0o644)
+    await fs.promises.chmod(compatibleTwo, 0o644)
+
+    await vault.sweeper.scan()
+
+    assert.equal((await vault.registry.getFile(incompatible)).status, "unavailable")
+    assert.equal((await vault.registry.getFile(compatibleOne)).status, "reference")
+    assert.equal((await vault.registry.getFile(compatibleTwo)).status, "duplicate")
+    assert.equal((await vault.perform("deduplicate", {
+      path: compatibleTwo
+    })).status, "converted")
+  })
+
+  test("a filesystem without hardlinks reports matches as unavailable", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "one", "model.bin"), contents)
+    await write(path.join(home, "api", "two", "model.bin"), contents)
+    vault.mode = "copy"
+
+    await vault.sweeper.scan()
+    const status = await vault.status(null, { view: "duplicates" })
+
+    assert.equal(await vault.registry.countFiles(["unavailable"]), 2)
+    assert.equal(status.inventory.counts.duplicates, 2)
+    assert.equal(status.inventory.shareable_duplicates, 0)
+    assert.equal(status.pending_bytes, 0)
+    assert.equal(status.items.every((item) =>
+      item.shareable === false &&
+      item.unavailable_reason === "hardlinks"), true)
+  })
+
+  test("a lone file matching an anchor on another volume is unavailable", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "one", "model.bin"), contents)
+    await write(path.join(home, "api", "two", "model.bin"), contents)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    await vault.perform("deduplicate", { path: duplicate.path })
+    for (const entry of [...await vault.registry.files({
+      hash: duplicate.hash
+    })]) {
+      await fs.promises.unlink(entry.path)
+    }
+    const independent = await write(
+      path.join(home, "api", "three", "model.bin"), contents)
+    const publishScan = vault.registry.publishScan.bind(vault.registry)
+    vault.registry.publishScan = (
+      runId, sourceIds, metadata, storeDev, canLink
+    ) => publishScan(runId, sourceIds, metadata, storeDev + 1, canLink)
+
+    await vault.sweeper.scan()
+
+    assert.equal((await vault.registry.getFile(independent)).status, "unavailable")
+    assert.equal(
+      (await vault.registry.getFile(independent)).unavailable_reason,
+      "different_disk"
+    )
+  })
+
+  test("a hash-looking anchor name never authorizes cleanup without byte verification", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const claimedHash = sha256(contents)
+    const anchorPath = vault.storePathFor(claimedHash)
+    await write(anchorPath, crypto.randomBytes(4096))
+    await write(path.join(home, "api", "one", "model.bin"), contents)
+    await write(path.join(home, "api", "two", "model.bin"), contents)
+
+    const result = await vault.sweeper.scan()
+    const status = await vault.status()
+
+    assert.equal(result.incomplete, false)
+    assert.equal((await vault.registry.getContent(claimedHash)).anchor_present, 0)
+    assert.equal(status.inventory.counts.reclaimable, 0)
+    assert.equal(status.inventory.shareable_duplicates, 0)
+    assert.equal(status.pending_bytes, 0)
+    assert.equal([...await vault.registry.files({
+      statuses: ["unavailable"]
+    })].length, 2)
+    assert.equal((await vault.perform("reclaim", {
+      hash: claimedHash
+    })).status, "not-found")
+    assert.equal(fs.existsSync(anchorPath), true)
+  })
+
+  test("anchor verification participates in scan cancellation", async () => {
+    const { vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const hash = sha256(contents)
+    const anchorPath = await write(vault.storePathFor(hash), contents)
+    let release
+    let entered
+    const enteredHash = new Promise((resolve) => { entered = resolve })
+    const gate = new Promise((resolve) => { release = resolve })
+    const hashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (...args) => {
+      if (args[0] === anchorPath) {
+        entered()
+        await gate
+      }
+      return hashFile(...args)
+    }
+
+    const pending = vault.sweeper.scan()
+    await enteredHash
+    assert.equal(vault.sweeper.currentHash.path, anchorPath)
+    vault.sweeper.cancel()
+    release()
+
+    assert.equal((await pending).cancelled, true)
+  })
+
+  test("nested external roots are walked once and internal symlinks are skipped", async (t) => {
+    const { home, vault } = await makeVault(0)
+    const external = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "pinokio-vault-external-"))
+    homes.push(external)
+    const nested = path.join(external, "nested")
+    const externalFile = await write(
+      path.join(nested, "model.bin"), crypto.randomBytes(4096))
+    const symlink = path.join(home, "api", "linked-external")
+    try {
+      await fs.promises.symlink(
+        external, symlink, process.platform === "win32" ? "junction" : "dir")
+    } catch (error) {
+      t.skip(`directory links unavailable: ${error.message}`)
+      return
+    }
+    await vault.addExternalSource(external)
+    await vault.addExternalSource(nested)
+
+    const result = await vault.sweeper.scan()
+    const canonicalFile = await fs.promises.realpath(externalFile)
+
+    assert.equal(result.files, 1)
+    assert.ok(await vault.registry.getFile(canonicalFile))
+    assert.equal(
+      [...await vault.registry.files()].some((row) =>
+        row.path.startsWith(symlink + path.sep)),
+      false
+    )
   })
 })

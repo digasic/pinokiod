@@ -15758,7 +15758,7 @@ class Server {
         ? req.query.scope_id
         : null
       if (req.query && req.query.progress === "1") {
-        res.json(vault.progressStatus(scopeId))
+        res.json(await vault.progressStatus(scopeId))
         return
       }
       res.json(await vault.status(scopeId, {
@@ -15768,6 +15768,7 @@ class Server {
         status_filter: req.query && req.query.status_filter,
         size_sort: req.query && req.query.size_sort,
         page: req.query && req.query.page,
+        cursor: req.query && req.query.cursor,
         page_size: req.query && req.query.page_size
       }))
     }))
@@ -15785,7 +15786,7 @@ class Server {
         res.redirect(`/setup/dev?callback=${encodeURIComponent(req.originalUrl)}`)
         return
       }
-      await vault.ensureInitialized()
+      await vault.openWorkspace()
       res.render("vault", { theme: this.theme, platform: this.kernel.platform, agent: req.agent })
     }))
     this.app.get("/vault/app/:name", ex(async (req, res) => {
@@ -15799,8 +15800,7 @@ class Server {
         res.sendStatus(404)
         return
       }
-      await vault.ensureInitialized()
-      await vault.refreshSources()
+      await vault.openWorkspace()
       const source = vault.sources().find((item) =>
         item.kind === "app" && item.app === req.params.name && item.available)
       if (!source) {

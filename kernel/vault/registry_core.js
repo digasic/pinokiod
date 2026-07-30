@@ -1,0 +1,2561 @@
+const fs = require("fs")
+const path = require("path")
+const crypto = require("crypto")
+const Database = require("better-sqlite3")
+
+const DATABASE_APPLICATION_ID = 0x5641554c
+const DATABASE_VERSION = 2
+
+const isMissing = (error) => !!(error &&
+  (error.code === "ENOENT" || error.code === "ENOTDIR"))
+
+const unsafePath = (filePath) => {
+  const error = new Error(`Storage index path is not safe: ${filePath}`)
+  error.code = "EVAULTPATH"
+  return error
+}
+
+const placeholders = (values) => values.map(() => "?").join(", ")
+
+class RegistryCore {
+  constructor(root) {
+    this.root = path.resolve(root)
+    this.databasePath = path.resolve(this.root, "registry.sqlite3")
+    this.database = null
+    this.maxEvents = 2000
+    this.scanSizes = new Map()
+    this.scanInodes = new Map()
+    this.scanAnchorInodes = new Set()
+  }
+
+  async load() {
+    let rootStat = null
+    try {
+      rootStat = await fs.promises.lstat(this.root)
+    } catch (error) {
+      if (!isMissing(error)) throw error
+    }
+    if (rootStat && (!rootStat.isDirectory() || rootStat.isSymbolicLink())) {
+      throw unsafePath(this.root)
+    }
+    if (!rootStat) await fs.promises.mkdir(this.root, { recursive: false, mode: 0o700 })
+
+    let databaseStat = null
+    try {
+      databaseStat = await fs.promises.lstat(this.databasePath)
+    } catch (error) {
+      if (!isMissing(error)) throw error
+    }
+    if (databaseStat && (!databaseStat.isFile() || databaseStat.isSymbolicLink())) {
+      throw unsafePath(this.databasePath)
+    }
+
+    this.database = new Database(this.databasePath)
+    try {
+      this.database.pragma("journal_mode = DELETE")
+      this.database.pragma("synchronous = NORMAL")
+      this.database.pragma("foreign_keys = ON")
+      this.database.pragma("busy_timeout = 5000")
+      this.database.pragma("cache_size = -65536")
+      this.database.pragma("temp_store = FILE")
+      this.checkSchemaIdentity()
+      this.createSchema()
+      this.dropLegacyScanSchema()
+      this.createScanSchema()
+      this.database.pragma(`application_id = ${DATABASE_APPLICATION_ID}`)
+      this.database.pragma(`user_version = ${DATABASE_VERSION}`)
+    } catch (error) {
+      this.database.close()
+      this.database = null
+      throw error
+    }
+    if (!databaseStat) await fs.promises.chmod(this.databasePath, 0o600)
+    return { existed: !!databaseStat }
+  }
+
+  checkSchemaIdentity() {
+    const applicationId = this.database.pragma(
+      "application_id", { simple: true })
+    const version = this.database.pragma("user_version", { simple: true })
+    if (applicationId === DATABASE_APPLICATION_ID &&
+        version === DATABASE_VERSION) return
+
+    const tables = this.database.prepare(`
+      SELECT name FROM sqlite_master
+      WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+    `).all().map((row) => row.name)
+    if (!tables.length) return
+
+    const error = new Error(
+      "The Save Space database uses an unsupported schema.")
+    error.code = "EVAULTSCHEMA"
+    throw error
+  }
+
+  createSchema() {
+    this.database.exec(`
+      CREATE TABLE IF NOT EXISTS content (
+        hash TEXT PRIMARY KEY,
+        size INTEGER NOT NULL,
+        first_seen INTEGER NOT NULL,
+        verified_at INTEGER,
+        anchor_verified_at INTEGER,
+        anchor_present INTEGER NOT NULL DEFAULT 0,
+        anchor_dev INTEGER,
+        anchor_ino INTEGER,
+        anchor_size INTEGER,
+        anchor_mtime REAL,
+        anchor_ctime REAL,
+        anchor_nlink INTEGER
+      );
+
+      CREATE TABLE IF NOT EXISTS files (
+        path TEXT PRIMARY KEY,
+        hash TEXT,
+        size INTEGER NOT NULL,
+        mtime REAL NOT NULL,
+        ctime REAL NOT NULL,
+        dev INTEGER NOT NULL,
+        ino INTEGER NOT NULL,
+        mode INTEGER NOT NULL,
+        uid INTEGER NOT NULL,
+        gid INTEGER NOT NULL,
+        source_id TEXT,
+        app TEXT,
+        status TEXT NOT NULL CHECK (
+          status IN ('reference', 'duplicate', 'linked', 'unavailable')
+        ),
+        unavailable_reason TEXT,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS files_hash_path_idx ON files(hash, path);
+      CREATE INDEX IF NOT EXISTS files_inode_path_idx
+        ON files(dev, ino, path);
+      CREATE INDEX IF NOT EXISTS files_status_path_idx
+        ON files(status, path);
+      CREATE INDEX IF NOT EXISTS files_status_size_path_idx
+        ON files(status, size, path);
+      CREATE INDEX IF NOT EXISTS files_source_path_idx
+        ON files(source_id, path);
+      CREATE INDEX IF NOT EXISTS files_source_size_path_idx
+        ON files(source_id, size, path);
+      CREATE INDEX IF NOT EXISTS files_source_status_path_idx
+        ON files(source_id, status, path);
+      CREATE INDEX IF NOT EXISTS files_source_status_size_path_idx
+        ON files(source_id, status, size, path);
+      CREATE INDEX IF NOT EXISTS files_size_path_idx ON files(size, path);
+      CREATE INDEX IF NOT EXISTS content_reclaimable_page_idx
+        ON content(anchor_present, anchor_nlink, size DESC, hash);
+
+      CREATE TABLE IF NOT EXISTS file_summaries (
+        source_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        file_count INTEGER NOT NULL,
+        bytes INTEGER NOT NULL,
+        PRIMARY KEY (source_id, status)
+      );
+
+      CREATE TABLE IF NOT EXISTS inode_savings (
+        dev INTEGER NOT NULL,
+        ino INTEGER NOT NULL,
+        source_id TEXT NOT NULL,
+        bytes REAL NOT NULL,
+        PRIMARY KEY (dev, ino, source_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS source_savings (
+        source_id TEXT PRIMARY KEY,
+        bytes REAL NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS hash_summaries (
+        hash TEXT PRIMARY KEY,
+        file_count INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS inode_summaries (
+        dev INTEGER NOT NULL,
+        ino INTEGER NOT NULL,
+        file_count INTEGER NOT NULL,
+        PRIMARY KEY (dev, ino)
+      );
+
+      CREATE TABLE IF NOT EXISTS global_summary (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        reclaimable_count INTEGER NOT NULL DEFAULT 0,
+        reclaimable_bytes INTEGER NOT NULL DEFAULT 0,
+        activity_count INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT OR IGNORE INTO global_summary(id) VALUES (1);
+
+      CREATE TABLE IF NOT EXISTS activity_summaries (
+        source_id TEXT PRIMARY KEY,
+        activity_count INTEGER NOT NULL
+      );
+
+      CREATE TRIGGER IF NOT EXISTS content_summary_insert
+      AFTER INSERT ON content
+      WHEN NEW.anchor_present = 1 AND NEW.anchor_nlink = 1 BEGIN
+        UPDATE global_summary SET
+          reclaimable_count = reclaimable_count + 1,
+          reclaimable_bytes = reclaimable_bytes + NEW.size
+        WHERE id = 1;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS content_summary_delete
+      AFTER DELETE ON content
+      WHEN OLD.anchor_present = 1 AND OLD.anchor_nlink = 1 BEGIN
+        UPDATE global_summary SET
+          reclaimable_count = reclaimable_count - 1,
+          reclaimable_bytes = reclaimable_bytes - OLD.size
+        WHERE id = 1;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS content_summary_update
+      AFTER UPDATE OF anchor_present, anchor_nlink, size ON content BEGIN
+        UPDATE global_summary SET
+          reclaimable_count = reclaimable_count -
+            CASE WHEN OLD.anchor_present = 1 AND OLD.anchor_nlink = 1
+              THEN 1 ELSE 0 END +
+            CASE WHEN NEW.anchor_present = 1 AND NEW.anchor_nlink = 1
+              THEN 1 ELSE 0 END,
+          reclaimable_bytes = reclaimable_bytes -
+            CASE WHEN OLD.anchor_present = 1 AND OLD.anchor_nlink = 1
+              THEN OLD.size ELSE 0 END +
+            CASE WHEN NEW.anchor_present = 1 AND NEW.anchor_nlink = 1
+              THEN NEW.size ELSE 0 END
+        WHERE id = 1;
+      END;
+
+      CREATE TABLE IF NOT EXISTS scans (
+        scope_id TEXT PRIMARY KEY,
+        completed_at INTEGER NOT NULL,
+        dirs INTEGER NOT NULL,
+        files INTEGER NOT NULL,
+        bytes_total INTEGER NOT NULL,
+        candidates INTEGER NOT NULL,
+        hashed INTEGER NOT NULL,
+        hash_total INTEGER NOT NULL,
+        hash_bytes INTEGER NOT NULL,
+        inode_reuses INTEGER NOT NULL,
+        unstable_hashes INTEGER NOT NULL,
+        hash_failures INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        walk_duration_ms INTEGER NOT NULL,
+        hash_wait_duration_ms INTEGER NOT NULL,
+        hash_duration_ms INTEGER NOT NULL,
+        details TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        hash TEXT,
+        path TEXT,
+        app TEXT,
+        source_id TEXT,
+        bytes INTEGER NOT NULL DEFAULT 0,
+        file_count INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE INDEX IF NOT EXISTS events_source_idx
+        ON events(source_id, id);
+
+      CREATE TABLE IF NOT EXISTS external_sources (
+        root TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL
+      );
+
+    `)
+    this.recreateFileTriggers()
+  }
+
+  dropLegacyScanSchema() {
+    this.database.pragma("foreign_keys = OFF")
+    try {
+      this.database.exec(`
+        DROP TABLE IF EXISTS main.scan_files;
+        DROP TABLE IF EXISTS main.scan_anchors;
+        DROP TABLE IF EXISTS main.scan_runs;
+      `)
+    } finally {
+      this.database.pragma("foreign_keys = ON")
+    }
+  }
+
+  createScanSchema() {
+    this.database.exec(`
+      CREATE TEMP TABLE scan_runs (
+        id TEXT PRIMARY KEY,
+        scope_id TEXT,
+        started_at INTEGER NOT NULL
+      ) WITHOUT ROWID;
+
+      CREATE TEMP TABLE scan_files (
+        run_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        mtime REAL NOT NULL,
+        ctime REAL NOT NULL,
+        dev INTEGER NOT NULL,
+        ino INTEGER NOT NULL,
+        nlink INTEGER NOT NULL,
+        mode INTEGER NOT NULL,
+        uid INTEGER NOT NULL,
+        gid INTEGER NOT NULL,
+        source_id TEXT,
+        app TEXT,
+        hash TEXT,
+        hash_attempted INTEGER NOT NULL DEFAULT 0,
+        hash_needed INTEGER NOT NULL DEFAULT 0,
+        managed INTEGER NOT NULL DEFAULT 0,
+        status TEXT,
+        unavailable_reason TEXT,
+        old_status TEXT,
+        PRIMARY KEY (run_id, path),
+        FOREIGN KEY (run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
+      ) WITHOUT ROWID;
+      CREATE INDEX temp.scan_files_group_idx
+        ON scan_files(run_id, hash, dev, status, path);
+      CREATE INDEX temp.scan_files_work_idx
+        ON scan_files(run_id, size, dev, ino, path);
+      CREATE INDEX temp.scan_files_hash_work_idx
+        ON scan_files(run_id, size, dev, ino, path)
+        WHERE hash IS NULL AND hash_attempted = 0 AND hash_needed = 1;
+      CREATE INDEX temp.scan_files_inode_path_idx
+        ON scan_files(run_id, dev, ino, path);
+
+      CREATE TEMP TABLE scan_anchors (
+        run_id TEXT NOT NULL,
+        hash_name TEXT NOT NULL,
+        path TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        mtime REAL NOT NULL,
+        ctime REAL NOT NULL,
+        dev INTEGER NOT NULL,
+        ino INTEGER NOT NULL,
+        nlink INTEGER NOT NULL,
+        mode INTEGER NOT NULL,
+        uid INTEGER NOT NULL,
+        gid INTEGER NOT NULL,
+        verified_hash TEXT,
+        verify_attempted INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (run_id, hash_name),
+        FOREIGN KEY (run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
+      ) WITHOUT ROWID;
+      CREATE INDEX temp.scan_anchors_inode_idx
+        ON scan_anchors(run_id, dev, ino);
+      CREATE INDEX temp.scan_anchors_size_idx
+        ON scan_anchors(run_id, size);
+
+      CREATE TEMP TABLE scan_linked_groups (
+        run_id TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        dev INTEGER NOT NULL,
+        mode_bits INTEGER NOT NULL,
+        uid INTEGER NOT NULL,
+        gid INTEGER NOT NULL,
+        PRIMARY KEY (run_id, hash, dev, mode_bits, uid, gid),
+        FOREIGN KEY (run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
+      ) WITHOUT ROWID;
+      CREATE INDEX temp.scan_linked_groups_hash_idx
+        ON scan_linked_groups(run_id, hash, dev);
+    `)
+  }
+
+  resetScanSchema() {
+    this.database.exec(`
+      DROP TABLE IF EXISTS temp.scan_linked_groups;
+      DROP TABLE IF EXISTS temp.scan_anchors;
+      DROP TABLE IF EXISTS temp.scan_files;
+      DROP TABLE IF EXISTS temp.scan_runs;
+    `)
+    this.createScanSchema()
+  }
+
+  dropFileTriggers() {
+    this.database.exec(`
+      DROP TRIGGER IF EXISTS files_summary_insert;
+      DROP TRIGGER IF EXISTS files_summary_delete;
+      DROP TRIGGER IF EXISTS files_summary_update;
+      DROP TRIGGER IF EXISTS files_group_insert;
+      DROP TRIGGER IF EXISTS files_group_delete;
+      DROP TRIGGER IF EXISTS files_group_update;
+    `)
+  }
+
+  createFileTriggers() {
+    this.database.exec(`
+      CREATE TRIGGER files_summary_insert
+      AFTER INSERT ON files BEGIN
+        INSERT INTO file_summaries(source_id, status, file_count, bytes)
+        VALUES (COALESCE(NEW.source_id, ''), NEW.status, 1, NEW.size)
+        ON CONFLICT(source_id, status) DO UPDATE SET
+          file_count = file_count + 1,
+          bytes = bytes + NEW.size;
+      END;
+
+      CREATE TRIGGER files_summary_delete
+      AFTER DELETE ON files BEGIN
+        UPDATE file_summaries SET
+          file_count = file_count - 1,
+          bytes = bytes - OLD.size
+        WHERE source_id = COALESCE(OLD.source_id, '')
+          AND status = OLD.status;
+        DELETE FROM file_summaries
+        WHERE source_id = COALESCE(OLD.source_id, '')
+          AND status = OLD.status
+          AND file_count <= 0;
+      END;
+
+      CREATE TRIGGER files_summary_update
+      AFTER UPDATE OF source_id, status, size ON files BEGIN
+        UPDATE file_summaries SET
+          file_count = file_count - 1,
+          bytes = bytes - OLD.size
+        WHERE source_id = COALESCE(OLD.source_id, '')
+          AND status = OLD.status;
+        DELETE FROM file_summaries
+        WHERE source_id = COALESCE(OLD.source_id, '')
+          AND status = OLD.status
+          AND file_count <= 0;
+        INSERT INTO file_summaries(source_id, status, file_count, bytes)
+        VALUES (COALESCE(NEW.source_id, ''), NEW.status, 1, NEW.size)
+        ON CONFLICT(source_id, status) DO UPDATE SET
+          file_count = file_count + 1,
+          bytes = bytes + NEW.size;
+      END;
+
+      CREATE TRIGGER files_group_insert
+      AFTER INSERT ON files BEGIN
+        INSERT INTO inode_summaries(dev, ino, file_count)
+        SELECT NEW.dev, NEW.ino, 1 WHERE NEW.status = 'linked'
+        ON CONFLICT(dev, ino) DO UPDATE SET
+          file_count = file_count + 1;
+        INSERT INTO hash_summaries(hash, file_count)
+        SELECT NEW.hash, 1 WHERE NEW.hash IS NOT NULL
+        ON CONFLICT(hash) DO UPDATE SET
+          file_count = file_count + 1;
+      END;
+
+      CREATE TRIGGER files_group_delete
+      AFTER DELETE ON files BEGIN
+        UPDATE inode_summaries SET file_count = file_count - 1
+        WHERE dev = OLD.dev AND ino = OLD.ino AND OLD.status = 'linked';
+        DELETE FROM inode_summaries
+        WHERE dev = OLD.dev AND ino = OLD.ino AND file_count <= 0;
+        UPDATE hash_summaries SET file_count = file_count - 1
+        WHERE hash = OLD.hash;
+        DELETE FROM hash_summaries
+        WHERE hash = OLD.hash AND file_count <= 0;
+      END;
+
+      CREATE TRIGGER files_group_update
+      AFTER UPDATE OF hash, dev, ino, status ON files BEGIN
+        UPDATE inode_summaries SET file_count = file_count - 1
+        WHERE dev = OLD.dev AND ino = OLD.ino AND OLD.status = 'linked';
+        DELETE FROM inode_summaries
+        WHERE dev = OLD.dev AND ino = OLD.ino AND file_count <= 0;
+        UPDATE hash_summaries SET file_count = file_count - 1
+        WHERE hash = OLD.hash;
+        DELETE FROM hash_summaries
+        WHERE hash = OLD.hash AND file_count <= 0;
+        INSERT INTO inode_summaries(dev, ino, file_count)
+        SELECT NEW.dev, NEW.ino, 1 WHERE NEW.status = 'linked'
+        ON CONFLICT(dev, ino) DO UPDATE SET
+          file_count = file_count + 1;
+        INSERT INTO hash_summaries(hash, file_count)
+        SELECT NEW.hash, 1 WHERE NEW.hash IS NOT NULL
+        ON CONFLICT(hash) DO UPDATE SET
+          file_count = file_count + 1;
+      END;
+    `)
+  }
+
+  recreateFileTriggers() {
+    this.dropFileTriggers()
+    this.createFileTriggers()
+  }
+
+  rebuildFileSummaries() {
+    this.database.prepare("DELETE FROM file_summaries").run()
+    this.database.prepare(`
+      INSERT INTO file_summaries(source_id, status, file_count, bytes)
+      SELECT
+        COALESCE(source_id, ''),
+        status,
+        COUNT(*),
+        COALESCE(SUM(size), 0)
+      FROM files
+      GROUP BY COALESCE(source_id, ''), status
+    `).run()
+  }
+
+  rebuildGroupSummaries() {
+    this.database.prepare("DELETE FROM hash_summaries").run()
+    this.database.prepare(`
+      INSERT INTO hash_summaries(hash, file_count)
+      SELECT hash, COUNT(*)
+      FROM files
+      WHERE hash IS NOT NULL
+      GROUP BY hash
+    `).run()
+    this.database.prepare("DELETE FROM inode_summaries").run()
+    this.database.prepare(`
+      INSERT INTO inode_summaries(dev, ino, file_count)
+      SELECT dev, ino, COUNT(*)
+      FROM files
+      WHERE status = 'linked'
+      GROUP BY dev, ino
+    `).run()
+  }
+
+  rebuildSavings() {
+    this.database.prepare("DELETE FROM inode_savings").run()
+    this.database.prepare(`
+      INSERT INTO inode_savings(dev, ino, source_id, bytes)
+      WITH linked AS (
+        SELECT dev, ino, COUNT(*) AS names
+        FROM files
+        WHERE status = 'linked'
+        GROUP BY dev, ino
+      )
+      SELECT
+        file.dev,
+        file.ino,
+        COALESCE(file.source_id, ''),
+        SUM(file.size - (CAST(file.size AS REAL) / linked.names))
+      FROM files file
+      JOIN linked USING (dev, ino)
+      WHERE file.status = 'linked'
+      GROUP BY file.dev, file.ino, COALESCE(file.source_id, '')
+    `).run()
+    this.database.prepare("DELETE FROM source_savings").run()
+    this.database.prepare(`
+      INSERT INTO source_savings(source_id, bytes)
+      SELECT source_id, COALESCE(SUM(bytes), 0)
+      FROM inode_savings
+      GROUP BY source_id
+    `).run()
+  }
+
+  rebuildActivitySummaries() {
+    this.database.prepare("DELETE FROM activity_summaries").run()
+    this.database.prepare(`
+      INSERT INTO activity_summaries(source_id, activity_count)
+      SELECT COALESCE(source_id, ''), COUNT(*)
+      FROM events
+      GROUP BY COALESCE(source_id, '')
+    `).run()
+    const global = this.database.prepare(`
+      SELECT COUNT(*) AS count FROM events
+    `).get()
+    this.database.prepare(`
+      UPDATE global_summary SET activity_count = ? WHERE id = 1
+    `).run(Number(global.count) || 0)
+  }
+
+  refreshInodeSavings(dev, ino) {
+    if (!Number.isFinite(dev) || !Number.isFinite(ino)) return
+    const previous = this.database.prepare(`
+      SELECT source_id, bytes
+      FROM inode_savings
+      WHERE dev = ? AND ino = ?
+    `).all(dev, ino)
+    this.database.prepare(
+      "DELETE FROM inode_savings WHERE dev = ? AND ino = ?"
+    ).run(dev, ino)
+    this.database.prepare(`
+      INSERT INTO inode_savings(dev, ino, source_id, bytes)
+      WITH linked AS (
+        SELECT COUNT(*) AS names
+        FROM files
+        WHERE status = 'linked' AND dev = ? AND ino = ?
+      )
+      SELECT
+        file.dev,
+        file.ino,
+        COALESCE(file.source_id, ''),
+        SUM(file.size - (CAST(file.size AS REAL) / linked.names))
+      FROM files file, linked
+      WHERE file.status = 'linked'
+        AND file.dev = ?
+        AND file.ino = ?
+        AND linked.names > 0
+      GROUP BY file.dev, file.ino, COALESCE(file.source_id, '')
+    `).run(dev, ino, dev, ino)
+    const next = this.database.prepare(`
+      SELECT source_id, bytes
+      FROM inode_savings
+      WHERE dev = ? AND ino = ?
+    `).all(dev, ino)
+    const deltas = new Map()
+    for (const row of previous) {
+      deltas.set(row.source_id,
+        (deltas.get(row.source_id) || 0) - Number(row.bytes))
+    }
+    for (const row of next) {
+      deltas.set(row.source_id,
+        (deltas.get(row.source_id) || 0) + Number(row.bytes))
+    }
+    const updateSourceSavings = this.database.prepare(`
+      INSERT INTO source_savings(source_id, bytes)
+      VALUES (?, ?)
+      ON CONFLICT(source_id) DO UPDATE SET
+        bytes = MAX(0, source_savings.bytes + ?)
+    `)
+    for (const [sourceId, delta] of deltas) {
+      updateSourceSavings.run(sourceId, Math.max(0, delta), delta)
+    }
+  }
+
+  close() {
+    if (!this.database) return
+    this.database.close()
+    this.database = null
+    this.scanSizes.clear()
+    this.scanInodes.clear()
+    this.scanAnchorInodes.clear()
+  }
+
+  transaction(callback) {
+    return this.database.transaction(callback)()
+  }
+
+  getFile(filePath) {
+    return this.database.prepare("SELECT * FROM files WHERE path = ?")
+      .get(path.resolve(filePath)) || null
+  }
+
+  upsertFile(entry) {
+    const resolvedPath = path.resolve(entry.path)
+    const previous = this.getFile(resolvedPath)
+    this.transaction(() => {
+      this.database.prepare(`
+      INSERT INTO files (
+        path, hash, size, mtime, ctime, dev, ino, mode, uid, gid, source_id,
+        app, status, unavailable_reason, updated_at
+      ) VALUES (
+        @path, @hash, @size, @mtime, @ctime, @dev, @ino, @mode, @uid, @gid,
+        @source_id, @app, @status, @unavailable_reason, @updated_at
+      )
+      ON CONFLICT(path) DO UPDATE SET
+        hash = excluded.hash,
+        size = excluded.size,
+        mtime = excluded.mtime,
+        ctime = excluded.ctime,
+        dev = excluded.dev,
+        ino = excluded.ino,
+        mode = excluded.mode,
+        uid = excluded.uid,
+        gid = excluded.gid,
+        source_id = excluded.source_id,
+        app = excluded.app,
+        status = excluded.status,
+        unavailable_reason = excluded.unavailable_reason,
+        updated_at = excluded.updated_at
+      `).run({
+      path: resolvedPath,
+      hash: entry.hash || null,
+      size: Math.max(0, Number(entry.size) || 0),
+      mtime: Number(entry.mtime) || 0,
+      ctime: Number(entry.ctime) || 0,
+      dev: Number(entry.dev) || 0,
+      ino: Number(entry.ino) || 0,
+      mode: Number(entry.mode) || 0,
+      uid: Number(entry.uid) || 0,
+      gid: Number(entry.gid) || 0,
+      source_id: entry.source_id || null,
+      app: entry.app || null,
+      status: entry.status,
+      unavailable_reason: entry.unavailable_reason || null,
+      updated_at: Number(entry.updated_at) || Date.now()
+      })
+      if (previous && previous.status === "linked") {
+        this.refreshInodeSavings(previous.dev, previous.ino)
+      }
+      if (entry.status === "linked") {
+        this.refreshInodeSavings(
+          Number(entry.dev) || 0,
+          Number(entry.ino) || 0
+        )
+      }
+    })
+  }
+
+  removeFile(filePath) {
+    const resolvedPath = path.resolve(filePath)
+    const previous = this.getFile(resolvedPath)
+    let removed = false
+    this.transaction(() => {
+      removed = this.database.prepare("DELETE FROM files WHERE path = ?")
+        .run(resolvedPath).changes > 0
+      if (previous && previous.status === "linked") {
+        this.refreshInodeSavings(previous.dev, previous.ino)
+      }
+    })
+    return removed
+  }
+
+  getContent(hash) {
+    return this.database.prepare("SELECT * FROM content WHERE hash = ?")
+      .get(hash) || null
+  }
+
+  upsertContent(entry) {
+    this.database.prepare(`
+      INSERT INTO content (
+        hash, size, first_seen, verified_at, anchor_verified_at,
+        anchor_present, anchor_dev, anchor_ino, anchor_size, anchor_mtime,
+        anchor_ctime, anchor_nlink
+      ) VALUES (
+        @hash, @size, @first_seen, @verified_at, @anchor_verified_at,
+        @anchor_present, @anchor_dev, @anchor_ino, @anchor_size,
+        @anchor_mtime, @anchor_ctime, @anchor_nlink
+      )
+      ON CONFLICT(hash) DO UPDATE SET
+        size = excluded.size,
+        verified_at = COALESCE(excluded.verified_at, content.verified_at),
+        anchor_verified_at = excluded.anchor_verified_at,
+        anchor_present = excluded.anchor_present,
+        anchor_dev = excluded.anchor_dev,
+        anchor_ino = excluded.anchor_ino,
+        anchor_size = excluded.anchor_size,
+        anchor_mtime = excluded.anchor_mtime,
+        anchor_ctime = excluded.anchor_ctime,
+        anchor_nlink = excluded.anchor_nlink
+    `).run({
+      hash: entry.hash,
+      size: Math.max(0, Number(entry.size) || 0),
+      first_seen: Number(entry.first_seen) || Date.now(),
+      verified_at: entry.verified_at || null,
+      anchor_verified_at: entry.anchor_verified_at || null,
+      anchor_present: entry.anchor_present ? 1 : 0,
+      anchor_dev: Number.isFinite(entry.anchor_dev) ? entry.anchor_dev : null,
+      anchor_ino: Number.isFinite(entry.anchor_ino) ? entry.anchor_ino : null,
+      anchor_size: Number.isFinite(entry.anchor_size) ? entry.anchor_size : null,
+      anchor_mtime: Number.isFinite(entry.anchor_mtime) ? entry.anchor_mtime : null,
+      anchor_ctime: Number.isFinite(entry.anchor_ctime) ? entry.anchor_ctime : null,
+      anchor_nlink: Number.isFinite(entry.anchor_nlink) ? entry.anchor_nlink : null
+    })
+  }
+
+  removeContent(hash) {
+    return this.database.prepare("DELETE FROM content WHERE hash = ?")
+      .run(hash).changes > 0
+  }
+
+  files(options = {}) {
+    const where = []
+    const values = []
+    if (options.hash) {
+      where.push("hash = ?")
+      values.push(options.hash)
+    }
+    if (options.dev !== undefined && options.ino !== undefined) {
+      where.push("dev = ? AND ino = ?")
+      values.push(options.dev, options.ino)
+    }
+    if (options.statuses && options.statuses.length) {
+      where.push(`status IN (${placeholders(options.statuses)})`)
+      values.push(...options.statuses)
+    }
+    if (options.sourceIds && options.sourceIds.length) {
+      where.push(`source_id IN (${placeholders(options.sourceIds)})`)
+      values.push(...options.sourceIds)
+    }
+    const limit = Math.max(1, Math.min(1000, Number(options.limit) || 1000))
+    const sql = `SELECT * FROM files${where.length ? ` WHERE ${where.join(" AND ")}` : ""}
+      ORDER BY path LIMIT ?`
+    return this.database.prepare(sql).all(...values, limit)
+  }
+
+  updateInodeSnapshots(dev, ino, snapshot) {
+    this.transaction(() => {
+      this.database.prepare(`
+        UPDATE files SET
+          size = ?, mtime = ?, ctime = ?, dev = ?, ino = ?,
+          mode = ?, uid = ?, gid = ?, updated_at = ?
+        WHERE dev = ? AND ino = ?
+      `).run(
+        snapshot.size, snapshot.mtime, snapshot.ctime,
+        snapshot.dev, snapshot.ino,
+        snapshot.mode, snapshot.uid, snapshot.gid, Date.now(), dev, ino
+      )
+      this.refreshInodeSavings(dev, ino)
+      if (snapshot.dev !== dev || snapshot.ino !== ino) {
+        this.refreshInodeSavings(snapshot.dev, snapshot.ino)
+      }
+    })
+  }
+
+  reclassifyHash(hash, storeDev, canLink = true, anchorSnapshot = null) {
+    const rows = this.database.prepare(`
+      SELECT * FROM files WHERE hash = ? ORDER BY path
+    `).all(hash)
+    if (!rows.length) return { files: 0 }
+
+    const inodeCounts = new Map()
+    for (const row of rows) {
+      const key = `${row.dev}:${row.ino}`
+      inodeCounts.set(key, (inodeCounts.get(key) || 0) + 1)
+    }
+    const anchor = anchorSnapshot &&
+      Number.isFinite(anchorSnapshot.dev) &&
+      Number.isFinite(anchorSnapshot.ino)
+      ? anchorSnapshot
+      : null
+    const metadataKey = (row) =>
+      `${Number(row.mode) & 0o7777}:${Number(row.uid)}:${Number(row.gid)}`
+    const pathOrder = (left, right) => Buffer.compare(
+      Buffer.from(left.path),
+      Buffer.from(right.path)
+    )
+    const states = new Map()
+
+    for (const row of rows) {
+      const inodeKey = `${row.dev}:${row.ino}`
+      if ((inodeCounts.get(inodeKey) || 0) > 1 ||
+          (anchor && row.dev === anchor.dev && row.ino === anchor.ino)) {
+        states.set(row.path, {
+          status: "linked",
+          unavailable_reason: null
+        })
+      }
+    }
+
+    const unlinked = rows.filter((row) => !states.has(row.path))
+    const hasOtherContent = rows.length > 1 || !!anchor
+    if (!hasOtherContent) {
+      states.set(unlinked[0].path, {
+        status: "reference",
+        unavailable_reason: null
+      })
+    } else {
+      const eligible = []
+      for (const row of unlinked) {
+        if (!canLink) {
+          states.set(row.path, {
+            status: "unavailable",
+            unavailable_reason: "hardlinks"
+          })
+        } else if (row.dev !== storeDev) {
+          states.set(row.path, {
+            status: "unavailable",
+            unavailable_reason: "different_disk"
+          })
+        } else {
+          eligible.push(row)
+        }
+      }
+
+      const linkedMetadata = rows
+        .filter((row) =>
+          states.get(row.path) &&
+          states.get(row.path).status === "linked" &&
+          row.dev === storeDev)
+        .map(metadataKey)
+      if (anchor && anchor.dev === storeDev) {
+        linkedMetadata.push(metadataKey(anchor))
+      }
+
+      if (linkedMetadata.length) {
+        const compatible = new Set(linkedMetadata)
+        for (const row of eligible) {
+          states.set(row.path, compatible.has(metadataKey(row))
+            ? { status: "duplicate", unavailable_reason: null }
+            : { status: "unavailable", unavailable_reason: "metadata" })
+        }
+      } else if (eligible.length) {
+        const groups = new Map()
+        for (const row of eligible) {
+          const key = metadataKey(row)
+          if (!groups.has(key)) groups.set(key, [])
+          groups.get(key).push(row)
+        }
+        const chosen = [...groups.values()]
+          .map((group) => group.sort(pathOrder))
+          .sort((left, right) =>
+            right.length - left.length || pathOrder(left[0], right[0]))[0]
+        const chosenPaths = new Set(chosen.map((row) => row.path))
+        for (const row of eligible) {
+          states.set(row.path, chosenPaths.has(row.path)
+            ? {
+                status: row.path === chosen[0].path
+                  ? "reference"
+                  : "duplicate",
+                unavailable_reason: null
+              }
+            : { status: "unavailable", unavailable_reason: "metadata" })
+        }
+      }
+    }
+
+    const update = this.database.prepare(`
+      UPDATE files SET
+        status = ?, unavailable_reason = ?, updated_at = ?
+      WHERE path = ?
+    `)
+    const inodeKeys = new Map(rows.map((row) => [
+      `${row.dev}:${row.ino}`,
+      { dev: row.dev, ino: row.ino }
+    ]))
+    this.transaction(() => {
+      const now = Date.now()
+      for (const row of rows) {
+        const state = states.get(row.path)
+        update.run(
+          state.status,
+          state.unavailable_reason,
+          now,
+          row.path
+        )
+      }
+      for (const inode of inodeKeys.values()) {
+        this.refreshInodeSavings(inode.dev, inode.ino)
+      }
+    })
+    return { files: rows.length }
+  }
+
+  externalSources() {
+    return this.database.prepare(
+      "SELECT root FROM external_sources ORDER BY created_at, root"
+    ).all().map((row) => row.root)
+  }
+
+  addExternalSource(root) {
+    this.database.prepare(`
+      INSERT OR IGNORE INTO external_sources(root, created_at) VALUES (?, ?)
+    `).run(path.resolve(root), Date.now())
+  }
+
+  removeExternalSource(root) {
+    this.database.prepare("DELETE FROM external_sources WHERE root = ?")
+      .run(path.resolve(root))
+  }
+
+  removeExternalSourceState(root, sourceId) {
+    this.transaction(() => {
+      this.removeExternalSource(root)
+      this.database.prepare("DELETE FROM files WHERE source_id = ?")
+        .run(sourceId)
+      this.removeScan(sourceId)
+      this.database.prepare(`
+        DELETE FROM content
+        WHERE anchor_present = 0
+          AND NOT EXISTS (
+            SELECT 1 FROM files WHERE files.hash = content.hash
+          )
+      `).run()
+      this.rebuildSavings()
+    })
+  }
+
+  scanFor(scopeId = null) {
+    const row = this.database.prepare("SELECT * FROM scans WHERE scope_id = ?")
+      .get(scopeId || "")
+    if (!row) return null
+    let details = {}
+    try {
+      details = JSON.parse(row.details)
+    } catch (error) {}
+    return Object.assign(details, {
+      ts: row.completed_at,
+      dirs: row.dirs,
+      files: row.files,
+      bytes_total: row.bytes_total,
+      candidates: row.candidates,
+      hashed: row.hashed,
+      hash_total: row.hash_total,
+      hash_bytes: row.hash_bytes,
+      inode_reuses: row.inode_reuses,
+      unstable_hashes: row.unstable_hashes,
+      hash_failures: row.hash_failures,
+      duration_ms: row.duration_ms,
+      walk_duration_ms: row.walk_duration_ms,
+      hash_wait_duration_ms: row.hash_wait_duration_ms,
+      hash_duration_ms: row.hash_duration_ms
+    })
+  }
+
+  removeScan(scopeId) {
+    this.database.prepare("DELETE FROM scans WHERE scope_id = ?")
+      .run(scopeId || "")
+  }
+
+  beginScan(scopeId = null) {
+    const id = crypto.randomUUID()
+    this.scanSizes.clear()
+    this.scanInodes.clear()
+    this.scanAnchorInodes.clear()
+    this.transaction(() => {
+      this.resetScanSchema()
+      this.database.prepare(
+        "INSERT INTO scan_runs(id, scope_id, started_at) VALUES (?, ?, ?)"
+      ).run(id, scopeId || null, Date.now())
+    })
+    return id
+  }
+
+  abortScan(runId) {
+    const exists = this.database.prepare(
+      "SELECT 1 FROM scan_runs WHERE id = ?").get(runId)
+    if (exists) this.resetScanSchema()
+    this.scanSizes.clear()
+    this.scanInodes.clear()
+    this.scanAnchorInodes.clear()
+    return { changes: exists ? 1 : 0 }
+  }
+
+  stageFiles(runId, entries, minimumSize = 0) {
+    if (!entries.length) return { changes: 0 }
+    const threshold = Math.max(0, Number(minimumSize) || 0)
+    const resolvedEntries = entries
+      .filter((entry) => entry.nlink > 1 ||
+        (entry.size > 0 && entry.size >= threshold))
+      .map((entry) => ({
+        entry,
+        path: path.resolve(entry.path)
+      }))
+    if (!resolvedEntries.length) return { changes: 0 }
+    const previousByPath = new Map(this.database.prepare(`
+      SELECT path, hash, size, mtime, ctime, dev, ino, status
+      FROM files
+      WHERE path IN (${placeholders(resolvedEntries)})
+    `).all(...resolvedEntries.map((candidate) => candidate.path))
+      .map((row) => [row.path, row]))
+
+    const wantedInodes = new Map()
+    for (const candidate of resolvedEntries) {
+      const { entry } = candidate
+      if (entry.nlink <= 1 || entry.ino === 0) continue
+      const key = `${entry.dev}:${entry.ino}`
+      if (this.scanAnchorInodes.has(key) || wantedInodes.has(key)) continue
+      wantedInodes.set(key, { dev: entry.dev, ino: entry.ino })
+    }
+    const managedInodes = new Set()
+    if (wantedInodes.size) {
+      const values = [...wantedInodes.values()]
+      const rows = this.database.prepare(`
+        WITH wanted(dev, ino) AS (
+          VALUES ${values.map(() => "(?, ?)").join(", ")}
+        )
+        SELECT wanted.dev, wanted.ino
+        FROM wanted
+        WHERE EXISTS (
+          SELECT 1 FROM files INDEXED BY files_inode_path_idx
+          WHERE files.dev = wanted.dev
+            AND files.ino = wanted.ino
+            AND files.status = 'linked'
+        )
+      `).all(...values.flatMap((value) => [value.dev, value.ino]))
+      for (const row of rows) {
+        managedInodes.add(`${row.dev}:${row.ino}`)
+      }
+    }
+    const insert = this.database.prepare(`
+      INSERT INTO scan_files (
+        run_id, path, size, mtime, ctime, dev, ino, nlink, mode, uid, gid,
+        source_id, app, hash, hash_needed, managed, status, old_status
+      ) VALUES (
+        @run_id, @path, @size, @mtime, @ctime, @dev, @ino, @nlink,
+        @mode, @uid, @gid, @source_id, @app, @hash, @hash_needed,
+        @managed, @status, @old_status
+      )
+      ON CONFLICT(run_id, path) DO UPDATE SET
+        size = excluded.size,
+        mtime = excluded.mtime,
+        ctime = excluded.ctime,
+        dev = excluded.dev,
+        ino = excluded.ino,
+        nlink = excluded.nlink,
+        mode = excluded.mode,
+        uid = excluded.uid,
+        gid = excluded.gid,
+        source_id = excluded.source_id,
+        app = excluded.app,
+        hash = excluded.hash,
+        hash_needed = excluded.hash_needed,
+        managed = excluded.managed,
+        status = excluded.status
+    `)
+    const staged = []
+    for (const resolved of resolvedEntries) {
+      const { entry } = resolved
+      const inodeKey = `${entry.dev}:${entry.ino}`
+      const anchored = entry.nlink > 1 &&
+        this.scanAnchorInodes.has(inodeKey)
+      const managed = anchored || (
+        entry.nlink > 1 && managedInodes.has(inodeKey)
+      )
+      if (!managed && (
+        entry.size <= 0 ||
+        entry.size < threshold
+      )) continue
+      const previous = previousByPath.get(resolved.path)
+      const reusableHash = previous &&
+        previous.dev === entry.dev &&
+        previous.ino === entry.ino &&
+        previous.size === entry.size &&
+        previous.mtime === entry.mtime &&
+        previous.ctime === entry.ctime
+        ? previous.hash
+        : null
+      staged.push({
+        entry,
+        path: resolved.path,
+        managed,
+        hashNeeded: false,
+        linked: managed,
+        hash: entry.hash || reusableHash || null,
+        oldStatus: previous ? previous.status : null
+      })
+    }
+    if (!staged.length) return { changes: 0 }
+
+    const stagedByPath = new Map()
+    const promoteHashPaths = new Set()
+    const promoteLinkedPaths = new Set()
+    for (const candidate of staged) {
+      const { entry } = candidate
+      const sizeState = this.scanSizes.get(entry.size) || {
+        files: 0,
+        hashNeeded: false,
+        firstPath: null
+      }
+      candidate.hashNeeded = sizeState.hashNeeded ||
+        candidate.managed ||
+        sizeState.files > 0
+      if (candidate.hashNeeded &&
+          !sizeState.hashNeeded &&
+          sizeState.firstPath) {
+        const first = stagedByPath.get(sizeState.firstPath)
+        if (first) first.hashNeeded = true
+        else promoteHashPaths.add(sizeState.firstPath)
+      }
+      if (!sizeState.firstPath) sizeState.firstPath = candidate.path
+      sizeState.files += 1
+      sizeState.hashNeeded = candidate.hashNeeded
+      this.scanSizes.set(entry.size, sizeState)
+
+      if (entry.nlink > 1 && entry.ino !== 0) {
+        const inodeKey = `${entry.dev}:${entry.ino}`
+        const inodeState = this.scanInodes.get(inodeKey)
+        if (inodeState && inodeState.firstPath !== candidate.path) {
+          candidate.linked = true
+          if (!inodeState.linked) {
+            const first = stagedByPath.get(inodeState.firstPath)
+            if (first) first.linked = true
+            else promoteLinkedPaths.add(inodeState.firstPath)
+          }
+          inodeState.linked = true
+        } else if (!inodeState) {
+          this.scanInodes.set(inodeKey, {
+            firstPath: candidate.path,
+            linked: candidate.linked
+          })
+        }
+      }
+      stagedByPath.set(candidate.path, candidate)
+    }
+
+    const updatePaths = (column, value, paths) => {
+      const values = [...paths]
+      if (!values.length) return
+      this.database.prepare(`
+        UPDATE scan_files SET ${column} = ?
+        WHERE run_id = ? AND path IN (${placeholders(values)})
+      `).run(value, runId, ...values)
+    }
+    let changes = 0
+    this.transaction(() => {
+      updatePaths("hash_needed", 1, promoteHashPaths)
+      updatePaths("status", "linked", promoteLinkedPaths)
+      for (const candidate of staged) {
+        const { entry } = candidate
+        changes += insert.run({
+          run_id: runId,
+          path: candidate.path,
+          size: entry.size,
+          mtime: entry.mtime,
+          ctime: entry.ctime,
+          dev: entry.dev,
+          ino: entry.ino,
+          nlink: entry.nlink,
+          mode: entry.mode,
+          uid: entry.uid,
+          gid: entry.gid,
+          source_id: entry.source_id || null,
+          app: entry.app || null,
+          hash: candidate.hash,
+          hash_needed: candidate.hashNeeded ? 1 : 0,
+          managed: candidate.managed ? 1 : 0,
+          status: candidate.linked ? "linked" : null,
+          old_status: candidate.oldStatus
+        }).changes
+      }
+    })
+    return { changes }
+  }
+
+  stageAnchors(runId, entries) {
+    if (!entries.length) return
+    const previousContent = this.database.prepare(
+      "SELECT * FROM content WHERE hash = ?")
+    const insert = this.database.prepare(`
+      INSERT INTO scan_anchors (
+        run_id, hash_name, path, size, mtime, ctime, dev, ino, nlink,
+        mode, uid, gid, verified_hash
+      ) VALUES (
+        @run_id, @hash_name, @path, @size, @mtime, @ctime, @dev, @ino,
+        @nlink, @mode, @uid, @gid, @verified_hash
+      )
+      ON CONFLICT(run_id, hash_name) DO UPDATE SET
+        path = excluded.path,
+        size = excluded.size,
+        mtime = excluded.mtime,
+        ctime = excluded.ctime,
+        dev = excluded.dev,
+        ino = excluded.ino,
+        nlink = excluded.nlink,
+        mode = excluded.mode,
+        uid = excluded.uid,
+        gid = excluded.gid,
+        verified_hash = excluded.verified_hash
+    `)
+    this.transaction(() => {
+      for (const entry of entries) {
+        const previous = previousContent.get(entry.hash_name)
+        const unchanged = previous && previous.anchor_verified_at &&
+          previous.anchor_present &&
+          previous.anchor_dev === entry.dev &&
+          previous.anchor_ino === entry.ino &&
+          previous.anchor_size === entry.size &&
+          previous.anchor_mtime === entry.mtime &&
+          previous.anchor_ctime === entry.ctime
+        insert.run({
+          run_id: runId,
+          hash_name: entry.hash_name,
+          path: path.resolve(entry.path),
+          size: entry.size,
+          mtime: entry.mtime,
+          ctime: entry.ctime,
+          dev: entry.dev,
+          ino: entry.ino,
+          nlink: entry.nlink,
+          mode: entry.mode,
+          uid: entry.uid,
+          gid: entry.gid,
+          verified_hash: unchanged ? entry.hash_name : null
+        })
+        this.scanAnchorInodes.add(`${entry.dev}:${entry.ino}`)
+        const sizeState = this.scanSizes.get(entry.size) || {
+          files: 0,
+          hashNeeded: false
+        }
+        sizeState.hashNeeded = true
+        this.scanSizes.set(entry.size, sizeState)
+      }
+    })
+  }
+
+  markAnchorVerified(runId, hash, verifiedHash) {
+    this.database.prepare(`
+      UPDATE scan_anchors SET verified_hash = ?, verify_attempted = 1
+      WHERE run_id = ? AND hash_name = ?
+    `).run(verifiedHash, runId, hash)
+  }
+
+  markAnchorVerificationFailed(runId, hash) {
+    this.database.prepare(`
+      UPDATE scan_anchors SET verify_attempted = 1
+      WHERE run_id = ? AND hash_name = ?
+    `).run(runId, hash)
+  }
+
+  hashWorkBatch(runId, cursor = null, limit = 128) {
+    const after = cursor && typeof cursor === "object" ? cursor : null
+    const afterCursor = after
+      ? `AND
+          (candidate.size, candidate.dev, candidate.ino, candidate.path) >
+          (@size, @dev, @ino, @path)`
+      : ""
+    return this.database.prepare(`
+      SELECT
+        candidate.*,
+        CASE WHEN candidate.nlink > 1 AND candidate.ino != 0 THEN (
+          SELECT peer.hash
+          FROM scan_files peer
+          WHERE peer.run_id = candidate.run_id
+            AND peer.dev = candidate.dev
+            AND peer.ino = candidate.ino
+            AND peer.hash IS NOT NULL
+          ORDER BY peer.path
+          LIMIT 1
+        ) END AS reusable_hash,
+        CASE WHEN
+          candidate.nlink <= 1 OR
+          candidate.ino = 0 OR
+          NOT EXISTS (
+            SELECT 1
+            FROM scan_files inode_peer
+            WHERE inode_peer.run_id = candidate.run_id
+              AND inode_peer.dev = candidate.dev
+              AND inode_peer.ino = candidate.ino
+              AND inode_peer.path < candidate.path
+          )
+        THEN 1 ELSE 0 END AS inode_representative
+      FROM scan_files candidate
+      WHERE candidate.run_id = @run_id
+        AND candidate.hash IS NULL
+        AND candidate.hash_attempted = 0
+        AND candidate.hash_needed = 1
+        ${afterCursor}
+      ORDER BY candidate.size, candidate.dev, candidate.ino, candidate.path
+      LIMIT @limit
+    `).all({
+      run_id: runId,
+      size: after ? Number(after.size) || 0 : 0,
+      dev: after ? Number(after.dev) || 0 : 0,
+      ino: after ? Number(after.ino) || 0 : 0,
+      path: after && typeof after.path === "string" ? after.path : "",
+      limit: Math.max(1, Math.min(1024, Number(limit) || 128))
+    })
+  }
+
+  setStageHash(runId, filePath, hash) {
+    return this.database.prepare(`
+      UPDATE scan_files SET hash = ?, hash_attempted = 1
+      WHERE run_id = ? AND path = ?
+    `).run(hash, runId, path.resolve(filePath))
+  }
+
+  setStageInodeHash(runId, dev, ino, hash) {
+    return this.database.prepare(`
+      UPDATE scan_files SET hash = ?, hash_attempted = 1
+      WHERE run_id = ? AND dev = ? AND ino = ? AND hash IS NULL
+    `).run(hash, runId, dev, ino)
+  }
+
+  markStageHashFailed(runId, filePath) {
+    this.database.prepare(`
+      UPDATE scan_files SET hash_attempted = 1
+      WHERE run_id = ? AND path = ?
+    `).run(runId, path.resolve(filePath))
+  }
+
+  verifyAnchorsFromLinkedFiles(runId) {
+    this.database.prepare(`
+      UPDATE scan_anchors AS anchor
+      SET verified_hash = anchor.hash_name
+      WHERE anchor.run_id = ?
+        AND EXISTS (
+          SELECT 1 FROM scan_files candidate
+          WHERE candidate.run_id = anchor.run_id
+            AND candidate.dev = anchor.dev
+            AND candidate.ino = anchor.ino
+            AND candidate.hash = anchor.hash_name
+        )
+    `).run(runId)
+  }
+
+  unverifiedAnchorBatch(runId, limit = 64) {
+    return this.database.prepare(`
+      SELECT anchor.*
+      FROM scan_anchors anchor
+      WHERE anchor.run_id = ?
+        AND anchor.verified_hash IS NULL
+        AND anchor.verify_attempted = 0
+      ORDER BY anchor.hash_name
+      LIMIT ?
+    `).all(runId, limit)
+  }
+
+  publishScan(runId, sourceIds, metadata, storeDev, canLink = true) {
+    const sourceList = [...new Set(sourceIds.filter(Boolean))]
+    const now = Date.now()
+    this.transaction(() => {
+      if (!canLink) {
+        this.database.prepare(`
+          UPDATE scan_files AS candidate
+          SET status = 'unavailable', unavailable_reason = 'hardlinks'
+          WHERE candidate.run_id = ?
+            AND candidate.status IS NULL
+            AND candidate.hash IS NOT NULL
+            AND (
+              EXISTS (
+                SELECT 1 FROM scan_files peer
+                WHERE peer.run_id = candidate.run_id
+                  AND peer.hash = candidate.hash
+                  AND peer.path != candidate.path
+              )
+              OR EXISTS (
+                SELECT 1 FROM scan_anchors anchor
+                WHERE anchor.run_id = candidate.run_id
+                  AND anchor.verified_hash = candidate.hash
+              )
+            )
+        `).run(runId)
+      }
+
+      this.database.prepare(`
+        UPDATE scan_files AS candidate
+        SET status = 'unavailable', unavailable_reason = 'anchor_conflict'
+        WHERE candidate.run_id = ?
+          AND candidate.status IS NULL
+          AND candidate.hash IS NOT NULL
+          AND candidate.dev = ?
+          AND EXISTS (
+            SELECT 1 FROM scan_anchors anchor
+            WHERE anchor.run_id = candidate.run_id
+              AND anchor.hash_name = candidate.hash
+              AND anchor.verify_attempted = 1
+              AND anchor.verified_hash IS NULL
+          )
+      `).run(runId, storeDev)
+
+      this.database.prepare(`
+        UPDATE scan_files AS candidate
+        SET status = 'unavailable', unavailable_reason = 'different_disk'
+        WHERE candidate.run_id = ?
+          AND candidate.status IS NULL
+          AND candidate.hash IS NOT NULL
+          AND candidate.dev != ?
+          AND (
+            EXISTS (
+              SELECT 1 FROM scan_files peer
+              WHERE peer.run_id = candidate.run_id
+                AND peer.hash = candidate.hash
+                AND peer.path != candidate.path
+            )
+            OR EXISTS (
+              SELECT 1 FROM scan_anchors anchor
+              WHERE anchor.run_id = candidate.run_id
+                AND anchor.verified_hash = candidate.hash
+            )
+          )
+      `).run(runId, storeDev)
+
+      this.database.prepare(`
+        INSERT OR IGNORE INTO scan_linked_groups (
+          run_id, hash, dev, mode_bits, uid, gid
+        )
+        SELECT
+          run_id, hash, dev, (mode & 4095), uid, gid
+        FROM scan_files
+        WHERE run_id = ?
+          AND status = 'linked'
+          AND hash IS NOT NULL
+        GROUP BY run_id, hash, dev, (mode & 4095), uid, gid
+      `).run(runId)
+
+      this.database.prepare(`
+        INSERT OR IGNORE INTO scan_linked_groups (
+          run_id, hash, dev, mode_bits, uid, gid
+        )
+        SELECT
+          run_id, verified_hash, dev, (mode & 4095), uid, gid
+        FROM scan_anchors
+        WHERE run_id = ?
+          AND verified_hash IS NOT NULL
+      `).run(runId)
+
+      this.database.prepare(`
+        UPDATE scan_files AS candidate
+        SET status = 'duplicate', unavailable_reason = NULL
+        WHERE candidate.run_id = ?
+          AND candidate.status IS NULL
+          AND candidate.hash IS NOT NULL
+          AND candidate.dev = ?
+          AND EXISTS (
+            SELECT 1 FROM scan_linked_groups linked
+            WHERE linked.run_id = candidate.run_id
+              AND linked.hash = candidate.hash
+              AND linked.dev = candidate.dev
+              AND linked.mode_bits = (candidate.mode & 4095)
+              AND linked.uid = candidate.uid
+              AND linked.gid = candidate.gid
+          )
+      `).run(runId, storeDev)
+
+      this.database.prepare(`
+        UPDATE scan_files AS candidate
+        SET status = 'unavailable', unavailable_reason = 'metadata'
+        WHERE candidate.run_id = ?
+          AND candidate.status IS NULL
+          AND candidate.hash IS NOT NULL
+          AND candidate.dev = ?
+          AND EXISTS (
+            SELECT 1 FROM scan_linked_groups linked
+            WHERE linked.run_id = candidate.run_id
+              AND linked.hash = candidate.hash
+              AND linked.dev = candidate.dev
+          )
+      `).run(runId, storeDev)
+
+      this.database.prepare(`
+        WITH metadata_groups AS (
+          SELECT
+            hash,
+            dev,
+            (mode & 4095) AS mode_bits,
+            uid,
+            gid,
+            COUNT(*) AS file_count,
+            MIN(path) AS representative_path
+          FROM scan_files
+          WHERE run_id = ?
+            AND status IS NULL
+            AND hash IS NOT NULL
+            AND dev = ?
+          GROUP BY hash, dev, (mode & 4095), uid, gid
+        ),
+        chosen_groups AS (
+          SELECT *
+          FROM (
+            SELECT metadata_groups.*,
+              ROW_NUMBER() OVER (
+                PARTITION BY hash, dev
+                ORDER BY file_count DESC, representative_path
+              ) AS group_rank
+            FROM metadata_groups
+          )
+          WHERE group_rank = 1
+        )
+        UPDATE scan_files AS candidate
+        SET
+          status = CASE
+            WHEN (candidate.mode & 4095) = chosen.mode_bits
+              AND candidate.uid = chosen.uid
+              AND candidate.gid = chosen.gid
+            THEN CASE
+              WHEN candidate.path = chosen.representative_path THEN NULL
+              ELSE 'duplicate'
+            END
+            ELSE 'unavailable'
+          END,
+          unavailable_reason = CASE
+            WHEN (candidate.mode & 4095) = chosen.mode_bits
+              AND candidate.uid = chosen.uid
+              AND candidate.gid = chosen.gid
+            THEN NULL
+            ELSE 'metadata'
+          END
+        FROM chosen_groups AS chosen
+        WHERE candidate.run_id = ?
+          AND candidate.status IS NULL
+          AND candidate.hash = chosen.hash
+          AND candidate.dev = chosen.dev
+      `).run(runId, storeDev, runId)
+
+      this.database.prepare(`
+        UPDATE content SET
+          anchor_verified_at = NULL,
+          anchor_present = 0,
+          anchor_dev = NULL,
+          anchor_ino = NULL,
+          anchor_size = NULL,
+          anchor_mtime = NULL,
+          anchor_ctime = NULL,
+          anchor_nlink = NULL
+      `).run()
+
+      this.database.prepare(`
+        INSERT INTO content (
+          hash, size, first_seen, verified_at, anchor_verified_at,
+          anchor_present, anchor_dev, anchor_ino, anchor_size, anchor_mtime,
+          anchor_ctime, anchor_nlink
+        )
+        SELECT
+          hash_name, size, ?,
+          CASE WHEN verified_hash = hash_name THEN ? END,
+          CASE WHEN verified_hash = hash_name THEN ? END,
+          1, dev, ino, size, mtime, ctime, nlink
+        FROM scan_anchors
+        WHERE run_id = ? AND verified_hash = hash_name
+        ON CONFLICT(hash) DO UPDATE SET
+          size = excluded.size,
+          verified_at = COALESCE(excluded.verified_at, content.verified_at),
+          anchor_verified_at = excluded.anchor_verified_at,
+          anchor_present = 1,
+          anchor_dev = excluded.anchor_dev,
+          anchor_ino = excluded.anchor_ino,
+          anchor_size = excluded.anchor_size,
+          anchor_mtime = excluded.anchor_mtime,
+          anchor_ctime = excluded.anchor_ctime,
+          anchor_nlink = excluded.anchor_nlink
+      `).run(now, now, now, runId)
+
+      this.database.prepare(`
+        INSERT INTO content(hash, size, first_seen, verified_at)
+        SELECT hash, MAX(size), ?, ?
+        FROM scan_files
+        WHERE run_id = ? AND hash IS NOT NULL
+        GROUP BY hash
+        ON CONFLICT(hash) DO UPDATE SET
+          size = excluded.size,
+          verified_at = excluded.verified_at
+      `).run(now, now, runId)
+
+      this.dropFileTriggers()
+      this.database.prepare(`
+        INSERT INTO files (
+          path, hash, size, mtime, ctime, dev, ino, mode, uid, gid, source_id,
+          app, status, unavailable_reason, updated_at
+        )
+        SELECT
+          candidate.path,
+          candidate.hash,
+          candidate.size,
+          candidate.mtime,
+          candidate.ctime,
+          candidate.dev,
+          candidate.ino,
+          candidate.mode,
+          candidate.uid,
+          candidate.gid,
+          candidate.source_id,
+          candidate.app,
+          COALESCE(candidate.status, 'reference'),
+          candidate.unavailable_reason,
+          ?
+        FROM scan_files candidate
+        WHERE candidate.run_id = ?
+        ON CONFLICT(path) DO UPDATE SET
+          hash = excluded.hash,
+          size = excluded.size,
+          mtime = excluded.mtime,
+          ctime = excluded.ctime,
+          dev = excluded.dev,
+          ino = excluded.ino,
+          mode = excluded.mode,
+          uid = excluded.uid,
+          gid = excluded.gid,
+          source_id = excluded.source_id,
+          app = excluded.app,
+          status = excluded.status,
+          unavailable_reason = excluded.unavailable_reason,
+          updated_at = excluded.updated_at
+        WHERE
+          files.hash IS NOT excluded.hash OR
+          files.size != excluded.size OR
+          files.mtime != excluded.mtime OR
+          files.ctime != excluded.ctime OR
+          files.dev != excluded.dev OR
+          files.ino != excluded.ino OR
+          files.mode != excluded.mode OR
+          files.uid != excluded.uid OR
+          files.gid != excluded.gid OR
+          files.source_id IS NOT excluded.source_id OR
+          files.app IS NOT excluded.app OR
+          files.status != excluded.status OR
+          files.unavailable_reason IS NOT excluded.unavailable_reason
+      `).run(now, runId)
+
+      if (!metadata.scope_id) {
+        this.database.prepare(`
+          DELETE FROM files
+          WHERE NOT EXISTS (
+            SELECT 1 FROM scan_files candidate
+            WHERE candidate.run_id = ? AND candidate.path = files.path
+          )
+        `).run(runId)
+      } else if (sourceList.length) {
+        this.database.prepare(`
+          DELETE FROM files
+          WHERE source_id IN (${placeholders(sourceList)})
+            AND NOT EXISTS (
+              SELECT 1 FROM scan_files candidate
+              WHERE candidate.run_id = ? AND candidate.path = files.path
+          )
+        `).run(...sourceList, runId)
+      }
+      this.rebuildFileSummaries()
+      this.rebuildGroupSummaries()
+      this.createFileTriggers()
+
+      const scan = Object.assign({
+        dirs: 0,
+        files: 0,
+        bytes_total: 0,
+        candidates: 0,
+        hashed: 0,
+        hash_total: 0,
+        hash_bytes: 0,
+        inode_reuses: 0,
+        unstable_hashes: 0,
+        hash_failures: 0,
+        duration_ms: 0,
+        walk_duration_ms: 0,
+        hash_wait_duration_ms: 0,
+        hash_duration_ms: 0
+      }, metadata)
+      this.database.prepare(`
+        INSERT INTO scans (
+          scope_id, completed_at, dirs, files, bytes_total, candidates, hashed,
+          hash_total, hash_bytes, inode_reuses, unstable_hashes, hash_failures,
+          duration_ms, walk_duration_ms,
+          hash_wait_duration_ms, hash_duration_ms, details
+        ) VALUES (
+          @scope_id, @completed_at, @dirs, @files, @bytes_total, @candidates,
+          @hashed, @hash_total, @hash_bytes, @inode_reuses, @unstable_hashes,
+          @hash_failures, @duration_ms, @walk_duration_ms,
+          @hash_wait_duration_ms, @hash_duration_ms, @details
+        )
+        ON CONFLICT(scope_id) DO UPDATE SET
+          completed_at = excluded.completed_at,
+          dirs = excluded.dirs,
+          files = excluded.files,
+          bytes_total = excluded.bytes_total,
+          candidates = excluded.candidates,
+          hashed = excluded.hashed,
+          hash_total = excluded.hash_total,
+          hash_bytes = excluded.hash_bytes,
+          inode_reuses = excluded.inode_reuses,
+          unstable_hashes = excluded.unstable_hashes,
+          hash_failures = excluded.hash_failures,
+          duration_ms = excluded.duration_ms,
+          walk_duration_ms = excluded.walk_duration_ms,
+          hash_wait_duration_ms = excluded.hash_wait_duration_ms,
+          hash_duration_ms = excluded.hash_duration_ms,
+          details = excluded.details
+      `).run({
+        scope_id: metadata.scope_id || "",
+        completed_at: now,
+        dirs: scan.dirs,
+        files: scan.files,
+        bytes_total: scan.bytes_total,
+        candidates: scan.candidates,
+        hashed: scan.hashed,
+        hash_total: scan.hash_total,
+        hash_bytes: scan.hash_bytes,
+        inode_reuses: scan.inode_reuses,
+        unstable_hashes: scan.unstable_hashes,
+        hash_failures: scan.hash_failures,
+        duration_ms: scan.duration_ms,
+        walk_duration_ms: scan.walk_duration_ms,
+        hash_wait_duration_ms: scan.hash_wait_duration_ms,
+        hash_duration_ms: scan.hash_duration_ms,
+        details: JSON.stringify(metadata)
+      })
+
+      this.database.prepare(`
+        DELETE FROM content
+        WHERE anchor_present = 0
+          AND NOT EXISTS (SELECT 1 FROM files WHERE files.hash = content.hash)
+      `).run()
+      this.rebuildSavings()
+      this.resetScanSchema()
+    })
+    this.scanSizes.clear()
+    this.scanInodes.clear()
+    this.scanAnchorInodes.clear()
+  }
+
+  addEvent(event) {
+    return this.transaction(() => {
+      const result = this.database.prepare(`
+        INSERT INTO events (
+          created_at, kind, hash, path, app, source_id, bytes, file_count
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        event.ts || Date.now(),
+        event.kind,
+        event.hash || null,
+        event.path ? path.resolve(event.path) : null,
+        event.app || null,
+        event.source_id || null,
+        Number(event.bytes || event.bytes_saved || event.size) || 0,
+        Math.max(1, Number(event.files || event.file_count) || 1)
+      )
+      this.trimEvents()
+      this.rebuildActivitySummaries()
+      return Number(result.lastInsertRowid)
+    })
+  }
+
+  trimEvents() {
+    this.database.prepare(`
+      DELETE FROM events
+      WHERE id <= COALESCE((SELECT MAX(id) - ? FROM events), 0)
+    `).run(this.maxEvents)
+  }
+
+  setMaxEvents(value) {
+    this.maxEvents = Math.max(1, Number(value) || 1)
+    this.transaction(() => {
+      this.trimEvents()
+      this.rebuildActivitySummaries()
+    })
+  }
+
+  firstFileForInode(hash, dev, ino) {
+    return this.database.prepare(`
+      SELECT path FROM files
+      WHERE hash = ? AND dev = ? AND ino = ?
+      ORDER BY path
+      LIMIT 1
+    `).get(hash, dev, ino) || null
+  }
+
+  anchorCandidate(hash, dev, mode, uid, gid) {
+    return this.database.prepare(`
+      SELECT * FROM files
+      WHERE hash = ? AND dev = ?
+        AND status IN ('reference', 'linked')
+        AND (mode & 4095) = ?
+        AND uid = ?
+        AND gid = ?
+      ORDER BY CASE status WHEN 'linked' THEN 0 ELSE 1 END, path
+      LIMIT 1
+    `).get(hash, dev, mode, uid, gid) || null
+  }
+
+  countActionFiles(status, sourceIds = []) {
+    const ids = [...new Set(sourceIds.filter(Boolean))]
+    if (!ids.length) {
+      const row = this.database.prepare(`
+        SELECT COALESCE(SUM(file_count), 0) AS count
+        FROM file_summaries
+        WHERE status = ?
+      `).get(status)
+      return Number(row.count) || 0
+    }
+    const row = this.database.prepare(`
+      SELECT COALESCE(SUM(file_count), 0) AS count
+      FROM file_summaries
+      WHERE status = ?
+        AND source_id IN (${placeholders(ids)})
+    `).get(status, ...ids)
+    return Number(row.count) || 0
+  }
+
+  matchingFileSummary(status, sourceIds = [], query = "") {
+    const ids = [...new Set(sourceIds.filter(Boolean))]
+    if (!ids.length) return { count: 0, bytes: 0 }
+    if (!query) {
+      const row = this.database.prepare(`
+        SELECT
+          COALESCE(SUM(file_count), 0) AS count,
+          COALESCE(SUM(bytes), 0) AS bytes
+        FROM file_summaries
+        WHERE status = ?
+          AND source_id IN (${placeholders(ids)})
+      `).get(status, ...ids)
+      return {
+        count: Number(row.count) || 0,
+        bytes: Number(row.bytes) || 0
+      }
+    }
+    const values = [status, ...ids]
+    values.push(`%${String(query).toLowerCase()
+      .replace(/\\/g, "\\\\")
+      .replace(/%/g, "\\%")
+      .replace(/_/g, "\\_")}%`)
+    const row = this.database.prepare(`
+      SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes
+      FROM files
+      WHERE status = ?
+        AND source_id IN (${placeholders(ids)})
+        AND LOWER(path) LIKE ? ESCAPE '\\'
+    `).get(...values)
+    return {
+      count: Number(row.count) || 0,
+      bytes: Number(row.bytes) || 0
+    }
+  }
+
+  fileBatch(
+    status,
+    sourceIds = [],
+    cursor = "",
+    limit = 100,
+    query = ""
+  ) {
+    const ids = [...new Set(sourceIds.filter(Boolean))]
+    if (!ids.length) return []
+    const values = [status, cursor, ...ids]
+    let search = ""
+    if (query) {
+      search = "AND LOWER(path) LIKE ? ESCAPE '\\'"
+      values.push(`%${String(query).toLowerCase()
+        .replace(/\\/g, "\\\\")
+        .replace(/%/g, "\\%")
+        .replace(/_/g, "\\_")}%`)
+    }
+    return this.database.prepare(`
+      SELECT path FROM files
+      WHERE status = ?
+        AND path > ?
+        AND source_id IN (${placeholders(ids)})
+        ${search}
+      ORDER BY path
+      LIMIT ?
+    `).all(...values, limit)
+  }
+
+  hasFilesForHash(hash) {
+    return !!this.database.prepare(
+      "SELECT 1 FROM files WHERE hash = ? LIMIT 1"
+    ).get(hash)
+  }
+
+  reclaimableBatch(cursor = "", limit = 100) {
+    return this.database.prepare(`
+      SELECT hash FROM content
+      WHERE anchor_present = 1
+        AND anchor_nlink = 1
+        AND hash > ?
+      ORDER BY hash
+      LIMIT ?
+    `).all(cursor, limit)
+  }
+
+  clearFiles() {
+    this.transaction(() => {
+      this.database.prepare("DELETE FROM files").run()
+      this.rebuildSavings()
+    })
+  }
+
+  summaryRows(sourceIds, unrestricted = false) {
+    const ids = [...new Set(sourceIds.filter(Boolean))]
+    if (!unrestricted && !ids.length) return []
+    return this.database.prepare(`
+      SELECT source_id, status, file_count, bytes
+      FROM file_summaries
+      WHERE ${unrestricted
+        ? "file_count > 0"
+        : `source_id IN (${placeholders(ids)}) AND file_count > 0`}
+    `).all(...(unrestricted ? [] : ids))
+  }
+
+  activityCount(sourceIds, scoped) {
+    if (!scoped) {
+      return Number(this.database.prepare(`
+        SELECT activity_count FROM global_summary WHERE id = 1
+      `).get().activity_count) || 0
+    }
+    const ids = [...new Set(sourceIds.filter(Boolean))]
+    if (!ids.length) return 0
+    if (ids.length === 1) {
+      const row = this.database.prepare(`
+        SELECT activity_count
+        FROM activity_summaries
+        WHERE source_id = ?
+      `).get(ids[0])
+      return row ? Number(row.activity_count) || 0 : 0
+    }
+    const row = this.database.prepare(`
+      SELECT COALESCE(SUM(activity_count), 0) AS count
+      FROM activity_summaries
+      WHERE source_id IN (${placeholders(ids)})
+    `).get(...ids)
+    return Number(row.count) || 0
+  }
+
+  decodeCursor(value) {
+    if (!value || typeof value !== "string") return null
+    try {
+      const parsed = JSON.parse(Buffer.from(value, "base64url").toString())
+      return parsed && typeof parsed === "object" ? parsed : null
+    } catch (error) {
+      return null
+    }
+  }
+
+  encodeCursor(value) {
+    return Buffer.from(JSON.stringify(value)).toString("base64url")
+  }
+
+  fileFilter(
+    view,
+    statusFilter,
+    sourceIds,
+    query,
+    unrestricted = false
+  ) {
+    const where = []
+    const values = []
+    if (view === "duplicates") {
+      where.push("status IN ('duplicate', 'unavailable')")
+    } else if (view === "shared") {
+      where.push("status = 'linked'")
+    } else if (view === "tracked") {
+      where.push("status = 'reference'")
+    } else if (view === "all" && statusFilter !== "all") {
+      const statuses = {
+        duplicate: ["duplicate", "unavailable"],
+        shared: ["linked"],
+        tracked: ["reference"]
+      }[statusFilter] || []
+      where.push(`status IN (${placeholders(statuses)})`)
+      values.push(...statuses)
+    }
+    if (unrestricted) {
+      // The registry is the completed global scan snapshot.
+    } else if (sourceIds.length) {
+      where.push(`source_id IN (${placeholders(sourceIds)})`)
+      values.push(...sourceIds)
+    } else {
+      where.push("0")
+    }
+    if (query) {
+      where.push("LOWER(path) LIKE ? ESCAPE '\\'")
+      values.push(`%${String(query).toLowerCase()
+        .replace(/\\/g, "\\\\")
+        .replace(/%/g, "\\%")
+        .replace(/_/g, "\\_")}%`)
+    }
+    return { where, values }
+  }
+
+  compareFileRows(left, right, sort) {
+    if (sort === "asc" && left.size !== right.size) {
+      return left.size < right.size ? -1 : 1
+    }
+    if (sort === "desc" && left.size !== right.size) {
+      return left.size > right.size ? -1 : 1
+    }
+    const pathOrder = Buffer.compare(
+      Buffer.from(left.path),
+      Buffer.from(right.path)
+    )
+    return sort === "desc" ? -pathOrder : pathOrder
+  }
+
+  fileStreamRows(options) {
+    const {
+      sourceId,
+      status,
+      query,
+      sort,
+      cursor,
+      limit
+    } = options
+    const where = []
+    const values = []
+    if (sourceId) {
+      where.push("source_id = ?")
+      values.push(sourceId)
+    }
+    if (status) {
+      where.push("status = ?")
+      values.push(status)
+    }
+    if (query) {
+      where.push("LOWER(path) LIKE ? ESCAPE '\\'")
+      values.push(`%${String(query).toLowerCase()
+        .replace(/\\/g, "\\\\")
+        .replace(/%/g, "\\%")
+        .replace(/_/g, "\\_")}%`)
+    }
+    if (cursor && typeof cursor.path === "string") {
+      if (sort === "asc" && Number.isFinite(cursor.size)) {
+        where.push("(size > ? OR (size = ? AND path > ?))")
+        values.push(cursor.size, cursor.size, cursor.path)
+      } else if (sort === "desc" && Number.isFinite(cursor.size)) {
+        where.push("(size < ? OR (size = ? AND path < ?))")
+        values.push(cursor.size, cursor.size, cursor.path)
+      } else if (sort === "path") {
+        where.push("path > ?")
+        values.push(cursor.path)
+      }
+    }
+    const order = sort === "asc"
+      ? "size ASC, path ASC"
+      : sort === "desc"
+        ? "size DESC, path DESC"
+        : "path ASC"
+    return this.database.prepare(`
+      SELECT * FROM files
+      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+      ORDER BY ${order}
+      LIMIT ?
+    `).all(...values, limit)
+  }
+
+  boundedFileRows(options) {
+    const {
+      sourceIds,
+      unrestricted,
+      statuses,
+      query,
+      sort,
+      cursor,
+      pageSize
+    } = options
+    const sources = unrestricted
+      ? [null]
+      : [...new Set(sourceIds.filter(Boolean))]
+    if (!sources.length) return []
+    const allStatuses = [
+      "reference", "duplicate", "linked", "unavailable"
+    ]
+    const statusStreams = statuses.length === allStatuses.length &&
+      allStatuses.every((status) => statuses.includes(status))
+      ? [null]
+      : statuses
+    if (!statusStreams.length) return []
+    const decoded = this.decodeCursor(cursor)
+    const initialCursor = decoded && decoded.sort === sort
+      ? decoded
+      : null
+    const streams = sources.flatMap((sourceId) =>
+      statusStreams.map((status) => ({
+        sourceId,
+        status,
+        cursor: initialCursor,
+        rows: [],
+        exhausted: false
+      })))
+    const refill = (stream, limit) => {
+      const rows = this.fileStreamRows({
+        sourceId: stream.sourceId,
+        status: stream.status,
+        query,
+        sort,
+        cursor: stream.cursor,
+        limit
+      })
+      stream.rows.push(...rows)
+      if (rows.length < limit) stream.exhausted = true
+      const last = rows[rows.length - 1]
+      if (last) {
+        stream.cursor = {
+          sort,
+          size: last.size,
+          path: last.path
+        }
+      }
+    }
+    for (const stream of streams) refill(stream, 1)
+    const result = []
+    while (result.length < pageSize + 1) {
+      let selected = null
+      for (const stream of streams) {
+        const row = stream.rows[0]
+        if (!row) continue
+        if (!selected ||
+            this.compareFileRows(
+              row, selected.rows[0], sort) < 0) {
+          selected = stream
+        }
+      }
+      if (!selected) break
+      result.push(selected.rows.shift())
+      if (!selected.rows.length && !selected.exhausted) {
+        refill(selected, 16)
+      }
+    }
+    return result
+  }
+
+  statusesForView(view, statusFilter) {
+    if (view === "duplicates") return ["duplicate", "unavailable"]
+    if (view === "shared") return ["linked"]
+    if (view === "tracked") return ["reference"]
+    if (view !== "all" || statusFilter === "all") {
+      return ["reference", "duplicate", "linked", "unavailable"]
+    }
+    return {
+      duplicate: ["duplicate", "unavailable"],
+      shared: ["linked"],
+      tracked: ["reference"]
+    }[statusFilter] || []
+  }
+
+  filePage(options) {
+    const {
+      view,
+      statusFilter,
+      sourceIds,
+      query,
+      pageSize,
+      sizeSort,
+      cursor,
+      unrestricted
+    } = options
+    const sort = sizeSort === "asc" || sizeSort === "desc"
+      ? sizeSort
+      : "path"
+    const rows = this.boundedFileRows({
+      sourceIds,
+      unrestricted,
+      statuses: this.statusesForView(view, statusFilter),
+      query,
+      sort,
+      cursor,
+      pageSize
+    })
+    const hasMore = rows.length > pageSize
+    if (hasMore) rows.pop()
+    const last = rows[rows.length - 1]
+    const nextCursor = hasMore && last
+      ? this.encodeCursor({
+        sort,
+        size: last.size,
+        path: last.path
+      })
+      : null
+
+    const hashes = [...new Set(rows
+      .filter((row) => row.status !== "linked")
+      .map((row) => row.hash)
+      .filter(Boolean))]
+    const hashSiblings = hashes.length
+      ? this.database.prepare(`
+        WITH selected(hash) AS (
+          VALUES ${hashes.map(() => "(?)").join(", ")}
+        ),
+        first_sample AS (
+          SELECT selected.hash,
+            (
+              SELECT path FROM files sample
+              WHERE sample.hash = selected.hash
+              ORDER BY path
+              LIMIT 1
+            ) AS first_path
+          FROM selected
+        ),
+        samples AS (
+          SELECT first_sample.*,
+            (
+              SELECT path FROM files sample
+              WHERE sample.hash = first_sample.hash
+                AND sample.path > first_sample.first_path
+              ORDER BY path
+              LIMIT 1
+            ) AS second_path
+          FROM first_sample
+        )
+        SELECT files.*, hash_summaries.file_count AS location_count
+        FROM samples
+        JOIN hash_summaries USING (hash)
+        JOIN files
+          ON files.path = samples.first_path
+          OR files.path = samples.second_path
+        ORDER BY files.hash, files.path
+      `).all(...hashes)
+      : []
+    const linkedInodes = [...new Map(rows
+      .filter((row) => row.status === "linked")
+      .map((row) => [
+        `${row.dev}:${row.ino}`,
+        { dev: row.dev, ino: row.ino }
+      ])).values()]
+    const inodeSiblings = linkedInodes.length
+      ? this.database.prepare(`
+        WITH selected(dev, ino) AS (
+          VALUES ${linkedInodes.map(() => "(?, ?)").join(", ")}
+        ),
+        first_sample AS (
+          SELECT selected.dev, selected.ino,
+            (
+              SELECT path FROM files sample
+              WHERE sample.dev = selected.dev
+                AND sample.ino = selected.ino
+                AND sample.status = 'linked'
+              ORDER BY path
+              LIMIT 1
+            ) AS first_path
+          FROM selected
+        ),
+        samples AS (
+          SELECT first_sample.*,
+            (
+              SELECT path FROM files sample
+              WHERE sample.dev = first_sample.dev
+                AND sample.ino = first_sample.ino
+                AND sample.status = 'linked'
+                AND sample.path > first_sample.first_path
+              ORDER BY path
+              LIMIT 1
+            ) AS second_path
+          FROM first_sample
+        )
+        SELECT files.*, inode_summaries.file_count AS location_count
+        FROM samples
+        JOIN inode_summaries USING (dev, ino)
+        JOIN files
+          ON files.path = samples.first_path
+          OR files.path = samples.second_path
+        ORDER BY files.dev, files.ino, files.path
+      `).all(...linkedInodes.flatMap((inode) => [inode.dev, inode.ino]))
+      : []
+    return { rows, hashSiblings, inodeSiblings, nextCursor }
+  }
+
+  reclaimablePage(pageSize, cursor) {
+    const decoded = this.decodeCursor(cursor)
+    const where = ["anchor_present = 1", "anchor_nlink = 1"]
+    const values = []
+    if (decoded && decoded.sort === "reclaimable" &&
+        Number.isFinite(decoded.size) &&
+        typeof decoded.hash === "string") {
+      where.push("(size < ? OR (size = ? AND hash > ?))")
+      values.push(decoded.size, decoded.size, decoded.hash)
+    }
+    const rows = this.database.prepare(`
+      SELECT hash, size, anchor_nlink AS nlink, 1 AS orphan
+      FROM content
+      WHERE ${where.join(" AND ")}
+      ORDER BY size DESC, hash
+      LIMIT ?
+    `).all(...values, pageSize + 1)
+    const hasMore = rows.length > pageSize
+    if (hasMore) rows.pop()
+    const last = rows[rows.length - 1]
+    return {
+      rows,
+      nextCursor: hasMore && last
+        ? this.encodeCursor({
+          sort: "reclaimable",
+          size: last.size,
+          hash: last.hash
+        })
+        : null
+    }
+  }
+
+  activityPage(sourceIds, scoped, query, pageSize, cursor) {
+    const baseWhere = []
+    const baseValues = []
+    if (scoped && sourceIds.length) {
+      baseWhere.push(`source_id IN (${placeholders(sourceIds)})`)
+      baseValues.push(...sourceIds)
+    } else if (scoped) {
+      baseWhere.push("0")
+    }
+    if (query) {
+      baseWhere.push(
+        "(LOWER(COALESCE(path, '')) LIKE ? ESCAPE '\\' OR " +
+        "LOWER(kind) LIKE ? ESCAPE '\\')"
+      )
+      const escaped = String(query).toLowerCase()
+        .replace(/\\/g, "\\\\")
+        .replace(/%/g, "\\%")
+        .replace(/_/g, "\\_")
+      baseValues.push(`%${escaped}%`, `%${escaped}%`)
+    }
+    let total = null
+    if (query) {
+      total = Number(this.database.prepare(`
+        SELECT COUNT(*) AS count
+        FROM events
+        ${baseWhere.length ? `WHERE ${baseWhere.join(" AND ")}` : ""}
+      `).get(...baseValues).count) || 0
+    }
+    const where = [...baseWhere]
+    const values = [...baseValues]
+    const decoded = this.decodeCursor(cursor)
+    if (decoded && decoded.sort === "activity" &&
+        Number.isFinite(decoded.id)) {
+      where.push("id < ?")
+      values.push(decoded.id)
+    }
+    const rows = this.database.prepare(`
+      SELECT
+        id,
+        created_at AS ts,
+        kind,
+        hash,
+        path,
+        app,
+        source_id,
+        bytes AS bytes_saved,
+        file_count AS files,
+        CASE
+          WHEN file_count > 1
+          THEN 'batch' ELSE 'event'
+        END AS activity_type
+      FROM events
+      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+      ORDER BY id DESC
+      LIMIT ?
+    `).all(...values, pageSize + 1)
+    const hasMore = rows.length > pageSize
+    if (hasMore) rows.pop()
+    const last = rows[rows.length - 1]
+    return {
+      rows,
+      total,
+      nextCursor: hasMore && last
+        ? this.encodeCursor({ sort: "activity", id: last.id })
+        : null
+    }
+  }
+
+  statusSnapshot(options = {}) {
+    const scopeSourceIds = [...new Set(
+      (options.scopeSourceIds || []).filter(Boolean))]
+    const locationSourceIds = [...new Set(
+      (options.locationSourceIds || []).filter(Boolean))]
+    const view = options.view || "all"
+    const statusFilter = options.statusFilter || "all"
+    const query = String(options.query || "")
+    const pageSize = Math.max(1, Math.min(500, Number(options.pageSize) || 500))
+    const scopeRows = this.summaryRows(
+      scopeSourceIds, !!options.scopeUnrestricted)
+    const locationRows = this.summaryRows(
+      locationSourceIds, !!options.locationUnrestricted)
+    const countsByStatus = {}
+    for (const row of scopeRows) {
+      countsByStatus[row.status] =
+        (countsByStatus[row.status] || 0) + Number(row.file_count)
+    }
+    const global = this.database.prepare(
+      "SELECT * FROM global_summary WHERE id = 1"
+    ).get()
+    const counts = {
+      all: ["reference", "duplicate", "linked", "unavailable"].reduce(
+        (sum, status) => sum + (countsByStatus[status] || 0), 0),
+      duplicates: (countsByStatus.duplicate || 0) +
+        (countsByStatus.unavailable || 0),
+      shared: countsByStatus.linked || 0,
+      tracked: countsByStatus.reference || 0,
+      reclaimable: options.scoped
+        ? 0
+        : Number(global.reclaimable_count) || 0,
+      activity: this.activityCount(scopeSourceIds, !!options.scoped)
+    }
+    const pending = scopeRows
+      .filter((row) => row.status === "duplicate")
+      .reduce((sum, row) => sum + Number(row.bytes), 0)
+    const shareableDuplicates = scopeRows
+      .filter((row) => row.status === "duplicate")
+      .reduce((sum, row) => sum + Number(row.file_count), 0)
+    const duplicateLocations = new Set(scopeRows
+      .filter((row) =>
+        row.status === "duplicate" && Number(row.file_count) > 0)
+      .map((row) => row.source_id)).size
+    const saved = options.scopeUnrestricted
+      ? Number(this.database.prepare(`
+        SELECT COALESCE(SUM(bytes), 0) AS bytes
+        FROM source_savings
+      `).get().bytes) || 0
+      : scopeSourceIds.length
+      ? Number(this.database.prepare(`
+        SELECT COALESCE(SUM(bytes), 0) AS bytes
+        FROM source_savings
+        WHERE source_id IN (${placeholders(scopeSourceIds)})
+      `).get(...scopeSourceIds).bytes) || 0
+      : 0
+    const selectedStatuses = this.statusesForView(view, statusFilter)
+    let total = 0
+    let currentLocations = 0
+    let currentShareableBytes = 0
+    let currentSeparateCount = 0
+    let currentSeparateBytes = 0
+    let page
+    if (view === "reclaimable") {
+      total = counts.reclaimable
+      page = this.reclaimablePage(pageSize, options.cursor)
+    } else if (view === "activity") {
+      page = this.activityPage(
+        scopeSourceIds,
+        !!options.scoped,
+        query,
+        pageSize,
+        options.cursor
+      )
+      total = page.total == null ? counts.activity : page.total
+    } else {
+      if (query) {
+        const filter = this.fileFilter(
+          view,
+          statusFilter,
+          locationSourceIds,
+          query,
+          !!options.locationUnrestricted
+        )
+        const row = this.database.prepare(`
+          SELECT
+            COUNT(*) AS count,
+            COUNT(DISTINCT source_id) AS locations,
+            COALESCE(SUM(
+              CASE WHEN status = 'duplicate' THEN size ELSE 0 END
+            ), 0) AS shareable_bytes,
+            COALESCE(SUM(
+              CASE WHEN status = 'linked' THEN 1 ELSE 0 END
+            ), 0) AS separate_count,
+            COALESCE(SUM(
+              CASE WHEN status = 'linked' THEN size ELSE 0 END
+            ), 0) AS separate_bytes
+          FROM files
+          WHERE ${filter.where.join(" AND ")}
+        `).get(...filter.values)
+        total = Number(row.count) || 0
+        currentLocations = Number(row.locations) || 0
+        currentShareableBytes = Number(row.shareable_bytes) || 0
+        currentSeparateCount = Number(row.separate_count) || 0
+        currentSeparateBytes = Number(row.separate_bytes) || 0
+      } else {
+        const selected = locationRows.filter((row) =>
+          selectedStatuses.includes(row.status))
+        total = selected.reduce(
+          (sum, row) => sum + Number(row.file_count), 0)
+        currentLocations = new Set(selected
+          .filter((row) => Number(row.file_count) > 0)
+          .map((row) => row.source_id)).size
+        currentShareableBytes = selected
+          .filter((row) => row.status === "duplicate")
+          .reduce((sum, row) => sum + Number(row.bytes), 0)
+        currentSeparateCount = selected
+          .filter((row) => row.status === "linked")
+          .reduce((sum, row) => sum + Number(row.file_count), 0)
+        currentSeparateBytes = selected
+          .filter((row) => row.status === "linked")
+          .reduce((sum, row) => sum + Number(row.bytes), 0)
+      }
+      page = this.filePage({
+        view,
+        statusFilter,
+        sourceIds: locationSourceIds,
+        query,
+        pageSize,
+        sizeSort: options.sizeSort,
+        cursor: options.cursor,
+        unrestricted: !!options.locationUnrestricted
+      })
+    }
+    return {
+      counts,
+      scopeRows,
+      pending,
+      shareableDuplicates,
+      duplicateLocations,
+      reclaimable: options.scoped
+        ? 0
+        : Number(global.reclaimable_bytes) || 0,
+      saved,
+      total,
+      currentLocations,
+      currentShareableBytes,
+      currentSeparateCount,
+      currentSeparateBytes,
+      page
+    }
+  }
+
+  countFiles(statuses = null, sourceIds = null) {
+    const where = []
+    const values = []
+    if (statuses && statuses.length) {
+      where.push(`status IN (${placeholders(statuses)})`)
+      values.push(...statuses)
+    }
+    if (sourceIds && sourceIds.length) {
+      where.push(`source_id IN (${placeholders(sourceIds)})`)
+      values.push(...sourceIds)
+    }
+    const row = this.database.prepare(`
+      SELECT COALESCE(SUM(file_count), 0) AS count FROM file_summaries
+      ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
+    `).get(...values)
+    return Number(row.count) || 0
+  }
+}
+
+module.exports = RegistryCore

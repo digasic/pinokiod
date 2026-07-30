@@ -7,7 +7,7 @@ const isHandledError = (options, error, target) => !!(
   !isMissingError(error) && options.onError && options.onError(error, target)
 )
 
-// One traversal primitive for Scan and Repair. It owns only directory
+// One traversal primitive for scans. It owns only directory
 // discovery and symlink policy; callers decide how files are classified.
 async function * walkBatches(root, options = {}) {
   const concurrency = Math.max(1, Number(options.concurrency) || 1)
@@ -15,25 +15,35 @@ async function * walkBatches(root, options = {}) {
   const statConcurrency = Math.max(1, Number(options.statConcurrency) || 32)
   const skipDirectory = options.skipDirectory || (() => false)
   const strictErrors = !!options.strictErrors
-  const pending = [{ dir: path.resolve(root), followRootSymlink: true }]
+  const strictRoot = !!options.strictRoot
+  const pending = [{ dir: path.resolve(root), isRoot: true }]
   const active = []
   try {
     while (pending.length || active.length) {
       while (active.length < concurrency && pending.length) {
-        const next = pending.pop()
-        const dir = next.dir
+        const { dir, isRoot } = pending.pop()
         try {
-          let st = await fs.promises.lstat(dir)
-          if (next.followRootSymlink && st.isSymbolicLink()) {
-            st = await fs.promises.stat(dir)
-          }
+          const st = await fs.promises.lstat(dir)
           if (!st.isDirectory()) {
+            if (strictRoot && isRoot) {
+              const error = new Error(`Scan location is not a directory: ${dir}`)
+              error.code = "ENOTDIR"
+              throw error
+            }
             yield [{ dir, entries: null, files: [], discoveredDirs: 0, discoveredFiles: 0, firstChunk: true }]
             continue
           }
-          active.push({ dir, handle: await fs.promises.opendir(dir), firstChunk: true })
+          active.push({
+            dir,
+            handle: await fs.promises.opendir(dir),
+            firstChunk: true,
+            isRoot
+          })
         } catch (error) {
-          if (strictErrors && !isMissingError(error) && !isHandledError(options, error, dir)) throw error
+          const missingRoot = strictRoot && isRoot && isMissingError(error)
+          if (missingRoot ||
+              (strictErrors && !isMissingError(error) &&
+                !isHandledError(options, error, dir))) throw error
           yield [{ dir, entries: null, files: [], discoveredDirs: 0, discoveredFiles: 0, firstChunk: true }]
         }
       }
@@ -51,7 +61,11 @@ async function * walkBatches(root, options = {}) {
             entries.push(entry)
           }
         } catch (error) {
-          if (strictErrors && !isMissingError(error) && !isHandledError(options, error, task.dir)) throw error
+          const missingRoot = strictRoot && task.isRoot &&
+            isMissingError(error)
+          if (missingRoot ||
+              (strictErrors && !isMissingError(error) &&
+                !isHandledError(options, error, task.dir))) throw error
           done = true
         }
         return {
@@ -67,7 +81,7 @@ async function * walkBatches(root, options = {}) {
           const full = path.resolve(group.dir, entry.name)
           if (entry.isDirectory()) {
             if (skipDirectory(full)) continue
-            pending.push({ dir: full, followRootSymlink: false })
+            pending.push({ dir: full, isRoot: false })
             group.discoveredDirs += 1
           } else if (entry.isFile()) {
             group.files.push({ path: full, entry })
@@ -90,7 +104,7 @@ async function * walkBatches(root, options = {}) {
           if (!st || st.isSymbolicLink()) continue
           if (st.isDirectory()) {
             if (skipDirectory(item.full)) continue
-            pending.push({ dir: item.full, followRootSymlink: false })
+            pending.push({ dir: item.full, isRoot: false })
             item.group.discoveredDirs += 1
           } else if (st.isFile()) {
             item.group.files.push({ path: item.full, entry: item.entry })

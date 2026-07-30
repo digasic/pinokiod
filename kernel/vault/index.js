@@ -1,25 +1,36 @@
-const fs = require('fs')
-const path = require('path')
-const crypto = require('crypto')
-const { Worker } = require('worker_threads')
-const Registry = require('./registry')
-const Sweeper = require('./sweeper')
-const { walkBatches, statMany } = require('./walker')
-const { fileSnapshot, sameSnapshot, sameContentState } = require('./snapshot')
+const fs = require("fs")
+const path = require("path")
+const crypto = require("crypto")
+const { Worker } = require("worker_threads")
+const Registry = require("./registry")
+const Sweeper = require("./sweeper")
+const { fileSnapshot, sameSnapshot, sameContentState } = require("./snapshot")
 const {
-  SIZE_THRESHOLD, CANDIDATE_SIZE_OPTIONS, TMP_SUFFIX, SHA256_RE,
-  DIR_CONCURRENCY, STAT_CONCURRENCY, HASH_INACTIVITY_MS, isCandidateFileSize
-} = require('./constants')
+  SIZE_THRESHOLD,
+  CANDIDATE_SIZE_OPTIONS,
+  TMP_SUFFIX,
+  SHA256_RE,
+  DIR_CONCURRENCY,
+  STAT_CONCURRENCY,
+  HASH_INACTIVITY_MS
+} = require("./constants")
 
-// Shared model store engine (spec/requirements/shared-model-store.md).
-// Store + registry + volume probe + hashing + adopt/convert/verify, plus the
-// user-facing operations behind the vault dashboard (detach, undo, reclaim).
-// Startup restores persisted state only. Discovery happens through a manual
-// scan, while full filesystem/index reconstruction is an explicit repair.
-
-const NO_LINK_CODES = new Set(["EXDEV", "ENOTSUP", "ENOSYS"])
+const NO_LINK_CODES = new Set([
+  "EXDEV", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EPERM", "EACCES"
+])
 const LOCK_CODES = new Set(["EBUSY", "EPERM", "EACCES"])
-const isMissingError = (error) => !!(error && (error.code === "ENOENT" || error.code === "ENOTDIR"))
+const STATUS_PAGE_SIZE = 500
+const MAX_BULK_FILE_ACTIONS = 500
+const STATUS_VIEWS = new Set([
+  "all", "duplicates", "shared", "tracked", "reclaimable", "activity"
+])
+const STATUS_FILTERS = new Set([
+  "all", "duplicate", "shared", "tracked"
+])
+
+const isMissingError = (error) => !!(error &&
+  (error.code === "ENOENT" || error.code === "ENOTDIR"))
+
 const lstatIfPresent = async (filePath) => {
   try {
     return await fs.promises.lstat(filePath)
@@ -28,9 +39,11 @@ const lstatIfPresent = async (filePath) => {
     throw error
   }
 }
+
 const sameIdentity = (left, right) => !!(
   left && right && left.dev === right.dev && left.ino === right.ino
 )
+
 const unlinkIfSame = async (filePath, expected) => {
   if (!expected) return false
   const current = await lstatIfPresent(filePath)
@@ -43,6 +56,7 @@ const unlinkIfSame = async (filePath, expected) => {
     throw error
   }
 }
+
 const unsafeStoragePath = (filePath) => {
   const error = new Error(`Storage path is not a real directory: ${filePath}`)
   error.code = "EVAULTPATH"
@@ -50,117 +64,55 @@ const unsafeStoragePath = (filePath) => {
 }
 
 const isPathWithin = (root, target) => {
-  const rel = path.relative(path.resolve(root), path.resolve(target))
-  return rel === "" || (!rel.startsWith(`..${path.sep}`) && rel !== ".." && !path.isAbsolute(rel))
+  const relative = path.relative(path.resolve(root), path.resolve(target))
+  return relative === "" || (
+    !relative.startsWith(`..${path.sep}`) &&
+    relative !== ".." &&
+    !path.isAbsolute(relative)
+  )
 }
 
 const samePath = (left, right) => {
-  const a = path.resolve(left)
-  const b = path.resolve(right)
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b
+  const first = path.resolve(left)
+  const second = path.resolve(right)
+  return process.platform === "win32"
+    ? first.toLowerCase() === second.toLowerCase()
+    : first === second
 }
 
 const sameFileMetadata = (left, right) => {
   if (!left || !right) return false
   if ((left.mode & 0o7777) !== (right.mode & 0o7777)) return false
-  if (left.uid !== undefined && right.uid !== undefined && left.uid !== right.uid) return false
-  if (left.gid !== undefined && right.gid !== undefined && left.gid !== right.gid) return false
+  if (left.uid !== undefined && right.uid !== undefined &&
+      left.uid !== right.uid) return false
+  if (left.gid !== undefined && right.gid !== undefined &&
+      left.gid !== right.gid) return false
   return true
 }
 
 const sourceId = (kind, name) => `${kind}:${encodeURIComponent(name)}`
-const STATUS_PAGE_SIZE = 500
-const STATUS_VIEWS = new Set([
-  "all", "duplicates", "shared", "tracked", "independent", "reclaimable", "activity"
-])
-const STATUS_FILTERS = new Set(["all", "duplicate", "shared", "tracked", "independent"])
-const REPAIR_DIR_CONCURRENCY = 1
-const REPAIR_STAT_CONCURRENCY = 4
-const REPAIR_YIELD_EVERY = 64
-const REPAIR_YIELD_MS = 5
 const boundedInteger = (value, fallback, minimum, maximum) => {
   const parsed = Number(value)
   if (!Number.isSafeInteger(parsed)) return fallback
   return Math.max(minimum, Math.min(maximum, parsed))
 }
-const repairCancelledError = () => {
-  const error = new Error("Index repair was cancelled.")
-  error.code = "EVAULTCANCELLED"
-  return error
-}
-
-class BoundedPage {
-  constructor(page, pageSize, compare) {
-    this.page = page
-    this.pageSize = pageSize
-    this.keep = Math.max(pageSize, (page + 1) * pageSize)
-    this.compare = compare
-    this.items = []
-    this.tail = []
-    this.total = 0
-  }
-  add(item) {
-    if (!this.compare) {
-      if (this.total >= this.page * this.pageSize &&
-          this.total < (this.page + 1) * this.pageSize) {
-        this.items.push(item)
-      }
-      if (this.tail.length < this.pageSize) this.tail.push(item)
-      else this.tail[this.total % this.pageSize] = item
-      this.total += 1
-      return
-    }
-    this.total += 1
-    this.items.push(item)
-    if (this.items.length >= this.keep * 2) {
-      this.items.sort(this.compare)
-      this.items.length = this.keep
-    }
-  }
-  result() {
-    if (!this.compare) {
-      const pages = Math.max(1, Math.ceil(this.total / this.pageSize))
-      const page = Math.min(this.page, pages - 1)
-      const start = page * this.pageSize
-      const tailStart = this.total < this.pageSize ? 0 : this.total % this.pageSize
-      const tail = tailStart
-        ? this.tail.slice(tailStart).concat(this.tail.slice(0, tailStart))
-        : this.tail
-      return {
-        items: page === this.page ? this.items : tail,
-        page,
-        page_size: this.pageSize,
-        start,
-        end: Math.min(start + this.pageSize, this.total),
-        total: this.total,
-        pages
-      }
-    }
-    this.items.sort(this.compare)
-    if (this.items.length > this.keep) this.items.length = this.keep
-    const pages = Math.max(1, Math.ceil(this.total / this.pageSize))
-    const page = Math.min(this.page, pages - 1)
-    const start = page * this.pageSize
-    return {
-      items: this.items.slice(start, start + this.pageSize),
-      page,
-      page_size: this.pageSize,
-      start,
-      end: Math.min(start + this.pageSize, this.total),
-      total: this.total,
-      pages
-    }
-  }
-}
+const rowSnapshot = (row) => ({
+  size: row.size,
+  mtime: row.mtime,
+  ctime: row.ctime,
+  dev: row.dev,
+  ino: row.ino
+})
 
 class Vault {
   constructor(kernel) {
     this.kernel = kernel
     this.enabled = false
     this.initialized = false
-    this.mode = null          // 'link' | 'copy' for the vault's own volume
-    this.volumeModes = new Map()  // dev -> 'link' | 'copy'
+    this.mode = null
+    this.volumeModes = new Map()
     this.registry = null
+    this.sweeper = null
     this.worker = null
     this.workerJobs = new Map()
     this.workerSeq = 0
@@ -171,609 +123,118 @@ class Vault {
     this.dirConcurrency = DIR_CONCURRENCY
     this.sizeThreshold = SIZE_THRESHOLD
     this._sources = []
+    this._sourcesById = new Map()
     this._sourceBases = new Map()
     this.operationTail = Promise.resolve()
     this.initializationPromise = null
+    this.scanPromise = null
     this.scanError = null
     this.scanScopeId = null
+    this.scanCancelRequested = false
+    this.lastScanCache = new Map()
     this.fileActionProgress = null
-    this.repairPromise = null
-    this.repairRequired = false
-    this.repairDirConcurrency = REPAIR_DIR_CONCURRENCY
-    this.repairStatConcurrency = REPAIR_STAT_CONCURRENCY
-    this.repairYieldEvery = REPAIR_YIELD_EVERY
-    this.repairYieldMs = REPAIR_YIELD_MS
-    this.repairState = this.idleRepairState()
+    this.fileActionCancelRequested = false
   }
+
   get root() {
     return path.resolve(this.kernel.homedir, "vault")
   }
+
   get blobRoot() {
     return path.resolve(this.root, "sha256")
   }
-  get externalSourcesPath() {
-    return path.resolve(this.root, "external-sources.json")
-  }
+
   storePathFor(hash) {
     if (typeof hash !== "string" || !SHA256_RE.test(hash)) {
       throw new TypeError("Invalid vault content identifier.")
     }
     return path.resolve(this.blobRoot, hash.slice(0, 2), hash)
   }
+
   async directoryIfSafe(directory) {
-    const st = await lstatIfPresent(directory)
-    if (st && !st.isDirectory()) throw unsafeStoragePath(directory)
-    return st
+    const stat = await lstatIfPresent(directory)
+    if (stat && (!stat.isDirectory() || stat.isSymbolicLink())) {
+      throw unsafeStoragePath(directory)
+    }
+    return stat
   }
+
   async ensureDirectory(directory) {
-    let st = await this.directoryIfSafe(directory)
-    if (st) return st
+    let stat = await this.directoryIfSafe(directory)
+    if (stat) return stat
     try {
-      await fs.promises.mkdir(directory)
+      await fs.promises.mkdir(directory, { mode: 0o700 })
     } catch (error) {
       if (!error || error.code !== "EEXIST") throw error
     }
-    st = await this.directoryIfSafe(directory)
-    if (!st) throw unsafeStoragePath(directory)
-    return st
+    stat = await this.directoryIfSafe(directory)
+    if (!stat) throw unsafeStoragePath(directory)
+    return stat
   }
-  async readExternalSourcePaths() {
-    let raw
-    try {
-      raw = await this.registry.readFile(this.externalSourcesPath)
-    } catch (error) {
-      if (isMissingError(error)) return []
-      throw error
-    }
-    let parsed
-    try {
-      parsed = JSON.parse(raw)
-    } catch (error) {
-      throw new Error("External folder settings are invalid.")
-    }
-    if (!parsed || !Array.isArray(parsed.paths)) {
-      throw new Error("External folder settings are invalid.")
-    }
-    const paths = []
-    for (const value of parsed.paths) {
-      if (typeof value !== "string" || !path.isAbsolute(value.trim())) continue
-      const resolved = path.resolve(value.trim())
-      if (!paths.some((existing) => samePath(existing, resolved))) paths.push(resolved)
-    }
-    return paths
-  }
-  async writeExternalSourcePaths(folderPaths) {
-    const paths = []
-    for (const value of folderPaths) {
-      if (typeof value !== "string" || !path.isAbsolute(value.trim())) continue
-      const resolved = path.resolve(value.trim())
-      if (!paths.some((existing) => samePath(existing, resolved))) paths.push(resolved)
-    }
-    await this.registry.atomicWrite(
-      this.externalSourcesPath,
-      JSON.stringify({ paths }, null, 2)
-    )
-  }
+
   async storeStatIfPresent(storePath, options = {}) {
-    if (!isPathWithin(this.blobRoot, storePath)) throw unsafeStoragePath(storePath)
-    if (!await this.directoryIfSafe(this.root) || !await this.directoryIfSafe(this.blobRoot)) {
+    if (!isPathWithin(this.blobRoot, storePath)) {
+      throw unsafeStoragePath(storePath)
+    }
+    if (!await this.directoryIfSafe(this.root) ||
+        !await this.directoryIfSafe(this.blobRoot)) {
       throw unsafeStoragePath(this.blobRoot)
     }
     const shard = path.dirname(storePath)
     let shardStat = await this.directoryIfSafe(shard)
-    if (!shardStat && options.createParent) shardStat = await this.ensureDirectory(shard)
+    if (!shardStat && options.createParent) {
+      shardStat = await this.ensureDirectory(shard)
+    }
     if (!shardStat) return null
-    return lstatIfPresent(storePath)
+    const stat = await lstatIfPresent(storePath)
+    if (stat && (!stat.isFile() || stat.isSymbolicLink())) {
+      throw unsafeStoragePath(storePath)
+    }
+    return stat
   }
-  // All dashboard mutations share one queue. Status reads remain concurrent,
-  // while scans, conversions, repair, undo, detach, and reclaim can never
-  // publish interleaved filesystem/registry state.
+
   runExclusive(operation) {
     const pending = this.operationTail.then(operation, operation)
     this.operationTail = pending.catch(() => {})
     return pending
   }
-  // A filesystem mutation is committed before its registry snapshot is
-  // flushed. Keep that distinction in the response: failed persistence is
-  // retried by Registry and must not make an already-completed action look as
-  // though it never happened.
+
   runMutation(operation) {
-    return this.runExclusive(async () => {
-      const result = await operation()
-      try {
-        if (this.registry) await this.registry.flush()
-      } catch (error) {
-        return Object.assign({}, result, { persistence_warning: true })
-      }
-      return result
-    })
+    return this.runExclusive(operation)
   }
+
   async runFileAction(progress, operation) {
+    this.fileActionCancelRequested = false
     this.fileActionProgress = progress
     try {
       return await operation(progress)
     } finally {
-      if (this.fileActionProgress === progress) this.fileActionProgress = null
-    }
-  }
-  idleRepairState() {
-    return {
-      active: false,
-      phase: "idle",
-      roots_total: 0,
-      roots_completed: 0,
-      directories_checked: 0,
-      files_checked: 0,
-      records_checked: 0,
-      current_location: null,
-      cancel_requested: false,
-      started: null,
-      duration_ms: null,
-      error: null,
-      persistence_warning: false
-    }
-  }
-  repairCheckpoint(progress, updates = {}) {
-    if (!progress) return
-    if (updates.phase) progress.phase = updates.phase
-    if (updates.current_location !== undefined) {
-      progress.current_location = updates.current_location
-    }
-    for (const key of ["roots_completed", "directories_checked", "files_checked", "records_checked"]) {
-      if (updates[key]) progress[key] += updates[key]
-    }
-    if (progress.cancel_requested) throw repairCancelledError()
-    progress.work_since_yield = (progress.work_since_yield || 0) +
-      Math.max(1, Number(updates.work) || 1)
-    if (progress.work_since_yield < this.repairYieldEvery) return
-    progress.work_since_yield = 0
-    return new Promise((resolve) => setTimeout(resolve, this.repairYieldMs))
-      .then(() => {
-        if (progress.cancel_requested) throw repairCancelledError()
-      })
-  }
-  startRepair() {
-    if (!this.enabled || !this.registry) return { started: false, disabled: true }
-    if (this.scanPromise || (this.sweeper && this.sweeper.state.active)) {
-      return { started: false, error: "Wait for the current scan to finish before repairing the index." }
-    }
-    if (this.fileActionProgress) {
-      return { started: false, error: "Wait for the current file action to finish before repairing the index." }
-    }
-    if (this.repairPromise) return { started: false, already_running: true }
-    const progress = Object.assign(this.idleRepairState(), {
-      kind: "repair",
-      active: false,
-      phase: "queued",
-      roots_total: this.scanRoots().length,
-      started: Date.now()
-    })
-    this.repairState = progress
-    this.repairPromise = this.runExclusive(async () => {
-      progress.active = true
-      progress.phase = "vault"
-      try {
-        if (progress.cancel_requested) throw repairCancelledError()
-        await this.rebuild(undefined, {
-          flush: false,
-          progress
-        })
-        if (progress.cancel_requested) throw repairCancelledError()
-        try {
-          await this.registry.flush()
-        } catch (error) {
-          progress.persistence_warning = true
-        }
-        this.repairRequired = false
-        progress.phase = "complete"
-      } catch (error) {
-        if (error && error.code === "EVAULTCANCELLED") {
-          progress.phase = "cancelled"
-        } else {
-          progress.phase = "failed"
-          progress.error = error && error.message ? error.message : String(error)
-        }
-      } finally {
-        progress.active = false
-        progress.current_location = null
-        progress.duration_ms = Date.now() - progress.started
-        delete progress.work_since_yield
+      if (this.fileActionProgress === progress) {
+        this.fileActionProgress = null
       }
-    }).finally(() => {
-      this.repairPromise = null
-    })
-    this.repairPromise.catch(() => {})
-    return {
-      started: true,
-      repair: this.repairStatus()
+      this.fileActionCancelRequested = false
     }
   }
-  cancelRepair() {
-    if (!this.repairPromise) {
-      return { cancel_requested: false, active: false }
-    }
-    this.repairState.cancel_requested = true
-    return {
-      cancel_requested: true,
-      active: !!this.repairState.active,
-      queued: !this.repairState.active
-    }
-  }
-  startScan(scopeId = null, sizeThreshold = this.sizeThreshold) {
-    if (!this.enabled || !this.sweeper) return { started: false, disabled: true }
-    if (this.repairRequired) {
-      return { started: false, error: "Repair Index is required before scanning." }
-    }
-    if (this.scanPromise) return { started: false, already_running: true }
-    if (this.repairPromise) {
-      return { started: false, error: "Wait for the index repair to finish before scanning." }
-    }
-    this.sizeThreshold = sizeThreshold
-    this.scanError = null
-    this.scanScopeId = scopeId
-    this.scanPromise = this.runExclusive(() => this.sweeper.scan(scopeId))
-      .catch((error) => {
-        this.scanError = error && error.message ? error.message : String(error)
-        throw error
-      })
-      .finally(() => {
-        this.scanPromise = null
-        this.scanScopeId = null
-      })
-    this.scanPromise.catch(() => {})
-    return { started: true }
-  }
-  async perform(action, payload = {}) {
-    if (!this.enabled) return { error: "Save space is disabled." }
-    await this.ensureInitialized()
-    if (this.repairRequired &&
-        action !== "repair" && action !== "cancel_repair") {
-      return { error: "Repair Index is required before using Save space." }
-    }
-    switch (action) {
-      case "add_source": {
-        const result = await this.runExclusive(() => this.addExternalSource(payload.path))
-        return {
-          created: result.created,
-          source: {
-            id: result.source.id,
-            label: result.source.label,
-            target_path: result.source.root,
-            shareable: !!result.source.shareable
-          }
-        }
-      }
-      case "remove_source":
-        if (typeof payload.source_id !== "string" || !payload.source_id) {
-          return { error: "Choose an external folder to remove." }
-        }
-        return this.runMutation(() => this.removeExternalSource(payload.source_id))
-      case "scan": {
-        if (payload.scope_id && !this.scanSource(payload.scope_id)) {
-          return { error: "That scan location is no longer available." }
-        }
-        let sizeThreshold = this.sizeThreshold
-        if (payload.candidate_size != null) {
-          if (!CANDIDATE_SIZE_OPTIONS.includes(payload.candidate_size)) {
-            return { error: "Choose a valid minimum file size." }
-          }
-          sizeThreshold = payload.candidate_size
-        }
-        return this.startScan(payload.scope_id || null, sizeThreshold)
-      }
-      case "deduplicate":
-        if (typeof payload.path === "string" && payload.path) {
-          return this.runMutation(() => this.runFileAction({
-            kind: "deduplicate-file",
-            path: path.resolve(payload.path)
-          }, () => this.deduplicateFile(payload.path, {
-            batch_id: `batch-${crypto.randomUUID()}`
-          })))
-        }
-        const selection = payload.selection || null
-        if (selection && selection !== "duplicates" && selection !== "kept-separate") {
-          return { error: "Choose files to deduplicate." }
-        }
-        if (payload.scope_id != null &&
-            (typeof payload.scope_id !== "string" || !payload.scope_id)) {
-          return { error: "Choose a valid location to deduplicate." }
-        }
-        const scopeId = typeof payload.scope_id === "string" && payload.scope_id
-          ? payload.scope_id
-          : null
-        if (!selection && !scopeId) {
-          return { error: "Choose a location to deduplicate." }
-        }
-        return this.runMutation(() => this.runFileAction({
-          kind: "deduplicate",
-          scope_id: scopeId,
-          selection: selection || "duplicates",
-          files_total: 0,
-          files_completed: 0
-        }, async (progress) => {
-          const options = {
-            batch_id: `batch-${crypto.randomUUID()}`,
-            progress
-          }
-          return selection
-            ? this.deduplicateSelection(selection, scopeId, options)
-            : this.deduplicateScope(scopeId, options)
-        }))
-      case "reclaim":
-        return this.runMutation(() => this.reclaim(payload.hash))
-      case "reclaim_all":
-        return this.runMutation(() => this.reclaimAll())
-      case "repair":
-        return this.startRepair()
-      case "cancel_repair":
-        return this.cancelRepair()
-      case "undo":
-        return this.runMutation(() => this.undoBatch(payload.batch_id))
-      case "detach":
-        if (typeof payload.path !== "string" || !payload.path) return { status: "not-found" }
-        return this.runMutation(() => {
-          const targetPath = path.resolve(payload.path)
-          const kind = this.registry.duplicates.has(targetPath)
-            ? "keep-separate"
-            : "make-separate"
-          return this.runFileAction({ kind, path: targetPath }, () => this.detach(targetPath))
-        })
-      default:
-        return { error: "unknown action" }
-    }
-  }
-  async refreshSources() {
-    const home = path.resolve(this.kernel.homedir)
-    const apiRoot = path.resolve(home, "api")
-    const sources = [
-      { id: "pinokio", kind: "pinokio", label: "Pinokio", root: home, parent_id: null },
-      { id: "apps", kind: "virtual", label: "Apps", root: apiRoot, parent_id: "pinokio" },
-      { id: "external", kind: "virtual", label: "External folders", root: null, parent_id: null }
-    ]
-    let storeDev = null
-    try {
-      storeDev = (await fs.promises.stat(this.root)).dev
-    } catch (error) {
-      if (!isMissingError(error)) throw error
-    }
-    const decorate = async (source) => {
-      if (!source.root) return source
-      try {
-        const st = await fs.promises.stat(source.root)
-        source.dev = st.dev
-        source.available = st.isDirectory()
-        source.shareable = source.available && storeDev !== null && st.dev === storeDev && this.mode === "link"
-      } catch (error) {
-        if (!isMissingError(error)) throw error
-        source.available = false
-        source.shareable = false
-      }
-      return source
-    }
 
-    let apiEntries = []
-    try {
-      apiEntries = await fs.promises.readdir(apiRoot, { withFileTypes: true })
-    } catch (error) {
-      if (!isMissingError(error)) throw error
+  cancelFileAction() {
+    if (!this.fileActionProgress ||
+        !this.fileActionProgress.cancelable) {
+      return { cancel_requested: false }
     }
-    for (const entry of apiEntries) {
-      const mountPath = path.resolve(apiRoot, entry.name)
-      if (entry.isDirectory()) {
-        sources.push(await decorate({
-          id: sourceId("app", entry.name), kind: "app", label: entry.name,
-          app: entry.name, root: mountPath, parent_id: "apps"
-        }))
-      }
-    }
-    for (const configuredPath of await this.readExternalSourcePaths()) {
-      sources.push(await decorate({
-        id: sourceId("external", configuredPath),
-        kind: "external",
-        label: path.basename(configuredPath) || configuredPath,
-        root: configuredPath,
-        parent_id: "external",
-        configured: true
-      }))
-    }
+    this.fileActionCancelRequested = true
+    this.fileActionProgress.cancel_requested = true
+    return { cancel_requested: true }
+  }
 
-    let homeEntries = []
-    try {
-      homeEntries = await fs.promises.readdir(home, { withFileTypes: true })
-    } catch (error) {
-      if (!isMissingError(error)) throw error
-    }
-    for (const entry of homeEntries) {
-      if (!entry.isDirectory() || entry.isSymbolicLink() || entry.name === "api" || entry.name === "vault") continue
-      sources.push(await decorate({
-        id: sourceId("folder", entry.name), kind: "folder", label: entry.name,
-        root: path.resolve(home, entry.name), parent_id: "pinokio"
-      }))
-    }
-    const homeSource = sources.find((source) => source.id === "pinokio")
-    if (homeSource) await decorate(homeSource)
-    this._sources = sources
-    this._sourceBases = new Map()
-    for (const source of sources) {
-      if (!source.root || source.kind === "virtual") continue
-      for (const base of [source.root, source.mount_path]) {
-        if (!base) continue
-        const resolved = path.resolve(base)
-        const key = process.platform === "win32" ? resolved.toLowerCase() : resolved
-        if (!this._sourceBases.has(key)) this._sourceBases.set(key, [])
-        this._sourceBases.get(key).push(source)
-      }
-    }
-    return sources
-  }
-  sources() {
-    return this._sources
-  }
-  async addExternalSource(folderPath) {
-    if (!this.enabled) throw new Error("Save space is disabled.")
-    if (typeof folderPath !== "string" || !path.isAbsolute(folderPath.trim())) {
-      throw new Error("Choose a valid folder.")
-    }
-    const requested = folderPath.trim()
-    let canonical
-    let stats
-    try {
-      canonical = path.resolve(await fs.promises.realpath(requested))
-      stats = await fs.promises.stat(canonical)
-    } catch (error) {
-      throw new Error("That folder is no longer available.")
-    }
-    if (!stats.isDirectory()) throw new Error("Choose a folder, not a file.")
-
-    const home = path.resolve(this.kernel.homedir)
-    const canonicalHome = path.resolve(await fs.promises.realpath(home))
-    if (isPathWithin(canonicalHome, canonical) || isPathWithin(canonical, canonicalHome)) {
-      throw new Error("That folder is already inside Pinokio and is included in scans.")
-    }
-
-    await this.refreshSources()
-    const existing = this._sources.find((source) => source.kind === "external" && source.root && samePath(source.root, canonical))
-    if (existing) {
-      return { created: false, source: existing }
-    }
-
-    const configuredPaths = await this.readExternalSourcePaths()
-    configuredPaths.push(canonical)
-    await this.writeExternalSourcePaths(configuredPaths)
-    await this.refreshSources()
-    const source = this._sources.find((item) =>
-      item.kind === "external" && item.configured && samePath(item.root, canonical))
-    if (!source) {
-      throw new Error("The folder could not be added. Restart Pinokio and try again.")
-    }
-    return { created: true, source }
-  }
-  async removeExternalSource(sourceIdToRemove) {
-    await this.refreshSources()
-    const source = this._sources.find((item) =>
-      item.id === sourceIdToRemove && item.kind === "external" && item.configured)
-    if (!source) return { error: "That external folder is no longer configured." }
-
-    const configuredPaths = await this.readExternalSourcePaths()
-    const remaining = configuredPaths.filter((folderPath) => !samePath(folderPath, source.root))
-    if (remaining.length === configuredPaths.length) {
-      return { error: "That external folder is no longer configured." }
-    }
-    await this.writeExternalSourcePaths(remaining)
-    await this.refreshSources()
-    this.reconcileConfiguredSources()
-    for (const [filePath, entry] of [...this.registry.excluded]) {
-      if (entry.source_id === source.id) this.registry.excluded.delete(filePath)
-    }
-    this.registry.sourceScans.delete(source.id)
-    this.registry.lastScan = null
-    this.registry.schedulePersist()
-    return { removed: true, source_id: source.id, label: source.label }
-  }
-  sourceForPath(filePath, preferredId) {
-    let cursor = path.resolve(filePath)
-    while (true) {
-      const key = process.platform === "win32" ? cursor.toLowerCase() : cursor
-      const matches = this._sourceBases.get(key)
-      if (matches && matches.length) {
-        return matches.find((source) => source.id === preferredId) || matches[0]
-      }
-      const parent = path.dirname(cursor)
-      if (parent === cursor) return null
-      cursor = parent
-    }
-  }
-  async canonicalPathIsWithinSource(filePath, source, options = {}) {
-    if (!source || !source.root) return false
-    try {
-      const [canonicalRoot, canonicalFile] = await Promise.all([
-        fs.promises.realpath(source.root),
-        fs.promises.realpath(filePath)
-      ])
-      return isPathWithin(canonicalRoot, canonicalFile)
-    } catch (error) {
-      if (options.strictErrors && !isMissingError(error)) throw error
-      return false
-    }
-  }
-  locationForPath(filePath, preferredId) {
-    const source = this.sourceForPath(filePath, preferredId)
-    if (!source) return { source_id: null, relative_path: path.basename(filePath) }
-    const absolute = path.resolve(filePath)
-    let base = source.root
-    if (source.mount_path && isPathWithin(source.mount_path, absolute)) base = source.mount_path
-    const relative = path.relative(base, absolute).split(path.sep).join("/") || path.basename(absolute)
-    return {
-      source_id: source.id,
-      source_kind: source.kind,
-      source_label: source.label,
-      relative_path: relative
-    }
-  }
-  async recordEvent(event) {
-    let entry = event
-    if (event.path) {
-      const location = this.locationForPath(event.path, event.source_id)
-      const context = location.source_id ? location : { relative_path: event.path }
-      entry = Object.assign({}, event, context)
-    }
-    try {
-      await this.registry.appendEvent(entry)
-      return true
-    } catch (error) {
-      return false
-    }
-  }
-  scanSource(scopeId) {
-    if (!scopeId) return null
-    return this._sources.find((source) =>
-      source.id === scopeId && source.kind !== "virtual" && source.available && source.root) || null
-  }
-  scanRoots(scopeId = null) {
-    if (scopeId) {
-      const source = this.scanSource(scopeId)
-      return source ? [{ root: path.resolve(source.root), source_id: source.id }] : []
-    }
-    const home = path.resolve(this.kernel.homedir)
-    const candidates = [{ root: home, source_id: "pinokio" }]
-    for (const source of this._sources) {
-      if (source.kind !== "external" || !source.available || !source.root) continue
-      const canonical = path.resolve(source.root)
-      if (isPathWithin(home, canonical) || isPathWithin(canonical, home)) continue
-      candidates.push({ root: canonical, source_id: source.id })
-    }
-    candidates.sort((left, right) => left.root.length - right.root.length)
-    const roots = []
-    for (const candidate of candidates) {
-      if (roots.some((existing) => isPathWithin(existing.root, candidate.root))) continue
-      roots.push(candidate)
-    }
-    return roots
-  }
-  reconcileConfiguredSources() {
-    if (!this.registry) return
-    const configured = (filePath, sourceId) => !!this.sourceForPath(filePath, sourceId)
-    for (const [filePath, entry] of [...this.registry.links]) {
-      if (!configured(filePath, entry.source_id)) this.registry.untrack(filePath)
-    }
-    for (const [filePath, entry] of [...this.registry.duplicates]) {
-      if (!configured(filePath, entry.source_id)) this.registry.untrack(filePath)
-    }
-    for (const [filePath, entry] of [...this.registry.scanIndex]) {
-      if (!configured(filePath, entry.source_id)) this.registry.untrack(filePath)
-    }
-  }
-  // Kill switch: system ENVIRONMENT variable PINOKIO_VAULT, default unset =
-  // enabled. Read directly (single key) to avoid loading the environment
-  // module chain before the kernel is fully up.
   async isEnabled() {
     let value = process.env.PINOKIO_VAULT
     if (value === undefined && this.kernel.homedir) {
       try {
-        const raw = await fs.promises.readFile(path.resolve(this.kernel.homedir, "ENVIRONMENT"), "utf8")
+        const raw = await fs.promises.readFile(
+          path.resolve(this.kernel.homedir, "ENVIRONMENT"), "utf8")
         for (const line of raw.split("\n")) {
-          const m = line.match(/^\s*PINOKIO_VAULT\s*=\s*(.*)\s*$/)
-          if (m) value = m[1].trim()
+          const match = line.match(/^\s*PINOKIO_VAULT\s*=\s*(.*)\s*$/)
+          if (match) value = match[1].trim()
         }
       } catch (error) {
         if (!isMissingError(error)) throw error
@@ -781,64 +242,68 @@ class Vault {
     }
     return String(value).toLowerCase() !== "false"
   }
-  // Disabled ⇒ do nothing observable: no directory, no registry, no probes.
+
   async init(options = {}) {
     this.enabled = await this.isEnabled()
     if (!this.enabled) return { enabled: false }
     if (options.deferStorage) return { enabled: true }
     return this.initializeStorage()
   }
+
   async initializeStorage() {
     if (this.initialized) return { enabled: true, mode: this.mode }
-    const existingBlobRoot = await this.directoryIfSafe(this.blobRoot)
     await this.ensureDirectory(this.root)
     await this.ensureDirectory(this.blobRoot)
     this.registry = new Registry(this.root)
+    await this.registry.load()
     this.mode = await this.probe(this.root)
     await this.refreshSources()
-    const loaded = await this.registry.load()
-    const missingExistingRegistry = !loaded.existed && !!existingBlobRoot
-    this.repairRequired = !!(loaded.corrupt || missingExistingRegistry)
     this.sweeper = new Sweeper(this)
     this.initialized = true
-    return {
-      enabled: true,
-      mode: this.mode
-    }
+    return { enabled: true, mode: this.mode }
   }
+
   async ensureInitialized() {
     if (!this.enabled) return { enabled: false }
     if (this.initialized) return { enabled: true, mode: this.mode }
     if (!this.initializationPromise) {
-      this.initializationPromise = this.initializeStorage()
-        .finally(() => {
-          this.initializationPromise = null
-        })
+      this.initializationPromise = this.initializeStorage().finally(() => {
+        this.initializationPromise = null
+      })
     }
     return this.initializationPromise
   }
-  // Capability probe: temp file + node:fs.link + nlink check. Once per volume.
-  async probe(dir) {
-    const dev = (await fs.promises.stat(dir)).dev
+
+  async openWorkspace() {
+    if (!this.initialized) return this.ensureInitialized()
+    await this.refreshSources()
+    return { enabled: true, mode: this.mode }
+  }
+
+  async probe(directory) {
+    const dev = (await fs.promises.stat(directory)).dev
     if (this.volumeModes.has(dev)) return this.volumeModes.get(dev)
-    const a = path.resolve(dir, `.pinokio-probe-${crypto.randomBytes(6).toString("hex")}`)
-    const b = a + "-link"
+    const first = path.resolve(
+      directory, `.pinokio-probe-${crypto.randomBytes(6).toString("hex")}`)
+    const second = `${first}-link`
     let mode = "copy"
-    let aStat = null
-    let bStat = null
+    let firstStat = null
+    let secondStat = null
     let failure = null
     try {
-      await fs.promises.writeFile(a, "probe", { flag: "wx" })
-      aStat = await fs.promises.lstat(a)
-      await fs.promises.link(a, b)
-      bStat = await fs.promises.lstat(b)
-      if (sameIdentity(bStat, aStat) && bStat.nlink === 2) mode = "link"
+      await fs.promises.writeFile(first, "probe", { flag: "wx" })
+      firstStat = await fs.promises.lstat(first)
+      await fs.promises.link(first, second)
+      secondStat = await fs.promises.lstat(second)
+      if (sameIdentity(firstStat, secondStat) && secondStat.nlink === 2) {
+        mode = "link"
+      }
     } catch (error) {
       if (!NO_LINK_CODES.has(error && error.code)) failure = error
     } finally {
       try {
-        await unlinkIfSame(b, bStat)
-        await unlinkIfSame(a, aStat)
+        await unlinkIfSame(second, secondStat)
+        await unlinkIfSame(first, firstStat)
       } catch (error) {
         if (!failure) failure = error
       }
@@ -847,6 +312,7 @@ class Vault {
     this.volumeModes.set(dev, mode)
     return mode
   }
+
   failHashWorker(worker, error, terminate = false) {
     if (this.worker === worker) {
       if (this.workerIdleTimer) clearTimeout(this.workerIdleTimer)
@@ -861,6 +327,7 @@ class Vault {
     }
     if (terminate) worker.terminate().catch(() => {})
   }
+
   async hashFile(filePath, options = {}) {
     if (this.workerIdleTimer) {
       clearTimeout(this.workerIdleTimer)
@@ -870,7 +337,9 @@ class Vault {
       const worker = new Worker(path.resolve(__dirname, "hash_worker.js"))
       this.worker = worker
       worker.unref()
-      worker.on("message", ({ id, hash, size, bytes_read: bytesRead, error, code }) => {
+      worker.on("message", ({
+        id, hash, size, bytes_read: bytesRead, error, code
+      }) => {
         const job = this.workerJobs.get(id)
         if (!job || job.worker !== worker) return
         if (Number.isFinite(bytesRead)) {
@@ -888,8 +357,6 @@ class Vault {
           job.reportProgress(size)
           job.resolve({ hash, size })
         }
-        // Keep the worker warm across the scan queue. Starting one worker per
-        // file costs ~30ms and adds up quickly on a first scan.
         if (this.workerJobs.size === 0 && this.worker === worker) {
           this.workerIdleTimer = setTimeout(() => {
             this.workerIdleTimer = null
@@ -902,38 +369,44 @@ class Vault {
         }
       })
       worker.on("error", (error) => {
-        if (this.worker !== worker) return
-        this.failHashWorker(worker, error)
+        if (this.worker === worker) this.failHashWorker(worker, error)
       })
       worker.on("exit", (code) => {
-        if (this.worker !== worker) return
-        this.failHashWorker(worker, new Error(`hash worker exited with code ${code}`))
+        if (this.worker === worker) {
+          this.failHashWorker(
+            worker, new Error(`hash worker exited with code ${code}`))
+        }
       })
     }
     const worker = this.worker
     const id = ++this.workerSeq
     return new Promise((resolve, reject) => {
-      const onProgress = typeof options.onProgress === "function" ? options.onProgress : null
+      const onProgress = typeof options.onProgress === "function"
+        ? options.onProgress
+        : null
       const job = {
         worker,
         resolve,
         reject,
         reportProgress: (bytes) => {
           if (!onProgress) return
-          // Progress is observational and must never fail a content hash.
-          try { onProgress(bytes) } catch (_) {}
+          try {
+            onProgress(bytes)
+          } catch (error) {}
         },
         inactivityTimer: null,
         resetInactivity: null
       }
       job.resetInactivity = () => {
         clearTimeout(job.inactivityTimer)
-        const inactivityMs = Math.max(1, Number(this.hashInactivityMs) || HASH_INACTIVITY_MS)
+        const timeout = Math.max(
+          1, Number(this.hashInactivityMs) || HASH_INACTIVITY_MS)
         job.inactivityTimer = setTimeout(() => {
-          const failure = new Error(`Timed out while reading ${path.basename(filePath)}`)
+          const failure = new Error(
+            `Timed out while reading ${path.basename(filePath)}`)
           failure.code = "ETIMEDOUT"
           this.failHashWorker(worker, failure, true)
-        }, inactivityMs)
+        }, timeout)
         if (job.inactivityTimer.unref) job.inactivityTimer.unref()
       }
       this.workerJobs.set(id, job)
@@ -945,386 +418,139 @@ class Vault {
       }
     })
   }
-  async refreshLinkSnapshots(hash, dev, ino) {
-    if (!this.registry) return
-    const key = this.registry.inoKey(dev, ino)
-    const paths = [...(this.registry.pathsByIno.get(key) || [])]
-    for (const linkPath of paths) {
-      const entry = this.registry.links.get(linkPath)
-      if (!entry || entry.hash !== hash) continue
-      try {
-        const source = this.sourceForPath(linkPath, entry.source_id)
-        if (!source || !await this.canonicalPathIsWithinSource(linkPath, source)) continue
-        const st = await fs.promises.lstat(linkPath)
-        if (st.dev !== dev || st.ino !== ino) continue
-        this.registry.setScanEntry(linkPath, Object.assign(fileSnapshot(st), {
-          hash,
-          source_id: entry.source_id || null
-        }))
-      } catch (error) {}
-    }
-    this.registry.schedulePersist()
-  }
-  async verifyStoreContent(hash, storePath, storeStat) {
-    if (!storeStat || !storeStat.isFile()) return { valid: false }
-    const key = this.registry.inoKey(storeStat.dev, storeStat.ino)
-    for (const linkPath of this.registry.pathsByIno.get(key) || []) {
-      const entry = this.registry.links.get(linkPath)
-      if (!entry) continue
-      if (entry.hash !== hash || entry.mode !== "link" ||
-          entry.dev !== storeStat.dev || entry.ino !== storeStat.ino) continue
-      const expected = this.registry.scanIndex.get(linkPath)
-      if (expected && expected.hash === hash && sameSnapshot(expected, storeStat)) {
-        return { valid: true, snapshot: fileSnapshot(storeStat) }
-      }
-    }
 
-    const before = fileSnapshot(storeStat)
-    let hashed
+  async refreshSources() {
+    const home = path.resolve(this.kernel.homedir)
+    const apiRoot = path.resolve(home, "api")
+    const sources = [
+      {
+        id: "pinokio", kind: "pinokio", label: "Pinokio",
+        root: home, parent_id: null
+      },
+      {
+        id: "apps", kind: "virtual", label: "Apps",
+        root: apiRoot, parent_id: "pinokio"
+      },
+      {
+        id: "external", kind: "virtual", label: "External folders",
+        root: null, parent_id: null
+      }
+    ]
+    let storeDev = null
     try {
-      hashed = await this.hashFile(storePath)
+      storeDev = (await fs.promises.stat(this.root)).dev
     } catch (error) {
-      return { valid: false }
+      if (!isMissingError(error)) throw error
     }
-    let after
-    try {
-      after = await this.storeStatIfPresent(storePath)
-    } catch (error) {
-      return { valid: false }
-    }
-    if (!sameSnapshot(before, after) || hashed.hash !== hash || hashed.size !== after.size) {
-      return { valid: false }
-    }
-    await this.refreshLinkSnapshots(hash, after.dev, after.ino)
-    return { valid: true, snapshot: fileSnapshot(after) }
-  }
-  // adopt: give an existing file a store name. Metadata-only, never copies.
-  async adopt(filePath, hash, meta = {}) {
-    if (!this.enabled) return { status: "disabled" }
-    const storePath = this.storePathFor(hash)
-    const st = await fs.promises.lstat(filePath)
-    if (!st.isFile()) return { status: "stale" }
-    if (meta.expected && !sameSnapshot(meta.expected, st)) return { status: "stale" }
-    const before = fileSnapshot(st)
-    const linkEntry = {
-      hash,
-      app: meta.app || null,
-      source_id: meta.source_id || null,
-      dev: st.dev,
-      ino: st.ino,
-      mode: "link"
-    }
-    const storeStat = await this.storeStatIfPresent(storePath, {
-      createParent: this.mode === "link"
-    })
-    if (storeStat) {
-      if (storeStat.dev === st.dev && storeStat.ino === st.ino) {
-        const current = await lstatIfPresent(filePath)
-        if (!sameSnapshot(before, current)) return { status: "stale" }
-        this.registry.addBlob(hash, { size: st.size, source_urls: meta.source_urls || [] })
-        this.registry.addLink(filePath, linkEntry)
-        await this.refreshLinkSnapshots(hash, st.dev, st.ino)
-        return { status: "already" }
-      }
-      const current = await lstatIfPresent(filePath)
-      if (!sameSnapshot(before, current)) return { status: "stale" }
-      return { status: "duplicate", storePath }
-    }
-    const registerCopy = async () => {
-      const current = await lstatIfPresent(filePath)
-      if (!sameSnapshot(before, current)) return { status: "stale" }
-      linkEntry.mode = "copy"
-      this.registry.addBlob(hash, { size: st.size, source_urls: meta.source_urls || [] })
-      this.registry.addLink(filePath, linkEntry)
-      await this.refreshLinkSnapshots(hash, st.dev, st.ino)
-      await this.recordEvent({
-        kind: "adopt", hash, path: filePath, app: meta.app || null,
-        source_id: meta.source_id || null, bytes_saved: 0, mode: "copy"
-      })
-      return { status: "copy-mode" }
-    }
-    if (this.mode === "copy") return registerCopy()
-    try {
-      await fs.promises.link(filePath, storePath)
-    } catch (e) {
-      if (NO_LINK_CODES.has(e.code)) {
-        return registerCopy()
-      }
-      throw e
-    }
-    const [current, currentStore] = await Promise.all([
-      lstatIfPresent(filePath),
-      this.storeStatIfPresent(storePath)
-    ])
-    if (!sameContentState(before, current) || !currentStore ||
-        currentStore.dev !== st.dev || currentStore.ino !== st.ino) {
-      // Remove only a store name that still points either to the inode we
-      // intended to link or to the current source inode that won the race.
-      // An unrelated replacement at the reserved store path is preserved.
-      const ownsStoreName = currentStore && (
-        (currentStore.dev === st.dev && currentStore.ino === st.ino) ||
-        (current && currentStore.dev === current.dev && currentStore.ino === current.ino)
-      )
-      if (ownsStoreName) {
-        try {
-          await fs.promises.unlink(storePath)
-        } catch (error) {
-          if (!isMissingError(error)) throw error
-        }
-      }
-      return { status: "stale" }
-    }
-    this.registry.addBlob(hash, { size: st.size, source_urls: meta.source_urls || [] })
-    this.registry.addLink(filePath, linkEntry)
-    await this.refreshLinkSnapshots(hash, st.dev, st.ino)
-    await this.recordEvent({ kind: "adopt", hash, path: filePath, app: meta.app || null, source_id: meta.source_id || null, bytes_saved: 0 })
-    return { status: "adopted" }
-  }
-  // convert: replace a byte-identical duplicate with a link to an existing
-  // blob. Atomic link+rename; target is never missing at any instant.
-  async convert(targetPath, hash, meta = {}) {
-    if (!this.enabled) return { status: "disabled" }
-    const storePath = this.storePathFor(hash)
-    let storeStat
-    try {
-      storeStat = await this.storeStatIfPresent(storePath)
-    } catch (e) {
-      return { status: "no-blob" }
-    }
-    if (!storeStat) return { status: "no-blob" }
-    let targetStat = await fs.promises.lstat(targetPath)
-    if (!storeStat.isFile() || !targetStat.isFile()) return { status: "stale" }
-    if (meta.expected && !sameSnapshot(meta.expected, targetStat)) {
-      // Windows metadata operations can change ctime without changing the
-      // file's identity or bytes. Recover only that isolated mismatch by
-      // hashing the target again, then retain the exact pre-rename check below.
-      if (!sameContentState(meta.expected, targetStat)) return { status: "stale" }
-      const before = fileSnapshot(targetStat)
-      let verifiedTarget
+    const decorate = async (source) => {
+      if (!source.root) return source
       try {
-        verifiedTarget = await this.hashFile(targetPath)
+        const [stat, realRoot] = await Promise.all([
+          fs.promises.lstat(source.root),
+          fs.promises.realpath(source.root)
+        ])
+        source.dev = stat.dev
+        source.available = stat.isDirectory() &&
+          !stat.isSymbolicLink() &&
+          (source.kind !== "external" || samePath(realRoot, source.root))
+        source.shareable = source.available &&
+          storeDev !== null &&
+          stat.dev === storeDev &&
+          this.mode === "link"
       } catch (error) {
-        return { status: "stale" }
+        if (!isMissingError(error)) throw error
+        source.available = false
+        source.shareable = false
       }
-      const after = await lstatIfPresent(targetPath)
-      if (!sameSnapshot(before, after) ||
-          verifiedTarget.hash !== hash || verifiedTarget.size !== after.size) {
-        return { status: "stale" }
-      }
-      targetStat = after
+      return source
     }
-    if (storeStat.dev !== targetStat.dev) {
-      return { status: "unavailable", code: "EXDEV" }
-    }
-    if (storeStat.dev === targetStat.dev && storeStat.ino === targetStat.ino) {
-      this.registry.addLink(targetPath, { hash, app: meta.app || null, source_id: meta.source_id || null, dev: storeStat.dev, ino: storeStat.ino, mode: "link" })
-      await this.refreshLinkSnapshots(hash, storeStat.dev, storeStat.ino)
-      return { status: "already" }
-    }
-    if (storeStat.size !== targetStat.size) {
-      return { status: "size-mismatch" }
-    }
-    if (!sameFileMetadata(storeStat, targetStat)) {
-      return { status: "metadata-mismatch" }
-    }
-    const verifiedStore = await this.verifyStoreContent(hash, storePath, storeStat)
-    if (!verifiedStore.valid) return { status: "stale-blob" }
-    if (meta.source && this.sourceAppIsRunning(meta.source)) return { status: "locked" }
-    const tmp = targetPath + TMP_SUFFIX
-    let ownsTmp = false
+
+    let apps = []
     try {
-      try {
-        await fs.promises.link(storePath, tmp)
-        ownsTmp = true
-      } catch (e) {
-        if (e.code === "EEXIST") {
-          let tmpStat = null
-          try { tmpStat = await fs.promises.lstat(tmp) } catch (error) {}
-          if (!tmpStat || tmpStat.dev !== storeStat.dev || tmpStat.ino !== storeStat.ino) {
-            return { status: "conflict" }
-          }
-        } else {
-          throw e
-        }
-      }
-      // Narrow the portable stat/rename race as far as Node permits. The app
-      // guard prevents known Pinokio writers; arbitrary external writers in the
-      // final syscall-sized interval are the documented residual limitation.
-      if (meta.source && this.sourceAppIsRunning(meta.source)) {
-        if (ownsTmp) await unlinkIfSame(tmp, storeStat).catch(() => {})
-        return { status: "locked" }
-      }
-      const currentTmpStat = await lstatIfPresent(tmp)
-      if (!currentTmpStat || currentTmpStat.dev !== storeStat.dev || currentTmpStat.ino !== storeStat.ino) {
-        if (ownsTmp) await unlinkIfSame(tmp, storeStat).catch(() => {})
-        return { status: "conflict" }
-      }
-      const currentTargetStat = await fs.promises.lstat(targetPath)
-      if (!sameSnapshot(fileSnapshot(targetStat), currentTargetStat)) {
-        if (ownsTmp) await unlinkIfSame(tmp, storeStat).catch(() => {})
-        return { status: "stale" }
-      }
-      const currentStoreStat = await this.storeStatIfPresent(storePath)
-      // Creating our temporary hardlink changes ctime on the shared inode.
-      // Identity, size, and mtime still detect replacement or content writes.
-      if (!currentStoreStat || !sameContentState(verifiedStore.snapshot, currentStoreStat) ||
-          !sameFileMetadata(currentStoreStat, currentTargetStat)) {
-        if (ownsTmp) await unlinkIfSame(tmp, storeStat).catch(() => {})
-        return { status: "stale-blob" }
-      }
-      await fs.promises.rename(tmp, targetPath)
-      ownsTmp = false
-    } catch (e) {
-      if (ownsTmp) await unlinkIfSame(tmp, storeStat).catch(() => {})
-      if (LOCK_CODES.has(e.code)) {
-        return { status: "locked" }
-      }
-      if (NO_LINK_CODES.has(e.code)) {
-        return { status: "unavailable", code: e.code }
-      }
-      throw e
-    }
-    let st
-    try {
-      st = await fs.promises.lstat(targetPath)
+      apps = await fs.promises.readdir(apiRoot, { withFileTypes: true })
     } catch (error) {
-      if (isMissingError(error)) return { status: "stale" }
-      // rename() is the commit point: it succeeded with a temporary name
-      // whose identity was already verified. A later metadata read failure
-      // must not report the completed replacement as failed.
-      st = storeStat
+      if (!isMissingError(error)) throw error
     }
-    if (st.dev !== storeStat.dev || st.ino !== storeStat.ino) {
-      return { status: "stale" }
+    for (const entry of apps) {
+      if (!entry.isDirectory() || entry.isSymbolicLink()) continue
+      sources.push(await decorate({
+        id: sourceId("app", entry.name),
+        kind: "app",
+        label: entry.name,
+        app: entry.name,
+        root: path.resolve(apiRoot, entry.name),
+        parent_id: "apps"
+      }))
     }
-    this.registry.addLink(targetPath, {
-      hash, app: meta.app || null, source_id: meta.source_id || null,
-      dev: st.dev, ino: st.ino, mode: "link", batch_id: meta.batch_id || null
-    })
-    await this.refreshLinkSnapshots(hash, st.dev, st.ino)
-    this.registry.addSaved(storeStat.size)
-    await this.recordEvent({
-      kind: "convert", hash, path: targetPath, app: meta.app || null, source_id: meta.source_id || null,
-      bytes_saved: storeStat.size, batch_id: meta.batch_id || null
-    })
-    return { status: "converted", bytes_saved: storeStat.size }
-  }
-  sourceAppIsRunning(source) {
-    if (!source || source.kind !== "app") return false
-    const appRoot = path.resolve(this.kernel.homedir, "api", source.app)
-    const api = this.kernel.api || {}
-    const running = api.running || {}
-    const runningPaths = api.running_paths || {}
-    return Object.keys(running).some((runningId) => {
-      if (!running[runningId]) return false
-      const runningPath = runningPaths[runningId] || (path.isAbsolute(runningId) ? runningId.split("?")[0] : null)
-      return !!(runningPath && isPathWithin(appRoot, runningPath))
-    })
-  }
-  storeCandidateIndex() {
-    const index = new Map()
-    for (const [filePath, entry] of this.registry.links) {
-      if (!index.has(entry.hash)) index.set(entry.hash, new Map())
-      const byDevice = index.get(entry.hash)
-      if (!byDevice.has(entry.dev)) byDevice.set(entry.dev, [])
-      byDevice.get(entry.dev).push([filePath, entry])
-    }
-    return index
-  }
-  async ensureStoreForHash(hash, dev, indexedCandidates = null) {
-    const storePath = this.storePathFor(hash)
-    const existing = await this.storeStatIfPresent(storePath)
-    if (existing && existing.isFile()) return { status: "ready" }
 
-    let locked = false
-    let stale = false
-    const candidates = indexedCandidates || [...this.registry.links].filter(([, entry]) =>
-      entry.hash === hash && (dev === undefined || entry.dev === dev))
-    for (const [filePath, entry] of candidates) {
-      const source = this.sourceForPath(filePath, entry.source_id)
-      if (!source || !source.shareable ||
-          !await this.canonicalPathIsWithinSource(filePath, source)) {
-        continue
-      }
-      if (this.sourceAppIsRunning(source)) {
-        locked = true
-        continue
-      }
-      const expected = this.registry.scanIndex.get(filePath)
-      const current = await lstatIfPresent(filePath)
-      if (!expected || expected.hash !== hash || !current || !current.isFile() ||
-          !sameSnapshot(expected, current)) {
-        this.registry.untrack(filePath)
-        stale = true
-        continue
-      }
-      const result = await this.adopt(filePath, hash, {
-        app: source.kind === "app" ? source.app : (entry.app || null),
-        source_id: source.id,
-        expected: fileSnapshot(current)
-      })
-      if (result.status === "adopted" || result.status === "already" ||
-          result.status === "duplicate") {
-        return { status: "ready" }
-      }
-      if (result.status === "stale") stale = true
-      else if (result.status === "copy-mode") return { status: "unavailable" }
+    for (const configuredPath of await this.registry.externalSources()) {
+      sources.push(await decorate({
+        id: sourceId("external", configuredPath),
+        kind: "external",
+        label: path.basename(configuredPath) || configuredPath,
+        root: configuredPath,
+        parent_id: "external",
+        configured: true
+      }))
     }
-    if (locked) return { status: "locked" }
-    return { status: stale ? "stale" : "no-blob" }
-  }
-  async deduplicateFile(filePath, options = {}) {
-    if (!this.enabled || typeof filePath !== "string" || !filePath) {
-      return { status: this.enabled ? "not-found" : "disabled" }
-    }
-    await this.refreshSources()
-    return this.deduplicateExcludedFile(filePath, options)
-  }
-  async deduplicateExcludedFile(filePath, options = {}) {
-    const targetPath = path.resolve(filePath)
-    const excluded = this.registry.excluded.get(targetPath)
-    if (!excluded) return { status: "not-found" }
-    const source = this.sourceForPath(targetPath, excluded.source_id)
-    if (!source || !await this.canonicalPathIsWithinSource(targetPath, source)) {
-      return { status: "stale" }
-    }
-    if (!source.shareable) return { status: "unavailable" }
-    if (this.sourceAppIsRunning(source)) return { status: "locked" }
 
-    const before = await lstatIfPresent(targetPath)
-    if (!before || !before.isFile()) return { status: "stale" }
-    let hashed
+    let homeEntries = []
     try {
-      hashed = await this.hashFile(targetPath)
+      homeEntries = await fs.promises.readdir(home, { withFileTypes: true })
     } catch (error) {
-      return { status: "stale" }
+      if (!isMissingError(error)) throw error
     }
-    const after = await lstatIfPresent(targetPath)
-    if (!sameSnapshot(fileSnapshot(before), after) || hashed.size !== after.size) {
-      return { status: "stale" }
+    for (const entry of homeEntries) {
+      if (!entry.isDirectory() || entry.isSymbolicLink() ||
+          entry.name === "api" || entry.name === "vault") continue
+      sources.push(await decorate({
+        id: sourceId("folder", entry.name),
+        kind: "folder",
+        label: entry.name,
+        root: path.resolve(home, entry.name),
+        parent_id: "pinokio"
+      }))
     }
-    if (!this.registry.blobs.has(hashed.hash)) return { status: "no-match" }
-    if (!await this.canonicalPathIsWithinSource(targetPath, source)) return { status: "stale" }
-    const indexedCandidates = options.storeCandidates
-      ? (options.storeCandidates.get(hashed.hash)?.get(after.dev) || [])
-      : null
-    const prepared = await this.ensureStoreForHash(hashed.hash, after.dev, indexedCandidates)
-    if (prepared.status !== "ready") return prepared
-    const current = await lstatIfPresent(targetPath)
-    if (!sameSnapshot(fileSnapshot(after), current)) return { status: "stale" }
 
-    const result = await this.convert(targetPath, hashed.hash, {
-      app: source.kind === "app" ? source.app : null,
-      source_id: source.id,
-      batch_id: options.batch_id || `batch-${crypto.randomUUID()}`,
-      source,
-      expected: fileSnapshot(current)
-    })
-    if (result.status === "converted" || result.status === "already") {
-      this.registry.allowSharing(targetPath)
+    const pinokio = sources.find((source) => source.id === "pinokio")
+    if (pinokio) await decorate(pinokio)
+    this._sources = sources
+    this._sourcesById = new Map(
+      sources.map((source) => [source.id, source])
+    )
+    this._sourceBases = new Map()
+    for (const source of sources) {
+      if (!source.root || source.kind === "virtual") continue
+      const resolved = path.resolve(source.root)
+      const key = process.platform === "win32"
+        ? resolved.toLowerCase()
+        : resolved
+      if (!this._sourceBases.has(key)) this._sourceBases.set(key, [])
+      this._sourceBases.get(key).push(source)
     }
-    return result
+    return sources
   }
+
+  sources() {
+    return this._sources
+  }
+
+  sourceForPath(filePath, preferredId = null) {
+    let cursor = path.resolve(filePath)
+    while (true) {
+      const key = process.platform === "win32"
+        ? cursor.toLowerCase()
+        : cursor
+      const matches = this._sourceBases.get(key)
+      if (matches && matches.length) {
+        return matches.find((source) => source.id === preferredId) || matches[0]
+      }
+      const parent = path.dirname(cursor)
+      if (parent === cursor) return null
+      cursor = parent
+    }
+  }
+
   sourceIsWithinScope(source, scopeId) {
     if (!scopeId) return true
     const seen = new Set()
@@ -1332,1206 +558,1377 @@ class Vault {
     while (current && !seen.has(current.id)) {
       if (current.id === scopeId) return true
       seen.add(current.id)
-      current = this._sources.find((item) => item.id === current.parent_id)
+      current = this._sourcesById.get(current.parent_id)
     }
     return false
   }
-  async deduplicateSelection(selection, scopeId, options = {}) {
-    if (selection === "duplicates") {
-      return this.deduplicateScope(scopeId, Object.assign({}, options, { includeDescendants: true }))
-    }
-    await this.refreshSources()
-    if (scopeId && !this._sources.some((source) => source.id === scopeId)) {
-      return { error: "That location is no longer available. Scan again to refresh it." }
-    }
-    const paths = [...this.registry.excluded].filter(([filePath, entry]) => {
-      const source = this.sourceForPath(filePath, entry.source_id)
-      return source ? this.sourceIsWithinScope(source, scopeId) : !scopeId
-    }).map(([filePath]) => filePath)
-    if (options.progress) options.progress.files_total = paths.length
-    const summary = {
-      converted: 0, bytes_saved: 0, locked: 0, stale: 0, unmatched: 0,
-      incompatible: 0, unavailable: 0, failed: 0
-    }
-    const batch = options.batch_id || `batch-${crypto.randomUUID()}`
-    const storeCandidates = this.storeCandidateIndex()
-    for (const filePath of paths) {
-      try {
-        const result = await this.deduplicateExcludedFile(filePath, {
-          batch_id: batch,
-          storeCandidates
-        })
-        if (result.status === "converted" || result.status === "already") {
-          summary.converted += 1
-          summary.bytes_saved += result.bytes_saved || 0
-        } else if (result.status === "locked") {
-          summary.locked += 1
-        } else if (result.status === "stale") {
-          summary.stale += 1
-        } else if (result.status === "no-match" || result.status === "no-blob" ||
-            result.status === "size-mismatch") {
-          summary.unmatched += 1
-        } else if (result.status === "metadata-mismatch") {
-          summary.incompatible += 1
-        } else if (result.status === "unavailable" || result.status === "copy-mode") {
-          summary.unavailable += 1
-        } else {
-          summary.failed += 1
-        }
-      } catch (error) {
-        summary.failed += 1
-      }
-      if (options.progress) options.progress.files_completed += 1
-    }
-    return summary
-  }
-  async deduplicateScope(scopeId, options = {}) {
-    await this.refreshSources()
-    const includeDescendants = options.includeDescendants === true
-    const source = scopeId
-      ? this._sources.find((item) => item.id === scopeId && (includeDescendants || item.kind !== "virtual"))
-      : null
-    if ((!includeDescendants || scopeId) && !source) {
-      return { error: "That location is no longer available. Scan again to refresh it." }
-    }
-    if (!includeDescendants) {
-      if (!source.shareable) return { error: "This location is on a disk that cannot share space with this vault." }
-      if (this.sourceAppIsRunning(source)) {
-        return { error: "This app has a running script. Stop it first, then deduplicate." }
-      }
-    }
 
-    const registry = this.registry
-    const batch = options.batch_id || `batch-${crypto.randomUUID()}`
-    const summary = { converted: 0, bytes_saved: 0, locked: 0, stale: 0, incompatible: 0, unavailable: 0, failed: 0 }
-    const staleHashes = new Set()
-    const entries = [...registry.duplicates]
-    const storeCandidates = this.storeCandidateIndex()
-    const matchesScope = (currentSource) => currentSource && currentSource.shareable &&
-      (includeDescendants ? this.sourceIsWithinScope(currentSource, scopeId) : currentSource.id === scopeId)
-    if (options.progress) {
-      options.progress.files_total = entries.reduce((total, [filePath, entry]) => {
-        const currentSource = this.sourceForPath(filePath, entry.source_id)
-        return total + (matchesScope(currentSource) ? 1 : 0)
-      }, 0)
-    }
-    const completeProgress = () => {
-      if (options.progress) options.progress.files_completed += 1
-    }
-    for (const [filePath, entry] of entries) {
-      const currentSource = this.sourceForPath(filePath, entry.source_id)
-      if (!matchesScope(currentSource)) continue
-      if (!await this.canonicalPathIsWithinSource(filePath, currentSource)) {
-        summary.stale += 1
-        completeProgress()
-        continue
-      }
-      const indexed = registry.scanIndex.get(filePath)
-      const expected = indexed && indexed.hash === entry.hash
-        ? indexed
-        : (entry.dev !== undefined && entry.ino !== undefined &&
-            entry.mtime !== undefined && entry.ctime !== undefined ? entry : null)
-      if (!expected) {
-        summary.stale += 1
-        completeProgress()
-        continue
-      }
-      if (staleHashes.has(entry.hash)) {
-        summary.stale += 1
-        completeProgress()
-        continue
-      }
-      try {
-        const indexedCandidates = storeCandidates.get(entry.hash)?.get(expected.dev) || []
-        const prepared = await this.ensureStoreForHash(entry.hash, expected.dev, indexedCandidates)
-        if (prepared.status !== "ready") {
-          if (prepared.status === "locked") summary.locked += 1
-          else if (prepared.status === "stale") summary.stale += 1
-          else if (prepared.status === "unavailable") summary.unavailable += 1
-          else summary.failed += 1
-          completeProgress()
-          continue
-        }
-        const result = await this.convert(filePath, entry.hash, {
-          app: currentSource.kind === "app" ? currentSource.app : (entry.app || null),
-          source_id: currentSource.id,
-          batch_id: batch,
-          source: currentSource,
-          expected
-        })
-        if (result.status === "converted" || result.status === "already") {
-          summary.converted += 1
-          summary.bytes_saved += result.bytes_saved || 0
-        } else if (result.status === "locked") {
-          summary.locked += 1
-        } else if (result.status === "stale") {
-          summary.stale += 1
-        } else if (result.status === "stale-blob") {
-          staleHashes.add(entry.hash)
-          summary.stale += 1
-        } else if (result.status === "metadata-mismatch") {
-          entry.unavailable_reason = "metadata"
-          summary.incompatible += 1
-        } else if (result.status === "unavailable" || result.status === "copy-mode") {
-          summary.unavailable += 1
-        } else {
-          summary.failed += 1
-        }
-      } catch (error) {
-        summary.failed += 1
-      }
-      completeProgress()
-    }
-    registry.schedulePersist()
-    return summary
+  scanSource(scopeId) {
+    if (!scopeId) return null
+    const source = this._sourcesById.get(scopeId)
+    return source &&
+      source.kind !== "virtual" &&
+      source.available &&
+      source.root
+      ? source
+      : null
   }
-  // reclaim: delete an orphan's store name. Refuses when any app name remains.
-  async reclaim(hash, options = {}) {
-    if (!this.enabled) return { status: "disabled" }
-    const storePath = this.storePathFor(hash)
-    if (!this.registry.blobs.has(hash)) return { status: "not-found" }
-    const st = await this.storeStatIfPresent(storePath)
-    if (!st) {
-      const hasCopyNames = options.hasCopyNames === undefined
-        ? [...this.registry.links.values()].some((entry) => entry.hash === hash && entry.mode === "copy")
-        : options.hasCopyNames
-      if (hasCopyNames) return { status: "unavailable" }
-      if (!options.deferRegistry) this.registry.removeBlob(hash)
-      return options.deferRegistry ? { status: "gone", remove_hash: true } : { status: "gone" }
+
+  scanRoots(scopeId = null) {
+    if (scopeId) {
+      const source = this.scanSource(scopeId)
+      return source
+        ? [{ root: path.resolve(source.root), source_id: source.id }]
+        : []
     }
-    if (!st.isFile()) {
-      if (!options.deferRegistry) this.registry.removeBlob(hash)
-      return options.deferRegistry
-        ? { status: "invalid", remove_hash: true }
-        : { status: "invalid" }
+    const home = path.resolve(this.kernel.homedir)
+    const candidates = [{ root: home, source_id: "pinokio" }]
+    const external = this._sources
+      .filter((source) =>
+        source.kind === "external" && source.available && source.root)
+      .sort((left, right) =>
+        path.resolve(left.root).length - path.resolve(right.root).length)
+    for (const source of external) {
+      const canonical = path.resolve(source.root)
+      if (candidates.some((candidate) =>
+        isPathWithin(candidate.root, canonical))) continue
+      candidates.push({ root: canonical, source_id: source.id })
     }
-    if (st.nlink > 1) return { status: "in-use" }
-    await fs.promises.unlink(storePath)
-    if (!options.deferRegistry) this.registry.removeBlob(hash)
-    await this.recordEvent({ kind: "reclaim", hash, bytes_saved: st.size })
-    return options.deferRegistry
-      ? { status: "reclaimed", bytes_freed: st.size, remove_hash: true }
-      : { status: "reclaimed", bytes_freed: st.size }
+    return candidates
   }
-  // Rebuild derived state from disk: store filenames are hashes, stat gives
-  // nlink, and (dev, ino) matching re-associates app paths. The replacement
-  // maps are assembled off to the side and swapped in only after the walk so
-  // a long repair never persists a half-reset registry.
-  async rebuild(roots, options = {}) {
-    if (!this.enabled) return
-    const registry = this.registry
-    const preserveState = options.preserveState !== false
-    await this.refreshSources()
-    const walkRoots = roots
-      ? roots.map((root) => typeof root === "string" ? { root, source_id: null } : root)
-      : this.scanRoots()
-    const progress = options.progress || null
-    if (progress) progress.roots_total = walkRoots.length
-    const preserved = preserveState ? {
-      blobs: registry.blobs,
-      links: registry.links,
-      excluded: registry.excluded,
-      totals: registry.totals,
-      lastScan: registry.lastScan,
-      sourceScans: registry.sourceScans,
-      duplicates: registry.duplicates,
-      scanIndex: registry.scanIndex
-    } : null
-    const rebuiltBlobs = new Map()
-    const rebuiltLinks = new Map()
-    const storeInoToHash = new Map()
-    let shards = []
+
+  scopeSourceIds(scopeId = null, locationId = null) {
+    return this._sources
+      .filter((source) => source.kind !== "virtual")
+      .filter((source) => !scopeId || this.sourceIsWithinScope(source, scopeId))
+      .filter((source) =>
+        !locationId || this.sourceIsWithinScope(source, locationId))
+      .map((source) => source.id)
+  }
+
+  async canonicalPathIsWithinSource(filePath, source) {
+    if (!source || !source.root) return false
     try {
-      shards = await fs.promises.readdir(this.blobRoot, { withFileTypes: true })
+      const rootStat = await fs.promises.lstat(source.root)
+      if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return false
+      const [root, target] = await Promise.all([
+        fs.promises.realpath(source.root),
+        fs.promises.realpath(filePath)
+      ])
+      if (source.kind === "external" && !samePath(root, source.root)) {
+        return false
+      }
+      return isPathWithin(root, target)
     } catch (error) {
       if (!isMissingError(error)) throw error
+      return false
     }
-    for (const shardEntry of shards) {
-      if (!shardEntry.isDirectory() || shardEntry.isSymbolicLink() ||
-          !/^[0-9a-f]{2}$/.test(shardEntry.name)) continue
-      const shard = shardEntry.name
-      const shardPath = path.resolve(this.blobRoot, shard)
-      if (!await this.directoryIfSafe(shardPath)) continue
-      let names = []
-      try {
-        names = await fs.promises.readdir(shardPath)
-      } catch (error) {
-        if (isMissingError(error)) continue
-        throw error
+  }
+
+  locationForPath(filePath, preferredId = null) {
+    const source = this.sourceForPath(filePath, preferredId)
+    if (!source) {
+      return {
+        source_id: null,
+        relative_path: path.basename(filePath)
       }
-      for (const name of names) {
-        const repairPause = this.repairCheckpoint(progress, {
-          phase: "vault",
-          current_location: path.resolve(this.blobRoot, shard, name),
-          records_checked: 1
+    }
+    const relative = path.relative(source.root, path.resolve(filePath))
+      .split(path.sep).join("/") || path.basename(filePath)
+    return {
+      source_id: source.id,
+      source_kind: source.kind,
+      source_label: source.label,
+      relative_path: relative
+    }
+  }
+
+  async addExternalSource(folderPath) {
+    if (typeof folderPath !== "string" ||
+        !path.isAbsolute(folderPath.trim())) {
+      throw new Error("Choose a valid folder.")
+    }
+    const canonical = path.resolve(
+      await fs.promises.realpath(folderPath.trim()))
+    const stat = await fs.promises.stat(canonical)
+    if (!stat.isDirectory()) throw new Error("Choose a folder, not a file.")
+
+    const home = path.resolve(await fs.promises.realpath(this.kernel.homedir))
+    if (isPathWithin(home, canonical) || isPathWithin(canonical, home)) {
+      throw new Error(
+        "That folder is already inside Pinokio and is included in scans.")
+    }
+    await this.refreshSources()
+    const existing = this._sources.find((source) =>
+      source.kind === "external" &&
+      source.root &&
+      samePath(source.root, canonical))
+    if (existing) return { created: false, source: existing }
+
+    await this.registry.addExternalSource(canonical)
+    await this.refreshSources()
+    const source = this._sources.find((candidate) =>
+      candidate.kind === "external" &&
+      samePath(candidate.root, canonical))
+    return { created: true, source }
+  }
+
+  async removeExternalSource(sourceIdToRemove) {
+    await this.refreshSources()
+    const source = this._sources.find((candidate) =>
+      candidate.id === sourceIdToRemove &&
+      candidate.kind === "external" &&
+      candidate.configured)
+    if (!source) {
+      return { error: "That external folder is no longer configured." }
+    }
+    await this.registry.removeExternalSourceState(source.root, source.id)
+    await this.refreshSources()
+    return {
+      removed: true,
+      source_id: source.id,
+      label: source.label
+    }
+  }
+
+  async recordEvent(event) {
+    try {
+      await this.registry.addEvent(event)
+      return true
+    } catch (error) {
+      return false
+    }
+  }
+
+  startScan(scopeId = null, sizeThreshold = this.sizeThreshold) {
+    if (!this.enabled || !this.sweeper) {
+      return { started: false, disabled: true }
+    }
+    if (this.scanPromise) return { started: false, already_running: true }
+    this.sizeThreshold = sizeThreshold
+    this.scanError = null
+    this.scanScopeId = scopeId
+    this.scanCancelRequested = false
+    this.scanPromise = this.runExclusive(() => {
+      if (this.scanCancelRequested) {
+        this.sweeper.state = Object.assign(this.sweeper.idleState(), {
+          phase: "cancelled",
+          scope_id: scopeId
         })
-        if (repairPause) await repairPause
-        if (!SHA256_RE.test(name) || !name.startsWith(shard)) continue
-        try {
-          const st = await fs.promises.lstat(path.resolve(this.blobRoot, shard, name))
-          if (!st.isFile()) continue
-          const previous = registry.blobs.get(name)
-          rebuiltBlobs.set(name, {
-            size: st.size,
-            first_seen: previous && previous.first_seen ? previous.first_seen : Date.now(),
-            source_urls: previous && Array.isArray(previous.source_urls) ? [...previous.source_urls] : [],
-            verified_at: Date.now(),
-            orphan: st.nlink === 1
-          })
-          storeInoToHash.set(`${st.dev}:${st.ino}`, name)
-        } catch (error) {
-          if (!isMissingError(error)) throw error
+        return { cancelled: true }
+      }
+      return this.sweeper.scan(scopeId)
+    }).catch((error) => {
+      this.scanError = error && error.message
+        ? error.message
+        : String(error)
+    }).finally(() => {
+      this.scanPromise = null
+      this.scanScopeId = null
+      this.scanCancelRequested = false
+    })
+    return { started: true }
+  }
+
+  cancelScan() {
+    if (!this.scanPromise || !this.sweeper) {
+      return { cancel_requested: false }
+    }
+    this.scanCancelRequested = true
+    if (this.sweeper.state.active && this.sweeper.currentHash &&
+        this.worker) {
+      const error = new Error("Scan cancelled.")
+      error.code = "EVAULTCANCELLED"
+      this.failHashWorker(this.worker, error, true)
+    }
+    return {
+      cancel_requested: this.sweeper.state.active
+        ? this.sweeper.cancel()
+        : true
+    }
+  }
+
+  async perform(action, payload = {}) {
+    if (!this.enabled) return { error: "Save space is disabled." }
+    await this.ensureInitialized()
+    switch (action) {
+      case "add_source": {
+        const result = await this.runExclusive(() =>
+          this.addExternalSource(payload.path))
+        return {
+          created: result.created,
+          source: {
+            id: result.source.id,
+            label: result.source.label,
+            target_path: result.source.root,
+            shareable: !!result.source.shareable
+          }
         }
       }
-    }
-    for (const entry of walkRoots) {
-      let repairPause = this.repairCheckpoint(progress, {
-        phase: "filesystem",
-        current_location: entry.root
-      })
-      if (repairPause) await repairPause
-      await this.walkForInoMatch(
-        entry.root,
-        storeInoToHash,
-        entry.source_id === "pinokio" ? null : entry.source_id,
-        rebuiltLinks,
-        {
-          progress,
-          dirConcurrency: this.repairDirConcurrency,
-          statConcurrency: this.repairStatConcurrency
+      case "remove_source":
+        if (typeof payload.source_id !== "string" || !payload.source_id) {
+          return { error: "Choose an external folder to remove." }
         }
+        return this.runMutation(() =>
+          this.removeExternalSource(payload.source_id))
+      case "scan": {
+        if (payload.scope_id && !this.scanSource(payload.scope_id)) {
+          return { error: "That scan location is no longer available." }
+        }
+        let threshold = this.sizeThreshold
+        if (payload.candidate_size != null) {
+          if (!CANDIDATE_SIZE_OPTIONS.includes(payload.candidate_size)) {
+            return { error: "Choose a valid minimum file size." }
+          }
+          threshold = payload.candidate_size
+        }
+        return this.startScan(payload.scope_id || null, threshold)
+      }
+      case "cancel_scan":
+        return this.cancelScan()
+      case "cancel_file_action":
+        return this.cancelFileAction()
+      case "deduplicate": {
+        const scopeId = typeof payload.scope_id === "string" &&
+          payload.scope_id
+          ? payload.scope_id
+          : null
+        if (scopeId && !this._sources.some((source) =>
+          source.id === scopeId)) {
+          return { error: "That location is no longer available." }
+        }
+        if (typeof payload.path === "string" && payload.path) {
+          return this.runMutation(() => this.runFileAction({
+            kind: "deduplicate-file",
+            path: path.resolve(payload.path)
+          }, () => this.deduplicateFile(payload.path)))
+        }
+        const filesTotal = await this.countActionFiles("duplicate", scopeId)
+        return this.runMutation(() => this.runFileAction({
+          kind: "deduplicate",
+          scope_id: scopeId,
+          files_total: filesTotal,
+          files_completed: 0
+        }, (progress) => this.deduplicateScope(scopeId, { progress })))
+      }
+      case "detach":
+        if (typeof payload.path !== "string" || !payload.path) {
+          return { status: "not-found" }
+        }
+        return this.runMutation(() => this.runFileAction({
+          kind: "make-separate",
+          path: path.resolve(payload.path)
+        }, () => this.separate(payload.path)))
+      case "separate_files": {
+        if (!Array.isArray(payload.paths) ||
+            payload.paths.length === 0 ||
+            payload.paths.length > MAX_BULK_FILE_ACTIONS ||
+            payload.paths.some((item) =>
+              typeof item !== "string" || !item)) {
+          return { error: "Choose valid deduplicated files to separate." }
+        }
+        return this.runMutation(() => this.runFileAction({
+          kind: "separate-files",
+          files_total: new Set(payload.paths.map((item) =>
+            path.resolve(item))).size,
+          files_completed: 0
+        }, (progress) => this.separateFiles(payload.paths, progress)))
+      }
+      case "separate_all": {
+        const selection = this.separateSelection(payload)
+        if (selection.error) return { error: selection.error }
+        const total = await this.registry.matchingFileSummary(
+          "linked", selection.sourceIds, selection.query)
+        if (!total.count) {
+          return { error: "No matching deduplicated files remain." }
+        }
+        return this.runMutation(() => this.runFileAction({
+          kind: "separate-files",
+          files_total: total.count,
+          files_completed: 0,
+          all_matching: true,
+          cancelable: true,
+          cancel_requested: false
+        }, (progress) =>
+          this.separateMatchingFiles(selection, progress)))
+      }
+      case "reclaim":
+        return this.runMutation(() => this.reclaim(payload.hash))
+      case "reclaim_all":
+        return this.runMutation(() => this.reclaimAll())
+      default:
+        return { error: "unknown action" }
+    }
+  }
+
+  sourceAppIsRunning(source) {
+    if (!source || source.kind !== "app") return false
+    const appRoot = path.resolve(this.kernel.homedir, "api", source.app)
+    const api = this.kernel.api || {}
+    const running = api.running || {}
+    const runningPaths = api.running_paths || {}
+    return Object.keys(running).some((id) => {
+      if (!running[id]) return false
+      const runningPath = runningPaths[id] ||
+        (path.isAbsolute(id) ? id.split("?")[0] : null)
+      return !!(runningPath && isPathWithin(appRoot, runningPath))
+    })
+  }
+
+  async refreshInodeSnapshots(hash, dev, ino) {
+    const storePath = this.storePathFor(hash)
+    const storeStat = await this.storeStatIfPresent(storePath)
+    let inodeStat = storeStat &&
+      storeStat.dev === dev &&
+      storeStat.ino === ino
+      ? storeStat
+      : null
+    if (!inodeStat) {
+      const row = await this.registry.firstFileForInode(hash, dev, ino)
+      if (row) {
+        try {
+          const stat = await fs.promises.lstat(row.path)
+          if (stat.isFile() && stat.dev === dev && stat.ino === ino) {
+            inodeStat = stat
+          }
+        } catch (error) {}
+      }
+    }
+    if (inodeStat) {
+      await this.registry.updateInodeSnapshots(
+        dev, ino, fileSnapshot(inodeStat))
+    }
+    const content = await this.registry.getContent(hash)
+    if (content) {
+      await this.registry.upsertContent(Object.assign({}, content, {
+        hash,
+        size: storeStat ? storeStat.size : content.size,
+        anchor_present: !!storeStat,
+        anchor_dev: storeStat ? storeStat.dev : null,
+        anchor_ino: storeStat ? storeStat.ino : null,
+        anchor_size: storeStat ? storeStat.size : null,
+        anchor_mtime: storeStat ? storeStat.mtimeMs : null,
+        anchor_ctime: storeStat ? storeStat.ctimeMs : null,
+        anchor_nlink: storeStat ? storeStat.nlink : null
+      }))
+    }
+  }
+
+  async reclassifyHashes(hashes) {
+    const storeDev = (await fs.promises.stat(this.root)).dev
+    for (const hash of new Set(hashes)) {
+      const storeStat = await this.storeStatIfPresent(
+        this.storePathFor(hash))
+      await this.registry.reclassifyHash(
+        hash,
+        storeDev,
+        this.mode === "link",
+        storeStat ? fileSnapshot(storeStat) : null
       )
-      repairPause = this.repairCheckpoint(progress, {
-        roots_completed: 1,
-        current_location: entry.root
-      })
-      if (repairPause) await repairPause
     }
-    const rebuiltDuplicates = new Map()
-    const rebuiltScanIndex = new Map()
-    const trustedHashes = new Set()
-    if (preserved) {
-      // Copy-mode content has no store inode to rediscover. Preserve only names
-      // whose exact scan snapshot still proves the recorded content group.
-      for (const [linkPath, link] of preserved.links) {
-        const repairPause = this.repairCheckpoint(progress, {
-          phase: "records",
-          current_location: linkPath,
-          records_checked: 1
-        })
-        if (repairPause) await repairPause
-        if (link.mode !== "copy" || preserved.excluded.has(linkPath)) continue
-        const blob = preserved.blobs.get(link.hash)
-        const expected = preserved.scanIndex.get(linkPath)
-        const source = this.sourceForPath(linkPath, link.source_id)
-        if (!blob || !expected || expected.hash !== link.hash || !source ||
-            !await this.canonicalPathIsWithinSource(linkPath, source, { strictErrors: true })) continue
+  }
+
+  async verifyStoreContent(hash, storePath, storeStat) {
+    if (!storeStat || !storeStat.isFile()) return { valid: false }
+    const content = await this.registry.getContent(hash)
+    if (content &&
+        content.anchor_verified_at &&
+        content.anchor_present &&
+        content.anchor_dev === storeStat.dev &&
+        content.anchor_ino === storeStat.ino &&
+        content.anchor_size === storeStat.size &&
+        content.anchor_mtime === storeStat.mtimeMs &&
+        content.anchor_ctime === storeStat.ctimeMs) {
+      return { valid: true, snapshot: fileSnapshot(storeStat) }
+    }
+    const before = fileSnapshot(storeStat)
+    let hashed
+    try {
+      hashed = await this.hashFile(storePath)
+    } catch (error) {
+      return { valid: false }
+    }
+    const after = await this.storeStatIfPresent(storePath)
+    if (!after ||
+        !sameSnapshot(before, after) ||
+        hashed.hash !== hash ||
+        hashed.size !== after.size) {
+      return { valid: false }
+    }
+    await this.registry.upsertContent({
+      hash,
+      size: after.size,
+      first_seen: content && content.first_seen,
+      verified_at: Date.now(),
+      anchor_verified_at: Date.now(),
+      anchor_present: true,
+      anchor_dev: after.dev,
+      anchor_ino: after.ino,
+      anchor_size: after.size,
+      anchor_mtime: after.mtimeMs,
+      anchor_ctime: after.ctimeMs,
+      anchor_nlink: after.nlink
+    })
+    return { valid: true, snapshot: fileSnapshot(after) }
+  }
+
+  async adopt(filePath, hash, expected) {
+    const current = await lstatIfPresent(filePath)
+    if (!current ||
+        !current.isFile() ||
+        !sameSnapshot(expected, current)) {
+      return { status: "stale" }
+    }
+    if (this.mode !== "link") return { status: "unavailable" }
+    const storePath = this.storePathFor(hash)
+    let storeStat = await this.storeStatIfPresent(storePath, {
+      createParent: true
+    })
+    if (storeStat) {
+      if (sameIdentity(storeStat, current)) return { status: "ready" }
+      return { status: "exists" }
+    }
+    try {
+      await fs.promises.link(filePath, storePath)
+    } catch (error) {
+      if (NO_LINK_CODES.has(error && error.code)) {
+        return { status: "unavailable" }
+      }
+      throw error
+    }
+    storeStat = await this.storeStatIfPresent(storePath)
+    const after = await lstatIfPresent(filePath)
+    if (!storeStat ||
+        !after ||
+        !sameIdentity(storeStat, after) ||
+        !sameContentState(expected, after)) {
+      if (storeStat) await unlinkIfSame(storePath, storeStat)
+      return { status: "stale" }
+    }
+    const existing = await this.registry.getFile(filePath)
+    await this.registry.upsertContent({
+      hash,
+      size: storeStat.size,
+      verified_at: Date.now(),
+      anchor_verified_at: Date.now(),
+      anchor_present: true,
+      anchor_dev: storeStat.dev,
+      anchor_ino: storeStat.ino,
+      anchor_size: storeStat.size,
+      anchor_mtime: storeStat.mtimeMs,
+      anchor_ctime: storeStat.ctimeMs,
+      anchor_nlink: storeStat.nlink
+    })
+    await this.registry.upsertFile(Object.assign({}, existing, {
+      path: filePath,
+      hash,
+      size: after.size,
+      mtime: after.mtimeMs,
+      ctime: after.ctimeMs,
+      dev: after.dev,
+      ino: after.ino,
+      source_id: existing && existing.source_id,
+      app: existing && existing.app,
+      status: "linked"
+    }))
+    await this.refreshInodeSnapshots(hash, after.dev, after.ino)
+    return { status: "ready" }
+  }
+
+  async ensureAnchorForHash(hash, targetStat) {
+    const dev = targetStat.dev
+    const storePath = this.storePathFor(hash)
+    const existingStore = await this.storeStatIfPresent(storePath)
+    if (existingStore) {
+      if (existingStore.dev !== dev) return { status: "unavailable" }
+      const verified = await this.verifyStoreContent(
+        hash, storePath, existingStore)
+      return verified.valid
+        ? { status: "ready", stat: existingStore }
+        : { status: "stale" }
+    }
+
+    const candidate = await this.registry.anchorCandidate(
+      hash,
+      dev,
+      targetStat.mode & 0o7777,
+      targetStat.uid,
+      targetStat.gid
+    )
+    if (!candidate) return { status: "no-source" }
+    const source = this.sourceForPath(candidate.path, candidate.source_id)
+    if (!source ||
+        !await this.canonicalPathIsWithinSource(candidate.path, source)) {
+      return { status: "stale" }
+    }
+    if (this.sourceAppIsRunning(source)) return { status: "locked" }
+    const before = await lstatIfPresent(candidate.path)
+    if (!before ||
+        !before.isFile() ||
+        !sameSnapshot(rowSnapshot(candidate), before)) {
+      return { status: "stale" }
+    }
+    const hashed = await this.hashFile(candidate.path)
+    const after = await lstatIfPresent(candidate.path)
+    if (!after ||
+        !sameSnapshot(fileSnapshot(before), after) ||
+        hashed.hash !== hash) {
+      return { status: "stale" }
+    }
+    const adopted = await this.adopt(
+      candidate.path, hash, fileSnapshot(after))
+    if (adopted.status !== "ready") return adopted
+    return {
+      status: "ready",
+      stat: await this.storeStatIfPresent(storePath)
+    }
+  }
+
+  async convert(targetPath) {
+    const target = await this.registry.getFile(targetPath)
+    if (!target || target.status !== "duplicate" || !target.hash) {
+      return { status: "not-found" }
+    }
+    const source = this.sourceForPath(target.path, target.source_id)
+    if (!source ||
+        !await this.canonicalPathIsWithinSource(target.path, source)) {
+      return { status: "stale" }
+    }
+    if (this.sourceAppIsRunning(source)) return { status: "locked" }
+
+    let targetStat = await lstatIfPresent(target.path)
+    if (!targetStat ||
+        !targetStat.isFile() ||
+        !sameSnapshot(rowSnapshot(target), targetStat)) {
+      return { status: "stale" }
+    }
+    const prepared = await this.ensureAnchorForHash(target.hash, targetStat)
+    if (prepared.status !== "ready") return prepared
+    let storeStat = await this.storeStatIfPresent(
+      this.storePathFor(target.hash))
+    if (!storeStat) return { status: "stale" }
+    if (storeStat.dev !== targetStat.dev) {
+      return { status: "unavailable" }
+    }
+    if (sameIdentity(storeStat, targetStat)) {
+      await this.registry.upsertFile(Object.assign({}, target, {
+        status: "linked"
+      }))
+      return { status: "already", bytes_saved: 0 }
+    }
+    if (storeStat.size !== targetStat.size) {
+      return { status: "size-mismatch" }
+    }
+    if (!sameFileMetadata(storeStat, targetStat)) {
+      return { status: "metadata-mismatch" }
+    }
+    const verified = await this.verifyStoreContent(
+      target.hash, this.storePathFor(target.hash), storeStat)
+    if (!verified.valid) return { status: "stale" }
+
+    const temporary = `${target.path}${TMP_SUFFIX}`
+    let temporaryStat = null
+    let committedStat = null
+    try {
+      await fs.promises.link(this.storePathFor(target.hash), temporary)
+      temporaryStat = await fs.promises.lstat(temporary)
+      if (this.sourceAppIsRunning(source)) {
+        await unlinkIfSame(temporary, temporaryStat)
+        return { status: "locked" }
+      }
+      const [currentTarget, currentStore, currentTemporary] =
+        await Promise.all([
+          lstatIfPresent(target.path),
+          this.storeStatIfPresent(this.storePathFor(target.hash)),
+          lstatIfPresent(temporary)
+        ])
+      if (!currentTarget ||
+          !sameSnapshot(fileSnapshot(targetStat), currentTarget) ||
+          !currentStore ||
+          !currentTemporary ||
+          !sameIdentity(currentStore, currentTemporary) ||
+          !sameContentState(verified.snapshot, currentStore)) {
+        await unlinkIfSame(temporary, temporaryStat)
+        return { status: "stale" }
+      }
+      committedStat = temporaryStat
+      await fs.promises.rename(temporary, target.path)
+      temporaryStat = null
+    } catch (error) {
+      if (temporaryStat) {
+        await unlinkIfSame(temporary, temporaryStat).catch(() => {})
+      }
+      if (LOCK_CODES.has(error && error.code)) return { status: "locked" }
+      if (NO_LINK_CODES.has(error && error.code)) {
+        return { status: "unavailable" }
+      }
+      if (error && error.code === "EEXIST") return { status: "conflict" }
+      throw error
+    }
+
+    let finalStat
+    try {
+      finalStat = await fs.promises.lstat(target.path)
+    } catch (error) {
+      if (!committedStat) throw error
+      finalStat = committedStat
+    }
+    storeStat = await this.storeStatIfPresent(this.storePathFor(target.hash))
+    if (!storeStat || !sameIdentity(finalStat, storeStat)) {
+      return { status: "stale" }
+    }
+    await this.registry.upsertFile(Object.assign({}, target, {
+      size: finalStat.size,
+      mtime: finalStat.mtimeMs,
+      ctime: finalStat.ctimeMs,
+      dev: finalStat.dev,
+      ino: finalStat.ino,
+      status: "linked"
+    }))
+    await this.refreshInodeSnapshots(
+      target.hash, finalStat.dev, finalStat.ino)
+    return {
+      status: "converted",
+      bytes_saved: finalStat.size,
+      hash: target.hash,
+      path: target.path,
+      app: target.app,
+      source_id: target.source_id
+    }
+  }
+
+  async countActionFiles(status, scopeId = null) {
+    const sourceIds = this.scopeSourceIds(scopeId)
+    if (scopeId && !sourceIds.length) return 0
+    return this.registry.countActionFiles(status, sourceIds)
+  }
+
+  separateSelection(payload = {}) {
+    const scopeId = typeof payload.scope_id === "string" &&
+      payload.scope_id
+      ? payload.scope_id
+      : null
+    const locationId = typeof payload.location_id === "string" &&
+      payload.location_id
+      ? payload.location_id
+      : null
+    if (scopeId && !this._sourcesById.has(scopeId)) {
+      return { error: "That location is no longer available." }
+    }
+    if (locationId && !this._sourcesById.has(locationId)) {
+      return { error: "That location is no longer available." }
+    }
+    const view = STATUS_VIEWS.has(payload.view) ? payload.view : "all"
+    const statusFilter = STATUS_FILTERS.has(payload.status_filter)
+      ? payload.status_filter
+      : "all"
+    if (view !== "shared" &&
+        !(view === "all" &&
+          (statusFilter === "all" || statusFilter === "shared"))) {
+      return {
+        error: "The current view has no deduplicated files to separate."
+      }
+    }
+    const sourceIds = this.scopeSourceIds(scopeId, locationId)
+    if (!sourceIds.length) {
+      return { error: "That location is no longer available." }
+    }
+    return {
+      sourceIds,
+      query: String(payload.query || "").slice(0, 500).trim()
+    }
+  }
+
+  async deduplicateFile(filePath) {
+    const result = await this.convert(path.resolve(filePath))
+    if (result.status === "converted") {
+      if (!await this.recordEvent({
+        kind: "convert",
+        hash: result.hash,
+        app: result.app,
+        source_id: result.source_id,
+        bytes: result.bytes_saved,
+        files: 1
+      })) {
+        result.activity_warning = true
+      }
+    }
+    return result
+  }
+
+  async deduplicateScope(scopeId = null, options = {}) {
+    const sourceIds = this.scopeSourceIds(scopeId)
+    const summary = {
+      converted: 0,
+      bytes_saved: 0,
+      locked: 0,
+      stale: 0,
+      incompatible: 0,
+      unavailable: 0,
+      failed: 0
+    }
+    if (scopeId && !sourceIds.length) return summary
+    let cursor = ""
+    while (true) {
+      const rows = await this.registry.fileBatch(
+        "duplicate", sourceIds, cursor, 100)
+      if (!rows.length) break
+      for (const row of rows) {
+        cursor = row.path
         try {
-          const st = await fs.promises.lstat(linkPath)
-          if (!st.isFile() || !isCandidateFileSize(st.size, this.sizeThreshold) ||
-              link.dev !== st.dev || link.ino !== st.ino ||
-              !sameSnapshot(expected, st)) continue
-          if (!rebuiltBlobs.has(link.hash)) {
-            rebuiltBlobs.set(link.hash, Object.assign({}, blob, {
-              size: st.size,
-              verified_at: Date.now(),
-              orphan: false
-            }))
+          const result = await this.convert(row.path)
+          if (result.status === "converted") {
+            summary.converted += 1
+            summary.bytes_saved += result.bytes_saved || 0
+          } else if (result.status === "already") {
+            // Another selected path already caused this inode to be shared.
+          } else if (result.status === "locked") {
+            summary.locked += 1
+          } else if (result.status === "metadata-mismatch") {
+            summary.incompatible += 1
+          } else if (result.status === "unavailable") {
+            summary.unavailable += 1
+          } else {
+            summary.stale += 1
           }
-          rebuiltLinks.set(linkPath, Object.assign({}, link, {
-            app: source.kind === "app" ? source.app : (link.app || null),
-            source_id: source.id,
-            dev: st.dev,
-            ino: st.ino,
-            mode: "copy"
-          }))
         } catch (error) {
-          if (!isMissingError(error)) throw error
+          summary.failed += 1
         }
+        if (options.progress) options.progress.files_completed += 1
       }
-      // A store filename is only a trustworthy content hash when at least one
-      // surviving name still matches the snapshot captured when that content
-      // was hashed. Repair itself never hashes, so unverified names are left
-      // without a scan-index entry and the next manual scan hashes them once.
-      for (const [linkPath, link] of rebuiltLinks) {
-        const repairPause = this.repairCheckpoint(progress, {
-          phase: "records",
-          current_location: linkPath,
-          records_checked: 1
-        })
-        if (repairPause) await repairPause
-        const expected = preserved.scanIndex.get(linkPath)
-        if (!expected || expected.hash !== link.hash) continue
-        try {
-          const st = await fs.promises.lstat(linkPath)
-          if (sameSnapshot(expected, st)) trustedHashes.add(link.hash)
-        } catch (error) {
-          if (!isMissingError(error)) throw error
-        }
+    }
+    if (summary.converted) {
+      const scopedSource = scopeId
+        ? this._sources.find((source) => source.id === scopeId)
+        : null
+      if (!await this.recordEvent({
+        kind: "convert",
+        bytes: summary.bytes_saved,
+        files: summary.converted,
+        source_id: scopedSource && scopedSource.kind !== "virtual"
+          ? scopeId
+          : null
+      })) {
+        summary.activity_warning = true
       }
-      for (const [linkPath, link] of rebuiltLinks) {
-        const repairPause = this.repairCheckpoint(progress, {
-          phase: "records",
-          current_location: linkPath,
-          records_checked: 1
-        })
-        if (repairPause) await repairPause
-        if (!trustedHashes.has(link.hash)) continue
-        try {
-          const st = await fs.promises.lstat(linkPath)
-          rebuiltScanIndex.set(linkPath, {
-            hash: link.hash, size: st.size, dev: st.dev, ino: st.ino,
-            mtime: st.mtimeMs, ctime: st.ctimeMs,
-            source_id: link.source_id || null
-          })
-        } catch (error) {
-          if (!isMissingError(error)) throw error
-        }
+    }
+    return summary
+  }
+
+  async copyOut(filePath, expected, source) {
+    const temporary = `${filePath}${TMP_SUFFIX}`
+    let temporaryStat = null
+    try {
+      await fs.promises.copyFile(
+        filePath, temporary, fs.constants.COPYFILE_EXCL)
+      if (Number.isFinite(expected.atimeMs) &&
+          Number.isFinite(expected.mtimeMs)) {
+        await fs.promises.utimes(
+          temporary,
+          new Date(expected.atimeMs),
+          new Date(expected.mtimeMs)
+        )
       }
-      for (const [duplicatePath, duplicate] of preserved.duplicates) {
-        const repairPause = this.repairCheckpoint(progress, {
-          phase: "records",
-          current_location: duplicatePath,
-          records_checked: 1
-        })
-        if (repairPause) await repairPause
-        if (preserved.excluded.has(duplicatePath) || rebuiltLinks.has(duplicatePath) ||
-            !rebuiltBlobs.has(duplicate.hash) || !trustedHashes.has(duplicate.hash) ||
-            !this.sourceForPath(duplicatePath, duplicate.source_id)) continue
-        try {
-          const source = this.sourceForPath(duplicatePath, duplicate.source_id)
-          if (!await this.canonicalPathIsWithinSource(duplicatePath, source, { strictErrors: true })) continue
-          const st = await fs.promises.lstat(duplicatePath)
-          const indexed = preserved.scanIndex.get(duplicatePath)
-          const expected = indexed && indexed.hash === duplicate.hash ? indexed : duplicate
-          if (st.isFile() && sameSnapshot(expected, st)) {
-            rebuiltDuplicates.set(duplicatePath, Object.assign({}, duplicate, {
-              size: st.size, dev: st.dev, ino: st.ino, mtime: st.mtimeMs, ctime: st.ctimeMs
-            }))
-            rebuiltScanIndex.set(duplicatePath, {
-              hash: duplicate.hash, size: st.size, dev: st.dev, ino: st.ino,
-              mtime: st.mtimeMs, ctime: st.ctimeMs,
-              source_id: duplicate.source_id || expected.source_id || null
+      temporaryStat = await fs.promises.lstat(temporary)
+      if (this.sourceAppIsRunning(source)) {
+        await unlinkIfSame(temporary, temporaryStat)
+        return { status: "locked" }
+      }
+      const [current, currentTemporary] = await Promise.all([
+        lstatIfPresent(filePath),
+        lstatIfPresent(temporary)
+      ])
+      if (!current ||
+          !sameSnapshot(expected, current) ||
+          !sameIdentity(temporaryStat, currentTemporary)) {
+        await unlinkIfSame(temporary, temporaryStat)
+        return { status: "stale" }
+      }
+      await fs.promises.rename(temporary, filePath)
+      let finalStat
+      try {
+        finalStat = await fs.promises.lstat(filePath)
+      } catch (error) {
+        // rename() already committed the separate copy. Preserve that
+        // successful action if only the post-commit metadata read failed.
+        finalStat = temporaryStat
+      }
+      if (!sameIdentity(finalStat, temporaryStat)) {
+        return { status: "stale" }
+      }
+      temporaryStat = null
+      return {
+        status: "copied",
+        stat: finalStat
+      }
+    } catch (error) {
+      if (temporaryStat) {
+        await unlinkIfSame(temporary, temporaryStat).catch(() => {})
+      }
+      if (error && error.code === "EEXIST") return { status: "conflict" }
+      if (isMissingError(error)) return { status: "stale" }
+      if (LOCK_CODES.has(error && error.code)) return { status: "locked" }
+      throw error
+    }
+  }
+
+  async separate(filePath, options = {}) {
+    const entry = await this.registry.getFile(filePath)
+    if (!entry) return { status: "not-found" }
+    const source = this.sourceForPath(entry.path, entry.source_id)
+    if (!source ||
+        !await this.canonicalPathIsWithinSource(entry.path, source)) {
+      return { status: "stale" }
+    }
+    const current = await lstatIfPresent(entry.path)
+    if (!current ||
+        !current.isFile() ||
+        !sameSnapshot(rowSnapshot(entry), current)) {
+      return { status: "stale" }
+    }
+    if (entry.status !== "linked") return { status: "not-found" }
+    if (this.sourceAppIsRunning(source)) return { status: "locked" }
+    const copied = await this.copyOut(
+      entry.path, current, source)
+    if (copied.status !== "copied") return copied
+    await this.registry.upsertFile(Object.assign(
+      {},
+      entry,
+      fileSnapshot(copied.stat),
+      {
+        status: "linked",
+        unavailable_reason: null
+      }
+    ))
+    await this.refreshInodeSnapshots(entry.hash, entry.dev, entry.ino)
+    if (options.reclassify !== false) {
+      await this.reclassifyHashes([entry.hash])
+    }
+    const result = {
+      status: "detached",
+      bytes: entry.size,
+      hash: entry.hash
+    }
+    if (options.recordActivity !== false && !await this.recordEvent({
+      kind: "detach",
+      hash: entry.hash,
+      path: entry.path,
+      app: entry.app,
+      source_id: entry.source_id,
+      bytes: entry.size
+    })) result.activity_warning = true
+    return result
+  }
+
+  async separateFiles(filePaths, progress = null) {
+    const summary = {
+      separated: 0,
+      bytes: 0,
+      failed: 0,
+      results: []
+    }
+    let separatedEntry = null
+    let commonSourceId
+    const affectedHashes = new Set()
+    for (const filePath of new Set(filePaths.map((item) =>
+      path.resolve(item)))) {
+      try {
+        const entry = await this.registry.getFile(filePath)
+        const result = entry && entry.status === "linked"
+          ? await this.separate(filePath, {
+              recordActivity: false,
+              reclassify: false
             })
+          : { status: "ineligible" }
+        if (result.status === "detached") {
+          summary.separated += 1
+          summary.bytes += result.bytes || 0
+          separatedEntry = entry
+          affectedHashes.add(result.hash)
+          const entrySourceId = entry.source_id || null
+          commonSourceId = summary.separated === 1
+            ? entrySourceId
+            : commonSourceId === entrySourceId ? commonSourceId : null
+        } else {
+          summary.failed += 1
+        }
+        summary.results.push({ path: filePath, status: result.status })
+      } catch (error) {
+        summary.failed += 1
+        summary.results.push({ path: filePath, status: "failed" })
+      } finally {
+        if (progress) progress.files_completed += 1
+      }
+    }
+    if (affectedHashes.size) {
+      await this.reclassifyHashes(affectedHashes)
+    }
+    const event = {
+      kind: "detach",
+      bytes: summary.bytes,
+      files: summary.separated
+    }
+    if (summary.separated === 1 && separatedEntry) {
+      event.hash = separatedEntry.hash
+      event.path = separatedEntry.path
+      event.app = separatedEntry.app
+      event.source_id = separatedEntry.source_id
+    } else if (commonSourceId) {
+      event.source_id = commonSourceId
+    }
+    if (summary.separated && !await this.recordEvent(event)) {
+      summary.activity_warning = true
+    }
+    return summary
+  }
+
+  async separateMatchingFiles(selection, progress = null) {
+    const summary = {
+      separated: 0,
+      bytes: 0,
+      failed: 0,
+      cancelled: false
+    }
+    let separatedEntry = null
+    let commonSourceId
+    let cursor = ""
+    while (true) {
+      if (this.fileActionCancelRequested) {
+        summary.cancelled = true
+        break
+      }
+      const rows = await this.registry.fileBatch(
+        "linked",
+        selection.sourceIds,
+        cursor,
+        100,
+        selection.query
+      )
+      if (!rows.length) break
+      const affectedHashes = new Set()
+      for (const row of rows) {
+        if (this.fileActionCancelRequested) {
+          summary.cancelled = true
+          break
+        }
+        cursor = row.path
+        try {
+          const entry = await this.registry.getFile(row.path)
+          const result = entry && entry.status === "linked"
+            ? await this.separate(row.path, {
+                recordActivity: false,
+                reclassify: false
+              })
+            : { status: "ineligible" }
+          if (result.status === "detached") {
+            summary.separated += 1
+            summary.bytes += result.bytes || 0
+            separatedEntry = entry
+            affectedHashes.add(result.hash)
+            const entrySourceId = entry.source_id || null
+            commonSourceId = summary.separated === 1
+              ? entrySourceId
+              : commonSourceId === entrySourceId ? commonSourceId : null
+          } else {
+            summary.failed += 1
           }
         } catch (error) {
-          if (!isMissingError(error)) throw error
+          summary.failed += 1
+        } finally {
+          if (progress) progress.files_completed += 1
         }
       }
-      for (const excludedPath of preserved.excluded.keys()) {
-        const repairPause = this.repairCheckpoint(progress, {
-          phase: "records",
-          current_location: excludedPath,
-          records_checked: 1
-        })
-        if (repairPause) await repairPause
-        rebuiltLinks.delete(excludedPath)
-        rebuiltScanIndex.delete(excludedPath)
+      if (affectedHashes.size) {
+        await this.reclassifyHashes(affectedHashes)
       }
+      if (summary.cancelled) break
     }
-    const repairPause = this.repairCheckpoint(progress, {
-      phase: "publishing",
-      current_location: null
-    })
-    if (repairPause) await repairPause
-    const rebuiltByIno = new Map()
-    const rebuiltPathsByIno = new Map()
-    for (const [linkPath, entry] of rebuiltLinks) {
-      const repairPause = this.repairCheckpoint(progress, {
-        phase: "publishing",
-        current_location: linkPath
-      })
-      if (repairPause) await repairPause
-      const key = registry.inoKey(entry.dev, entry.ino)
-      rebuiltByIno.set(key, entry.hash)
-      if (!rebuiltPathsByIno.has(key)) rebuiltPathsByIno.set(key, new Set())
-      rebuiltPathsByIno.get(key).add(linkPath)
+    const event = {
+      kind: "detach",
+      bytes: summary.bytes,
+      files: summary.separated
     }
-    registry.replaceState({
-      blobs: rebuiltBlobs,
-      links: rebuiltLinks,
-      scanIndex: rebuiltScanIndex,
-      duplicates: rebuiltDuplicates,
-      excluded: preserved ? preserved.excluded : new Map(),
-      lastScan: preserved ? preserved.lastScan : null,
-      sourceScans: preserved ? preserved.sourceScans : new Map(),
-      totals: preserved ? preserved.totals : { lifetime_bytes_saved: 0 },
-      byIno: rebuiltByIno,
-      pathsByIno: rebuiltPathsByIno
-    })
-    if (options.flush !== false) await registry.flush()
+    if (summary.separated === 1 && separatedEntry) {
+      event.hash = separatedEntry.hash
+      event.path = separatedEntry.path
+      event.app = separatedEntry.app
+      event.source_id = separatedEntry.source_id
+    } else if (commonSourceId) {
+      event.source_id = commonSourceId
+    }
+    if (summary.separated && !await this.recordEvent(event)) {
+      summary.activity_warning = true
+    }
+    return summary
   }
-  async walkForInoMatch(
-    root,
-    storeInoToHash,
-    preferredSourceId = null,
-    outputLinks = null,
-    options = {}
-  ) {
-    const vaultRoot = path.resolve(this.root)
-    const dirConcurrency = options.dirConcurrency || this.dirConcurrency
-    const statConcurrency = options.statConcurrency || this.statConcurrency
-    const progress = options.progress || null
-    for await (const batch of walkBatches(root, {
-      concurrency: dirConcurrency,
-      statConcurrency,
-      skipDirectory: (full) => full === vaultRoot,
-      strictErrors: true
-    })) {
-      const files = batch.flatMap((group) => group.files.map((file) => file.path))
-      const stats = await statMany(files, statConcurrency, null, {
-        strictErrors: true,
-        followSymlinks: false
-      })
-      for (let index = 0; index < files.length; index++) {
-        const st = stats[index]
-        if (!st || !st.isFile() || !isCandidateFileSize(st.size, this.sizeThreshold)) continue
-        const hash = storeInoToHash.get(`${st.dev}:${st.ino}`)
-        if (hash) {
-          const source = this.sourceForPath(files[index], preferredSourceId)
-          const previous = this.registry.links.get(files[index])
-          const batchId = previous && previous.hash === hash && previous.mode === "link" &&
-            previous.dev === st.dev && previous.ino === st.ino
-            ? previous.batch_id || null
-            : null
-          const link = {
-            hash, app: source && source.kind === "app" ? source.app : null,
-            source_id: source ? source.id : null, dev: st.dev, ino: st.ino,
-            mode: "link", created: Date.now(),
-            batch_id: batchId
+
+  async reclaim(hash) {
+    if (typeof hash !== "string" || !SHA256_RE.test(hash)) {
+      return { status: "not-found" }
+    }
+    const content = await this.registry.getContent(hash)
+    if (!content || !content.anchor_present) {
+      return { status: "not-found" }
+    }
+    const storePath = this.storePathFor(hash)
+    const stat = await this.storeStatIfPresent(storePath)
+    if (!stat) {
+      await this.registry.upsertContent(Object.assign({}, content, {
+        hash,
+        anchor_present: false,
+        anchor_verified_at: null
+      }))
+      return { status: "gone" }
+    }
+    const expected = {
+      size: content.anchor_size,
+      mtime: content.anchor_mtime,
+      ctime: content.anchor_ctime,
+      dev: content.anchor_dev,
+      ino: content.anchor_ino
+    }
+    if (!sameSnapshot(expected, stat)) return { status: "stale" }
+    if (stat.nlink !== 1) return { status: "in-use" }
+    await fs.promises.unlink(storePath)
+    const hasFiles = await this.registry.hasFilesForHash(hash)
+    if (hasFiles) {
+      await this.registry.upsertContent(Object.assign({}, content, {
+        hash,
+        anchor_present: false,
+        anchor_verified_at: null,
+        anchor_dev: null,
+        anchor_ino: null,
+        anchor_size: null,
+        anchor_mtime: null,
+        anchor_ctime: null,
+        anchor_nlink: null
+      }))
+    } else {
+      await this.registry.removeContent(hash)
+    }
+    const result = { status: "reclaimed", bytes_freed: stat.size }
+    if (!await this.recordEvent({
+      kind: "reclaim",
+      hash,
+      bytes: stat.size
+    })) result.activity_warning = true
+    return result
+  }
+
+  async reclaimAll() {
+    const summary = { reclaimed: 0, bytes_freed: 0, failed: 0 }
+    let cursor = ""
+    while (true) {
+      const hashes = await this.registry.reclaimableBatch(cursor, 100)
+      if (!hashes.length) break
+      for (const row of hashes) {
+        cursor = row.hash
+        try {
+          const result = await this.reclaim(row.hash)
+          if (result.status === "reclaimed") {
+            summary.reclaimed += 1
+            summary.bytes_freed += result.bytes_freed || 0
+            if (result.activity_warning) summary.activity_warning = true
+          } else if (!["gone", "in-use"].includes(result.status)) {
+            summary.failed += 1
           }
-          if (outputLinks) outputLinks.set(files[index], link)
-          else this.registry.addLink(files[index], link)
+        } catch (error) {
+          summary.failed += 1
         }
       }
-      const repairPause = this.repairCheckpoint(progress, {
-        phase: "filesystem",
-        current_location: batch.length ? batch[batch.length - 1].dir : root,
-        directories_checked: batch.filter((group) => group.firstChunk).length,
-        files_checked: files.length,
-        work: Math.max(1, files.length)
-      })
-      if (repairPause) await repairPause
     }
+    return summary
   }
-  cloudSyncProvider() {
-    const home = path.resolve(this.kernel.homedir || "").replace(/\\/g, "/").toLowerCase()
-    if (home.includes("/onedrive") || home.includes("/one drive")) return "OneDrive"
-    if (home.includes("/dropbox")) return "Dropbox"
-    if (home.includes("/library/mobile documents/") || home.includes("/icloud drive/")) return "iCloud Drive"
-    return null
+
+  async scanForScope(scopeId) {
+    const direct = await this.registry.scanFor(scopeId)
+    const key = scopeId || ""
+    if (direct || !scopeId) {
+      if (direct) this.lastScanCache.set(key, direct)
+      else this.lastScanCache.delete(key)
+      return direct
+    }
+    const global = await this.registry.scanFor()
+    if (global) this.lastScanCache.set("", global)
+    else this.lastScanCache.delete("")
+    if (!global ||
+        !global.source_files ||
+        !Object.prototype.hasOwnProperty.call(
+          global.source_files, scopeId)) {
+      this.lastScanCache.delete(key)
+      return null
+    }
+    const scoped = Object.assign({}, global, {
+      files: global.source_files[scopeId] || 0,
+      bytes_total: global.source_bytes[scopeId] || 0,
+      hash_failures: global.source_hash_failures
+        ? global.source_hash_failures[scopeId] || 0
+        : 0
+    })
+    this.lastScanCache.set(key, scoped)
+    return scoped
   }
-  // Global state for the vault page and the health endpoint. Answered from
-  // memory + one stat per blob and occupied shard; never a discovery walk.
-  // Large inventories are filtered and paged before they cross the HTTP
-  // boundary, because neither Express nor a browser can safely materialize a
-  // multi-hundred-megabyte JSON string.
+
+  sourceCountMaps(summaryRows) {
+    const counts = {
+      all: {},
+      duplicates: {},
+      shareable: {}
+    }
+    const add = (target, sourceIdValue, amount) => {
+      let current = this._sourcesById.get(sourceIdValue)
+      const seen = new Set()
+      while (current && !seen.has(current.id)) {
+        target[current.id] = (target[current.id] || 0) + amount
+        seen.add(current.id)
+        current = current.parent_id
+          ? this._sourcesById.get(current.parent_id)
+          : null
+      }
+    }
+    for (const row of summaryRows) {
+      const amount = Number(row.file_count) || 0
+      if (!["reference", "duplicate", "linked", "unavailable"]
+        .includes(row.status)) continue
+      add(counts.all, row.source_id, amount)
+      if (row.status === "duplicate" || row.status === "unavailable") {
+        add(counts.duplicates, row.source_id, amount)
+      }
+      if (row.status === "duplicate") {
+        add(counts.shareable, row.source_id, amount)
+      }
+    }
+    return counts
+  }
+
+  publicFileItems(page) {
+    const hashSiblings = new Map()
+    for (const sibling of page.hashSiblings || []) {
+      if (!hashSiblings.has(sibling.hash)) {
+        hashSiblings.set(sibling.hash, [])
+      }
+      hashSiblings.get(sibling.hash).push(sibling)
+    }
+    const inodeSiblings = new Map()
+    for (const sibling of page.inodeSiblings || []) {
+      const key = `${sibling.dev}:${sibling.ino}`
+      if (!inodeSiblings.has(key)) inodeSiblings.set(key, [])
+      inodeSiblings.get(key).push(sibling)
+    }
+    return (page.rows || []).map((row) => {
+      const sampledMatches = row.status === "linked"
+        ? inodeSiblings.get(`${row.dev}:${row.ino}`) || []
+        : hashSiblings.get(row.hash) || []
+      const allMatches = [
+        row,
+        ...sampledMatches.filter((match) => match.path !== row.path)
+      ]
+      const locations = allMatches.map((match) =>
+        Object.assign({
+          path: match.path,
+          app: match.app,
+          dev: match.dev,
+          ino: match.ino
+        }, this.locationForPath(match.path, match.source_id)))
+      const publicStatus = {
+        reference: "tracked",
+        duplicate: "duplicate",
+        unavailable: "duplicate",
+        linked: "shared"
+      }[row.status]
+      const result = Object.assign({
+        path: row.path,
+        hash: row.hash,
+        size: row.size,
+        app: row.app,
+        status: publicStatus,
+        shareable: row.status === "duplicate",
+        unavailable_reason: row.status === "unavailable"
+          ? row.unavailable_reason || "different_disk"
+          : null,
+        location_count: sampledMatches.length
+          ? Number(sampledMatches[0].location_count) || 1
+          : 1,
+        locations
+      }, this.locationForPath(row.path, row.source_id))
+      if (row.status === "duplicate" || row.status === "unavailable") {
+        const match = allMatches.find((candidate) =>
+          candidate.path !== row.path)
+        result.match = match
+          ? Object.assign({
+            path: match.path,
+            app: match.app
+          }, this.locationForPath(match.path, match.source_id))
+          : null
+      }
+      return result
+    })
+  }
+
   async status(scopeId = null, options = {}) {
     if (!this.enabled || !this.registry) return { enabled: false }
-    const registry = this.registry
-    const scope = scopeId ? this.scanSource(scopeId) : null
-    if (scopeId && !scope) throw new Error("That location is no longer available.")
     const view = STATUS_VIEWS.has(options.view) ? options.view : "all"
     const statusFilter = STATUS_FILTERS.has(options.status_filter)
       ? options.status_filter
       : "all"
-    const sizeSort = options.size_sort === "asc" || options.size_sort === "desc"
-      ? options.size_sort
-      : null
-    const query = String(options.query || "").slice(0, 500).trim().toLowerCase()
-    const pageSize = boundedInteger(options.page_size, STATUS_PAGE_SIZE, 1, STATUS_PAGE_SIZE)
-    const requestedPage = boundedInteger(options.page, 0, 0, 10000)
-    const requestedLocation = typeof options.location_id === "string"
+    const query = String(options.query || "").slice(0, 500).trim()
+    const cursor = typeof options.cursor === "string"
+      ? options.cursor.slice(0, 2048)
+      : ""
+    const pageSize = boundedInteger(
+      options.page_size, STATUS_PAGE_SIZE, 1, STATUS_PAGE_SIZE)
+    const requestedPage = boundedInteger(
+      options.page, 0, 0, Number.MAX_SAFE_INTEGER)
+    const locationId = typeof options.location_id === "string" &&
+      options.location_id
       ? options.location_id
       : null
-    const sourceMap = new Map(this._sources.map((source) => [source.id, source]))
-    const locationId = requestedLocation && sourceMap.has(requestedLocation)
-      ? requestedLocation
-      : null
-    const isInLocation = (candidateId) => {
-      if (!locationId) return true
-      let currentId = candidateId
-      const seen = new Set()
-      while (currentId && !seen.has(currentId)) {
-        if (currentId === locationId) return true
-        seen.add(currentId)
-        const current = sourceMap.get(currentId)
-        currentId = current ? current.parent_id : null
-      }
-      return false
-    }
-    const sourceLabelCache = new Map()
-    const sourceLabel = (id) => {
-      if (sourceLabelCache.has(id)) return sourceLabelCache.get(id)
-      const labels = []
-      let current = sourceMap.get(id)
-      const seen = new Set()
-      while (current && !seen.has(current.id)) {
-        labels.unshift(current.label || "")
-        seen.add(current.id)
-        current = current.parent_id ? sourceMap.get(current.parent_id) : null
-      }
-      const label = labels.join(" / ")
-      sourceLabelCache.set(id, label)
-      return label
-    }
-    const compare = sizeSort
-      ? (left, right) => {
-        const difference = (Number(left.size) || 0) - (Number(right.size) || 0)
-        if (difference) return sizeSort === "asc" ? difference : -difference
-        return left.sort_key.localeCompare(right.sort_key)
-      }
-      : null
-    const selected = new BoundedPage(requestedPage, pageSize, compare)
-    const filteredLocations = new Set()
-    let filteredShareableBytes = 0
-    const matchesCurrent = (record) => {
-      if (view === "all") {
-        if (!record.status) return false
-        if (statusFilter !== "all" && record.status !== statusFilter) return false
-      } else if (view === "duplicates" && record.status !== "duplicate") return false
-      else if (view === "shared" && record.status !== "shared") return false
-      else if (view === "tracked" && record.status !== "tracked") return false
-      else if (view === "independent" && record.status !== "independent") return false
-      else if (view === "reclaimable" && record.kind !== "reclaimable") return false
-      else if (view === "activity" && record.kind !== "activity") return false
-      const recordSourceIds = record.source_ids ||
-        (record.source_id ? [record.source_id] : [])
-      if (locationId && !recordSourceIds.some(isInLocation)) return false
-      if (query && !record.search.includes(query)) return false
-      return true
-    }
-    const addCurrent = (record) => {
-      if (!matchesCurrent(record)) return
-      selected.add(record)
-      for (const sourceId of record.source_ids ||
-        (record.source_id ? [record.source_id] : [])) {
-        filteredLocations.add(sourceId)
-      }
-      if (record.status === "duplicate" && record.shareable) {
-        filteredShareableBytes += Number(record.size) || 0
-      }
-    }
-    const counts = {
-      all: 0, duplicates: 0, shared: 0, tracked: 0,
-      independent: 0, reclaimable: 0, activity: 0
-    }
-    const sourceCounts = { all: {}, duplicates: {}, independent: {} }
-    const shareableBySource = {}
-    const countSource = (target, id) => {
-      let currentId = id
-      const seen = new Set()
-      while (currentId && !seen.has(currentId)) {
-        target[currentId] = (target[currentId] || 0) + 1
-        seen.add(currentId)
-        const current = sourceMap.get(currentId)
-        currentId = current ? current.parent_id : null
-      }
-    }
-    const scopeHashes = scopeId ? new Set() : null
-    if (scopeHashes) {
-      for (const entry of registry.links.values()) {
-        if (entry.source_id === scopeId) scopeHashes.add(entry.hash)
-      }
-      for (const entry of registry.duplicates.values()) {
-        if (entry.source_id === scopeId) scopeHashes.add(entry.hash)
-      }
-    }
-    const namesByHash = new Map()
-    const undoBatchMap = new Map()
-    for (const [linkPath, entry] of registry.links) {
-      if (scopeHashes && !scopeHashes.has(entry.hash)) continue
-      if (!namesByHash.has(entry.hash)) namesByHash.set(entry.hash, [])
-      const location = this.locationForPath(linkPath, entry.source_id)
-      namesByHash.get(entry.hash).push(Object.assign({
-        path: linkPath, app: entry.app || null, mode: entry.mode,
-        dev: entry.dev, ino: entry.ino
-      }, location))
-      if (entry.batch_id && (!scopeId || entry.source_id === scopeId)) {
-        if (!undoBatchMap.has(entry.batch_id)) {
-          undoBatchMap.set(entry.batch_id, {
-            batch_id: entry.batch_id, files: 0, bytes: 0, ts: null,
-            source_ids: new Set()
-          })
-        }
-        const batch = undoBatchMap.get(entry.batch_id)
-        const blob = registry.blobs.get(entry.hash)
-        batch.files += 1
-        batch.bytes += blob && Number.isFinite(blob.size) ? blob.size : 0
-        if (entry.source_id) batch.source_ids.add(entry.source_id)
-      }
-    }
-    const pendingBytesByHash = new Map()
-    for (const entry of registry.duplicates.values()) {
-      if (scopeId && entry.source_id !== scopeId) continue
-      pendingBytesByHash.set(
-        entry.hash,
-        (pendingBytesByHash.get(entry.hash) || 0) + (entry.size || 0)
-      )
-    }
-    const blobEntries = [...registry.blobs]
-      .filter(([hash]) => !scopeHashes || scopeHashes.has(hash))
-    if (!await this.directoryIfSafe(this.root) || !await this.directoryIfSafe(this.blobRoot)) {
-      throw unsafeStoragePath(this.blobRoot)
-    }
-    const storePaths = blobEntries.map(([hash]) => this.storePathFor(hash))
-    await Promise.all([...new Set(storePaths.map((storePath) => path.dirname(storePath)))]
-      .map((shard) => this.directoryIfSafe(shard)))
-    const blobStats = await statMany(
-      storePaths,
-      this.statConcurrency,
-      null,
-      { strictErrors: true, followSymlinks: false }
+    const scopeSourceIds = this.scopeSourceIds(scopeId)
+    const locationSourceIds = this.scopeSourceIds(
+      scopeId,
+      locationId
     )
-    const blobByHash = new Map()
-    const storeStats = new Map()
-    let bytesOnDisk = 0
-    let wouldBe = 0
-    let trackedLogicalBytes = 0
-    let reclaimable = 0
-    for (let index = 0; index < blobEntries.length; index++) {
-      const [hash, blob] = blobEntries[index]
-      const names = namesByHash.get(hash) || []
-      const apps = new Set(names.map((name) => name.app).filter(Boolean))
-      const storeStat = blobStats[index] && blobStats[index].isFile()
-        ? blobStats[index]
-        : null
-      storeStats.set(hash, storeStat)
-      const size = blob.size || 0
-      const linkedCopy = storeStat || names.some((name) => name.mode === "link") ? 1 : 0
-      const copyInodes = new Set(names.filter((name) => name.mode === "copy").map((name) =>
-        name.dev !== undefined && name.ino !== undefined
-          ? `${name.dev}:${name.ino}`
-          : `path:${name.path}`))
-      for (const name of names) {
-        if (name.mode === "link") copyInodes.delete(`${name.dev}:${name.ino}`)
-      }
-      const physicalCopies = linkedCopy + copyInodes.size
-      const pendingBytes = pendingBytesByHash.get(hash) || 0
-      trackedLogicalBytes += (size * names.length) + pendingBytes
-      bytesOnDisk += (size * physicalCopies) + pendingBytes
-      wouldBe += (size * Math.max(physicalCopies, names.length)) + pendingBytes
-      const orphan = !!(storeStat && storeStat.nlink === 1)
-      if (orphan) reclaimable += size
-      blobByHash.set(hash, {
-        hash, size, orphan, nlink: storeStat ? storeStat.nlink : null,
-        names, apps: [...apps], source_urls: blob.source_urls || []
-      })
-    }
-    if (!scopeId) {
-      const lastScan = registry.scanFor()
-      const scannedBytes = lastScan && Number.isFinite(lastScan.bytes_total)
-        ? lastScan.bytes_total
-        : null
-      const untrackedScannedBytes = scannedBytes === null
-        ? 0
-        : Math.max(0, scannedBytes - trackedLogicalBytes)
-      bytesOnDisk += untrackedScannedBytes
-      wouldBe += untrackedScannedBytes
-    }
-    for (const [linkPath, entry] of registry.links) {
-      if (scopeId && entry.source_id !== scopeId) continue
-      const blob = blobByHash.get(entry.hash)
-      if (!blob) continue
-      const name = blob.names.find((candidate) => candidate.path === linkPath)
-      if (!name) continue
-      const linkedNames = blob.names.filter((candidate) => candidate.mode === "link")
-      const status = entry.mode === "link" && linkedNames.length > 1 ? "shared" : "tracked"
-      counts.all += 1
-      counts[status] += 1
-      countSource(sourceCounts.all, entry.source_id)
-      const label = sourceLabel(entry.source_id)
-      addCurrent({
-        kind: "file", status, path: linkPath, source_id: entry.source_id,
-        hash: entry.hash, size: blob.size, name, blob,
-        sort_key: sizeSort ? `${label}\u0000${linkPath}` : "",
-        search: query ? `${linkPath} ${label}`.toLowerCase() : ""
-      })
-    }
-    let duplicateBytes = 0
-    let shareableDuplicateBytes = 0
-    let shareableDuplicates = 0
-    const duplicateLocations = new Set()
-    for (const [duplicatePath, entry] of registry.duplicates) {
-      if (scopeId && entry.source_id !== scopeId) continue
-      const index = registry.scanIndex.get(duplicatePath)
-      const storeStat = storeStats.get(entry.hash)
-      const blob = blobByHash.get(entry.hash)
-      const source = this.sourceForPath(duplicatePath, entry.source_id)
-      const compatibleName = blob && blob.names.find((name) =>
-        name.path !== duplicatePath &&
-        (!index || index.dev === undefined || name.dev === index.dev))
-      const compatibleStore = storeStat &&
-        (!index || index.dev === undefined || index.dev === storeStat.dev)
-      const shareable = !!(source && source.shareable && !entry.unavailable_reason &&
-        (compatibleStore || compatibleName))
-      let unavailableReason = entry.unavailable_reason || null
-      if (!shareable && !unavailableReason) {
-        unavailableReason = source && storeStat && index &&
-          index.dev !== undefined && index.dev !== storeStat.dev
-          ? "different_disk"
-          : "unsupported_disk"
-      }
-      counts.all += 1
-      counts.duplicates += 1
-      countSource(sourceCounts.all, entry.source_id)
-      countSource(sourceCounts.duplicates, entry.source_id)
-      duplicateBytes += Number(entry.size) || 0
-      if (shareable) {
-        shareableDuplicates += 1
-        shareableDuplicateBytes += Number(entry.size) || 0
-        countSource(shareableBySource, entry.source_id)
-        if (entry.source_id) duplicateLocations.add(entry.source_id)
-      }
-      const label = sourceLabel(entry.source_id)
-      addCurrent({
-        kind: "duplicate", status: "duplicate", path: duplicatePath,
-        source_id: entry.source_id, entry, blob, shareable,
-        unavailable_reason: unavailableReason,
-        match: blob ? blob.names.find((name) => name.path !== duplicatePath) || null : null,
-        size: entry.size || 0,
-        sort_key: sizeSort ? `${label}\u0000${duplicatePath}` : "",
-        search: query ? `${duplicatePath} ${label}`.toLowerCase() : ""
-      })
-    }
-    let excludedBytes = 0
-    for (const [excludedPath, entry] of registry.excluded) {
-      if (scopeId && entry.source_id !== scopeId) continue
-      counts.all += 1
-      counts.independent += 1
-      countSource(sourceCounts.all, entry.source_id)
-      countSource(sourceCounts.independent, entry.source_id)
-      excludedBytes += Number(entry.size) || 0
-      const label = sourceLabel(entry.source_id)
-      addCurrent({
-        kind: "excluded", status: "independent", path: excludedPath,
-        source_id: entry.source_id, entry, size: Number(entry.size) || 0,
-        sort_key: sizeSort ? `${label}\u0000${excludedPath}` : "",
-        search: query ? `${excludedPath} ${label}`.toLowerCase() : ""
-      })
-    }
-    for (const blob of blobByHash.values()) {
-      if (!blob.orphan || scopeId) continue
-      counts.reclaimable += 1
-      const label = blob.names[0] ? blob.names[0].path : blob.hash
-      addCurrent({
-        kind: "reclaimable", status: null, source_id: null,
-        blob, size: blob.size, sort_key: label.toLowerCase(),
-        search: label.toLowerCase()
-      })
-    }
-    const events = (await registry.readEvents()).reverse()
-      .filter((event) => !scopeId || event.source_id === scopeId)
-      .map((event) => {
-        const currentLocation = event.path
+    const snapshot = await this.registry.statusSnapshot({
+      scopeSourceIds,
+      locationSourceIds,
+      scoped: !!scopeId,
+      scopeUnrestricted: !scopeId,
+      locationUnrestricted: !scopeId && !locationId,
+      view,
+      statusFilter,
+      query,
+      pageSize,
+      sizeSort: options.size_sort,
+      cursor
+    })
+    let items
+    if (view === "activity") {
+      items = (snapshot.page.rows || []).map((event) => Object.assign(
+        {},
+        event.path
           ? this.locationForPath(event.path, event.source_id)
-          : null
-        const fallbackLocation = currentLocation && currentLocation.source_id
-          ? currentLocation
-          : (event.path ? { relative_path: event.path } : {})
-        const publicEvent = Object.assign({}, fallbackLocation, event)
-        if (event.kind === "convert" && event.batch_id && event.path) {
-          const current = registry.links.get(event.path)
-          publicEvent.undoable = !!(current && (
-            current.batch_id === event.batch_id ||
-            (!current.batch_id && current.hash === event.hash)
-          ))
-          const batch = undoBatchMap.get(event.batch_id)
-          if (batch && Number.isFinite(event.ts)) {
-            batch.ts = Math.max(batch.ts || 0, event.ts)
-          }
-        }
-        return publicEvent
-      })
-    const seenBatches = new Set()
-    const activity = events.map((event) => {
-      const showUndo = event.kind === "convert" && event.batch_id &&
-        event.undoable !== false && !seenBatches.has(event.batch_id)
-      if (showUndo) seenBatches.add(event.batch_id)
-      return {
-        item: Object.assign({}, event, {
-          activity_type: "event", show_undo: showUndo
-        }),
-        source_ids: event.source_id ? [event.source_id] : []
-      }
-    })
-    for (const batch of undoBatchMap.values()) {
-      if (!seenBatches.has(batch.batch_id)) {
-        activity.push({
-          item: {
-            batch_id: batch.batch_id,
-            files: batch.files,
-            bytes: batch.bytes,
-            ts: batch.ts,
-            activity_type: "batch"
-          },
-          source_ids: [...batch.source_ids]
-        })
-      }
+          : {},
+        event
+      ))
+    } else if (view === "reclaimable") {
+      items = snapshot.page.rows || []
+    } else {
+      items = this.publicFileItems(snapshot.page)
     }
-    counts.activity = activity.length
-    activity.forEach(({ item, source_ids }, order) => {
-      const eventPath = item.path || item.batch_id || ""
-      addCurrent({
-        kind: "activity", status: null, source_id: item.source_id || null,
-        source_ids,
-        item, order, size: item.bytes || item.bytes_saved || item.size || 0,
-        sort_key: String(order).padStart(8, "0"),
-        search: `${item.kind || "convert"} ${eventPath}`.toLowerCase()
-      })
-    })
-    const page = selected.result()
-    const items = page.items.map((record) => {
-      if (record.kind === "file") {
-        return {
-          path: record.path,
-          relative_path: record.name.relative_path || path.basename(record.path),
-          source_id: record.name.source_id,
-          source_label: record.name.source_label,
-          size: record.size,
-          status: record.status,
-          locations: record.blob.names
-        }
-      }
-      if (record.kind === "duplicate") {
-        return Object.assign({
-          path: record.path,
-          hash: record.entry.hash,
-          size: record.size,
-          app: record.entry.app || null,
-          status: "duplicate",
-          shareable: record.shareable,
-          unavailable_reason: record.unavailable_reason,
-          match: record.match
-        }, this.locationForPath(record.path, record.entry.source_id))
-      }
-      if (record.kind === "excluded") {
-        return Object.assign({
-          path: record.path,
-          ts: record.entry.ts || null,
-          size: record.size,
-          status: "independent"
-        }, this.locationForPath(record.path, record.entry.source_id))
-      }
-      if (record.kind === "reclaimable") return record.blob
-      return record.item
-    })
+
+    const lastScan = await this.scanForScope(scopeId)
+    const before = lastScan && Number.isFinite(lastScan.bytes_total)
+      ? lastScan.bytes_total
+      : 0
+    const saved = Math.max(0, Number(snapshot.saved) || 0)
+    const total = Number(snapshot.total) || 0
+    const pages = Math.max(1, Math.ceil(total / pageSize))
     const publicSources = this._sources
       .filter((source) => !scopeId || source.id === scopeId)
       .map((source) => ({
-        id: source.id, kind: source.kind, label: source.label, root: source.root,
-        display_path: source.kind === "pinokio"
-          ? source.root
-          : (source.mount_path || source.root),
+        id: source.id,
+        kind: source.kind,
+        label: source.label,
+        root: source.root,
+        display_path: source.root,
         target_path: source.kind === "external" ? source.root : null,
         parent_id: scopeId ? null : source.parent_id,
         app: source.app || null,
         available: source.available !== false,
         shareable: source.kind === "virtual" ? null : !!source.shareable,
-        removable: source.kind === "external" && source.configured === true
+        removable: source.kind === "external" &&
+          source.configured === true
       }))
+    const sourceCounts = this.sourceCountMaps(snapshot.scopeRows)
     const result = {
       enabled: true,
       mode: this.mode,
       scan: this.scanStatus(),
-      repair: this.repairStatus(),
-      last_scan: registry.scanFor(scopeId),
-      bytes_on_disk: bytesOnDisk,
-      bytes_without_sharing: wouldBe,
-      saved_by_sharing: wouldBe - bytesOnDisk,
-      lifetime_bytes_saved: registry.totals.lifetime_bytes_saved,
-      reclaimable,
-      pending_bytes: shareableDuplicateBytes,
+      last_scan: lastScan,
+      bytes_without_sharing: before,
+      bytes_on_disk: Math.max(0, before - saved),
+      saved_by_sharing: saved,
+      effective_bytes: Math.max(0, before - saved),
+      reclaimable: Number(snapshot.reclaimable) || 0,
+      pending_bytes: Number(snapshot.pending) || 0,
       file_action: this.fileActionStatus(scopeId),
-      activity_error: registry.eventError,
-      cloud_sync_warning: this.cloudSyncProvider(),
       sources: publicSources,
       items,
       inventory: {
         view,
-        counts,
+        counts: snapshot.counts,
         source_counts: sourceCounts,
-        shareable_by_source: shareableBySource,
-        shareable_duplicates: shareableDuplicates,
-        duplicate_locations: duplicateLocations.size,
+        shareable_by_source: sourceCounts.shareable,
+        shareable_duplicates:
+          Number(snapshot.shareableDuplicates) || 0,
+        duplicate_locations:
+          Number(snapshot.duplicateLocations) || 0,
         current: {
-          count: page.total,
-          locations: filteredLocations.size,
-          shareable_bytes: filteredShareableBytes
+          count: total,
+          locations: Number(snapshot.currentLocations) || 0,
+          shareable_bytes:
+            Number(snapshot.currentShareableBytes) || 0,
+          separate_count:
+            Number(snapshot.currentSeparateCount) || 0,
+          separate_bytes:
+            Number(snapshot.currentSeparateBytes) || 0
         },
-        page: page.page,
-        page_size: page.page_size,
-        start: page.start,
-        end: page.end,
-        total: page.total,
-        pages: page.pages
+        page: requestedPage,
+        page_size: pageSize,
+        start: requestedPage * pageSize,
+        end: Math.min((requestedPage * pageSize) + items.length, total),
+        total,
+        pages,
+        cursor: cursor || null,
+        next_cursor: snapshot.page.nextCursor || null,
+        has_previous: requestedPage > 0,
+        has_next: !!snapshot.page.nextCursor
       }
     }
-    if (scopeId) {
-      let linkedBytes = 0
-      let effectiveLinkedBytes = 0
-      let sharedBytes = 0
-      for (const blob of blobByHash.values()) {
-        const scopedNames = blob.names.filter((name) => name.source_id === scopeId)
-        const scopedLinks = scopedNames.filter((name) => name.mode === "link").length
-        const scopedCopies = scopedNames.length - scopedLinks
-        const registeredLinks = blob.names.filter((name) => name.mode === "link").length
-        const filesystemLinks = Number.isFinite(blob.nlink)
-          ? Math.max(0, blob.nlink - 1)
-          : 0
-        const sharingLocations = Math.max(1, registeredLinks, filesystemLinks)
-        linkedBytes += blob.size * scopedNames.length
-        effectiveLinkedBytes += (blob.size * scopedCopies) +
-          (blob.size * scopedLinks / sharingLocations)
-        if (registeredLinks >= 2) sharedBytes += blob.size * scopedLinks
-      }
-      const trackedBytes = linkedBytes + duplicateBytes + excludedBytes
-      const effectiveTrackedBytes = effectiveLinkedBytes + duplicateBytes + excludedBytes
-      const folderBytes = result.last_scan && Number.isFinite(result.last_scan.bytes_total)
-        ? result.last_scan.bytes_total
-        : null
-      result.scope_id = scopeId
-      result.tracked_bytes = trackedBytes
-      result.effective_bytes = folderBytes === null
-        ? null
-        : Math.max(0, folderBytes - trackedBytes) + effectiveTrackedBytes
-      result.shared_bytes = sharedBytes
-      result.reclaimable = 0
-    }
+    if (scopeId) result.scope_id = scopeId
     return result
   }
+
   scanStatus() {
-    const sweeper = this.sweeper
-    if (!sweeper) return null
-    const pending = !!this.scanPromise && !sweeper.state.active
+    if (!this.sweeper) return null
+    const pending = !!this.scanPromise && !this.sweeper.state.active
     const state = pending
-      ? Object.assign(sweeper.idleState(), { phase: "queued", scope_id: this.scanScopeId })
-      : sweeper.state
+      ? Object.assign(this.sweeper.idleState(), {
+        phase: "queued",
+        scope_id: this.scanScopeId
+      })
+      : this.sweeper.state
     return Object.assign({}, state, {
-      current_file: sweeper.currentHash ? path.basename(sweeper.currentHash.path) : null,
-      current_file_bytes: sweeper.currentHash ? sweeper.currentHash.bytes : null,
-      current_file_size: sweeper.currentHash ? sweeper.currentHash.size : null,
+      current_file: this.sweeper.currentHash
+        ? path.basename(this.sweeper.currentHash.path)
+        : null,
+      current_file_bytes: this.sweeper.currentHash
+        ? this.sweeper.currentHash.bytes
+        : null,
+      current_file_size: this.sweeper.currentHash
+        ? this.sweeper.currentHash.size
+        : null,
       pending,
       error: this.scanError
     })
   }
-  repairStatus() {
-    return Object.assign({}, this.repairState || this.idleRepairState(), {
-      required: this.repairRequired
-    })
-  }
+
   fileActionStatus(scopeId = null) {
     const progress = this.fileActionProgress
     if (!progress) return null
-    if (scopeId) {
-      if (progress.scope_id && progress.scope_id !== scopeId) return null
-      if (progress.path) {
-        const source = this.sourceForPath(progress.path)
-        if (!source || source.id !== scopeId) return null
-      }
-    }
+    if (scopeId && progress.scope_id &&
+        progress.scope_id !== scopeId) return null
     return Object.assign({}, progress)
   }
-  progressStatus(scopeId = null) {
+
+  async progressStatus(scopeId = null) {
     return {
       enabled: !!this.enabled,
       scan: this.scanStatus(),
-      repair: this.repairStatus(),
       file_action: this.fileActionStatus(scopeId),
-      last_scan: this.registry ? this.registry.scanFor(scopeId) : null
+      last_scan: this.lastScanCache.get(scopeId || "") || null
     }
-  }
-  async copyOut(filePath, sourcePath, expectedTarget, expectedSource = expectedTarget, options = {}) {
-    const tmp = filePath + TMP_SUFFIX
-    let copiedStat = null
-    try {
-      await fs.promises.copyFile(sourcePath, tmp, fs.constants.COPYFILE_EXCL)
-      copiedStat = await fs.promises.lstat(tmp)
-      if (options.canReplace && !options.canReplace()) {
-        await unlinkIfSame(tmp, copiedStat)
-        return { status: "locked" }
-      }
-      const currentTarget = await lstatIfPresent(filePath)
-      const currentSource = sourcePath === filePath ? currentTarget : await lstatIfPresent(sourcePath)
-      const currentTmp = await lstatIfPresent(tmp)
-      if (!currentTarget || !currentSource || !sameSnapshot(expectedTarget, currentTarget) ||
-          !sameSnapshot(expectedSource, currentSource) || !sameIdentity(currentTmp, copiedStat)) {
-        await unlinkIfSame(tmp, copiedStat)
-        return { status: "stale" }
-      }
-      await fs.promises.rename(tmp, filePath)
-      let finalStat
-      try {
-        finalStat = await lstatIfPresent(filePath)
-      } catch (error) {
-        // The independent copy was committed by rename(). Preserve that
-        // completed action when only the post-commit metadata read failed.
-        finalStat = copiedStat
-      }
-      if (!finalStat || finalStat.dev !== copiedStat.dev || finalStat.ino !== copiedStat.ino) {
-        return { status: "stale" }
-      }
-      copiedStat = null
-      return { status: "copied", stat: finalStat }
-    } catch (error) {
-      await unlinkIfSame(tmp, copiedStat).catch(() => {})
-      if (error && error.code === "EEXIST") return { status: "conflict" }
-      if (isMissingError(error)) return { status: "stale" }
-      throw error
-    }
-  }
-  // detach: make one name an independent copy again ("go back"), and pin it
-  // so future scans neither re-list nor re-share it. Works on linked names
-  // (copies bytes out) and on pending duplicates (just ignores them).
-  async detach(filePath) {
-    if (!this.enabled) return { status: "disabled" }
-    await this.refreshSources()
-    const entry = this.registry.links.get(filePath)
-    if (entry) {
-      const source = this.sourceForPath(filePath, entry.source_id)
-      if (!source || !await this.canonicalPathIsWithinSource(filePath, source)) {
-        return { status: "stale" }
-      }
-      if (entry.mode === "copy") {
-        const st = await lstatIfPresent(filePath)
-        if (!st || !st.isFile() || st.dev !== entry.dev || st.ino !== entry.ino) return { status: "stale" }
-        this.registry.exclude(filePath, {
-          ts: Date.now(), source_id: entry.source_id || null, size: st.size
-        })
-        await this.recordEvent({
-          kind: "skip", hash: entry.hash, path: filePath,
-          app: entry.app || null, source_id: entry.source_id || null, size: st.size
-        })
-        return { status: "ignored" }
-      }
-      if (this.sourceAppIsRunning(source)) return { status: "locked" }
-      const before = await lstatIfPresent(filePath)
-      if (!before || !before.isFile() || before.dev !== entry.dev || before.ino !== entry.ino) return { status: "stale" }
-      const copied = await this.copyOut(filePath, filePath, fileSnapshot(before), fileSnapshot(before), {
-        canReplace: () => !this.sourceAppIsRunning(source)
-      })
-      if (copied.status !== "copied") return copied
-      const st = copied.stat
-      this.registry.exclude(filePath, { ts: Date.now(), source_id: entry.source_id || null, size: st.size })
-      await this.refreshLinkSnapshots(entry.hash, entry.dev, entry.ino)
-      await this.recordEvent({ kind: "detach", hash: entry.hash, path: filePath, app: entry.app || null, source_id: entry.source_id || null, size: st.size })
-      return { status: "detached" }
-    }
-    if (this.registry.duplicates.has(filePath)) {
-      const dup = this.registry.duplicates.get(filePath)
-      this.registry.exclude(filePath, { ts: Date.now(), source_id: dup.source_id || null, size: dup.size || 0 })
-      await this.recordEvent({ kind: "skip", hash: dup.hash, path: filePath, app: dup.app || null, source_id: dup.source_id || null, size: dup.size || 0 })
-      return { status: "ignored" }
-    }
-    return { status: "not-found" }
-  }
-  // Undo a conversion batch: replace each converted name with an independent
-  // copy of the bytes (spec, UX contract surface 3).
-  async undoBatch(batchId) {
-    if (!this.enabled || !batchId) return { undone: 0 }
-    await this.refreshSources()
-    const events = await this.registry.readEvents()
-    const conversionEvents = new Map(events
-      .filter((event) => event.kind === "convert" && event.batch_id === batchId && event.path)
-      .map((event) => [event.path, event]))
-    const targets = new Set(conversionEvents.keys())
-    for (const [filePath, entry] of this.registry.links) {
-      if (entry.batch_id === batchId) targets.add(filePath)
-    }
-    const summary = { undone: 0, bytes: 0, failed: 0 }
-    for (const filePath of targets) {
-      const event = conversionEvents.get(filePath) || {}
-      const entry = this.registry.links.get(filePath)
-      if (!entry || (entry.batch_id && entry.batch_id !== batchId) ||
-          (event.hash && entry.hash !== event.hash)) continue
-      const storePath = this.storePathFor(entry.hash)
-      try {
-        const source = this.sourceForPath(filePath, entry.source_id || event.source_id)
-        if (!source || !await this.canonicalPathIsWithinSource(filePath, source)) {
-          summary.failed += 1
-          continue
-        }
-        if (this.sourceAppIsRunning(source)) {
-          summary.failed += 1
-          continue
-        }
-        const st = await fs.promises.lstat(filePath)
-        const storeStat = await this.storeStatIfPresent(storePath)
-        if (!st.isFile() || !storeStat || !storeStat.isFile()) {
-          summary.failed += 1
-          continue
-        }
-        if (st.ino !== storeStat.ino || st.dev !== storeStat.dev ||
-            st.dev !== entry.dev || st.ino !== entry.ino) {
-          summary.failed += 1
-          continue
-        }
-        const copied = await this.copyOut(filePath, storePath, fileSnapshot(st), fileSnapshot(storeStat), {
-          canReplace: () => !this.sourceAppIsRunning(source)
-        })
-        if (copied.status !== "copied") {
-          summary.failed += 1
-          continue
-        }
-        const independentStat = copied.stat
-        const duplicateEntry = {
-          hash: entry.hash, size: storeStat.size, app: entry.app || null,
-          source_id: entry.source_id || event.source_id || null, discovered: Date.now(),
-          dev: independentStat.dev, ino: independentStat.ino,
-          mtime: independentStat.mtimeMs, ctime: independentStat.ctimeMs
-        }
-        const scanEntry = {
-          hash: entry.hash, size: independentStat.size,
-          dev: independentStat.dev, ino: independentStat.ino,
-          mtime: independentStat.mtimeMs, ctime: independentStat.ctimeMs,
-          source_id: entry.source_id || event.source_id || null
-        }
-        this.registry.setDuplicate(filePath, duplicateEntry, scanEntry)
-        await this.refreshLinkSnapshots(entry.hash, entry.dev, entry.ino)
-        const bytesSaved = event.bytes_saved || storeStat.size
-        this.registry.totals.lifetime_bytes_saved = Math.max(0,
-          this.registry.totals.lifetime_bytes_saved - bytesSaved)
-        await this.recordEvent({
-          kind: "undo", hash: entry.hash, path: filePath,
-          source_id: entry.source_id || event.source_id || null, batch_id: batchId,
-          bytes_saved: bytesSaved
-        })
-        summary.undone += 1
-        summary.bytes += storeStat.size
-      } catch (e) {
-        summary.failed += 1
-      }
-    }
-    this.registry.schedulePersist()
-    return summary
-  }
-  async reclaimAll() {
-    if (!this.enabled) return { reclaimed: 0, bytes_freed: 0 }
-    const summary = { reclaimed: 0, bytes_freed: 0, failed: 0 }
-    const removedHashes = new Set()
-    const copyHashes = new Set([...this.registry.links.values()]
-      .filter((entry) => entry.mode === "copy")
-      .map((entry) => entry.hash))
-    try {
-      for (const [hash] of [...this.registry.blobs]) {
-        const result = await this.reclaim(hash, {
-          deferRegistry: true,
-          hasCopyNames: copyHashes.has(hash)
-        })
-        if (result.remove_hash) removedHashes.add(hash)
-        if (result.status === "reclaimed") {
-          summary.reclaimed += 1
-          summary.bytes_freed += result.bytes_freed || 0
-        } else if (!["gone", "in-use", "unavailable"].includes(result.status)) summary.failed += 1
-      }
-    } finally {
-      this.registry.removeBlobs(removedHashes)
-    }
-    return summary
   }
 }
-
-Vault.SIZE_THRESHOLD = SIZE_THRESHOLD
-Vault.TMP_SUFFIX = TMP_SUFFIX
 
 module.exports = Vault
