@@ -46,22 +46,30 @@ const COPY = {
   scanning_elsewhere_hint: "This app can be scanned when the current scan finishes.",
   cancel: "Cancel",
   cancelling: "Cancelling…",
-  scan_progress: "Scanning your configured locations",
-  scan_location: "Scanning {location}",
+  scan_progress: "Discovering files",
+  scan_location: "Discovering files in {location}",
   scan_queued: "Waiting to start scan",
-  scan_analyzing: "Analyzing files",
+  scan_analyzing: "Verifying duplicates",
   scan_finishing: "Finishing scan",
   scan_finishing_help: "File analysis is complete; the index is being updated",
+  scan_step: "Step {current} of 3",
   scan_file_bytes: "{done} of {total}",
+  scan_hash_progress: "{done} of {total} analyzed · {percent}%",
   scan_folders: "folders checked",
   scan_files: "files checked",
-  analyzing: "analyzing",
+  analyzing: "verifying",
   scan_complete: "Scan complete",
   scan_cancelled: "Scan cancelled",
-  scan_incomplete: "Scan incomplete",
+  scan_completed_with_exclusions: "Scan completed with exclusions",
   scan_unreadable_path: "file or path could not be analyzed",
   scan_unreadable_paths: "files or paths could not be analyzed",
-  scan_partial_rest: "Previous completed results were kept.",
+  scan_partial_rest: "The rest of the scan completed.",
+  scan_preview: "Duplicates found so far",
+  scan_preview_detail: "{count} redundant copies verified · {size} can be saved so far. Provisional until the scan completes.",
+  scan_preview_group: "{files} with identical contents · {size} can be saved",
+  view_matches: "View matches",
+  hide_matches: "Hide matches",
+  partial_results: "Partial results",
   view_unreadable_path: "View affected path",
   view_unreadable_paths: "View affected paths",
   scan_not_analyzed: "could not be analyzed",
@@ -231,6 +239,7 @@ const state = {
   scanBaseline: null,
   scanResult: null,
   scanProblemsOpen: false,
+  scanPreviewOpen: false,
   feedback: null,
   actionProgress: null,
   actionRequest: false,
@@ -924,18 +933,23 @@ const renderOverview = () => {
         </div>
       </div>` : ""
     const opportunity = activeScan
-      ? `<span class="vault-summary-state"><i class="fa-solid fa-circle-notch fa-spin"></i>${esc(COPY.scanning)}</span>`
+      ? ""
       : pendingBytes
         ? `<span class="vault-summary-state attention"><i class="fa-regular fa-copy"></i><strong>${esc(COPY.more_can_be_saved.replace("{size}", fmt(pendingBytes)))}</strong></span>${state.view === "duplicates" ? "" : `<button class="vault-button primary" type="button" id="btn-review-metric">${esc(COPY.review_files)}</button>`}`
         : `<span class="vault-summary-state"><i class="fa-regular fa-circle-check"></i>${esc(COPY.nothing_more_to_save)}</span>`
-    const freshness = last ? `${COPY.scanned} ${timeAgo(last.ts)}` : COPY.not_scanned
+    const freshness = last
+      ? `${last.partial ? `${COPY.partial_results} · ` : ""}${COPY.scanned} ${timeAgo(last.ts)}`
+      : COPY.not_scanned
+    const summarySide = opportunity
+      ? `${opportunity}<span class="vault-summary-divider" aria-hidden="true"></span><span class="vault-summary-freshness">${esc(freshness)}</span>`
+      : `<span class="vault-summary-freshness">${esc(freshness)}</span>`
     metrics.innerHTML = `
       <div class="vault-summary-main">
         <div class="vault-summary-label"><i class="fa-solid fa-hard-drive"></i>${esc(COPY.save_space)}</div>
         <div class="vault-summary-value">${esc(headline)}</div>
         ${comparison}
       </div>
-      <div class="vault-summary-side">${opportunity}<span class="vault-summary-divider" aria-hidden="true"></span><span class="vault-summary-freshness">${esc(freshness)}</span></div>`
+      <div class="vault-summary-side">${summarySide}</div>`
   }
   el("btn-scan").innerHTML = scanning
     ? `<i class="fa-solid fa-xmark"></i>${esc(state.scanCancelRequested ? COPY.cancelling : COPY.cancel)}`
@@ -955,6 +969,7 @@ const renderOverview = () => {
     const scanPhase = scan.phase || "discovering"
     const queued = scanPhase === "queued"
     const walking = scanPhase === "discovering"
+    const hashing = scanPhase === "hashing"
     const finishing = scanPhase === "publishing"
     const currentFileSize = Math.max(0, Number(scan.current_file_size) || 0)
     const currentFileBytes = Math.min(currentFileSize, Math.max(0, Number(scan.current_file_bytes) || 0))
@@ -962,37 +977,48 @@ const renderOverview = () => {
     const scanProgressLabel = scanSource
       ? COPY.scan_location.replace("{location}", scanSource.label)
       : COPY.scan_progress
-    const phase = queued
+    const phaseName = queued
       ? COPY.scan_queued
       : walking
         ? scanProgressLabel
         : finishing
           ? COPY.scan_finishing
           : COPY.scan_analyzing
-    const details = [
-      `${scan.dirs || 0} ${COPY.scan_folders}`,
-      `${scan.files || 0} ${COPY.scan_files}`,
-      fmt(scan.bytes_total || 0)
-    ]
+    const step = queued ? null : walking ? 1 : finishing ? 3 : 2
+    const phase = step
+      ? `${COPY.scan_step.replace("{current}", step)} · ${phaseName}`
+      : phaseName
+    const hashWorkBytes = Math.max(
+      0, Number(scan.hash_work_bytes) || 0)
+    const completedHashBytes = Math.min(
+      hashWorkBytes,
+      Math.max(0, Number(scan.hash_bytes_completed) || 0) +
+        (hashing ? currentFileBytes : 0)
+    )
+    const hashRatio = hashWorkBytes
+      ? Math.min(1, completedHashBytes / hashWorkBytes)
+      : 0
+    const details = hashing && hashWorkBytes
+      ? [COPY.scan_hash_progress
+          .replace("{done}", fmt(completedHashBytes))
+          .replace("{total}", fmt(hashWorkBytes))
+          .replace("{percent}", Math.floor(hashRatio * 100))]
+      : [
+          `${scan.dirs || 0} ${COPY.scan_folders}`,
+          `${scan.files || 0} ${COPY.scan_files}`,
+          fmt(scan.bytes_total || 0)
+        ]
     if (scan.current_file) {
       const fileProgress = currentFileSize
         ? ` (${COPY.scan_file_bytes.replace("{done}", fmt(currentFileBytes)).replace("{total}", fmt(currentFileSize))})`
         : ""
       details.push(`${COPY.analyzing} ${scan.current_file}${fileProgress}`)
     }
-    const progressHelp = finishing ? COPY.scan_finishing_help : phase
-    if (!scanState.querySelector(".vault-progress-track")) {
-      scanState.innerHTML = `<i class="fa-solid fa-circle-notch fa-spin"></i><strong></strong><span class="vault-scan-detail"></span><span class="vault-progress-track" role="progressbar"><span class="vault-progress-bar indeterminate"></span></span>`
-    }
+    const progress = hashing && hashWorkBytes
+      ? `<span class="vault-progress-track" role="progressbar" aria-label="${attr(phaseName)}" aria-valuemin="0" aria-valuemax="${hashWorkBytes}" aria-valuenow="${completedHashBytes}"><span class="vault-progress-bar determinate" style="--vault-progress:${hashRatio}"></span></span>`
+      : `<span class="vault-progress-track" role="progressbar" aria-label="${attr(phaseName)}" aria-valuetext="${attr(`${details.join(" · ")}. ${finishing ? COPY.scan_finishing_help : phaseName}.`)}"><span class="vault-progress-bar indeterminate"></span></span>`
     scanState.classList.add("show")
-    scanState.querySelector("strong").textContent = phase
-    scanState.querySelector(".vault-scan-detail").textContent = details.join(" · ")
-    const track = scanState.querySelector(".vault-progress-track")
-    track.setAttribute("aria-label", phase)
-    track.setAttribute(
-      "aria-valuetext",
-      `${details.join(" · ")}. ${progressHelp}.`
-    )
+    scanState.innerHTML = `<i class="fa-solid fa-circle-notch fa-spin"></i><strong>${esc(phase)}</strong><span class="vault-scan-detail">${esc(details.join(" · "))}</span>${progress}`
   } else {
     scanState.classList.remove("show")
     scanState.innerHTML = ""
@@ -1002,6 +1028,33 @@ const renderOverview = () => {
 const renderResult = () => {
   const result = el("vault-result")
   if (!state.scanResult) {
+    const scan = state.data && state.data.scan
+    const preview = scanMatchesContext(scan) && scan.preview
+    const groups = preview && Array.isArray(preview.groups)
+      ? preview.groups
+      : []
+    if (groups.length) {
+      const count = Math.max(0, Number(preview.duplicate_files) || 0)
+      const detail = COPY.scan_preview_detail
+        .replace("{count}", count)
+        .replace("{size}", fmt(preview.bytes || 0))
+      const groupDetails = groups.map((group) => {
+        const groupDetail = COPY.scan_preview_group
+          .replace("{files}", countLabel(
+            Number(group.locations) || 0, COPY.file, COPY.files))
+          .replace("{size}", fmt(group.bytes || 0))
+        const representative = group.representative_path
+          ? `${group.representative_path} · `
+          : ""
+        return `<div class="vault-result-path"><span class="vault-result-path-dot" aria-hidden="true"></span><span>${esc(`${representative}${groupDetail}`)}</span></div>`
+      }).join("")
+      const toggleLabel = state.scanPreviewOpen
+        ? COPY.hide_matches
+        : COPY.view_matches
+      result.className = `vault-result show preview${state.scanPreviewOpen ? " expanded" : ""}`
+      result.innerHTML = `<div class="vault-result-message"><i class="fa-regular fa-copy"></i><span class="vault-result-heading"><strong>${esc(COPY.scan_preview)}</strong><span>${esc(detail)}</span></span><button class="vault-result-toggle" type="button" id="btn-scan-preview" aria-expanded="${state.scanPreviewOpen}" aria-controls="vault-preview-paths">${esc(toggleLabel)}<i class="fa-solid fa-chevron-down"></i></button></div><div class="vault-result-paths" id="vault-preview-paths"${state.scanPreviewOpen ? "" : " hidden"}>${groupDetails}</div>`
+      return
+    }
     result.className = "vault-result"
     result.innerHTML = ""
     return
@@ -1011,23 +1064,23 @@ const renderResult = () => {
   const review = info.count && state.view !== "duplicates"
     ? `<button class="vault-button primary" type="button" id="btn-review-result">${esc(COPY.review)} ${duplicateLabel}<i class="fa-solid fa-chevron-right"></i></button>`
     : ""
-  if (info.incomplete) {
+  if (info.partial) {
     result.className = `vault-result show incomplete${state.scanProblemsOpen ? " expanded" : ""}`
     const unreadableLabel = `${info.inaccessible} ${info.inaccessible === 1 ? COPY.scan_unreadable_path : COPY.scan_unreadable_paths}`
-    const affectedPaths = info.inaccessiblePaths
-    const viewLabel = affectedPaths.length === 1
+    const exclusions = info.exclusions
+    const viewLabel = exclusions.length === 1
       ? COPY.view_unreadable_path
       : COPY.view_unreadable_paths
-    const paths = info.inaccessiblePaths.map((filePath) =>
-      `<div class="vault-result-path"><span class="vault-result-path-dot" aria-hidden="true"></span><span>${esc(filePath)}</span></div>`
+    const paths = exclusions.map((exclusion) =>
+      `<div class="vault-result-path"><span class="vault-result-path-dot" aria-hidden="true"></span><span>${esc(exclusion.path)} · ${esc(String(exclusion.reason || COPY.scan_not_analyzed).replaceAll("_", " "))}</span></div>`
     ).join("")
-    const toggle = affectedPaths.length
+    const toggle = exclusions.length
       ? `<button class="vault-result-toggle" type="button" id="btn-scan-problems" aria-expanded="${state.scanProblemsOpen}" aria-controls="vault-result-paths">${esc(viewLabel)}<i class="fa-solid fa-chevron-down"></i></button>`
       : ""
-    const pathDetails = affectedPaths.length
+    const pathDetails = exclusions.length
       ? `<div class="vault-result-paths" id="vault-result-paths"${state.scanProblemsOpen ? "" : " hidden"}>${paths}</div>`
       : ""
-    result.innerHTML = `<div class="vault-result-message"><i class="fa-solid fa-triangle-exclamation"></i><span class="vault-result-heading"><strong>${esc(COPY.scan_incomplete)}</strong><span>${esc(`${unreadableLabel}. ${COPY.scan_partial_rest}`)}</span></span><span class="vault-result-actions">${toggle}${review}</span></div>${pathDetails}`
+    result.innerHTML = `<div class="vault-result-message"><i class="fa-solid fa-triangle-exclamation"></i><span class="vault-result-heading"><strong>${esc(COPY.scan_completed_with_exclusions)}</strong><span>${esc(`${unreadableLabel}. ${COPY.scan_partial_rest}`)}</span></span><span class="vault-result-actions">${toggle}${review}</span></div>${pathDetails}`
     return
   }
   result.className = "vault-result show"
@@ -1196,13 +1249,16 @@ const applyFullData = (data) => {
   const scanning = scanActive(data.scan)
   const contextualScan = !IS_APP_MODE || !data.scan || data.scan.scope_id === SCOPE_ID
   const completed = state.scanRequested && !scanning && data.last_scan && data.last_scan.ts !== state.scanBaseline
-  const incomplete = contextualScan && !scanning && data.scan && data.scan.phase === "incomplete"
+  const partial = contextualScan && !scanning && (
+    (data.scan && data.scan.phase === "completed_with_exclusions") ||
+    (completed && data.last_scan && data.last_scan.partial)
+  )
   const cancelled = contextualScan && !scanning && data.scan && data.scan.phase === "cancelled"
   const failed = contextualScan && state.scanRequested && !scanning && data.scan && data.scan.error
   const shareableDuplicateCount = Number(data.inventory.shareable_duplicates) || 0
   const unreviewed = !scanning && data.last_scan &&
     reviewedScan() !== String(data.last_scan.ts) &&
-    (shareableDuplicateCount > 0 || data.last_scan.hash_failures > 0)
+    (shareableDuplicateCount > 0 || data.last_scan.partial)
   state.data = data
   const fileAction = serverFileAction(data.file_action)
   if (fileAction) state.actionProgress = fileAction
@@ -1214,24 +1270,23 @@ const applyFullData = (data) => {
   } else if (cancelled) {
     state.scanRequested = false
     state.feedback = { error: false, message: COPY.scan_cancelled }
-  } else if (completed || incomplete || (!state.scanResult && unreviewed)) {
+  } else if (completed || partial || (!state.scanResult && unreviewed)) {
     state.scanRequested = false
+    const exclusions = Array.isArray(data.last_scan && data.last_scan.exclusions)
+      ? data.last_scan.exclusions
+      : Array.isArray(data.scan && data.scan.exclusions)
+        ? data.scan.exclusions
+        : []
+    const resultPartial = partial ||
+      !!(data.last_scan && data.last_scan.partial)
     state.scanResult = {
       count: Number(data.inventory.shareable_duplicates) || 0,
       locations: Number(data.inventory.duplicate_locations) || 0,
       bytes: Number(data.pending_bytes) || 0,
-      skipped: Number(incomplete
-        ? (data.scan.hash_failures || 0) + (data.scan.unstable_hashes || 0)
-        : data.last_scan && data.last_scan.hash_failures) || 0,
-      incomplete,
-      inaccessible: incomplete
-        ? (Number(data.scan.inaccessible) || 0) +
-          (Number(data.scan.hash_failures) || 0) +
-          (Number(data.scan.unstable_hashes) || 0)
-        : 0,
-      inaccessiblePaths: incomplete && Array.isArray(data.scan.inaccessible_paths)
-        ? data.scan.inaccessible_paths
-        : []
+      skipped: exclusions.length,
+      partial: resultPartial,
+      inaccessible: exclusions.length,
+      exclusions
     }
   }
   render()
@@ -1255,6 +1310,7 @@ const refresh = async (forceFull = false) => {
       if (scanActive(progress.scan) || fileAction) {
         delay = 1500
         renderOverview()
+        renderResult()
         renderActionProgress()
         renderFeedback()
       } else {
@@ -1641,6 +1697,7 @@ document.addEventListener("click", async (event) => {
     state.scanBaseline = state.data.last_scan ? state.data.last_scan.ts : null
     state.scanResult = null
     state.scanProblemsOpen = false
+    state.scanPreviewOpen = false
     state.feedback = null
     try {
       const result = await post({
@@ -1655,6 +1712,16 @@ document.addEventListener("click", async (event) => {
       state.feedback = { error: true, message: error && error.message ? error.message : String(error) }
       renderFeedback()
     }
+  } else if (target.id === "btn-scan-preview") {
+    state.scanPreviewOpen = !state.scanPreviewOpen
+    const paths = el("vault-preview-paths")
+    target.setAttribute("aria-expanded", String(state.scanPreviewOpen))
+    target.firstChild.textContent = state.scanPreviewOpen
+      ? COPY.hide_matches
+      : COPY.view_matches
+    target.closest(".vault-result").classList.toggle(
+      "expanded", state.scanPreviewOpen)
+    if (paths) paths.hidden = !state.scanPreviewOpen
   } else if (target.id === "btn-scan-problems") {
     state.scanProblemsOpen = !state.scanProblemsOpen
     const paths = el("vault-result-paths")
@@ -1662,7 +1729,7 @@ document.addEventListener("click", async (event) => {
     target.closest(".vault-result").classList.toggle("expanded", state.scanProblemsOpen)
     if (paths) paths.hidden = !state.scanProblemsOpen
   } else if (target.id === "btn-review-result" || target.id === "btn-review-metric") {
-    if (!state.scanResult || !state.scanResult.incomplete) markScanReviewed()
+    if (!state.scanResult || !state.scanResult.partial) markScanReviewed()
     state.view = "duplicates"
     state.displayMode = "folders"
     state.sizeSort = null

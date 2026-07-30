@@ -6,6 +6,7 @@ const os = require("node:os")
 const path = require("node:path")
 const Vault = require("../kernel/vault")
 const RegistryCore = require("../kernel/vault/registry_core")
+const { statMany } = require("../kernel/vault/walker")
 
 const homes = []
 const vaults = []
@@ -47,6 +48,26 @@ after(async () => {
 })
 
 describe("Save Space scans", () => {
+  test("a path disappearing during metadata reads is reported", async () => {
+    const root = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "pinokio-vault-missing-"))
+    homes.push(root)
+    const missing = path.join(root, "missing.bin")
+    const errors = []
+
+    const stats = await statMany([missing], 1, null, {
+      followSymlinks: false,
+      strictErrors: true,
+      onError: (error, filePath) => {
+        errors.push({ code: error.code, path: filePath })
+        return true
+      }
+    })
+
+    assert.deepEqual(stats, [null])
+    assert.deepEqual(errors, [{ code: "ENOENT", path: missing }])
+  })
+
   test("a scan reads files without creating anchors or hardlinks", async () => {
     const { home, vault } = await makeVault()
     const contents = crypto.randomBytes(4096)
@@ -59,7 +80,7 @@ describe("Save Space scans", () => {
 
     const result = await vault.sweeper.scan()
 
-    assert.equal(result.incomplete, false)
+    assert.equal(result.partial, false)
     assert.equal(await vault.registry.countFiles(), 2)
     assert.equal(await vault.registry.countFiles(["duplicate"]), 1)
     assert.deepEqual(
@@ -114,13 +135,16 @@ describe("Save Space scans", () => {
 
     await vault.sweeper.scan()
     assert.equal(hashes, 2)
+    assert.equal(vault.sweeper.state.hash_work_files, 2)
     hashes = 0
     await vault.sweeper.scan()
     assert.equal(hashes, 0)
+    assert.equal(vault.sweeper.state.hash_work_files, 0)
 
     await fs.promises.writeFile(second, crypto.randomBytes(contents.length))
     await vault.sweeper.scan()
     assert.equal(hashes, 1)
+    assert.equal(vault.sweeper.state.hash_work_files, 1)
     assert.equal(await vault.registry.countFiles(["duplicate"]), 0)
 
     const linked = path.join(home, "api", "three", "model.bin")
@@ -131,6 +155,7 @@ describe("Save Space scans", () => {
     hashes = 0
     await vault.sweeper.scan()
     assert.equal(hashes, 1)
+    assert.equal(vault.sweeper.state.hash_work_files, 1)
     assert.equal((await vault.registry.getFile(first)).status, "linked")
     assert.equal((await vault.registry.getFile(linked)).status, "linked")
   })
@@ -302,6 +327,88 @@ describe("Save Space scans", () => {
     assert.equal(progress.last_scan.ts, lastScan.ts)
   })
 
+  test("hashing exposes determinate byte progress", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "one", "model.bin"), contents)
+    await write(path.join(home, "api", "two", "model.bin"), contents)
+    const hashFile = vault.hashFile.bind(vault)
+    let release
+    let entered
+    let blocked = false
+    const enteredHash = new Promise((resolve) => { entered = resolve })
+    const gate = new Promise((resolve) => { release = resolve })
+    vault.hashFile = async (filePath, options = {}) => {
+      if (!blocked) {
+        blocked = true
+        if (options.onProgress) options.onProgress(1024)
+        entered()
+        await gate
+      }
+      return hashFile(filePath, options)
+    }
+
+    const pending = vault.sweeper.scan()
+    await enteredHash
+    const progress = vault.scanStatus()
+
+    try {
+      assert.equal(progress.phase, "hashing")
+      assert.equal(progress.hash_work_files, 2)
+      assert.equal(progress.hash_work_bytes, contents.length * 2)
+      assert.equal(progress.hash_files_completed, 0)
+      assert.equal(progress.hash_bytes_completed, 0)
+      assert.equal(progress.current_file_bytes, 1024)
+      assert.equal(progress.current_file_size, contents.length)
+    } finally {
+      release()
+    }
+    await pending
+    assert.equal(vault.scanStatus().hash_files_completed, 2)
+    assert.equal(
+      vault.scanStatus().hash_bytes_completed,
+      contents.length * 2
+    )
+  })
+
+  test("an anchor sharing a scanned inode is not counted as a second read", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const first = await write(
+      path.join(home, "api", "one", "model.bin"), contents)
+    await write(path.join(home, "api", "two", "model.bin"), contents)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    await vault.perform("deduplicate", { path: duplicate.path })
+    const anchor = vault.storePathFor(duplicate.hash)
+    const stat = await fs.promises.stat(anchor)
+    await fs.promises.utimes(
+      anchor,
+      new Date(stat.atimeMs),
+      new Date(stat.mtimeMs + 1000)
+    )
+    let reads = 0
+    const hashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (...args) => {
+      reads += 1
+      return hashFile(...args)
+    }
+
+    await vault.sweeper.scan()
+
+    assert.equal(reads, 1)
+    assert.equal(vault.sweeper.state.hash_work_files, 1)
+    assert.equal(vault.sweeper.state.hash_files_completed, 1)
+    assert.equal(vault.sweeper.state.hash_work_bytes, contents.length)
+    assert.equal(
+      vault.sweeper.state.hash_bytes_completed,
+      contents.length
+    )
+    assert.equal((await vault.registry.getFile(first)).hash, duplicate.hash)
+  })
+
   test("scan staging is temporary and publication rebuilds summaries", async () => {
     const root = await fs.promises.mkdtemp(
       path.join(os.tmpdir(), "pinokio-vault-registry-"))
@@ -322,7 +429,7 @@ describe("Save Space scans", () => {
         SELECT COUNT(*) AS count
         FROM sqlite_temp_master
         WHERE type = 'table' AND name GLOB 'scan_*'
-      `).get().count, 4)
+      `).get().count, 5)
 
       const runId = registry.beginScan()
       const entries = []
@@ -380,7 +487,7 @@ describe("Save Space scans", () => {
     }
   })
 
-  test("a cached inode hash is reused inside a bounded hash batch", async () => {
+  test("a cached inode hash removes that inode from hash work", async () => {
     const root = await fs.promises.mkdtemp(
       path.join(os.tmpdir(), "pinokio-vault-inode-cache-"))
     homes.push(root)
@@ -415,13 +522,7 @@ describe("Save Space scans", () => {
       ]).changes, 2)
 
       const batch = registry.hashWorkBatch(runId)
-      assert.equal(batch.length, 1)
-      assert.equal(batch[0].path, second)
-      assert.equal(batch[0].reusable_hash, hash)
-      assert.equal(
-        registry.setStageInodeHash(runId, 1, 2, hash).changes,
-        1
-      )
+      assert.equal(batch.length, 0)
       assert.equal(registry.database.prepare(`
         SELECT COUNT(*) AS count
         FROM scan_files
@@ -508,7 +609,7 @@ describe("Save Space scans", () => {
     assert.equal(await vault.registry.getFile(filePath), null)
   })
 
-  test("failed and cancelled scans preserve the previous generation", async () => {
+  test("path exclusions publish verified work and cancellation preserves it", async () => {
     const { home, vault } = await makeVault()
     const original = crypto.randomBytes(4096)
     await write(path.join(home, "api", "one", "model.bin"), original)
@@ -530,13 +631,17 @@ describe("Save Space scans", () => {
       }
       return hashFile(filePath, options)
     }
-    const incomplete = await vault.sweeper.scan()
-    assert.equal(incomplete.incomplete, true)
-    assert.equal((await vault.registry.scanFor()).ts, previousScan.ts)
-    assert.deepEqual(
-      [...await vault.registry.files()].map((row) => row.path),
-      previousPaths
-    )
+    const partial = await vault.sweeper.scan()
+    const partialScan = await vault.registry.scanFor()
+    const partialPaths = [...await vault.registry.files()]
+      .map((row) => row.path)
+    assert.equal(partial.partial, true)
+    assert.equal(partial.outcome, "completed_with_exclusions")
+    assert.notEqual(partialScan.ts, previousScan.ts)
+    assert.equal(partialScan.partial, true)
+    assert.deepEqual(partialPaths, previousPaths.concat(
+      path.join(home, "api", "four", "new.bin")
+    ).sort())
 
     vault.hashFile = hashFile
     let release
@@ -554,11 +659,399 @@ describe("Save Space scans", () => {
     release()
     const cancelled = await pending
     assert.equal(cancelled.cancelled, true)
+    assert.equal((await vault.registry.scanFor()).ts, partialScan.ts)
+    assert.deepEqual(
+      [...await vault.registry.files()].map((row) => row.path),
+      partialPaths
+    )
+  })
+
+  test("a denied subtree stays stale while covered deletions publish", async (t) => {
+    if (process.platform === "win32") {
+      t.skip("POSIX directory permissions are required")
+      return
+    }
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const deniedRoot = path.join(home, "api", "denied")
+    const denied = await write(path.join(deniedRoot, "model.bin"), contents)
+    const healthy = await write(
+      path.join(home, "api", "healthy", "model.bin"), contents)
+    const removed = await write(
+      path.join(home, "api", "removed", "model.bin"), contents)
+    await vault.sweeper.scan()
+    await fs.promises.unlink(removed)
+    await fs.promises.chmod(deniedRoot, 0o000)
+
+    try {
+      const result = await vault.sweeper.scan()
+      if (!result.partial) {
+        t.skip("The test process can read mode-000 directories")
+        return
+      }
+
+      assert.equal(result.outcome, "completed_with_exclusions")
+      assert.equal(result.exclusions.some((entry) =>
+        entry.path === deniedRoot &&
+        entry.reason === "permission_denied"), true)
+      assert.equal(await vault.registry.getFile(removed), null)
+      assert.equal(
+        (await vault.registry.getFile(denied)).unavailable_reason,
+        "stale"
+      )
+      assert.equal((await vault.registry.getFile(healthy)).status, "reference")
+
+      const status = await vault.status(null, { view: "all" })
+      assert.equal(status.last_scan.partial, true)
+      assert.equal(status.last_scan.exclusions[0].path, deniedRoot)
+      assert.equal(status.last_scan.files, 1)
+      assert.equal(status.last_scan.bytes_total, contents.length)
+      assert.equal(status.inventory.counts.all, 1)
+      assert.equal(status.inventory.shareable_duplicates, 0)
+      assert.equal(status.pending_bytes, 0)
+      assert.deepEqual(status.items.map((item) => item.path), [healthy])
+      assert.equal((await vault.perform("deduplicate", {
+        path: denied
+      })).status, "not-found")
+    } finally {
+      await fs.promises.chmod(deniedRoot, 0o700).catch(() => {})
+    }
+
+    const recovered = await vault.sweeper.scan()
+    assert.equal(recovered.partial, false)
+    assert.notEqual((await vault.registry.getFile(denied)).unavailable_reason,
+      "stale")
+    assert.equal(await vault.registry.countFiles(["duplicate"]), 1)
+  })
+
+  test("a file that changes while hashing is excluded without losing peers", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const changing = await write(
+      path.join(home, "api", "changing", "model.bin"), contents)
+    const stable = await write(
+      path.join(home, "api", "stable", "model.bin"), contents)
+    const hashFile = vault.hashFile.bind(vault)
+    let changed = false
+    vault.hashFile = async (filePath, options) => {
+      const result = await hashFile(filePath, options)
+      if (filePath === changing && !changed) {
+        changed = true
+        await fs.promises.writeFile(filePath, contents)
+      }
+      return result
+    }
+
+    const result = await vault.sweeper.scan()
+
+    assert.equal(result.outcome, "completed_with_exclusions")
+    assert.equal(result.exclusions.some((entry) =>
+      entry.path === changing &&
+      entry.reason === "changed_during_scan"), true)
+    assert.equal(await vault.registry.getFile(changing), null)
+    assert.equal((await vault.registry.getFile(stable)).status, "reference")
+    const status = await vault.status()
+    assert.equal(status.last_scan.files, 1)
+    assert.equal(status.last_scan.bytes_total, contents.length)
+  })
+
+  test("a publication failure preserves the previous generation", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "one", "model.bin"), contents)
+    await write(path.join(home, "api", "two", "model.bin"), contents)
+    await vault.sweeper.scan()
+    const previousScan = await vault.registry.scanFor()
+    const previousPaths = [...await vault.registry.files()]
+      .map((row) => row.path)
+    await write(
+      path.join(home, "api", "three", "new.bin"),
+      crypto.randomBytes(5000)
+    )
+    const publishScan = vault.registry.publishScan
+    vault.registry.publishScan = async () => {
+      const error = new Error("database unavailable")
+      error.code = "EVAULTDB"
+      throw error
+    }
+
+    await assert.rejects(vault.sweeper.scan(), /database unavailable/)
+
+    vault.registry.publishScan = publishScan
     assert.equal((await vault.registry.scanFor()).ts, previousScan.ts)
     assert.deepEqual(
       [...await vault.registry.files()].map((row) => row.path),
       previousPaths
     )
+  })
+
+  test("an unreadable store anchor is excluded without discarding the scan", async () => {
+    const { home, vault } = await makeVault()
+    await write(
+      path.join(home, "api", "model.bin"),
+      crypto.randomBytes(4096)
+    )
+    await vault.sweeper.scan()
+    const previousScan = await vault.registry.scanFor()
+
+    const contents = crypto.randomBytes(5000)
+    const hash = sha256(contents)
+    const anchor = await write(vault.storePathFor(hash), contents)
+    const stat = await fs.promises.stat(anchor)
+    const now = Date.now()
+    await vault.registry.upsertContent({
+      hash,
+      size: stat.size,
+      first_seen: now,
+      verified_at: now,
+      anchor_verified_at: now,
+      anchor_present: true,
+      anchor_dev: stat.dev,
+      anchor_ino: stat.ino,
+      anchor_size: stat.size,
+      anchor_mtime: stat.mtimeMs,
+      anchor_ctime: stat.ctimeMs,
+      anchor_nlink: stat.nlink
+    })
+    await fs.promises.utimes(
+      anchor,
+      new Date(stat.atimeMs),
+      new Date(stat.mtimeMs + 1000)
+    )
+
+    const hashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath, options) => {
+      if (filePath === anchor) {
+        const error = new Error("store anchor unavailable")
+        error.code = "EACCES"
+        throw error
+      }
+      return hashFile(filePath, options)
+    }
+
+    const result = await vault.sweeper.scan()
+
+    vault.hashFile = hashFile
+    const preserved = await vault.registry.getContent(hash)
+    assert.equal(result.outcome, "completed_with_exclusions")
+    assert.equal(result.exclusions.some((entry) =>
+      entry.path === anchor &&
+      entry.reason === "permission_denied"), true)
+    assert.notEqual((await vault.registry.scanFor()).ts, previousScan.ts)
+    assert.equal(preserved.anchor_present, 0)
+    assert.equal(preserved.anchor_ino, null)
+    assert.equal(await fs.promises.readFile(anchor).then(
+      (value) => value.equals(contents)), true)
+
+    await vault.sweeper.scan()
+    assert.equal((await vault.registry.getContent(hash)).anchor_present, 1)
+  })
+
+  test("a failed hardlink path retries another path to the same inode", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const first = await write(
+      path.join(home, "api", "one", "model.bin"), contents)
+    const second = path.join(home, "api", "two", "model.bin")
+    await fs.promises.mkdir(path.dirname(second), { recursive: true })
+    await fs.promises.link(first, second)
+
+    const hashFile = vault.hashFile.bind(vault)
+    const hashPaths = []
+    vault.hashFile = async (filePath, options) => {
+      hashPaths.push(filePath)
+      if (filePath === first) {
+        const error = new Error("first hardlink path unavailable")
+        error.code = "EACCES"
+        throw error
+      }
+      return hashFile(filePath, options)
+    }
+
+    const result = await vault.sweeper.scan()
+    vault.hashFile = hashFile
+
+    assert.equal(result.outcome, "completed_with_exclusions")
+    assert.deepEqual(hashPaths, [first, second])
+    assert.equal(vault.sweeper.state.hash_work_files, 1)
+    assert.equal(vault.sweeper.state.hash_files_completed, 1)
+    assert.equal(vault.sweeper.state.hash_total, 2)
+    assert.equal(await vault.registry.getFile(first), null)
+    assert.equal((await vault.registry.getFile(second)).hash, sha256(contents))
+  })
+
+  test("an anchor fallback does not change the discovered hash workload", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "one", "model.bin"), contents)
+    await write(path.join(home, "api", "two", "model.bin"), contents)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    await vault.perform("deduplicate", { path: duplicate.path })
+    const anchor = vault.storePathFor(duplicate.hash)
+    const anchorStat = await fs.promises.stat(anchor)
+    await fs.promises.utimes(
+      anchor,
+      new Date(anchorStat.atimeMs),
+      new Date(anchorStat.mtimeMs + 1000)
+    )
+    const anchorIdentity = await fs.promises.stat(anchor)
+    const failingPaths = new Set([...await vault.registry.files({
+      dev: anchorIdentity.dev,
+      ino: anchorIdentity.ino
+    })].map((entry) => entry.path))
+
+    const hashFile = vault.hashFile.bind(vault)
+    const hashPaths = []
+    let enterAnchor
+    let releaseAnchor
+    const anchorEntered = new Promise((resolve) => { enterAnchor = resolve })
+    const anchorGate = new Promise((resolve) => { releaseAnchor = resolve })
+    vault.hashFile = async (filePath, options) => {
+      hashPaths.push(filePath)
+      if (failingPaths.has(filePath)) {
+        const error = new Error("linked path unavailable")
+        error.code = "EACCES"
+        throw error
+      }
+      if (filePath === anchor) {
+        enterAnchor()
+        await anchorGate
+      }
+      return hashFile(filePath, options)
+    }
+
+    const pending = vault.sweeper.scan()
+    const reachedAnchor = await Promise.race([
+      anchorEntered.then(() => true),
+      pending.then(() => false)
+    ])
+    assert.equal(reachedAnchor, true, JSON.stringify({
+      anchor,
+      failingPaths: [...failingPaths],
+      hashPaths
+    }))
+    try {
+      const progress = vault.scanStatus()
+      assert.equal(progress.hash_work_files, 1)
+      assert.equal(progress.hash_files_completed, 0)
+      assert.equal(progress.hash_work_bytes, contents.length)
+      assert.equal(progress.hash_bytes_completed, 0)
+    } finally {
+      releaseAnchor()
+    }
+    const result = await pending
+    vault.hashFile = hashFile
+
+    assert.equal(
+      [...failingPaths].every((filePath) => hashPaths.includes(filePath)),
+      true,
+      hashPaths.join("\n")
+    )
+    assert.equal(result.outcome, "completed_with_exclusions")
+    assert.equal(vault.sweeper.state.hash_work_files, 1)
+    assert.equal(vault.sweeper.state.hash_files_completed, 1)
+    assert.equal(vault.sweeper.state.hash_work_bytes, contents.length)
+    assert.equal(
+      vault.sweeper.state.hash_bytes_completed,
+      contents.length
+    )
+  })
+
+  test("active scan previews are bounded, provisional, and contain no actions", async () => {
+    const { home, vault } = await makeVault()
+    let expectedBytes = 0
+    for (let index = 0; index < 25; index++) {
+      const contents = Buffer.alloc(4096 + index, index + 1)
+      expectedBytes += contents.length
+      await write(
+        path.join(home, "api", `group-${index}`, "one.bin"),
+        contents
+      )
+      await write(
+        path.join(home, "api", `group-${index}`, "two.bin"),
+        contents
+      )
+    }
+    let release
+    let entered
+    const enteredPublish = new Promise((resolve) => { entered = resolve })
+    const gate = new Promise((resolve) => { release = resolve })
+    const publishScan = vault.registry.publishScan.bind(vault.registry)
+    vault.registry.publishScan = async (...args) => {
+      entered()
+      await gate
+      return publishScan(...args)
+    }
+
+    const pending = vault.sweeper.scan()
+    await enteredPublish
+    const progress = await vault.progressStatus()
+    const preview = progress.scan.preview
+    assert.equal(progress.scan.active, true)
+    assert.equal(preview.provisional, true)
+    assert.equal(preview.duplicate_files, 25)
+    assert.equal(preview.bytes, expectedBytes)
+    assert.equal(preview.groups.length, 20)
+    assert.equal(vault.sweeper.previewGroups.size, 20)
+    assert.equal(progress.scan.hash_work_files, 50)
+    assert.equal(progress.scan.hash_files_completed, 50)
+    assert.equal(progress.scan.hash_work_bytes, expectedBytes * 2)
+    assert.equal(progress.scan.hash_bytes_completed, expectedBytes * 2)
+    assert.equal(preview.groups.every((group) =>
+      typeof group.representative_path === "string" &&
+      group.representative_path.endsWith("one.bin")), true)
+    assert.equal(Object.hasOwn(preview, "actions"), false)
+    assert.equal(await vault.registry.countFiles(), 0)
+
+    release()
+    await pending
+    assert.equal(vault.scanStatus().preview.groups.length, 0)
+    assert.equal(await vault.registry.countFiles(), 50)
+  })
+
+  test("app results inherit only exclusions inside that app", async () => {
+    const { home, vault } = await makeVault()
+    const firstRoot = path.join(home, "api", "first")
+    const secondRoot = path.join(home, "api", "second")
+    const contents = crypto.randomBytes(4096)
+    const excluded = await write(
+      path.join(firstRoot, "one.bin"), contents)
+    await write(path.join(firstRoot, "two.bin"), contents)
+    await write(path.join(secondRoot, "one.bin"), contents)
+    await write(path.join(secondRoot, "two.bin"), contents)
+    await vault.refreshSources()
+    const firstSource = vault.sources().find((source) =>
+      source.root === firstRoot)
+    const secondSource = vault.sources().find((source) =>
+      source.root === secondRoot)
+    assert.ok(firstSource)
+    assert.ok(secondSource)
+
+    const hashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath, options) => {
+      if (filePath === excluded) {
+        const error = new Error("file unavailable")
+        error.code = "EACCES"
+        throw error
+      }
+      return hashFile(filePath, options)
+    }
+
+    const result = await vault.sweeper.scan()
+    vault.hashFile = hashFile
+    assert.equal(result.partial, true)
+
+    const firstScan = await vault.scanForScope(firstSource.id)
+    const secondScan = await vault.scanForScope(secondSource.id)
+    assert.equal(firstScan.partial, true)
+    assert.equal(firstScan.exclusions.length, 1)
+    assert.equal(firstScan.exclusions[0].path, excluded)
+    assert.equal(secondScan.partial, false)
+    assert.equal(secondScan.outcome, "complete")
+    assert.deepEqual(secondScan.exclusions, [])
   })
 
   test("an unavailable configured root cannot publish a partial global scan", async () => {
@@ -820,7 +1313,7 @@ describe("Save Space scans", () => {
     const result = await vault.sweeper.scan()
     const status = await vault.status()
 
-    assert.equal(result.incomplete, false)
+    assert.equal(result.partial, false)
     assert.equal((await vault.registry.getContent(claimedHash)).anchor_present, 0)
     assert.equal(status.inventory.counts.reclaimable, 0)
     assert.equal(status.inventory.shareable_duplicates, 0)

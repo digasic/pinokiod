@@ -4,7 +4,7 @@ const { ENTRY_BATCH_SIZE } = require('./constants')
 
 const isMissingError = (error) => !!(error && (error.code === "ENOENT" || error.code === "ENOTDIR"))
 const isHandledError = (options, error, target) => !!(
-  !isMissingError(error) && options.onError && options.onError(error, target)
+  options.onError && options.onError(error, target)
 )
 
 // One traversal primitive for scans. It owns only directory
@@ -41,9 +41,11 @@ async function * walkBatches(root, options = {}) {
           })
         } catch (error) {
           const missingRoot = strictRoot && isRoot && isMissingError(error)
+          const handled = !missingRoot &&
+            isHandledError(options, error, dir)
           if (missingRoot ||
               (strictErrors && !isMissingError(error) &&
-                !isHandledError(options, error, dir))) throw error
+                !handled)) throw error
           yield [{ dir, entries: null, files: [], discoveredDirs: 0, discoveredFiles: 0, firstChunk: true }]
         }
       }
@@ -63,9 +65,11 @@ async function * walkBatches(root, options = {}) {
         } catch (error) {
           const missingRoot = strictRoot && task.isRoot &&
             isMissingError(error)
+          const handled = !missingRoot &&
+            isHandledError(options, error, task.dir)
           if (missingRoot ||
               (strictErrors && !isMissingError(error) &&
-                !isHandledError(options, error, task.dir))) throw error
+                !handled)) throw error
           done = true
         }
         return {
@@ -134,8 +138,9 @@ const statMany = async (paths, concurrency = 32, onSettled = null, options = {})
       try {
         results[index] = await readMetadata(paths[index])
       } catch (error) {
+        const handled = isHandledError(options, error, paths[index])
         if (options.strictErrors && !isMissingError(error) &&
-            !isHandledError(options, error, paths[index])) throw error
+            !handled) throw error
         results[index] = null
       } finally {
         if (onSettled) onSettled(index, results[index])

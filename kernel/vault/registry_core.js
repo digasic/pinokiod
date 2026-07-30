@@ -26,6 +26,8 @@ class RegistryCore {
     this.scanSizes = new Map()
     this.scanInodes = new Map()
     this.scanAnchorInodes = new Set()
+    this.scanHashWorkFiles = 0
+    this.scanHashWorkBytes = 0
   }
 
   async load() {
@@ -291,6 +293,17 @@ class RegistryCore {
         started_at INTEGER NOT NULL
       ) WITHOUT ROWID;
 
+      CREATE TEMP TABLE scan_exclusions (
+        run_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        prefix TEXT NOT NULL,
+        source_id TEXT,
+        reason TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (run_id, path),
+        FOREIGN KEY (run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
+      ) WITHOUT ROWID;
+
       CREATE TEMP TABLE scan_files (
         run_id TEXT NOT NULL,
         path TEXT NOT NULL,
@@ -368,6 +381,7 @@ class RegistryCore {
       DROP TABLE IF EXISTS temp.scan_linked_groups;
       DROP TABLE IF EXISTS temp.scan_anchors;
       DROP TABLE IF EXISTS temp.scan_files;
+      DROP TABLE IF EXISTS temp.scan_exclusions;
       DROP TABLE IF EXISTS temp.scan_runs;
     `)
     this.createScanSchema()
@@ -387,7 +401,8 @@ class RegistryCore {
   createFileTriggers() {
     this.database.exec(`
       CREATE TRIGGER files_summary_insert
-      AFTER INSERT ON files BEGIN
+      AFTER INSERT ON files
+      WHEN NEW.unavailable_reason IS NOT 'stale' BEGIN
         INSERT INTO file_summaries(source_id, status, file_count, bytes)
         VALUES (COALESCE(NEW.source_id, ''), NEW.status, 1, NEW.size)
         ON CONFLICT(source_id, status) DO UPDATE SET
@@ -396,7 +411,8 @@ class RegistryCore {
       END;
 
       CREATE TRIGGER files_summary_delete
-      AFTER DELETE ON files BEGIN
+      AFTER DELETE ON files
+      WHEN OLD.unavailable_reason IS NOT 'stale' BEGIN
         UPDATE file_summaries SET
           file_count = file_count - 1,
           bytes = bytes - OLD.size
@@ -409,18 +425,20 @@ class RegistryCore {
       END;
 
       CREATE TRIGGER files_summary_update
-      AFTER UPDATE OF source_id, status, size ON files BEGIN
+      AFTER UPDATE OF source_id, status, size, unavailable_reason ON files BEGIN
         UPDATE file_summaries SET
           file_count = file_count - 1,
           bytes = bytes - OLD.size
         WHERE source_id = COALESCE(OLD.source_id, '')
-          AND status = OLD.status;
+          AND status = OLD.status
+          AND OLD.unavailable_reason IS NOT 'stale';
         DELETE FROM file_summaries
         WHERE source_id = COALESCE(OLD.source_id, '')
           AND status = OLD.status
           AND file_count <= 0;
         INSERT INTO file_summaries(source_id, status, file_count, bytes)
-        VALUES (COALESCE(NEW.source_id, ''), NEW.status, 1, NEW.size)
+        SELECT COALESCE(NEW.source_id, ''), NEW.status, 1, NEW.size
+        WHERE NEW.unavailable_reason IS NOT 'stale'
         ON CONFLICT(source_id, status) DO UPDATE SET
           file_count = file_count + 1,
           bytes = bytes + NEW.size;
@@ -429,11 +447,15 @@ class RegistryCore {
       CREATE TRIGGER files_group_insert
       AFTER INSERT ON files BEGIN
         INSERT INTO inode_summaries(dev, ino, file_count)
-        SELECT NEW.dev, NEW.ino, 1 WHERE NEW.status = 'linked'
+        SELECT NEW.dev, NEW.ino, 1
+        WHERE NEW.status = 'linked'
+          AND NEW.unavailable_reason IS NOT 'stale'
         ON CONFLICT(dev, ino) DO UPDATE SET
           file_count = file_count + 1;
         INSERT INTO hash_summaries(hash, file_count)
-        SELECT NEW.hash, 1 WHERE NEW.hash IS NOT NULL
+        SELECT NEW.hash, 1
+        WHERE NEW.hash IS NOT NULL
+          AND NEW.unavailable_reason IS NOT 'stale'
         ON CONFLICT(hash) DO UPDATE SET
           file_count = file_count + 1;
       END;
@@ -441,31 +463,41 @@ class RegistryCore {
       CREATE TRIGGER files_group_delete
       AFTER DELETE ON files BEGIN
         UPDATE inode_summaries SET file_count = file_count - 1
-        WHERE dev = OLD.dev AND ino = OLD.ino AND OLD.status = 'linked';
+        WHERE dev = OLD.dev AND ino = OLD.ino
+          AND OLD.status = 'linked'
+          AND OLD.unavailable_reason IS NOT 'stale';
         DELETE FROM inode_summaries
         WHERE dev = OLD.dev AND ino = OLD.ino AND file_count <= 0;
         UPDATE hash_summaries SET file_count = file_count - 1
-        WHERE hash = OLD.hash;
+        WHERE hash = OLD.hash
+          AND OLD.unavailable_reason IS NOT 'stale';
         DELETE FROM hash_summaries
         WHERE hash = OLD.hash AND file_count <= 0;
       END;
 
       CREATE TRIGGER files_group_update
-      AFTER UPDATE OF hash, dev, ino, status ON files BEGIN
+      AFTER UPDATE OF hash, dev, ino, status, unavailable_reason ON files BEGIN
         UPDATE inode_summaries SET file_count = file_count - 1
-        WHERE dev = OLD.dev AND ino = OLD.ino AND OLD.status = 'linked';
+        WHERE dev = OLD.dev AND ino = OLD.ino
+          AND OLD.status = 'linked'
+          AND OLD.unavailable_reason IS NOT 'stale';
         DELETE FROM inode_summaries
         WHERE dev = OLD.dev AND ino = OLD.ino AND file_count <= 0;
         UPDATE hash_summaries SET file_count = file_count - 1
-        WHERE hash = OLD.hash;
+        WHERE hash = OLD.hash
+          AND OLD.unavailable_reason IS NOT 'stale';
         DELETE FROM hash_summaries
         WHERE hash = OLD.hash AND file_count <= 0;
         INSERT INTO inode_summaries(dev, ino, file_count)
-        SELECT NEW.dev, NEW.ino, 1 WHERE NEW.status = 'linked'
+        SELECT NEW.dev, NEW.ino, 1
+        WHERE NEW.status = 'linked'
+          AND NEW.unavailable_reason IS NOT 'stale'
         ON CONFLICT(dev, ino) DO UPDATE SET
           file_count = file_count + 1;
         INSERT INTO hash_summaries(hash, file_count)
-        SELECT NEW.hash, 1 WHERE NEW.hash IS NOT NULL
+        SELECT NEW.hash, 1
+        WHERE NEW.hash IS NOT NULL
+          AND NEW.unavailable_reason IS NOT 'stale'
         ON CONFLICT(hash) DO UPDATE SET
           file_count = file_count + 1;
       END;
@@ -487,6 +519,7 @@ class RegistryCore {
         COUNT(*),
         COALESCE(SUM(size), 0)
       FROM files
+      WHERE unavailable_reason IS NOT 'stale'
       GROUP BY COALESCE(source_id, ''), status
     `).run()
   }
@@ -498,6 +531,7 @@ class RegistryCore {
       SELECT hash, COUNT(*)
       FROM files
       WHERE hash IS NOT NULL
+        AND unavailable_reason IS NOT 'stale'
       GROUP BY hash
     `).run()
     this.database.prepare("DELETE FROM inode_summaries").run()
@@ -506,6 +540,7 @@ class RegistryCore {
       SELECT dev, ino, COUNT(*)
       FROM files
       WHERE status = 'linked'
+        AND unavailable_reason IS NOT 'stale'
       GROUP BY dev, ino
     `).run()
   }
@@ -518,6 +553,7 @@ class RegistryCore {
         SELECT dev, ino, COUNT(*) AS names
         FROM files
         WHERE status = 'linked'
+          AND unavailable_reason IS NOT 'stale'
         GROUP BY dev, ino
       )
       SELECT
@@ -528,6 +564,7 @@ class RegistryCore {
       FROM files file
       JOIN linked USING (dev, ino)
       WHERE file.status = 'linked'
+        AND file.unavailable_reason IS NOT 'stale'
       GROUP BY file.dev, file.ino, COALESCE(file.source_id, '')
     `).run()
     this.database.prepare("DELETE FROM source_savings").run()
@@ -570,7 +607,9 @@ class RegistryCore {
       WITH linked AS (
         SELECT COUNT(*) AS names
         FROM files
-        WHERE status = 'linked' AND dev = ? AND ino = ?
+        WHERE status = 'linked'
+          AND unavailable_reason IS NOT 'stale'
+          AND dev = ? AND ino = ?
       )
       SELECT
         file.dev,
@@ -579,6 +618,7 @@ class RegistryCore {
         SUM(file.size - (CAST(file.size AS REAL) / linked.names))
       FROM files file, linked
       WHERE file.status = 'linked'
+        AND file.unavailable_reason IS NOT 'stale'
         AND file.dev = ?
         AND file.ino = ?
         AND linked.names > 0
@@ -616,6 +656,8 @@ class RegistryCore {
     this.scanSizes.clear()
     this.scanInodes.clear()
     this.scanAnchorInodes.clear()
+    this.scanHashWorkFiles = 0
+    this.scanHashWorkBytes = 0
   }
 
   transaction(callback) {
@@ -791,7 +833,10 @@ class RegistryCore {
 
   reclassifyHash(hash, storeDev, canLink = true, anchorSnapshot = null) {
     const rows = this.database.prepare(`
-      SELECT * FROM files WHERE hash = ? ORDER BY path
+      SELECT * FROM files
+      WHERE hash = ?
+        AND unavailable_reason IS NOT 'stale'
+      ORDER BY path
     `).all(hash)
     if (!rows.length) return { files: 0 }
 
@@ -989,6 +1034,8 @@ class RegistryCore {
     this.scanSizes.clear()
     this.scanInodes.clear()
     this.scanAnchorInodes.clear()
+    this.scanHashWorkFiles = 0
+    this.scanHashWorkBytes = 0
     this.transaction(() => {
       this.resetScanSchema()
       this.database.prepare(
@@ -1005,11 +1052,177 @@ class RegistryCore {
     this.scanSizes.clear()
     this.scanInodes.clear()
     this.scanAnchorInodes.clear()
+    this.scanHashWorkFiles = 0
+    this.scanHashWorkBytes = 0
     return { changes: exists ? 1 : 0 }
   }
 
-  stageFiles(runId, entries, minimumSize = 0) {
+  scanInodeState(entry) {
+    if (!(entry.nlink > 1) || entry.ino === 0) return null
+    const key = `${entry.dev}:${entry.ino}`
+    let state = this.scanInodes.get(key)
+    if (!state) {
+      state = {
+        firstPath: null,
+        linked: false,
+        knownHash: null,
+        workCounted: false
+      }
+      this.scanInodes.set(key, state)
+    }
+    return state
+  }
+
+  rememberScanHash(entry, hash) {
+    if (!hash) return
+    const inode = this.scanInodeState(entry)
+    if (!inode) return
+    inode.knownHash = hash
+    if (!inode.workCounted) return
+    inode.workCounted = false
+    this.scanHashWorkFiles = Math.max(0, this.scanHashWorkFiles - 1)
+    this.scanHashWorkBytes = Math.max(
+      0, this.scanHashWorkBytes - entry.size)
+  }
+
+  addScanHashWork(candidate) {
+    if (!candidate || candidate.hash || candidate.workCounted) return
+    const { entry } = candidate
+    const inode = this.scanInodeState(entry)
+    if (inode) {
+      if (inode.knownHash || inode.workCounted) return
+      inode.workCounted = true
+    } else {
+      candidate.workCounted = true
+    }
+    this.scanHashWorkFiles += 1
+    this.scanHashWorkBytes += entry.size
+  }
+
+  scanHashWork() {
+    return {
+      hash_work_files: this.scanHashWorkFiles,
+      hash_work_bytes: this.scanHashWorkBytes
+    }
+  }
+
+  checkScanAnchorsForInode(runId, dev, ino, hash) {
+    return this.database.prepare(`
+      UPDATE scan_anchors SET
+        verified_hash = CASE WHEN hash_name = ? THEN ? END,
+        verify_attempted = 1
+      WHERE run_id = ? AND dev = ? AND ino = ?
+    `).run(hash, hash, runId, dev, ino)
+  }
+
+  stageExclusions(runId, entries) {
     if (!entries.length) return { changes: 0 }
+    const insert = this.database.prepare(`
+      INSERT INTO scan_exclusions (
+        run_id, path, prefix, source_id, reason, created_at
+      ) VALUES (
+        @run_id, @path, @prefix, @source_id, @reason, @created_at
+      )
+      ON CONFLICT(run_id, path) DO UPDATE SET
+        source_id = excluded.source_id,
+        reason = excluded.reason,
+        created_at = excluded.created_at
+    `)
+    const removeStagedPath = this.database.prepare(`
+      DELETE FROM scan_files WHERE run_id = ? AND path = ?
+    `)
+    let changes = 0
+    this.transaction(() => {
+      for (const entry of entries) {
+        const resolvedPath = path.resolve(entry.path)
+        const prefix = resolvedPath.endsWith(path.sep)
+          ? resolvedPath
+          : `${resolvedPath}${path.sep}`
+        changes += insert.run({
+          run_id: runId,
+          path: resolvedPath,
+          prefix,
+          source_id: entry.source_id || null,
+          reason: entry.reason || "unreadable",
+          created_at: Number(entry.created_at) || Date.now()
+        }).changes
+        removeStagedPath.run(runId, resolvedPath)
+      }
+    })
+    return { changes }
+  }
+
+  scanPreviewGroups(runId, hashes) {
+    const values = [...new Set(hashes.filter(Boolean))]
+    if (!values.length) return new Map()
+    return new Map(this.database.prepare(`
+      SELECT
+        hash,
+        MAX(size) AS size,
+        MIN(path) AS representative_path,
+        COUNT(*) AS locations,
+        COUNT(DISTINCT CASE
+          WHEN ino != 0 THEN printf('%lld:%lld', dev, ino)
+          ELSE path
+        END) AS inode_count
+      FROM scan_files
+      WHERE run_id = ?
+        AND hash IN (${placeholders(values)})
+      GROUP BY hash
+    `).all(runId, ...values).map((row) => {
+      const duplicateFiles = Math.max(
+        0, Number(row.inode_count) - 1)
+      return [row.hash, {
+        hash: row.hash,
+        size: Number(row.size) || 0,
+        representative_path: row.representative_path,
+        locations: Number(row.locations) || 0,
+        duplicate_files: duplicateFiles,
+        bytes: duplicateFiles * (Number(row.size) || 0)
+      }]
+    }))
+  }
+
+  scanPreviewChange(runId, hashes, before) {
+    const after = this.scanPreviewGroups(runId, hashes)
+    let duplicateFilesDelta = 0
+    let bytesDelta = 0
+    const groups = []
+    for (const hash of new Set([
+      ...before.keys(),
+      ...after.keys()
+    ])) {
+      const previous = before.get(hash) || {
+        duplicate_files: 0,
+        bytes: 0
+      }
+      const current = after.get(hash) || {
+        hash,
+        size: previous.size || 0,
+        locations: 0,
+        duplicate_files: 0,
+        bytes: 0
+      }
+      duplicateFilesDelta +=
+        current.duplicate_files - previous.duplicate_files
+      bytesDelta += current.bytes - previous.bytes
+      if (current.duplicate_files || previous.duplicate_files) {
+        groups.push(current)
+      }
+    }
+    return {
+      duplicate_files_delta: duplicateFilesDelta,
+      bytes_delta: bytesDelta,
+      groups
+    }
+  }
+
+  stageFiles(runId, entries, minimumSize = 0) {
+    if (!entries.length) return {
+      changes: 0,
+      preview: null,
+      work: this.scanHashWork()
+    }
     const threshold = Math.max(0, Number(minimumSize) || 0)
     const resolvedEntries = entries
       .filter((entry) => entry.nlink > 1 ||
@@ -1018,7 +1231,11 @@ class RegistryCore {
         entry,
         path: path.resolve(entry.path)
       }))
-    if (!resolvedEntries.length) return { changes: 0 }
+    if (!resolvedEntries.length) return {
+      changes: 0,
+      preview: null,
+      work: this.scanHashWork()
+    }
     const previousByPath = new Map(this.database.prepare(`
       SELECT path, hash, size, mtime, ctime, dev, ino, status
       FROM files
@@ -1112,17 +1329,27 @@ class RegistryCore {
         oldStatus: previous ? previous.status : null
       })
     }
-    if (!staged.length) return { changes: 0 }
+    if (!staged.length) return {
+      changes: 0,
+      preview: null,
+      work: this.scanHashWork()
+    }
 
     const stagedByPath = new Map()
     const promoteHashPaths = new Set()
     const promoteLinkedPaths = new Set()
     for (const candidate of staged) {
       const { entry } = candidate
+      const inode = this.scanInodeState(entry)
+      if (inode && !candidate.hash && inode.knownHash) {
+        candidate.hash = inode.knownHash
+      }
+      this.rememberScanHash(entry, candidate.hash)
       const sizeState = this.scanSizes.get(entry.size) || {
         files: 0,
         hashNeeded: false,
-        firstPath: null
+        firstPath: null,
+        firstCandidate: null
       }
       candidate.hashNeeded = sizeState.hashNeeded ||
         candidate.managed ||
@@ -1131,30 +1358,34 @@ class RegistryCore {
           !sizeState.hashNeeded &&
           sizeState.firstPath) {
         const first = stagedByPath.get(sizeState.firstPath)
-        if (first) first.hashNeeded = true
-        else promoteHashPaths.add(sizeState.firstPath)
+        const promoted = first || sizeState.firstCandidate
+        if (promoted) {
+          promoted.hashNeeded = true
+          this.addScanHashWork(promoted)
+        }
+        if (!first) promoteHashPaths.add(sizeState.firstPath)
       }
-      if (!sizeState.firstPath) sizeState.firstPath = candidate.path
+      if (!sizeState.firstPath) {
+        sizeState.firstPath = candidate.path
+        sizeState.firstCandidate = candidate
+      }
       sizeState.files += 1
       sizeState.hashNeeded = candidate.hashNeeded
       this.scanSizes.set(entry.size, sizeState)
+      if (candidate.hashNeeded) this.addScanHashWork(candidate)
 
       if (entry.nlink > 1 && entry.ino !== 0) {
-        const inodeKey = `${entry.dev}:${entry.ino}`
-        const inodeState = this.scanInodes.get(inodeKey)
-        if (inodeState && inodeState.firstPath !== candidate.path) {
+        if (inode.firstPath && inode.firstPath !== candidate.path) {
           candidate.linked = true
-          if (!inodeState.linked) {
-            const first = stagedByPath.get(inodeState.firstPath)
+          if (!inode.linked) {
+            const first = stagedByPath.get(inode.firstPath)
             if (first) first.linked = true
-            else promoteLinkedPaths.add(inodeState.firstPath)
+            else promoteLinkedPaths.add(inode.firstPath)
           }
-          inodeState.linked = true
-        } else if (!inodeState) {
-          this.scanInodes.set(inodeKey, {
-            firstPath: candidate.path,
-            linked: candidate.linked
-          })
+          inode.linked = true
+        } else if (!inode.firstPath) {
+          inode.firstPath = candidate.path
+          inode.linked = candidate.linked
         }
       }
       stagedByPath.set(candidate.path, candidate)
@@ -1168,6 +1399,23 @@ class RegistryCore {
         WHERE run_id = ? AND path IN (${placeholders(values)})
       `).run(value, runId, ...values)
     }
+    const previewHashes = staged
+      .filter((candidate) => candidate.hash)
+      .map((candidate) => candidate.hash)
+    const knownInodeHashes = new Map(staged
+      .filter((candidate) =>
+        candidate.hash &&
+        candidate.entry.nlink > 1 &&
+        candidate.entry.ino !== 0)
+      .map((candidate) => [
+        `${candidate.entry.dev}:${candidate.entry.ino}`,
+        {
+          dev: candidate.entry.dev,
+          ino: candidate.entry.ino,
+          hash: candidate.hash
+        }
+      ]))
+    const previewBefore = this.scanPreviewGroups(runId, previewHashes)
     let changes = 0
     this.transaction(() => {
       updatePaths("hash_needed", 1, promoteHashPaths)
@@ -1195,12 +1443,21 @@ class RegistryCore {
           old_status: candidate.oldStatus
         }).changes
       }
+      for (const known of knownInodeHashes.values()) {
+        this.checkScanAnchorsForInode(
+          runId, known.dev, known.ino, known.hash)
+      }
     })
-    return { changes }
+    return {
+      changes,
+      preview: this.scanPreviewChange(
+        runId, previewHashes, previewBefore),
+      work: this.scanHashWork()
+    }
   }
 
   stageAnchors(runId, entries) {
-    if (!entries.length) return
+    if (!entries.length) return { work: this.scanHashWork() }
     const previousContent = this.database.prepare(
       "SELECT * FROM content WHERE hash = ?")
     const insert = this.database.prepare(`
@@ -1250,6 +1507,15 @@ class RegistryCore {
           verified_hash: unchanged ? entry.hash_name : null
         })
         this.scanAnchorInodes.add(`${entry.dev}:${entry.ino}`)
+        if (unchanged) {
+          this.rememberScanHash(entry, entry.hash_name)
+        } else {
+          this.addScanHashWork({
+            entry,
+            path: path.resolve(entry.path),
+            hash: null
+          })
+        }
         const sizeState = this.scanSizes.get(entry.size) || {
           files: 0,
           hashNeeded: false
@@ -1258,20 +1524,49 @@ class RegistryCore {
         this.scanSizes.set(entry.size, sizeState)
       }
     })
+    return { work: this.scanHashWork() }
   }
 
-  markAnchorVerified(runId, hash, verifiedHash) {
+  markAnchorChecked(runId, anchor, verifiedHash) {
+    if (anchor.nlink > 1 && anchor.ino !== 0) {
+      this.transaction(() => {
+        this.checkScanAnchorsForInode(
+          runId, anchor.dev, anchor.ino, verifiedHash)
+        this.database.prepare(`
+          UPDATE scan_files SET hash = ?, hash_attempted = 1
+          WHERE run_id = ? AND dev = ? AND ino = ? AND hash IS NULL
+        `).run(verifiedHash, runId, anchor.dev, anchor.ino)
+      })
+      return
+    }
     this.database.prepare(`
-      UPDATE scan_anchors SET verified_hash = ?, verify_attempted = 1
+      UPDATE scan_anchors SET
+        verified_hash = CASE WHEN hash_name = ? THEN ? END,
+        verify_attempted = 1
       WHERE run_id = ? AND hash_name = ?
-    `).run(verifiedHash, runId, hash)
+    `).run(verifiedHash, verifiedHash, runId, anchor.hash_name)
   }
 
-  markAnchorVerificationFailed(runId, hash) {
-    this.database.prepare(`
-      UPDATE scan_anchors SET verify_attempted = 1
-      WHERE run_id = ? AND hash_name = ?
-    `).run(runId, hash)
+  markAnchorVerificationFailed(runId, anchor) {
+    let retryAvailable = false
+    this.transaction(() => {
+      this.database.prepare(`
+        UPDATE scan_anchors SET verify_attempted = 1
+        WHERE run_id = ? AND hash_name = ?
+      `).run(runId, anchor.hash_name)
+      if (!(anchor.nlink > 1) || anchor.ino === 0) return
+      retryAvailable = !!this.database.prepare(`
+        SELECT 1
+        FROM scan_anchors
+        WHERE run_id = ?
+          AND dev = ?
+          AND ino = ?
+          AND verified_hash IS NULL
+          AND verify_attempted = 0
+        LIMIT 1
+      `).get(runId, anchor.dev, anchor.ino)
+    })
+    return { retry_available: retryAvailable }
   }
 
   hashWorkBatch(runId, cursor = null, limit = 128) {
@@ -1293,8 +1588,13 @@ class RegistryCore {
             AND peer.hash IS NOT NULL
           ORDER BY peer.path
           LIMIT 1
-        ) END AS reusable_hash,
-        CASE WHEN
+        ) END AS reusable_hash
+      FROM scan_files candidate
+      WHERE candidate.run_id = @run_id
+        AND candidate.hash IS NULL
+        AND candidate.hash_attempted = 0
+        AND candidate.hash_needed = 1
+        AND (
           candidate.nlink <= 1 OR
           candidate.ino = 0 OR
           NOT EXISTS (
@@ -1303,14 +1603,12 @@ class RegistryCore {
             WHERE inode_peer.run_id = candidate.run_id
               AND inode_peer.dev = candidate.dev
               AND inode_peer.ino = candidate.ino
+              AND inode_peer.hash IS NULL
+              AND inode_peer.hash_attempted = 0
+              AND inode_peer.hash_needed = 1
               AND inode_peer.path < candidate.path
           )
-        THEN 1 ELSE 0 END AS inode_representative
-      FROM scan_files candidate
-      WHERE candidate.run_id = @run_id
-        AND candidate.hash IS NULL
-        AND candidate.hash_attempted = 0
-        AND candidate.hash_needed = 1
+        )
         ${afterCursor}
       ORDER BY candidate.size, candidate.dev, candidate.ino, candidate.path
       LIMIT @limit
@@ -1325,39 +1623,71 @@ class RegistryCore {
   }
 
   setStageHash(runId, filePath, hash) {
-    return this.database.prepare(`
+    const previewBefore = this.scanPreviewGroups(runId, [hash])
+    const result = this.database.prepare(`
       UPDATE scan_files SET hash = ?, hash_attempted = 1
       WHERE run_id = ? AND path = ?
     `).run(hash, runId, path.resolve(filePath))
+    return {
+      changes: result.changes,
+      preview: this.scanPreviewChange(runId, [hash], previewBefore)
+    }
   }
 
   setStageInodeHash(runId, dev, ino, hash) {
-    return this.database.prepare(`
-      UPDATE scan_files SET hash = ?, hash_attempted = 1
-      WHERE run_id = ? AND dev = ? AND ino = ? AND hash IS NULL
-    `).run(hash, runId, dev, ino)
+    const previewBefore = this.scanPreviewGroups(runId, [hash])
+    let result
+    this.transaction(() => {
+      result = this.database.prepare(`
+        UPDATE scan_files SET hash = ?, hash_attempted = 1
+        WHERE run_id = ? AND dev = ? AND ino = ? AND hash IS NULL
+      `).run(hash, runId, dev, ino)
+      this.checkScanAnchorsForInode(runId, dev, ino, hash)
+    })
+    return {
+      changes: result.changes,
+      preview: this.scanPreviewChange(runId, [hash], previewBefore)
+    }
   }
 
-  markStageHashFailed(runId, filePath) {
-    this.database.prepare(`
-      UPDATE scan_files SET hash_attempted = 1
-      WHERE run_id = ? AND path = ?
-    `).run(runId, path.resolve(filePath))
-  }
-
-  verifyAnchorsFromLinkedFiles(runId) {
-    this.database.prepare(`
-      UPDATE scan_anchors AS anchor
-      SET verified_hash = anchor.hash_name
-      WHERE anchor.run_id = ?
-        AND EXISTS (
-          SELECT 1 FROM scan_files candidate
-          WHERE candidate.run_id = anchor.run_id
-            AND candidate.dev = anchor.dev
-            AND candidate.ino = anchor.ino
-            AND candidate.hash = anchor.hash_name
-        )
-    `).run(runId)
+  markStageHashFailed(runId, candidate) {
+    const resolvedPath = path.resolve(candidate.path)
+    let next = null
+    let anchorFallback = false
+    this.transaction(() => {
+      this.database.prepare(`
+        UPDATE scan_files SET hash_attempted = 1
+        WHERE run_id = ? AND path = ?
+      `).run(runId, resolvedPath)
+      if (!(candidate.nlink > 1) || candidate.ino === 0) return
+      next = this.database.prepare(`
+        SELECT *
+        FROM scan_files
+        WHERE run_id = ?
+          AND dev = ?
+          AND ino = ?
+          AND hash IS NULL
+          AND hash_attempted = 0
+          AND hash_needed = 1
+        ORDER BY path
+        LIMIT 1
+      `).get(runId, candidate.dev, candidate.ino) || null
+      if (next) return
+      anchorFallback = !!this.database.prepare(`
+        SELECT 1
+        FROM scan_anchors
+        WHERE run_id = ?
+          AND dev = ?
+          AND ino = ?
+          AND verified_hash IS NULL
+          AND verify_attempted = 0
+        LIMIT 1
+      `).get(runId, candidate.dev, candidate.ino)
+    })
+    return {
+      next,
+      anchor_fallback: anchorFallback
+    }
   }
 
   unverifiedAnchorBatch(runId, limit = 64) {
@@ -1367,13 +1697,35 @@ class RegistryCore {
       WHERE anchor.run_id = ?
         AND anchor.verified_hash IS NULL
         AND anchor.verify_attempted = 0
+        AND (
+          anchor.nlink <= 1 OR
+          anchor.ino = 0 OR
+          NOT EXISTS (
+            SELECT 1
+            FROM scan_anchors inode_peer
+            WHERE inode_peer.run_id = anchor.run_id
+              AND inode_peer.dev = anchor.dev
+              AND inode_peer.ino = anchor.ino
+              AND inode_peer.verified_hash IS NULL
+              AND inode_peer.verify_attempted = 0
+              AND inode_peer.hash_name < anchor.hash_name
+          )
+        )
       ORDER BY anchor.hash_name
       LIMIT ?
     `).all(runId, limit)
   }
 
-  publishScan(runId, sourceIds, metadata, storeDev, canLink = true) {
+  publishScan(
+    runId,
+    sourceIds,
+    metadata,
+    storeDev,
+    canLink = true,
+    anchorRoot = ""
+  ) {
     const sourceList = [...new Set(sourceIds.filter(Boolean))]
+    const resolvedAnchorRoot = anchorRoot ? path.resolve(anchorRoot) : ""
     const now = Date.now()
     this.transaction(() => {
       if (!canLink) {
@@ -1600,6 +1952,22 @@ class RegistryCore {
 
       this.dropFileTriggers()
       this.database.prepare(`
+        UPDATE files
+        SET
+          unavailable_reason = 'stale',
+          updated_at = ?
+        WHERE EXISTS (
+          SELECT 1 FROM scan_exclusions excluded
+          WHERE excluded.run_id = ?
+            AND (
+              files.path = excluded.path OR
+              substr(files.path, 1, length(excluded.prefix)) =
+                excluded.prefix
+            )
+        )
+      `).run(now, runId)
+
+      this.database.prepare(`
         INSERT INTO files (
           path, hash, size, mtime, ctime, dev, ino, mode, uid, gid, source_id,
           app, status, unavailable_reason, updated_at
@@ -1660,7 +2028,16 @@ class RegistryCore {
             SELECT 1 FROM scan_files candidate
             WHERE candidate.run_id = ? AND candidate.path = files.path
           )
-        `).run(runId)
+            AND NOT EXISTS (
+              SELECT 1 FROM scan_exclusions excluded
+              WHERE excluded.run_id = ?
+                AND (
+                  files.path = excluded.path OR
+                  substr(files.path, 1, length(excluded.prefix)) =
+                    excluded.prefix
+                )
+            )
+        `).run(runId, runId)
       } else if (sourceList.length) {
         this.database.prepare(`
           DELETE FROM files
@@ -1668,8 +2045,17 @@ class RegistryCore {
             AND NOT EXISTS (
               SELECT 1 FROM scan_files candidate
               WHERE candidate.run_id = ? AND candidate.path = files.path
-          )
-        `).run(...sourceList, runId)
+            )
+            AND NOT EXISTS (
+              SELECT 1 FROM scan_exclusions excluded
+              WHERE excluded.run_id = ?
+                AND (
+                  files.path = excluded.path OR
+                  substr(files.path, 1, length(excluded.prefix)) =
+                    excluded.prefix
+                )
+            )
+        `).run(...sourceList, runId, runId)
       }
       this.rebuildFileSummaries()
       this.rebuildGroupSummaries()
@@ -1744,13 +2130,36 @@ class RegistryCore {
         DELETE FROM content
         WHERE anchor_present = 0
           AND NOT EXISTS (SELECT 1 FROM files WHERE files.hash = content.hash)
-      `).run()
+          AND NOT EXISTS (
+            SELECT 1
+            FROM scan_exclusions excluded
+            WHERE excluded.run_id = @run_id
+              AND (
+                (
+                  @anchor_root || @separator ||
+                  substr(content.hash, 1, 2) || @separator || content.hash
+                ) = excluded.path
+                OR substr(
+                  @anchor_root || @separator ||
+                  substr(content.hash, 1, 2) || @separator || content.hash,
+                  1,
+                  length(excluded.prefix)
+                ) = excluded.prefix
+              )
+          )
+      `).run({
+        run_id: runId,
+        anchor_root: resolvedAnchorRoot,
+        separator: path.sep
+      })
       this.rebuildSavings()
       this.resetScanSchema()
     })
     this.scanSizes.clear()
     this.scanInodes.clear()
     this.scanAnchorInodes.clear()
+    this.scanHashWorkFiles = 0
+    this.scanHashWorkBytes = 0
   }
 
   addEvent(event) {
@@ -1794,6 +2203,7 @@ class RegistryCore {
     return this.database.prepare(`
       SELECT path FROM files
       WHERE hash = ? AND dev = ? AND ino = ?
+        AND unavailable_reason IS NOT 'stale'
       ORDER BY path
       LIMIT 1
     `).get(hash, dev, ino) || null
@@ -1804,6 +2214,7 @@ class RegistryCore {
       SELECT * FROM files
       WHERE hash = ? AND dev = ?
         AND status IN ('reference', 'linked')
+        AND unavailable_reason IS NOT 'stale'
         AND (mode & 4095) = ?
         AND uid = ?
         AND gid = ?
@@ -1858,6 +2269,7 @@ class RegistryCore {
       FROM files
       WHERE status = ?
         AND source_id IN (${placeholders(ids)})
+        AND unavailable_reason IS NOT 'stale'
         AND LOWER(path) LIKE ? ESCAPE '\\'
     `).get(...values)
     return {
@@ -1889,6 +2301,7 @@ class RegistryCore {
       WHERE status = ?
         AND path > ?
         AND source_id IN (${placeholders(ids)})
+        AND unavailable_reason IS NOT 'stale'
         ${search}
       ORDER BY path
       LIMIT ?
@@ -1976,7 +2389,7 @@ class RegistryCore {
     query,
     unrestricted = false
   ) {
-    const where = []
+    const where = ["unavailable_reason IS NOT 'stale'"]
     const values = []
     if (view === "duplicates") {
       where.push("status IN ('duplicate', 'unavailable')")
@@ -2034,7 +2447,7 @@ class RegistryCore {
       cursor,
       limit
     } = options
-    const where = []
+    const where = ["unavailable_reason IS NOT 'stale'"]
     const values = []
     if (sourceId) {
       where.push("source_id = ?")
@@ -2214,6 +2627,7 @@ class RegistryCore {
             (
               SELECT path FROM files sample
               WHERE sample.hash = selected.hash
+                AND sample.unavailable_reason IS NOT 'stale'
               ORDER BY path
               LIMIT 1
             ) AS first_path
@@ -2225,6 +2639,7 @@ class RegistryCore {
               SELECT path FROM files sample
               WHERE sample.hash = first_sample.hash
                 AND sample.path > first_sample.first_path
+                AND sample.unavailable_reason IS NOT 'stale'
               ORDER BY path
               LIMIT 1
             ) AS second_path
@@ -2257,6 +2672,7 @@ class RegistryCore {
               WHERE sample.dev = selected.dev
                 AND sample.ino = selected.ino
                 AND sample.status = 'linked'
+                AND sample.unavailable_reason IS NOT 'stale'
               ORDER BY path
               LIMIT 1
             ) AS first_path
@@ -2269,6 +2685,7 @@ class RegistryCore {
               WHERE sample.dev = first_sample.dev
                 AND sample.ino = first_sample.ino
                 AND sample.status = 'linked'
+                AND sample.unavailable_reason IS NOT 'stale'
                 AND sample.path > first_sample.first_path
               ORDER BY path
               LIMIT 1

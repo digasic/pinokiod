@@ -285,6 +285,7 @@ body[data-vault-mode="app"] .vault-overview {
   padding: 6px var(--vault-inline);
   border-bottom: 1px solid var(--task-border);
   font-size: 12.5px;
+  flex: 0 0 auto;
 }
 .vault-scan-state,
 .vault-action-state {
@@ -317,6 +318,14 @@ body[data-vault-mode="app"] .vault-overview {
   min-height: 40px;
   padding: 0 var(--vault-inline);
   background: var(--vault-warning-soft);
+}
+.vault-result.preview {
+  display: block;
+  overflow: hidden;
+  padding: 0 var(--vault-inline);
+}
+.vault-result.preview .vault-result-message > i {
+  color: var(--task-accent);
 }
 .vault-result-message {
   display: grid;
@@ -415,7 +424,7 @@ body[data-vault-mode="app"] .vault-overview {
   right: 0;
   bottom: 0;
   left: 0;
-  height: 4px;
+  height: 6px;
   overflow: hidden;
   background: color-mix(in srgb, var(--task-accent) 12%, transparent);
 }

@@ -194,8 +194,10 @@ describe("Save Space interface", () => {
     assert.doesNotMatch(combined, /\bundo\b/i)
     assert.match(combined, /const candidateSizeOptions = \[0\]/)
     assert.match(combined, /\[1, 10, 50, 100, 500\]/)
-    assert.match(combined, /Previous completed results were kept\./)
-    assert.doesNotMatch(combined, /The rest of the scan completed\./)
+    assert.match(combined, /The rest of the scan completed\./)
+    assert.doesNotMatch(combined, /Previous completed results were kept\./)
+    assert.match(combined, /Scan completed with exclusions/)
+    assert.match(combined, /Provisional until the scan completes/)
   })
 
   test("the header checkbox selects every Deduplicated row on the page", async () => {
@@ -341,9 +343,16 @@ describe("Save Space interface", () => {
       }
     })
     const { dom, requests } = await makePage(active)
-    const button = dom.window.document.getElementById("btn-scan")
+    const document = dom.window.document
+    const button = document.getElementById("btn-scan")
+    const progress = document.querySelector(
+      "#vault-scan-state [role='progressbar']")
 
     assert.match(button.textContent, /Cancel/)
+    assert.ok(progress.querySelector(".vault-progress-bar.indeterminate"))
+    assert.doesNotMatch(
+      document.getElementById("vault-metrics").textContent,
+      /Scanning/)
     button.click()
     await waitFor(() => requests.some((request) =>
       request.action === "cancel_scan"))
@@ -353,5 +362,66 @@ describe("Save Space interface", () => {
     )
     await settle()
     dom.window.close()
+  })
+
+  test("hashing is one determinate scan while provisional matches are results", async () => {
+    const active = fixture([], {
+      scan: {
+        active: true,
+        pending: false,
+        phase: "hashing",
+        queued: 1,
+        scope_id: null,
+        dirs: 20,
+        files: 100,
+        bytes_total: 4096,
+        hash_work_bytes: 1000,
+        hash_bytes_completed: 300,
+        current_file: "model.bin",
+        current_file_size: 500,
+        current_file_bytes: 100,
+        preview: {
+          provisional: true,
+          duplicate_files: 1,
+          bytes: 200,
+          groups: [{
+            hash: "a".repeat(64),
+            representative_path: "/pinokio/api/app/model.bin",
+            locations: 2,
+            duplicate_files: 1,
+            bytes: 200
+          }]
+        }
+      }
+    })
+    const { dom } = await makePage(active)
+    const document = dom.window.document
+    const scan = document.getElementById("vault-scan-state")
+    const progress = scan.querySelector('[role="progressbar"]')
+    const preview = document.getElementById("vault-result")
+
+    try {
+      assert.match(scan.textContent, /Step 2 of 3 · Verifying duplicates/)
+      assert.match(scan.textContent, /400 B of 1 KB analyzed · 40%/)
+      assert.ok(progress.querySelector(".vault-progress-bar.determinate"))
+      assert.equal(progress.getAttribute("aria-valuemax"), "1000")
+      assert.equal(progress.getAttribute("aria-valuenow"), "400")
+      assert.match(preview.textContent, /Duplicates found so far/)
+      assert.match(preview.textContent,
+        /\/pinokio\/api\/app\/model\.bin · 2 files with identical contents/)
+      assert.equal(preview.querySelector(".fa-spin"), null)
+      assert.equal(preview.querySelector(".vault-result-paths").hidden, true)
+      assert.match(preview.querySelector("#btn-scan-preview").textContent,
+        /View matches/)
+      preview.querySelector("#btn-scan-preview").click()
+      assert.equal(preview.querySelector(".vault-result-paths").hidden, false)
+      assert.match(preview.querySelector("#btn-scan-preview").textContent,
+        /Hide matches/)
+      assert.doesNotMatch(preview.textContent, /locations locations/)
+      assert.doesNotMatch(preview.textContent,
+        /duplicates verified duplicates/)
+    } finally {
+      dom.window.close()
+    }
   })
 })

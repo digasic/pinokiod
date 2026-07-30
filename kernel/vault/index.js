@@ -369,12 +369,18 @@ class Vault {
         }
       })
       worker.on("error", (error) => {
-        if (this.worker === worker) this.failHashWorker(worker, error)
+        if (this.worker !== worker) return
+        const failure = new Error(error && error.message
+          ? error.message
+          : "Hash worker failed.")
+        failure.code = "EVAULTHASHWORKER"
+        this.failHashWorker(worker, failure)
       })
       worker.on("exit", (code) => {
         if (this.worker === worker) {
-          this.failHashWorker(
-            worker, new Error(`hash worker exited with code ${code}`))
+          const failure = new Error(`hash worker exited with code ${code}`)
+          failure.code = "EVAULTHASHWORKER"
+          this.failHashWorker(worker, failure)
         }
       })
     }
@@ -414,7 +420,11 @@ class Vault {
       try {
         worker.postMessage({ id, filePath })
       } catch (error) {
-        this.failHashWorker(worker, error, true)
+        const failure = new Error(error && error.message
+          ? error.message
+          : "Hash worker could not accept work.")
+        failure.code = "EVAULTHASHWORKER"
+        this.failHashWorker(worker, failure, true)
       }
     })
   }
@@ -1086,7 +1096,10 @@ class Vault {
 
   async convert(targetPath) {
     const target = await this.registry.getFile(targetPath)
-    if (!target || target.status !== "duplicate" || !target.hash) {
+    if (!target ||
+        target.unavailable_reason === "stale" ||
+        target.status !== "duplicate" ||
+        !target.hash) {
       return { status: "not-found" }
     }
     const source = this.sourceForPath(target.path, target.source_id)
@@ -1374,7 +1387,9 @@ class Vault {
 
   async separate(filePath, options = {}) {
     const entry = await this.registry.getFile(filePath)
-    if (!entry) return { status: "not-found" }
+    if (!entry || entry.unavailable_reason === "stale") {
+      return { status: "not-found" }
+    }
     const source = this.sourceForPath(entry.path, entry.source_id)
     if (!source ||
         !await this.canonicalPathIsWithinSource(entry.path, source)) {
@@ -1665,6 +1680,15 @@ class Vault {
         ? global.source_hash_failures[scopeId] || 0
         : 0
     })
+    const sourceIds = new Set(this.scopeSourceIds(scopeId))
+    scoped.exclusions = Array.isArray(global.exclusions)
+      ? global.exclusions.filter((entry) =>
+        entry && sourceIds.has(entry.source_id))
+      : []
+    scoped.partial = scoped.exclusions.length > 0
+    scoped.outcome = scoped.partial
+      ? "completed_with_exclusions"
+      : "complete"
     this.lastScanCache.set(key, scoped)
     return scoped
   }

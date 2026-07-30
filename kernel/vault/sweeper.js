@@ -8,8 +8,41 @@ const {
   SHA256_RE
 } = require("./constants")
 
-const isAccessError = (error) => !!(error &&
-  (error.code === "EACCES" || error.code === "EPERM"))
+const PREVIEW_GROUP_LIMIT = 20
+
+const PATH_ERROR_CODES = new Set([
+  "EACCES",
+  "EAGAIN",
+  "EBUSY",
+  "EIO",
+  "EISDIR",
+  "ELOOP",
+  "ENODATA",
+  "ENOENT",
+  "ENOTDIR",
+  "ENXIO",
+  "EPERM",
+  "EROFS",
+  "ESTALE",
+  "ETIMEDOUT",
+  "EWOULDBLOCK"
+])
+
+const isPathError = (error) => !!(
+  error && PATH_ERROR_CODES.has(error.code))
+
+const exclusionReason = (error) => {
+  if (!error) return "unreadable"
+  if (error.code === "EACCES" || error.code === "EPERM") {
+    return "permission_denied"
+  }
+  if (error.code === "ENOENT" || error.code === "ENOTDIR") {
+    return "disappeared"
+  }
+  if (["EAGAIN", "ENODATA", "ETIMEDOUT", "EWOULDBLOCK"]
+    .includes(error.code)) return "not_resident"
+  return "unreadable"
+}
 
 const cancelledError = () => {
   const error = new Error("Scan cancelled.")
@@ -25,7 +58,9 @@ class Sweeper {
     this.cancelRequested = false
     this.statConcurrency = vault.statConcurrency || STAT_CONCURRENCY
     this.dirConcurrency = vault.dirConcurrency || DIR_CONCURRENCY
-    this.inaccessiblePaths = new Set()
+    this.exclusions = new Map()
+    this.previewGroups = new Map()
+    this.completedHashInodes = new Set()
   }
 
   idleState() {
@@ -43,12 +78,21 @@ class Sweeper {
       hashed: 0,
       hash_total: 0,
       hash_bytes: 0,
+      hash_work_files: 0,
+      hash_work_bytes: 0,
+      hash_files_completed: 0,
+      hash_bytes_completed: 0,
       queued: 0,
       inode_reuses: 0,
       unstable_hashes: 0,
       hash_failures: 0,
-      inaccessible: 0,
-      inaccessible_paths: [],
+      exclusions: [],
+      preview: {
+        provisional: true,
+        duplicate_files: 0,
+        bytes: 0,
+        groups: []
+      },
       started: null,
       duration_ms: null,
       walk_duration_ms: null,
@@ -81,7 +125,9 @@ class Sweeper {
   async scan(scopeId = null) {
     if (this.state.active) return { already_running: true }
     this.cancelRequested = false
-    this.inaccessiblePaths.clear()
+    this.exclusions.clear()
+    this.previewGroups.clear()
+    this.completedHashInodes.clear()
     this.state = Object.assign(this.idleState(), {
       active: true,
       phase: "discovering",
@@ -125,33 +171,31 @@ class Sweeper {
         this.checkpoint()
       }
       this.state.walk_duration_ms = Date.now() - walkStarted
+      await registry.stageExclusions(runId, this.exclusionList())
 
       this.state.phase = "hashing"
       const hashStarted = Date.now()
       await this.hashCandidates(runId)
+      await registry.stageExclusions(runId, this.exclusionList())
       await this.verifyCandidateAnchors(runId)
+      await registry.stageExclusions(runId, this.exclusionList())
       this.state.hash_wait_duration_ms = Date.now() - hashStarted
 
-      const incomplete = this.state.inaccessible > 0 ||
-        this.state.hash_failures > 0 ||
-        this.state.unstable_hashes > 0
-      if (incomplete) {
-        outcome = "incomplete"
-        await registry.abortScan(runId)
-      } else {
-        this.state.phase = "publishing"
-        this.state.duration_ms = Date.now() - this.state.started
-        const metadata = this.scanMetadata(scopeId)
-        const storeStat = await fs.promises.stat(this.vault.root)
-        await registry.publishScan(
-          runId,
-          this.publicationSourceIds(scopeId),
-          metadata,
-          storeStat.dev,
-          this.vault.mode === "link"
-        )
-        outcome = "complete"
-      }
+      outcome = this.exclusions.size
+        ? "completed_with_exclusions"
+        : "complete"
+      this.state.phase = "publishing"
+      this.state.duration_ms = Date.now() - this.state.started
+      const metadata = this.scanMetadata(scopeId, outcome)
+      const storeStat = await fs.promises.stat(this.vault.root)
+      await registry.publishScan(
+        runId,
+        this.publicationSourceIds(scopeId),
+        metadata,
+        storeStat.dev,
+        this.vault.mode === "link",
+        this.vault.blobRoot
+      )
     } catch (error) {
       await registry.abortScan(runId).catch(() => {})
       if (error && error.code === "EVAULTCANCELLED") {
@@ -164,6 +208,7 @@ class Sweeper {
       this.state.active = false
       this.state.phase = outcome
       this.state.duration_ms = Date.now() - this.state.started
+      this.clearPreview()
     }
 
     if (fatalError) throw fatalError
@@ -172,16 +217,19 @@ class Sweeper {
       files: this.state.files,
       bytes_total: this.state.bytes_total,
       candidates: this.state.candidates,
-      incomplete: outcome === "incomplete",
+      outcome,
+      partial: outcome === "completed_with_exclusions",
       cancelled: outcome === "cancelled",
-      inaccessible: this.state.inaccessible,
-      inaccessible_paths: this.state.inaccessible_paths.slice()
+      exclusions: this.exclusionList()
     }
   }
 
-  scanMetadata(scopeId) {
+  scanMetadata(scopeId, outcome = "complete") {
     return {
       scope_id: scopeId || "",
+      outcome,
+      partial: outcome === "completed_with_exclusions",
+      exclusions: this.exclusionList(),
       dirs: this.state.dirs,
       files: this.state.files,
       bytes_total: this.state.bytes_total,
@@ -192,6 +240,10 @@ class Sweeper {
       hashed: this.state.hashed,
       hash_total: this.state.hash_total,
       hash_bytes: this.state.hash_bytes,
+      hash_work_files: this.state.hash_work_files,
+      hash_work_bytes: this.state.hash_work_bytes,
+      hash_files_completed: this.state.hash_files_completed,
+      hash_bytes_completed: this.state.hash_bytes_completed,
       inode_reuses: this.state.inode_reuses,
       unstable_hashes: this.state.unstable_hashes,
       hash_failures: this.state.hash_failures,
@@ -203,13 +255,93 @@ class Sweeper {
     }
   }
 
-  recordInaccessible(error, filePath) {
-    if (!isAccessError(error)) return false
+  recordExclusion(
+    error,
+    filePath,
+    sourceId = null,
+    reason = null,
+    observed = null
+  ) {
+    if (!reason && !isPathError(error)) return false
     const target = path.resolve(filePath)
-    this.inaccessiblePaths.add(target)
-    this.state.inaccessible = this.inaccessiblePaths.size
-    this.state.inaccessible_paths = [...this.inaccessiblePaths].slice(0, 20)
+    const firstExclusion = !this.exclusions.has(target)
+    const source = this.vault.sourceForPath(target, sourceId)
+    this.exclusions.set(target, {
+      path: target,
+      source_id: source ? source.id : sourceId,
+      reason: reason || exclusionReason(error),
+      created_at: Date.now()
+    })
+    if (firstExclusion && observed) {
+      const observedSourceId = observed.source_id || sourceId || "pinokio"
+      const observedSize = Math.max(0, Number(observed.size) || 0)
+      this.state.files = Math.max(0, this.state.files - 1)
+      this.state.bytes_total = Math.max(
+        0, this.state.bytes_total - observedSize)
+      this.state.source_files[observedSourceId] = Math.max(
+        0, (this.state.source_files[observedSourceId] || 0) - 1)
+      this.state.source_bytes[observedSourceId] = Math.max(
+        0, (this.state.source_bytes[observedSourceId] || 0) - observedSize)
+    }
+    this.state.exclusions = this.exclusionList().slice(0, 100)
     return true
+  }
+
+  exclusionList() {
+    return [...this.exclusions.values()]
+  }
+
+  clearPreview() {
+    this.previewGroups.clear()
+    this.state.preview = {
+      provisional: true,
+      duplicate_files: 0,
+      bytes: 0,
+      groups: []
+    }
+  }
+
+  applyPreview(change) {
+    if (!change) return
+    this.state.preview.duplicate_files = Math.max(
+      0,
+      this.state.preview.duplicate_files +
+        (Number(change.duplicate_files_delta) || 0)
+    )
+    this.state.preview.bytes = Math.max(
+      0,
+      this.state.preview.bytes + (Number(change.bytes_delta) || 0)
+    )
+    for (const group of change.groups || []) {
+      if (!group || !group.hash) continue
+      if (!(Number(group.duplicate_files) > 0)) {
+        this.previewGroups.delete(group.hash)
+      } else if (this.previewGroups.has(group.hash) ||
+          this.previewGroups.size < PREVIEW_GROUP_LIMIT) {
+        this.previewGroups.set(group.hash, group)
+      }
+    }
+    this.state.preview.groups = [...this.previewGroups.values()]
+      .sort((left, right) =>
+        right.bytes - left.bytes || left.hash.localeCompare(right.hash))
+  }
+
+  applyHashWork(work) {
+    if (!work) return
+    this.state.hash_work_files = Math.max(
+      0, Number(work.hash_work_files) || 0)
+    this.state.hash_work_bytes = Math.max(
+      0, Number(work.hash_work_bytes) || 0)
+  }
+
+  completeHashWork(entry) {
+    if (entry.nlink > 1 && entry.ino !== 0) {
+      const key = `${entry.dev}:${entry.ino}`
+      if (this.completedHashInodes.has(key)) return
+      this.completedHashInodes.add(key)
+    }
+    this.state.hash_files_completed += 1
+    this.state.hash_bytes_completed += entry.size
   }
 
   async stageAnchors(runId) {
@@ -219,6 +351,7 @@ class Sweeper {
       stat = await fs.promises.lstat(blobRoot)
     } catch (error) {
       if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) return
+      if (this.recordExclusion(error, blobRoot)) return
       throw error
     }
     if (!stat.isDirectory() || stat.isSymbolicLink()) return
@@ -226,7 +359,8 @@ class Sweeper {
     for await (const directoryResults of walkBatches(blobRoot, {
       concurrency: this.dirConcurrency,
       strictErrors: true,
-      onError: (error, filePath) => this.recordInaccessible(error, filePath)
+      onError: (error, filePath) =>
+        this.recordExclusion(error, filePath)
     })) {
       this.checkpoint()
       const files = directoryResults.flatMap((group) =>
@@ -234,7 +368,8 @@ class Sweeper {
       const stats = await statMany(files, this.statConcurrency, null, {
         followSymlinks: false,
         strictErrors: true,
-        onError: (error, filePath) => this.recordInaccessible(error, filePath)
+        onError: (error, filePath) =>
+          this.recordExclusion(error, filePath)
       })
       const anchors = []
       for (let index = 0; index < files.length; index++) {
@@ -245,17 +380,21 @@ class Sweeper {
         if (path.basename(path.dirname(filePath)) !== hash.slice(0, 2)) continue
         anchors.push(anchorEntry(filePath, hash, fileStat))
       }
-      await this.vault.registry.stageAnchors(runId, anchors)
+      const staged = await this.vault.registry.stageAnchors(runId, anchors)
+      this.applyHashWork(staged && staged.work)
     }
   }
 
   async walk(root, runId, preferredSourceId = null) {
+    const rootHandle = await fs.promises.opendir(root)
+    await rootHandle.close()
     for await (const directoryResults of walkBatches(root, {
       concurrency: this.dirConcurrency,
       skipDirectory: (full) => full === this.vault.root,
       strictErrors: true,
       strictRoot: true,
-      onError: (error, filePath) => this.recordInaccessible(error, filePath)
+      onError: (error, filePath) =>
+        this.recordExclusion(error, filePath, preferredSourceId)
     })) {
       this.checkpoint()
       this.state.dirs += directoryResults
@@ -270,7 +409,8 @@ class Sweeper {
     const stats = await statMany(filePaths, this.statConcurrency, null, {
       followSymlinks: false,
       strictErrors: true,
-      onError: (error, filePath) => this.recordInaccessible(error, filePath)
+      onError: (error, filePath) =>
+        this.recordExclusion(error, filePath, preferredSourceId)
     })
     const entries = []
     for (let index = 0; index < filePaths.length; index++) {
@@ -285,6 +425,8 @@ class Sweeper {
     const staged = await this.vault.registry.stageFiles(
       runId, entries, this.vault.sizeThreshold)
     this.state.candidates += Number(staged && staged.changes) || 0
+    this.applyPreview(staged && staged.preview)
+    this.applyHashWork(staged && staged.work)
   }
 
   considerStat(filePath, stat, preferredSourceId) {
@@ -332,72 +474,95 @@ class Sweeper {
           const updated = await this.vault.registry.setStageInodeHash(
             runId, candidate.dev, candidate.ino, candidate.reusable_hash)
           this.state.inode_reuses += updated.changes
+          this.applyPreview(updated.preview)
           continue
         }
-        if (!candidate.hash_needed || !candidate.inode_representative) {
-          continue
-        }
-        const started = Date.now()
-        this.state.hash_total += 1
-        this.state.queued = 1
-        this.currentHash = {
-          path: candidate.path,
-          size: candidate.size,
-          bytes: 0
-        }
-        try {
-          const expected = stageSnapshot(candidate)
-          const result = await this.vault.hashFile(candidate.path, {
-            onProgress: (bytes) => {
-              if (this.currentHash &&
-                  this.currentHash.path === candidate.path) {
-                this.currentHash.bytes = bytes
-              }
-            }
-          })
-          const current = await fs.promises.lstat(candidate.path)
-          if (result.size !== current.size ||
-              !sameSnapshot(expected, current)) {
-            this.state.unstable_hashes += 1
-            await this.vault.registry.markStageHashFailed(
-              runId, candidate.path)
-            continue
-          }
-          const updated = candidate.nlink > 1 && candidate.ino !== 0
-            ? await this.vault.registry.setStageInodeHash(
-              runId, candidate.dev, candidate.ino, result.hash)
-            : await this.vault.registry.setStageHash(
-              runId, candidate.path, result.hash)
-          this.state.hashed += 1
-          this.state.hash_bytes += result.size
-          this.state.inode_reuses += Math.max(0, updated.changes - 1)
-        } catch (error) {
-          await this.vault.registry.markStageHashFailed(
-            runId, candidate.path)
-          if (error && error.code === "EVAULTCANCELLED") throw error
-          if (!this.recordInaccessible(error, candidate.path)) {
-            this.state.hash_failures += 1
-            const sourceId = candidate.source_id || "pinokio"
-            this.state.source_hash_failures[sourceId] =
-              (this.state.source_hash_failures[sourceId] || 0) + 1
-          }
-        } finally {
-          this.state.hash_duration_ms += Date.now() - started
-          this.state.queued = 0
-          this.currentHash = null
-        }
+        await this.hashCandidateRoutes(runId, candidate)
       }
     }
   }
 
+  async hashCandidateRoutes(runId, work) {
+    let candidate = work
+    let deferCompletion = false
+    while (candidate) {
+      this.checkpoint()
+      const started = Date.now()
+      this.state.hash_total += 1
+      this.state.queued = 1
+      this.currentHash = {
+        path: candidate.path,
+        size: candidate.size,
+        bytes: 0
+      }
+      try {
+        const expected = stageSnapshot(candidate)
+        const result = await this.vault.hashFile(candidate.path, {
+          onProgress: (bytes) => {
+            if (this.currentHash &&
+                this.currentHash.path === candidate.path) {
+              this.currentHash.bytes = bytes
+            }
+          }
+        })
+        const current = await fs.promises.lstat(candidate.path)
+        if (result.size !== current.size ||
+            !sameSnapshot(expected, current)) {
+          this.state.unstable_hashes += 1
+          const retry = await this.vault.registry.markStageHashFailed(
+            runId, candidate)
+          this.recordExclusion(
+            null,
+            candidate.path,
+            candidate.source_id,
+            "changed_during_scan",
+            candidate
+          )
+          candidate = retry.next
+          deferCompletion = !candidate && retry.anchor_fallback
+          continue
+        }
+        const updated = candidate.nlink > 1 && candidate.ino !== 0
+          ? await this.vault.registry.setStageInodeHash(
+            runId, candidate.dev, candidate.ino, result.hash)
+          : await this.vault.registry.setStageHash(
+            runId, candidate.path, result.hash)
+        this.state.hashed += 1
+        this.state.hash_bytes += result.size
+        this.state.inode_reuses += Math.max(0, updated.changes - 1)
+        this.applyPreview(updated.preview)
+        candidate = null
+        deferCompletion = false
+      } catch (error) {
+        const retry = await this.vault.registry.markStageHashFailed(
+          runId, candidate)
+        if (error && error.code === "EVAULTCANCELLED") throw error
+        if (!this.recordExclusion(
+          error, candidate.path, candidate.source_id, null, candidate
+        )) throw error
+        this.state.hash_failures += 1
+        const sourceId = candidate.source_id || "pinokio"
+        this.state.source_hash_failures[sourceId] =
+          (this.state.source_hash_failures[sourceId] || 0) + 1
+        candidate = retry.next
+        deferCompletion = !candidate && retry.anchor_fallback
+      } finally {
+        this.state.hash_duration_ms += Date.now() - started
+        this.state.queued = 0
+        this.currentHash = null
+      }
+    }
+    if (!deferCompletion) this.completeHashWork(work)
+  }
+
   async verifyCandidateAnchors(runId) {
-    await this.vault.registry.verifyAnchorsFromLinkedFiles(runId)
     while (true) {
       this.checkpoint()
       const anchors = await this.vault.registry.unverifiedAnchorBatch(runId)
       if (!anchors.length) return
       for (const anchor of anchors) {
         this.checkpoint()
+        let completeWork = false
         const expected = stageSnapshot(anchor)
         this.currentHash = {
           path: anchor.path,
@@ -416,22 +581,28 @@ class Sweeper {
           const current = await fs.promises.lstat(anchor.path)
           const unchanged = result.size === current.size &&
             sameSnapshot(expected, current)
-          if (unchanged && result.hash === anchor.hash_name) {
-            await this.vault.registry.markAnchorVerified(
-              runId, anchor.hash_name, result.hash)
+          if (unchanged) {
+            await this.vault.registry.markAnchorChecked(
+              runId, anchor, result.hash)
+            completeWork = true
           } else {
-            await this.vault.registry.markAnchorVerificationFailed(
-              runId, anchor.hash_name)
-            if (!unchanged) this.state.unstable_hashes += 1
+            const retry =
+              await this.vault.registry.markAnchorVerificationFailed(
+                runId, anchor)
+            this.state.unstable_hashes += 1
+            this.recordExclusion(
+              null, anchor.path, null, "changed_during_scan")
+            completeWork = !retry.retry_available
           }
         } catch (error) {
-          await this.vault.registry.markAnchorVerificationFailed(
-            runId, anchor.hash_name)
+          const retry =
+            await this.vault.registry.markAnchorVerificationFailed(
+              runId, anchor)
           if (error && error.code === "EVAULTCANCELLED") throw error
-          if (!this.recordInaccessible(error, anchor.path)) {
-            this.state.hash_failures += 1
-          }
+          if (!this.recordExclusion(error, anchor.path)) throw error
+          completeWork = !retry.retry_available
         } finally {
+          if (completeWork) this.completeHashWork(anchor)
           this.currentHash = null
         }
       }
