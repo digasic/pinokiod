@@ -1,6 +1,7 @@
 const fs = require("fs")
 const path = require("path")
 const crypto = require("crypto")
+const { execFile } = require("child_process")
 const { Worker } = require("worker_threads")
 const Registry = require("./registry")
 const Sweeper = require("./sweeper")
@@ -110,9 +111,32 @@ const rowSnapshot = (row) => ({
   ino: row.ino
 })
 
+const revealInFileManager = (filePath, platform = process.platform) =>
+  new Promise((resolve, reject) => {
+    const command = platform === "darwin"
+      ? "open"
+      : platform === "win32"
+        ? "explorer.exe"
+        : "xdg-open"
+    const args = platform === "darwin"
+      ? ["-R", filePath]
+      : platform === "win32"
+        ? [`/select,${filePath}`]
+        : [path.dirname(filePath)]
+    execFile(command, args, {
+      timeout: 10000,
+      windowsHide: true
+    }, (error) => error ? reject(error) : resolve())
+  })
+
 class Vault {
   constructor(kernel) {
     this.kernel = kernel
+    this.fileManagerLauncher = (filePath) =>
+      revealInFileManager(
+        filePath,
+        this.kernel.platform || process.platform
+      )
     this.enabled = false
     this.initialized = false
     this.mode = null
@@ -1054,6 +1078,37 @@ class Vault {
     }
   }
 
+  async revealFile(scopeId, filePath) {
+    if (typeof filePath !== "string" ||
+        !path.isAbsolute(filePath)) {
+      return { error: "Choose a valid file." }
+    }
+    if (scopeId && !this._sourcesById.has(scopeId)) {
+      return { error: "That location is no longer available." }
+    }
+    const entry = await this.registry.getFile(path.resolve(filePath))
+    if (!entry || entry.unavailable_reason === "stale") {
+      return { error: "This file is no longer tracked. Scan again to refresh this view." }
+    }
+    const source = this.sourceForPath(entry.path, entry.source_id)
+    if (!source || !this.sourceIsWithinScope(source, scopeId)) {
+      return { error: "This file is outside the current location." }
+    }
+    if (!await this.canonicalPathIsWithinSource(entry.path, source)) {
+      return { error: "This file is no longer available at the scanned location." }
+    }
+    const current = await lstatIfPresent(entry.path)
+    if (!current || !current.isFile()) {
+      return { error: "This file is no longer available at the scanned location." }
+    }
+    try {
+      await this.fileManagerLauncher(entry.path)
+    } catch (error) {
+      return { error: "The file manager could not open this file." }
+    }
+    return { revealed: true }
+  }
+
   locationForPath(filePath, preferredId = null) {
     const source = this.sourceForPath(filePath, preferredId)
     if (!source) {
@@ -1232,6 +1287,13 @@ class Vault {
         return this.cancelScan()
       case "cancel_file_action":
         return this.cancelFileAction()
+      case "reveal":
+        return this.revealFile(
+          typeof payload.scope_id === "string" && payload.scope_id
+            ? payload.scope_id
+            : null,
+          payload.path
+        )
       case "deduplicate": {
         const scopeId = typeof payload.scope_id === "string" &&
           payload.scope_id

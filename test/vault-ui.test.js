@@ -152,7 +152,9 @@ const makePage = async (status) => {
     if (options.method === "POST") {
       const payload = JSON.parse(options.body)
       requests.push(payload)
-      const result = payload.action === "deduplicate_files"
+      const result = payload.action === "reveal"
+        ? { revealed: true }
+        : payload.action === "deduplicate_files"
         ? {
             converted: payload.paths.length,
             bytes_saved: payload.paths.length * 4096,
@@ -358,7 +360,7 @@ describe("Save Space interface", () => {
       ]
     }
 
-    const { dom } = await makePage((url) => {
+    const { dom, requests } = await makePage((url) => {
       if (url.includes("group_hash=")) return children
       return url.includes("display_mode=files") ? grouped : status
     })
@@ -414,6 +416,26 @@ describe("Save Space interface", () => {
     assert.match(document.querySelector(
       ".vault-duplicate-children").textContent,
       /original\.bin/)
+    assert.equal(document.querySelector(
+      ".vault-duplicate-content-group [data-reveal-file]"), null)
+    const revealButtons = document.querySelectorAll(
+      ".vault-duplicate-child [data-reveal-file]")
+    assert.equal(revealButtons.length, 2)
+    const revealLabel = process.platform === "darwin"
+      ? "Show in Finder"
+      : process.platform === "win32"
+        ? "Show in File Explorer"
+        : "Open containing folder"
+    assert.equal(revealButtons[0].title, revealLabel)
+    assert.match(revealButtons[0].getAttribute("aria-label"),
+      new RegExp(`^${revealLabel}:`))
+
+    revealButtons[0].click()
+    await waitFor(() => requests.some((request) =>
+      request.action === "reveal"))
+    const reveal = requests.find((request) => request.action === "reveal")
+    assert.equal(reveal.path, duplicate.path)
+    assert.equal(reveal.scope_id, null)
 
     dom.window.close()
   })

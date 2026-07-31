@@ -927,9 +927,10 @@ body.vault-page .vault-view-tabs {
   cursor: pointer;
   font-size: 10px;
 }
-.vault-name-copy { min-width: 0; }
+.vault-name-copy { min-width: 0; flex: 1; }
 .vault-file-name {
   display: block;
+  min-width: 0;
   overflow: hidden;
   color: var(--task-text);
   font-size: 12px;
@@ -938,6 +939,28 @@ body.vault-page .vault-view-tabs {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.vault-name-cell > .vault-file-name { flex: 1; }
+.vault-reveal-button {
+  display: inline-grid;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--task-muted);
+  cursor: pointer;
+  font-size: 11px;
+}
+.vault-reveal-button:hover:not(:disabled),
+.vault-reveal-button:focus-visible {
+  border-color: var(--task-border);
+  background: var(--task-soft);
+  color: var(--task-text);
+}
+.vault-reveal-button:disabled { cursor: progress; opacity: .5; }
 .vault-file-path {
   display: block;
   overflow: hidden;
@@ -1018,6 +1041,7 @@ body.dark .vault-row-action .vault-text-button:hover:not(:disabled) {
 .vault-detail-label { margin-bottom: 5px; color: var(--task-muted); font-size: 10px; font-weight: 650; }
 .vault-location-detail { display: flex; align-items: center; gap: 7px; padding: 2px 0; color: var(--task-text); font-size: 10.5px; }
 .vault-location-detail i { color: var(--task-muted); }
+.vault-location-detail > span { min-width: 0; flex: 1; overflow-wrap: anywhere; }
 .vault-duplicate-content-group {
   min-height: 52px;
   background: color-mix(in srgb, var(--task-soft) 28%, transparent);
@@ -1029,7 +1053,7 @@ body.dark .vault-row-action .vault-text-button:hover:not(:disabled) {
 .vault-duplicate-child {
   display: grid;
   min-height: 36px;
-  grid-template-columns: 15px 16px minmax(260px, 1fr) minmax(150px, auto);
+  grid-template-columns: 15px 16px minmax(260px, 1fr) minmax(150px, auto) 26px;
   align-items: center;
   gap: 9px;
   padding: 5px var(--vault-inline) 5px calc(var(--vault-inline) + 30px);
@@ -1160,6 +1184,11 @@ body.dark .vault-row-action .vault-text-button:hover:not(:disabled) {
   .vault-disclosure { width: 44px; min-height: 44px; flex-basis: 44px; }
   .vault-status-cell > .vault-text-button,
   .vault-row-action .vault-text-button { min-height: 44px; }
+  .vault-reveal-button { width: 44px; height: 44px; flex-basis: 44px; }
+  .vault-duplicate-child {
+    min-height: 52px;
+    grid-template-columns: 15px 16px minmax(260px, 1fr) minmax(150px, auto) 44px;
+  }
 }
 @media (prefers-reduced-motion: reduce) {
   .vault-page * { scroll-behavior: auto !important; }

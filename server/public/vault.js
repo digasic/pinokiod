@@ -87,6 +87,10 @@ const COPY = {
   search_in: "Search in {location}",
   status_request_failed: "Couldn’t load Save space status ({status})",
   action_request_failed: "The Save space action failed ({status})",
+  show_in_finder: "Show in Finder",
+  show_in_file_explorer: "Show in File Explorer",
+  open_containing_folder: "Open containing folder",
+  reveal_failed: "The file manager could not open this file.",
   all_statuses: "All statuses",
   name: "Name",
   location_column: "Location",
@@ -350,6 +354,27 @@ const post = async (payload) => {
 }
 const sourceById = (id) => (state.data.sources || []).find((source) => source.id === id)
 const sourceChildren = (id) => (state.data.sources || []).filter((source) => source.parent_id === id)
+const sourceIsWithinScope = (sourceId) => {
+  if (!SCOPE_ID) return true
+  const seen = new Set()
+  let source = sourceById(sourceId)
+  while (source && !seen.has(source.id)) {
+    if (source.id === SCOPE_ID) return true
+    seen.add(source.id)
+    source = sourceById(source.parent_id)
+  }
+  return false
+}
+const revealLabel = document.body.dataset.platform === "darwin"
+  ? COPY.show_in_finder
+  : document.body.dataset.platform === "win32"
+    ? COPY.show_in_file_explorer
+    : COPY.open_containing_folder
+const revealButton = (filePath, sourceId, name) => {
+  if (!filePath || !sourceIsWithinScope(sourceId)) return ""
+  const label = `${revealLabel}: ${name || basename(filePath)}`
+  return `<button class="vault-reveal-button" type="button" data-reveal-file="${attr(filePath)}" aria-label="${attr(label)}" title="${attr(revealLabel)}"><i class="fa-regular fa-folder-open" aria-hidden="true"></i></button>`
+}
 const sourcePath = (source) => {
   if (!source) return ""
   if (source.kind === "pinokio") return `~/${basename(source.root)}`
@@ -634,7 +659,7 @@ const fileDetail = (item) => {
       .replace("{total}", total)
     : `${COPY.identical_contents_at} ${countLabel(total, COPY.location, COPY.locations_lower)}`
   return `<div class="vault-detail"><div class="vault-detail-label">${esc(label)}</div>${item.locations.map((location) => `
-    <div class="vault-location-detail"><i class="fa-regular fa-file"></i><span>${esc(externalLocation(location) || [location.source_label, location.relative_path].filter(Boolean).join(" / "))}</span></div>`).join("")}</div>`
+    <div class="vault-location-detail"><i class="fa-regular fa-file"></i><span>${esc(externalLocation(location) || [location.source_label, location.relative_path].filter(Boolean).join(" / "))}</span>${revealButton(location.path, location.source_id, basename(location.relative_path))}</div>`).join("")}</div>`
 }
 const separateCheckbox = (item) => item.status === "shared"
   ? `<input class="vault-row-checkbox" type="checkbox" data-select-separate="${attr(item.path)}" aria-label="${attr(`${COPY.select_for_separation}: ${basename(item.relative_path)}`)}" ${state.separateAllMatching || state.selectedSeparateFiles.has(item.path) ? "checked" : ""} />`
@@ -663,6 +688,7 @@ const renderFileRow = (item, depth = 0, showMatch = false) => {
       ${expandable ? `<button class="vault-disclosure" type="button" data-expand-file="${attr(item.path)}" aria-label="${state.expandedFiles.has(item.path) ? COPY.collapse : COPY.expand}" aria-expanded="${state.expandedFiles.has(item.path)}"><i class="fa-solid fa-chevron-${state.expandedFiles.has(item.path) ? "down" : "right"}"></i></button>` : `<span class="vault-disclosure"></span>`}
       <i class="fa-regular fa-file vault-name-icon"></i>
       <span class="vault-name-copy"><span class="vault-file-name">${esc(basename(item.relative_path))}</span>${directoryPath && depth === 0 ? `<span class="vault-file-path">${esc(directoryPath)}</span>` : ""}</span>
+      ${revealButton(item.path, item.source_id, basename(item.relative_path))}
     </div>
     <span class="vault-size">${item.size ? fmt(item.size) : "—"}</span>
     ${rowTail}
@@ -755,6 +781,7 @@ const renderFlatFiles = (items) => [...items]
         ${expandable ? `<button class="vault-disclosure" type="button" data-expand-file="${attr(item.path)}" aria-label="${state.expandedFiles.has(item.path) ? COPY.collapse : COPY.expand}" aria-expanded="${state.expandedFiles.has(item.path)}"><i class="fa-solid fa-chevron-${state.expandedFiles.has(item.path) ? "down" : "right"}"></i></button>` : `<span class="vault-disclosure"></span>`}
         <i class="fa-regular fa-file vault-name-icon"></i>
         <span class="vault-file-name">${esc(basename(item.relative_path))}</span>
+        ${revealButton(item.path, item.source_id, basename(item.relative_path))}
       </div>
       <span class="vault-flat-location">${esc(flatLocation(item))}</span>
       <span class="vault-size">${item.size ? fmt(item.size) : "—"}</span>
@@ -802,6 +829,7 @@ const renderDuplicateGroupChildren = (group) => {
       <i class="fa-regular fa-file"></i>
       <span class="vault-duplicate-child-path" title="${attr(location)}">${esc(location)}</span>
       <span class="vault-duplicate-child-status ${state.selectedDuplicateFiles.has(item.path) ? "selected" : ""}">${esc(duplicateChildStatus(item))}</span>
+      ${revealButton(item.path, item.source_id, basename(item.relative_path))}
     </div>`
   }).join("")
   const remaining = Math.max(
@@ -1906,6 +1934,30 @@ const chooseExternalFolder = () => new Promise((resolve, reject) => {
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("button")
   if (!target) return
+  if (target.hasAttribute("data-reveal-file")) {
+    target.disabled = true
+    target.setAttribute("aria-busy", "true")
+    try {
+      const result = await post({
+        action: "reveal",
+        scope_id: SCOPE_ID,
+        path: target.dataset.revealFile
+      })
+      if (result.error || !result.revealed) {
+        throw new Error(result.error || COPY.reveal_failed)
+      }
+    } catch (error) {
+      state.feedback = {
+        error: true,
+        message: error && error.message ? error.message : String(error)
+      }
+      renderFeedback()
+    } finally {
+      target.disabled = false
+      target.removeAttribute("aria-busy")
+    }
+    return
+  }
   if (target.hasAttribute("data-cancel-file-action")) {
     target.disabled = true
     try {

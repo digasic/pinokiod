@@ -239,6 +239,41 @@ describe("Save Space engine", () => {
     await close(vault)
   })
 
+  test("revealing a file is scoped to a current registered path", async () => {
+    const { home, vault } = await makeVault()
+    const pair = await duplicatePair(home, 'model "quoted".bin')
+    await vault.sweeper.scan()
+
+    const first = await vault.registry.getFile(pair.first)
+    const second = await vault.registry.getFile(pair.second)
+    const launched = []
+    vault.fileManagerLauncher = async (filePath) => {
+      launched.push(filePath)
+    }
+
+    assert.deepEqual(await vault.perform("reveal", {
+      scope_id: first.source_id,
+      path: pair.first
+    }), { revealed: true })
+    assert.deepEqual(launched, [pair.first])
+
+    const outside = await vault.perform("reveal", {
+      scope_id: first.source_id,
+      path: pair.second
+    })
+    assert.match(outside.error, /outside the current location/i)
+    assert.notEqual(first.source_id, second.source_id)
+    assert.deepEqual(launched, [pair.first])
+
+    const untracked = await vault.perform("reveal", {
+      path: path.join(home, "api", "first", "missing.bin")
+    })
+    assert.match(untracked.error, /no longer tracked/i)
+    assert.deepEqual(launched, [pair.first])
+
+    await close(vault)
+  })
+
   test("bulk Deduplicate changes only the selected duplicate paths", async () => {
     const { home, vault } = await makeVault()
     await duplicatePair(home, "first.bin")
