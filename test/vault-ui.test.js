@@ -306,6 +306,38 @@ describe("Save Space interface", () => {
     dom.window.close()
   })
 
+  test("search keeps focus while debounced results refresh", async () => {
+    const status = fixture([item()])
+    const urls = []
+    const { dom } = await makePage((url) => {
+      urls.push(url)
+      return status
+    })
+    const document = dom.window.document
+    urls.length = 0
+
+    const search = document.getElementById("vault-search")
+    search.focus()
+    search.value = "model"
+    search.setSelectionRange(3, 3)
+    search.dispatchEvent(new dom.window.Event("input", {
+      bubbles: true
+    }))
+
+    await waitFor(() => urls.some((url) =>
+      url.includes("q=model")))
+    await waitFor(() =>
+      document.getElementById("vault-search") !== search)
+
+    const refreshedSearch = document.getElementById("vault-search")
+    assert.equal(document.activeElement, refreshedSearch)
+    assert.equal(refreshedSearch.value, "model")
+    assert.equal(refreshedSearch.selectionStart, 3)
+    assert.equal(refreshedSearch.selectionEnd, 3)
+
+    dom.window.close()
+  })
+
   test("Duplicates can switch between location groups and content groups", async () => {
     const duplicate = item({
       path: "/pinokio/api/app/models/duplicate.bin",

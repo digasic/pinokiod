@@ -588,6 +588,18 @@ const displayModeControl = () => supportsDisplayMode() ? `<div class="vault-disp
   <button type="button" data-display-mode="files" aria-pressed="${state.displayMode === "files"}" class="${state.displayMode === "files" ? "selected" : ""}">${esc(COPY.files_mode)}</button>
 </div>` : ""
 const renderToolbar = () => {
+  const previousSearch = el("vault-search")
+  const restoreSearchFocus = previousSearch &&
+    document.activeElement === previousSearch
+  const selectionStart = restoreSearchFocus
+    ? previousSearch.selectionStart
+    : null
+  const selectionEnd = restoreSearchFocus
+    ? previousSearch.selectionEnd
+    : null
+  const selectionDirection = restoreSearchFocus
+    ? previousSearch.selectionDirection
+    : null
   const description = COPY[`${state.view}_description`] || ""
   const descriptionMarkup = `<span class="vault-toolbar-description" title="${attr(description)}">${esc(description)}</span>`
   if (state.view === "reclaimable") {
@@ -611,6 +623,17 @@ const renderToolbar = () => {
     ${bulkSeparateAction()}
     ${state.view === "all" ? batchAction(source) : bulkDeduplicationAction()}
     ${removeSourceAction(source)}`
+  if (restoreSearchFocus) {
+    const search = el("vault-search")
+    if (search) {
+      search.focus({ preventScroll: true })
+      search.setSelectionRange(
+        selectionStart,
+        selectionEnd,
+        selectionDirection
+      )
+    }
+  }
 }
 
 const unavailableLabel = (item) =>
