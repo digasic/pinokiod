@@ -1248,7 +1248,7 @@ class Vault {
   }
 
   async perform(action, payload = {}) {
-    if (!this.enabled) return { error: "Save space is disabled." }
+    if (!this.enabled) return { error: "Disk Saver is disabled." }
     await this.ensureInitialized()
     switch (action) {
       case "add_source": {
