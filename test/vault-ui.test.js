@@ -177,6 +177,7 @@ describe("Save Space interface", () => {
       await source(path.join(publicRoot, "vault.js")),
       await source(workspacePath)
     ].join("\n")
+    const vaultCss = await source(path.join(publicRoot, "vault.css"))
 
     assert.doesNotMatch(combined, /\brepair\b/i)
     assert.doesNotMatch(combined, /\bmigration\b/i)
@@ -198,6 +199,129 @@ describe("Save Space interface", () => {
     assert.doesNotMatch(combined, /Previous completed results were kept\./)
     assert.match(combined, /Scan completed with exclusions/)
     assert.match(combined, /Provisional until the scan completes/)
+    assert.doesNotMatch(combined, /Scan all locations/)
+    assert.doesNotMatch(combined,
+      /btn-empty-scan|vault-rail-footer|vault-visually-hidden/)
+    assert.match(vaultCss,
+      /body\.vault-page \.vault-view-tabs\s*\{[^}]*padding:\s*0;/s)
+  })
+
+  test("global mode makes the existing location hierarchy primary", async () => {
+    const status = fixture([item()])
+    status.sources.push(
+      {
+        id: "external", kind: "virtual", label: "External folders",
+        root: null, parent_id: null, available: true, shareable: null
+      },
+      {
+        id: "external:movies", kind: "external", label: "Movies",
+        root: "/Users/test/Movies", parent_id: "external",
+        available: true, shareable: true, removable: true
+      },
+      {
+        id: "external:pictures", kind: "external", label: "Pictures",
+        root: "/Users/test/Pictures", parent_id: "external",
+        available: true, shareable: true, removable: true
+      },
+      {
+        id: "app:empty", kind: "app", label: "empty-app",
+        root: "/pinokio/api/empty-app", parent_id: "apps",
+        available: true, shareable: true
+      },
+      {
+        id: "folder:empty", kind: "folder", label: "empty-folder",
+        root: "/pinokio/empty-folder", parent_id: "pinokio",
+        available: true, shareable: true
+      }
+    )
+    status.inventory.source_counts.all.external = 0
+    status.inventory.source_counts.all["external:movies"] = 0
+    status.inventory.source_counts.all["external:pictures"] = 0
+
+    const { dom, requests } = await makePage(status)
+    const document = dom.window.document
+    const rail = document.querySelector(".vault-rail-global")
+    const tabs = document.querySelector(".vault-view-tabs")
+
+    assert.ok(rail)
+    assert.ok(tabs)
+    assert.equal(rail.querySelector("#vault-views"), null)
+    assert.ok(tabs.querySelector("#vault-views"))
+    assert.match(tabs.textContent, /All files/)
+    assert.match(tabs.textContent, /Duplicates/)
+    assert.match(document.getElementById("btn-add-source").textContent,
+      /Add folder/)
+    assert.equal(document.querySelectorAll("#btn-scan").length, 1)
+    assert.equal(document.querySelectorAll("#vault-candidate-size").length, 1)
+    assert.ok(rail.querySelector("#btn-scan"))
+    assert.ok(rail.querySelector("#vault-candidate-size"))
+    assert.equal(document.querySelector(".vault-overview #btn-scan"), null)
+    assert.match(document.getElementById("btn-scan").textContent,
+      /Scan again/)
+    assert.ok(document.querySelector('.vault-all-locations[data-source=""]'))
+    assert.ok(document.querySelector('[data-source="pinokio"]'))
+    assert.ok(document.querySelector('[data-source="apps"]'))
+    assert.ok(document.querySelector('[data-source="app:app"]'))
+    assert.match(document.getElementById("vault-locations").textContent,
+      /Other folders/)
+    assert.ok(document.querySelector('[data-source="external:movies"]'))
+    assert.ok(document.querySelector('[data-source="external:pictures"]'))
+    assert.ok(document.querySelector('[data-source="app:empty"]'))
+    assert.ok(document.querySelector('[data-source="folder:empty"]'))
+
+    document.querySelector('[data-view="duplicates"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+    assert.ok(document.querySelector('[data-source="pinokio"]'))
+    assert.ok(document.querySelector('[data-source="apps"]'))
+    assert.ok(document.querySelector('[data-source="app:app"]'))
+    assert.ok(document.querySelector('[data-source="external:movies"]'))
+    assert.ok(document.querySelector('[data-source="app:empty"]'))
+    assert.ok(document.querySelector('[data-source="folder:empty"]'))
+
+    document.getElementById("btn-scan").click()
+    await waitFor(() => requests.some((request) =>
+      request.action === "scan"))
+    const scan = requests.find((request) => request.action === "scan")
+    assert.equal(scan.scope_id, null)
+    assert.equal(scan.candidate_size, 100 *
+      (process.platform === "win32" ? 1024 : 1000) ** 2)
+    await settle()
+    dom.window.close()
+  })
+
+  test("the fresh empty state keeps the rail as the only scan action", async () => {
+    const status = fixture([], {
+      last_scan: null,
+      bytes_without_sharing: 0,
+      bytes_on_disk: 0,
+      saved_by_sharing: 0,
+      effective_bytes: 0
+    })
+    const { dom } = await makePage(status)
+    const document = dom.window.document
+
+    assert.equal(document.querySelectorAll("#btn-scan").length, 1)
+    assert.equal(document.getElementById("btn-empty-scan"), null)
+    assert.ok(document.querySelector(".vault-rail-global #btn-scan"))
+    assert.match(document.getElementById("btn-scan").textContent, /Scan now/)
+    assert.match(document.querySelector(".vault-empty").textContent, /No files/)
+
+    dom.window.close()
+  })
+
+  test("app mode keeps its existing rail structure", async () => {
+    const workspace = ejs.render(await source(workspacePath), {
+      appMode: true
+    })
+
+    assert.match(workspace, /vault-rail-app/)
+    assert.match(workspace, /id='vault-views'/)
+    assert.match(workspace, /id='vault-locations'/)
+    assert.match(workspace, /vault-overview-actions/)
+    assert.match(workspace, /id='btn-scan'/)
+    assert.doesNotMatch(workspace, /id='btn-rail-scan'/)
+    assert.doesNotMatch(workspace, /class='vault-view-tabs'/)
   })
 
   test("the header checkbox selects every Deduplicated row on the page", async () => {

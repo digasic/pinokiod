@@ -13,6 +13,8 @@ const COPY = {
   reclaimable_description: "Private links no longer used by any linked file.",
   activity_description: "A history of changes made by Save space.",
   add_external_folder: "Add external folder",
+  all_locations: "All locations",
+  other_folders: "Other folders",
   files_region: "Files",
   folder_picker_error: "The folder picker could not be opened.",
   external_added: "Added to Locations. Run a scan when you’re ready.",
@@ -177,7 +179,6 @@ const COPY = {
   no_activity: "No activity yet",
   no_activity_hint: "Changes made by Save space will appear here.",
   view_all: "View all files",
-  show_all_locations: "Show all locations",
   tracked_note: "Only files {size} and larger appear here. Files keep their current locations.",
   tracked_note_all: "All non-empty files appear here. Files keep their current locations.",
   duplicate_note: "Only files waiting for review are shown.",
@@ -358,17 +359,14 @@ const renderViews = () => {
 }
 
 const renderSourceNode = (source, depth, counts) => {
-  const children = sourceChildren(source.id).filter((child) => {
-    const count = state.view === "duplicates" ? counts.duplicates.get(child.id) : counts.tracked.get(child.id)
-    return child.kind === "virtual" || count > 0 || (child.kind === "external" && child.available)
-  })
+  const children = sourceChildren(source.id)
   const duplicateCount = counts.duplicates.get(source.id) || 0
   const trackedCount = counts.tracked.get(source.id) || 0
-  if (!IS_APP_MODE && state.view === "duplicates" && duplicateCount === 0) return ""
   const collapsed = state.collapsedSources.has(source.id)
   const pathText = source.kind === "virtual" ? (source.id === "apps" ? "api" : "") : sourcePath(source)
   const count = state.view === "duplicates" ? duplicateCount : trackedCount
   const icon = source.kind === "app" ? "fa-regular fa-folder-open" : "fa-regular fa-folder"
+  const label = source.id === "external" ? COPY.other_folders : source.label
   let html = `<div class="vault-source-line depth-${Math.min(depth, 2)} ${pathText ? "has-path" : ""} ${state.sourceId === source.id ? "selected" : ""}">`
   if (children.length) {
     html += `<button class="vault-source-toggle" type="button" data-toggle-source="${attr(source.id)}" aria-label="${collapsed ? COPY.expand : COPY.collapse}" aria-expanded="${!collapsed}"><i class="fa-solid fa-chevron-${collapsed ? "right" : "down"}"></i></button>`
@@ -377,7 +375,7 @@ const renderSourceNode = (source, depth, counts) => {
   }
   html += `<button class="vault-nav-row ${state.sourceId === source.id ? "selected" : ""}" type="button" data-source="${attr(source.id)}" ${state.sourceId === source.id ? 'aria-current="page"' : ""}>
     <i class="${icon}"></i>
-    <span class="vault-nav-copy"><span class="vault-nav-name">${esc(source.label)}</span>${pathText ? `<span class="vault-nav-path" title="${attr(pathText)}">${esc(pathText)}</span>` : ""}</span>
+    <span class="vault-nav-copy"><span class="vault-nav-name">${esc(label)}</span>${pathText ? `<span class="vault-nav-path" title="${attr(pathText)}">${esc(pathText)}</span>` : ""}</span>
     <span class="vault-nav-count ${duplicateCount ? "attention" : ""}">${count || ""}</span>
   </button></div>`
   if (!collapsed) html += children.map((child) => renderSourceNode(child, depth + 1, counts)).join("")
@@ -398,13 +396,18 @@ const renderLocations = () => {
     const source = sourceById(SCOPE_ID)
     html = source ? renderSourceNode(source, 0, counts) : ""
   } else {
-    html = pinokio ? renderSourceNode(pinokio, 0, counts) : ""
+    const allCount = state.view === "duplicates"
+      ? Number(state.data.inventory.counts.duplicates) || 0
+      : Number(state.data.inventory.counts.all) || 0
+    html = `<button class="vault-nav-row vault-all-locations ${state.sourceId ? "" : "selected"}" type="button" data-source="" ${state.sourceId ? "" : 'aria-current="page"'}>
+      <i class="fa-solid fa-hard-drive"></i>
+      <span class="vault-nav-copy"><span class="vault-nav-name">${esc(COPY.all_locations)}</span></span>
+      <span class="vault-nav-count ${state.view === "duplicates" && allCount ? "attention" : ""}">${allCount || ""}</span>
+    </button>`
+    if (pinokio) html += renderSourceNode(pinokio, 0, counts)
     if (external && sourceChildren("external").length) html += renderSourceNode(external, 0, counts)
   }
   el("vault-locations").innerHTML = html
-  el("vault-rail-footer").innerHTML = !IS_APP_MODE && state.view === "duplicates"
-    ? `<button class="vault-text-button" type="button" data-view="all">${esc(COPY.show_all_locations)}</button>`
-    : ""
 }
 
 const selectedSource = () => state.sourceId ? sourceById(state.sourceId) : null
@@ -695,7 +698,6 @@ const renderInventoryGroups = (items) => {
 }
 
 const emptyState = (view) => {
-  const activeScan = scanActive(state.data && state.data.scan)
   const scanning = scanMatchesContext(state.data && state.data.scan)
   const content = {
     all: scanning
@@ -707,8 +709,7 @@ const emptyState = (view) => {
     reclaimable: [COPY.no_reclaimable, COPY.no_reclaimable_hint, "fa-regular fa-circle-check"],
     activity: [COPY.no_activity, COPY.no_activity_hint, "fa-solid fa-wave-square"]
   }[view]
-  const scanLabel = IS_APP_MODE ? COPY.scan_app : COPY.scan
-  return `<div class="vault-empty"><div class="vault-empty-inner"><i class="${content[2]}"></i><h3>${esc(content[0])}</h3><p>${esc(content[1])}</p>${view === "duplicates" ? `<button class="vault-button" type="button" data-view="all">${esc(COPY.view_all)}</button>` : view === "all" && !activeScan ? `<button class="vault-button" type="button" id="btn-empty-scan">${esc(scanLabel)}</button>` : ""}</div></div>`
+  return `<div class="vault-empty"><div class="vault-empty-inner"><i class="${content[2]}"></i><h3>${esc(content[0])}</h3><p>${esc(content[1])}</p>${view === "duplicates" ? `<button class="vault-button" type="button" data-view="all">${esc(COPY.view_all)}</button>` : ""}</div></div>`
 }
 
 const renderReclaimable = (blobs) => {
@@ -1611,11 +1612,12 @@ document.addEventListener("click", async (event) => {
     }
     resetPage()
     await refresh(true)
-  } else if (target.dataset.source) {
+  } else if (target.hasAttribute("data-source")) {
     clearSeparateSelection()
+    const sourceId = target.dataset.source || null
     state.sourceId = IS_APP_MODE
       ? SCOPE_ID
-      : (state.sourceId === target.dataset.source ? null : target.dataset.source)
+      : (state.sourceId === sourceId ? null : sourceId)
     resetPage()
     await refresh(true)
   } else if (target.dataset.toggleSource) {
@@ -1675,7 +1677,7 @@ document.addEventListener("click", async (event) => {
     } finally {
       target.disabled = false
     }
-  } else if (target.id === "btn-scan" || target.id === "btn-empty-scan") {
+  } else if (target.id === "btn-scan") {
     if (scanMatchesContext(state.data && state.data.scan)) {
       state.scanCancelRequested = true
       renderOverview()
