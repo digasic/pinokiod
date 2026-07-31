@@ -26,6 +26,15 @@
             </button>
             <select class='vault-select' id='vault-candidate-size'></select>
             <button class='vault-button primary vault-rail-action' id='btn-scan' type='button'></button>
+            <aside class='vault-external-prompt' id='vault-external-prompt' aria-labelledby='vault-external-prompt-title' hidden>
+              <button class='vault-external-prompt-dismiss' type='button' data-dismiss-external-prompt aria-label='Dismiss'></button>
+              <div class='vault-external-prompt-title' id='vault-external-prompt-title'>
+                <i class='fa-regular fa-folder-open' aria-hidden='true'></i>
+                <span>Save space outside Pinokio</span>
+              </div>
+              <p>Add folders used by other apps to find duplicates with Pinokio.</p>
+              <button class='vault-button vault-external-prompt-action' type='button' data-add-source>Add folder</button>
+            </aside>
           </div>
           <div class='vault-location-tree'>
             <div id='vault-locations'></div>

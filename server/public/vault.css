@@ -509,6 +509,77 @@ body[data-vault-mode="global"] .vault-explorer {
   min-height: 30px;
 }
 .vault-rail-scope .vault-select { width: 100%; min-width: 0; }
+.vault-external-prompt {
+  position: relative;
+  padding: 10px;
+  border: 1px solid var(--task-border-strong);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--task-panel) 92%, var(--task-soft));
+}
+.vault-external-prompt[hidden] { display: none; }
+.vault-external-prompt-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  padding-right: 20px;
+  color: var(--task-text);
+  font-size: 11.75px;
+  font-weight: 650;
+  line-height: 1.25;
+}
+.vault-external-prompt-title i {
+  width: 13px;
+  color: var(--task-muted);
+  text-align: center;
+  font-size: 11px;
+}
+.vault-external-prompt p {
+  margin: 7px 0 0;
+  color: var(--task-muted);
+  font-size: 10.75px;
+  line-height: 1.45;
+}
+.vault-external-prompt-action {
+  min-height: 26px;
+  margin-top: 9px;
+  padding: 5px 9px;
+  font-size: 11px;
+}
+.vault-external-prompt-dismiss {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--task-muted);
+  cursor: pointer;
+}
+.vault-external-prompt-dismiss::before,
+.vault-external-prompt-dismiss::after {
+  content: "";
+  position: absolute;
+  top: 10px;
+  left: 6px;
+  width: 10px;
+  height: 1px;
+  border-radius: 1px;
+  background: currentColor;
+}
+.vault-external-prompt-dismiss::before { transform: rotate(45deg); }
+.vault-external-prompt-dismiss::after { transform: rotate(-45deg); }
+.vault-external-prompt-dismiss:hover {
+  background: var(--task-soft);
+  color: var(--task-text);
+}
+.vault-external-prompt-dismiss:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--task-accent) 55%, transparent);
+  outline-offset: 1px;
+}
 .vault-location-tree {
   min-height: 0;
   padding: 8px 0 10px;

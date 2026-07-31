@@ -254,6 +254,7 @@ const duplicateGroupUrl = (hash, options = {}) => {
 }
 const reviewedScanKey = `pinokio:vault:reviewed-scan:${SCOPE_ID || "global"}`
 const candidateSizeKey = "pinokio:vault:candidate-size"
+const externalPromptKey = "pinokio:vault:external-prompt-dismissed"
 const candidateSizeBase = document.body.dataset.platform === "win32" ? 1024 : 1000
 const defaultCandidateSize = 100 * candidateSizeBase ** 2
 const candidateSizeOptions = [0]
@@ -480,6 +481,25 @@ const renderLocations = () => {
     html += renderSourceNode(external, 0, counts)
   }
   locations.innerHTML = html
+}
+
+const externalPromptDismissed = () => {
+  try { return localStorage.getItem(externalPromptKey) === "1" }
+  catch (error) { return false }
+}
+const dismissExternalPrompt = () => {
+  try { localStorage.setItem(externalPromptKey, "1") } catch (error) {}
+  const prompt = el("vault-external-prompt")
+  if (prompt) prompt.hidden = true
+}
+const renderExternalPrompt = () => {
+  const prompt = el("vault-external-prompt")
+  if (!prompt || IS_APP_MODE || !state.data) return
+  const hasCompletedScan = !!(state.data.last_scan && state.data.last_scan.ts)
+  const hasExternalLocation = (state.data.sources || []).some((source) =>
+    source.kind === "external")
+  prompt.hidden = !hasCompletedScan || hasExternalLocation ||
+    externalPromptDismissed()
 }
 
 const selectedSource = () => state.sourceId ? sourceById(state.sourceId) : null
@@ -1554,6 +1574,7 @@ const render = () => {
     }
   }
   renderViews()
+  renderExternalPrompt()
   renderLocations()
   renderToolbar()
   const page = pagedItems(items)
@@ -2113,7 +2134,9 @@ document.addEventListener("click", async (event) => {
       state.sourceId = null
       return COPY.external_removed
     })
-  } else if (target.id === "btn-add-source") {
+  } else if (target.hasAttribute("data-dismiss-external-prompt")) {
+    dismissExternalPrompt()
+  } else if (target.id === "btn-add-source" || target.hasAttribute("data-add-source")) {
     target.disabled = true
     try {
       const folderPath = await chooseExternalFolder()
@@ -2122,6 +2145,7 @@ document.addEventListener("click", async (event) => {
       if (result.error) {
         state.feedback = { error: true, message: result.error }
       } else {
+        dismissExternalPrompt()
         state.view = "all"
         state.displayMode = "folders"
         state.sizeSort = null

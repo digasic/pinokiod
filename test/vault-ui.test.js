@@ -306,6 +306,37 @@ describe("Save Space interface", () => {
     dom.window.close()
   })
 
+  test("the external-folder prompt appears after a scan and respects dismissal", async () => {
+    const { dom } = await makePage(fixture([item()]))
+    const document = dom.window.document
+    const prompt = document.getElementById("vault-external-prompt")
+
+    assert.ok(prompt)
+    assert.equal(prompt.hidden, false)
+    assert.match(prompt.textContent, /Save space outside Pinokio/)
+    assert.match(prompt.textContent,
+      /Add folders used by other apps to find duplicates with Pinokio\./)
+    assert.ok(prompt.querySelector("[data-add-source]"))
+
+    prompt.querySelector("[data-dismiss-external-prompt]").click()
+    assert.equal(prompt.hidden, true)
+    assert.equal(dom.window.localStorage.getItem(
+      "pinokio:vault:external-prompt-dismissed"), "1")
+
+    document.querySelector('[data-view="duplicates"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+    assert.equal(prompt.hidden, true)
+
+    dom.window.close()
+
+    const withoutScan = fixture([item()], { last_scan: null })
+    const { dom: unscannedDom } = await makePage(withoutScan)
+    assert.equal(unscannedDom.window.document.getElementById(
+      "vault-external-prompt").hidden, true)
+    unscannedDom.window.close()
+  })
+
   test("search keeps focus while debounced results refresh", async () => {
     const status = fixture([item()])
     const urls = []
