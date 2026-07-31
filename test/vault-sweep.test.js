@@ -25,13 +25,21 @@ const makeVault = async (threshold = 1) => {
     path.join(os.tmpdir(), "pinokio-vault-scan-"))
   homes.push(home)
   await fs.promises.mkdir(path.join(home, "api"), { recursive: true })
-  const kernel = { homedir: home, platform: process.platform }
+  const values = {}
+  const store = {
+    root: path.join(home, ".pinokio"),
+    get: (key) => values[key],
+    set: (key, value) => {
+      values[key] = JSON.parse(JSON.stringify(value))
+    }
+  }
+  const kernel = { homedir: home, platform: process.platform, store }
   const vault = new Vault(kernel)
   kernel.vault = vault
   await vault.init()
   vault.sizeThreshold = threshold
   vaults.push(vault)
-  return { home, vault }
+  return { home, vault, store }
 }
 
 const close = async (vault) => {
@@ -90,7 +98,7 @@ describe("Save Space scans", () => {
       })),
       before.map((stat) => ({ ino: stat.ino, nlink: stat.nlink }))
     )
-    assert.deepEqual(await fs.promises.readdir(vault.blobRoot), [])
+    assert.equal(fs.existsSync(vault.blobRoot), false)
   })
 
   test("hash-looking cache paths and metadata never replace byte hashing", async () => {
@@ -429,7 +437,7 @@ describe("Save Space scans", () => {
         SELECT COUNT(*) AS count
         FROM sqlite_temp_master
         WHERE type = 'table' AND name GLOB 'scan_*'
-      `).get().count, 5)
+      `).get().count, 6)
 
       const runId = registry.beginScan()
       const entries = []
@@ -454,7 +462,7 @@ describe("Save Space scans", () => {
         files: entries.length,
         bytes_total: entries.reduce((sum, entry) => sum + entry.size, 0),
         candidates: entries.length
-      }, 1, true)
+      }, [{ store_id: "store", dev: 1, can_link: true, root }])
 
       assert.deepEqual(registry.database.prepare(`
         SELECT status, file_count
@@ -478,7 +486,7 @@ describe("Save Space scans", () => {
         files: entries.length,
         bytes_total: entries.reduce((sum, entry) => sum + entry.size, 0),
         candidates: entries.length
-      }, 1, true)
+      }, [{ store_id: "store", dev: 1, can_link: true, root }])
       assert.equal(registry.database.prepare(`
         SELECT updated_at FROM files WHERE path = ?
       `).get(samplePath).updated_at, 123)
@@ -796,6 +804,8 @@ describe("Save Space scans", () => {
 
     const contents = crypto.randomBytes(5000)
     const hash = sha256(contents)
+    const store = vault.defaultAnchorStore()
+    await vault.ensureAnchorStore(store, (await fs.promises.stat(home)).dev)
     const anchor = await write(vault.storePathFor(hash), contents)
     const stat = await fs.promises.stat(anchor)
     const now = Date.now()
@@ -803,15 +813,22 @@ describe("Save Space scans", () => {
       hash,
       size: stat.size,
       first_seen: now,
+      verified_at: now
+    })
+    await vault.registry.upsertAnchor({
+      store_id: store.id,
+      hash,
+      path: anchor,
       verified_at: now,
-      anchor_verified_at: now,
-      anchor_present: true,
-      anchor_dev: stat.dev,
-      anchor_ino: stat.ino,
-      anchor_size: stat.size,
-      anchor_mtime: stat.mtimeMs,
-      anchor_ctime: stat.ctimeMs,
-      anchor_nlink: stat.nlink
+      dev: stat.dev,
+      ino: stat.ino,
+      size: stat.size,
+      mtime: stat.mtimeMs,
+      ctime: stat.ctimeMs,
+      nlink: stat.nlink,
+      mode: stat.mode,
+      uid: stat.uid,
+      gid: stat.gid
     })
     await fs.promises.utimes(
       anchor,
@@ -832,19 +849,18 @@ describe("Save Space scans", () => {
     const result = await vault.sweeper.scan()
 
     vault.hashFile = hashFile
-    const preserved = await vault.registry.getContent(hash)
     assert.equal(result.outcome, "completed_with_exclusions")
     assert.equal(result.exclusions.some((entry) =>
       entry.path === anchor &&
       entry.reason === "permission_denied"), true)
     assert.notEqual((await vault.registry.scanFor()).ts, previousScan.ts)
-    assert.equal(preserved.anchor_present, 0)
-    assert.equal(preserved.anchor_ino, null)
+    assert.equal(await vault.registry.getContent(hash), null)
+    assert.equal(await vault.registry.getAnchor(store.id, hash), null)
     assert.equal(await fs.promises.readFile(anchor).then(
       (value) => value.equals(contents)), true)
 
     await vault.sweeper.scan()
-    assert.equal((await vault.registry.getContent(hash)).anchor_present, 1)
+    assert.ok(await vault.registry.getAnchor(store.id, hash))
   })
 
   test("a failed hardlink path retries another path to the same inode", async () => {
@@ -1108,7 +1124,7 @@ describe("Save Space scans", () => {
   })
 
   test("a missing database is rebuilt by a normal scan, including managed links below the threshold", async () => {
-    const { home, vault } = await makeVault()
+    const { home, vault, store } = await makeVault()
     const contents = crypto.randomBytes(4096)
     await write(path.join(home, "api", "one", "model.bin"), contents)
     await write(path.join(home, "api", "two", "model.bin"), contents)
@@ -1121,7 +1137,11 @@ describe("Save Space scans", () => {
 
     await close(vault)
     await fs.promises.unlink(path.join(home, "vault", "registry.sqlite3"))
-    const replacement = new Vault({ homedir: home, platform: process.platform })
+    const replacement = new Vault({
+      homedir: home,
+      platform: process.platform,
+      store
+    })
     await replacement.init()
     replacement.sizeThreshold = contents.length * 2
     vaults.push(replacement)
@@ -1256,7 +1276,7 @@ describe("Save Space scans", () => {
     const contents = crypto.randomBytes(4096)
     await write(path.join(home, "api", "one", "model.bin"), contents)
     await write(path.join(home, "api", "two", "model.bin"), contents)
-    vault.mode = "copy"
+    vault.defaultAnchorStore().mode = "copy"
 
     await vault.sweeper.scan()
     const status = await vault.status(null, { view: "duplicates" })
@@ -1270,41 +1290,128 @@ describe("Save Space scans", () => {
       item.unavailable_reason === "hardlinks"), true)
   })
 
-  test("a lone file matching an anchor on another volume is unavailable", async () => {
-    const { home, vault } = await makeVault()
-    const contents = crypto.randomBytes(4096)
-    await write(path.join(home, "api", "one", "model.bin"), contents)
-    await write(path.join(home, "api", "two", "model.bin"), contents)
-    await vault.sweeper.scan()
-    const duplicate = [...await vault.registry.files({
-      statuses: ["duplicate"]
-    })][0]
-    await vault.perform("deduplicate", { path: duplicate.path })
-    for (const entry of [...await vault.registry.files({
-      hash: duplicate.hash
-    })]) {
-      await fs.promises.unlink(entry.path)
-    }
-    const independent = await write(
-      path.join(home, "api", "three", "model.bin"), contents)
-    const publishScan = vault.registry.publishScan.bind(vault.registry)
-    vault.registry.publishScan = (
-      runId, sourceIds, metadata, storeDev, canLink
-    ) => publishScan(runId, sourceIds, metadata, storeDev + 1, canLink)
+  test("copies are independent across filesystems but actionable within each filesystem", async () => {
+    const root = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "pinokio-vault-devices-"))
+    homes.push(root)
+    const registry = new RegistryCore(root)
+    await registry.load()
+    const hash = "a".repeat(64)
+    registry.upsertContent({
+      hash,
+      size: 4096,
+      first_seen: Date.now(),
+      verified_at: Date.now()
+    })
+    const add = (filePath, dev, ino) => registry.upsertFile({
+      path: filePath,
+      hash,
+      size: 4096,
+      mtime: 1,
+      ctime: 1,
+      dev,
+      ino,
+      mode: 0o100644,
+      uid: 501,
+      gid: 20,
+      source_id: "external",
+      status: "reference"
+    })
+    add(path.join(root, "drive-a", "one.bin"), 101, 1)
+    add(path.join(root, "drive-b", "one.bin"), 202, 2)
+    add(path.join(root, "drive-b", "two.bin"), 202, 3)
 
-    await vault.sweeper.scan()
+    registry.reclassifyHash(hash, [
+      { store_id: "store-a", dev: 101, can_link: true },
+      { store_id: "store-b", dev: 202, can_link: true }
+    ])
 
-    assert.equal((await vault.registry.getFile(independent)).status, "unavailable")
     assert.equal(
-      (await vault.registry.getFile(independent)).unavailable_reason,
-      "different_disk"
+      registry.getFile(path.join(root, "drive-a", "one.bin")).status,
+      "reference"
     )
+    assert.deepEqual(
+      [
+        registry.getFile(path.join(root, "drive-b", "one.bin")).status,
+        registry.getFile(path.join(root, "drive-b", "two.bin")).status
+      ].sort(),
+      ["duplicate", "reference"]
+    )
+    const grouped = registry.duplicateGroupPage({
+      unrestricted: true,
+      authorizedUnrestricted: true,
+      pageSize: 500
+    })
+    assert.equal(grouped.rows.length, 1)
+    assert.equal(grouped.rows[0].hash, hash)
+    assert.equal(grouped.rows[0].total_count, 3)
+    assert.equal(grouped.rows[0].eligible_count, 1)
+    assert.equal(grouped.rows[0].can_save, 4096)
+    const children = registry.duplicateGroupChildren({
+      hash,
+      unrestricted: true,
+      activeUnrestricted: true,
+      pageSize: 500
+    })
+    assert.equal(children.total, 3)
+    assert.equal(children.rows.filter((row) => row.selectable).length, 1)
+    const selection = registry.duplicateGroupSelection({
+      hash,
+      unrestricted: true
+    })
+    assert.equal(selection.paths.length, 1)
+    assert.equal(selection.exceeded, false)
+
+    registry.upsertAnchor({
+      store_id: "store-a",
+      hash,
+      path: path.join(root, "store-a", hash),
+      verified_at: Date.now(),
+      dev: 101,
+      ino: 10,
+      size: 4096,
+      mtime: 1,
+      ctime: 1,
+      nlink: 1,
+      mode: 0o100644,
+      uid: 501,
+      gid: 20
+    })
+    registry.upsertAnchor({
+      store_id: "store-b",
+      hash,
+      path: path.join(root, "store-b", hash),
+      verified_at: Date.now(),
+      dev: 202,
+      ino: 20,
+      size: 4096,
+      mtime: 1,
+      ctime: 1,
+      nlink: 1,
+      mode: 0o100644,
+      uid: 501,
+      gid: 20
+    })
+    assert.deepEqual(
+      registry.anchorsForHash(hash).map((anchor) => anchor.store_id),
+      ["store-a", "store-b"]
+    )
+    assert.deepEqual(
+      registry.reclaimableBatch({ store_id: "", hash: "" }, 10)
+        .map((anchor) => anchor.store_id),
+      ["store-a", "store-b"]
+    )
+    registry.close()
   })
 
   test("a hash-looking anchor name never authorizes cleanup without byte verification", async () => {
     const { home, vault } = await makeVault()
     const contents = crypto.randomBytes(4096)
     const claimedHash = sha256(contents)
+    await vault.ensureAnchorStore(
+      vault.defaultAnchorStore(),
+      (await fs.promises.stat(home)).dev
+    )
     const anchorPath = vault.storePathFor(claimedHash)
     await write(anchorPath, crypto.randomBytes(4096))
     await write(path.join(home, "api", "one", "model.bin"), contents)
@@ -1314,7 +1421,7 @@ describe("Save Space scans", () => {
     const status = await vault.status()
 
     assert.equal(result.partial, false)
-    assert.equal((await vault.registry.getContent(claimedHash)).anchor_present, 0)
+    assert.deepEqual(await vault.registry.anchorsForHash(claimedHash), [])
     assert.equal(status.inventory.counts.reclaimable, 0)
     assert.equal(status.inventory.shareable_duplicates, 0)
     assert.equal(status.pending_bytes, 0)
@@ -1328,9 +1435,13 @@ describe("Save Space scans", () => {
   })
 
   test("anchor verification participates in scan cancellation", async () => {
-    const { vault } = await makeVault()
+    const { home, vault } = await makeVault()
     const contents = crypto.randomBytes(4096)
     const hash = sha256(contents)
+    await vault.ensureAnchorStore(
+      vault.defaultAnchorStore(),
+      (await fs.promises.stat(home)).dev
+    )
     const anchorPath = await write(vault.storePathFor(hash), contents)
     let release
     let entered
@@ -1381,6 +1492,56 @@ describe("Save Space scans", () => {
     assert.equal(
       [...await vault.registry.files()].some((row) =>
         row.path.startsWith(symlink + path.sep)),
+      false
+    )
+  })
+
+  test("an external ancestor is walked once while Pinokio keeps its own attribution", async () => {
+    const base = await fs.promises.mkdtemp(
+      path.join(os.tmpdir(), "pinokio-vault-ancestor-"))
+    homes.push(base)
+    const home = path.join(base, "pinokio")
+    await fs.promises.mkdir(path.join(home, "api", "app"), {
+      recursive: true
+    })
+    const pinokioFile = await write(
+      path.join(home, "api", "app", "model.bin"),
+      crypto.randomBytes(4096)
+    )
+    const externalFile = await write(
+      path.join(base, "Documents", "archive.bin"),
+      crypto.randomBytes(4096)
+    )
+    const kernel = { homedir: home, platform: process.platform }
+    const vault = new Vault(kernel)
+    kernel.vault = vault
+    await vault.init()
+    vault.sizeThreshold = 0
+    vaults.push(vault)
+
+    const added = await vault.addExternalSource(base)
+    assert.equal(added.created, true)
+    assert.deepEqual(vault.scanRoots(), [{
+      root: added.source.root,
+      source_id: added.source.id
+    }])
+
+    await vault.sweeper.scan()
+
+    assert.equal(
+      (await vault.registry.getFile(
+        await fs.promises.realpath(pinokioFile))).source_id,
+      `app:${encodeURIComponent("app")}`
+    )
+    assert.equal(
+      (await vault.registry.getFile(
+        await fs.promises.realpath(externalFile))).source_id,
+      added.source.id
+    )
+    const registryRoot = await fs.promises.realpath(vault.root)
+    assert.equal(
+      [...await vault.registry.files()].some((row) =>
+        row.path.startsWith(`${registryRoot}${path.sep}`)),
       false
     )
   })

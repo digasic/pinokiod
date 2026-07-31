@@ -104,6 +104,8 @@ const fixture = (items = [], overrides = {}) => {
         locations: items.length ? 1 : 0,
         shareable_bytes: shareable.reduce(
           (sum, entry) => sum + (Number(entry.size) || 0), 0),
+        deduplicate_bytes: shareable.reduce(
+          (sum, entry) => sum + (Number(entry.size) || 0), 0),
         separate_count: shared.length,
         separate_bytes: shared.reduce(
           (sum, entry) => sum + (Number(entry.size) || 0), 0)
@@ -150,7 +152,13 @@ const makePage = async (status) => {
     if (options.method === "POST") {
       const payload = JSON.parse(options.body)
       requests.push(payload)
-      const result = payload.action === "separate_files"
+      const result = payload.action === "deduplicate_files"
+        ? {
+            converted: payload.paths.length,
+            bytes_saved: payload.paths.length * 4096,
+            failed: 0
+          }
+        : payload.action === "separate_files"
         ? { separated: payload.paths.length, failed: 0 }
         : payload.action === "separate_all"
           ? { separated: 1200, failed: 0, cancelled: false }
@@ -188,6 +196,8 @@ describe("Save Space interface", () => {
     assert.match(combined, /action:\s*"cancel_file_action"/)
     assert.match(combined, /action:\s*"cancel_scan"/)
     assert.match(combined, /const MAX_BULK_SEPARATE_FILES = 500/)
+    assert.match(combined,
+      /const MAX_BULK_DEDUPLICATE_FILES = 500/)
     assert.match(combined, /make_file_separate:\s*"Make file separate"/)
     assert.match(combined, /make_files_separate:\s*"Make \{count\} files separate"/)
     assert.doesNotMatch(combined,
@@ -287,6 +297,341 @@ describe("Save Space interface", () => {
     assert.equal(scan.candidate_size, 100 *
       (process.platform === "win32" ? 1024 : 1000) ** 2)
     await settle()
+    dom.window.close()
+  })
+
+  test("Duplicates can switch between location groups and content groups", async () => {
+    const duplicate = item({
+      path: "/pinokio/api/app/models/duplicate.bin",
+      relative_path: "models/duplicate.bin",
+      status: "duplicate",
+      shareable: true,
+      match: {
+        path: "/Users/test/Models/original.bin",
+        source_id: "external:models",
+        source_label: "Models",
+        relative_path: "original.bin"
+      }
+    })
+    const status = fixture([duplicate])
+    status.inventory.source_counts.duplicates["app:app"] = 1
+    status.inventory.shareable_by_source["app:app"] = 1
+    delete status.inventory.current.deduplicate_bytes
+    const grouped = JSON.parse(JSON.stringify(status))
+    grouped.items = [{
+      kind: "duplicate_group",
+      hash: duplicate.hash,
+      path: duplicate.path,
+      size: duplicate.size,
+      total_count: 2,
+      eligible_count: 1,
+      can_save: duplicate.size,
+      source_id: duplicate.source_id,
+      source_kind: duplicate.source_kind,
+      source_label: duplicate.source_label,
+      relative_path: duplicate.relative_path
+    }]
+    grouped.inventory.total = 1
+    grouped.inventory.end = 1
+    const children = {
+      hash: duplicate.hash,
+      total: 2,
+      next_cursor: null,
+      items: [
+        Object.assign({}, duplicate, {
+          kind: "duplicate_path",
+          registry_status: "duplicate",
+          selectable: true
+        }),
+        item({
+          kind: "duplicate_path",
+          path: "/Users/test/Models/original.bin",
+          relative_path: "original.bin",
+          status: "tracked",
+          registry_status: "reference",
+          shareable: false,
+          selectable: false,
+          source_id: "external:models",
+          source_kind: "external",
+          source_label: "Models"
+        })
+      ]
+    }
+
+    const { dom } = await makePage((url) => {
+      if (url.includes("group_hash=")) return children
+      return url.includes("display_mode=files") ? grouped : status
+    })
+    const document = dom.window.document
+
+    document.querySelector('[data-view="duplicates"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+
+    assert.equal(
+      document.getElementById("vault-toolbar-summary").textContent.trim(),
+      "1 file · 1 location"
+    )
+    assert.equal(
+      document.querySelector("[data-deduplicate-all]").textContent.trim(),
+      `Deduplicate all 1 file (${dom.window.PinokioFormatStorageSize(
+        status.pending_bytes
+      )})`
+    )
+
+    const displayMode = document.querySelector(".vault-display-mode")
+    assert.ok(displayMode)
+    assert.equal(document.querySelector(
+      '[data-display-mode="folders"]').getAttribute("aria-pressed"), "true")
+    assert.ok(document.querySelector(".vault-table.matches"))
+    assert.match(document.querySelector(".vault-group-title").textContent,
+      /Pinokio \/ Apps \/ app/)
+    assert.doesNotMatch(document.getElementById("vault-toolbar").textContent,
+      /By location/)
+
+    document.querySelector('[data-display-mode="files"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-display-mode="files"]').getAttribute("aria-pressed") === "true")
+
+    const table = document.querySelector(".vault-table.duplicate-files")
+    assert.ok(table)
+    assert.match(table.querySelector(".vault-columns").textContent,
+      /NameCopiesSize eachCan save/)
+    assert.equal(table.querySelectorAll(
+      ".vault-duplicate-content-group").length, 1)
+    assert.match(table.querySelector(
+      ".vault-duplicate-content-group").textContent,
+      /duplicate\.bin2 identical copies · 1 can be deduplicated/)
+    assert.equal(document.querySelector(
+      "[data-select-duplicate-page]"), null)
+
+    table.querySelector("[data-expand-duplicate-group]").click()
+    await waitFor(() => document.querySelectorAll(
+      ".vault-duplicate-child").length === 2)
+    assert.match(document.querySelector(
+      ".vault-duplicate-children").textContent,
+      /duplicate\.bin/)
+    assert.match(document.querySelector(
+      ".vault-duplicate-children").textContent,
+      /original\.bin/)
+
+    dom.window.close()
+  })
+
+  test("Duplicate rows can be selected and deduplicated as a bounded batch", async () => {
+    const first = item({
+      path: "/pinokio/api/app/models/first.bin",
+      relative_path: "models/first.bin",
+      status: "duplicate",
+      shareable: true
+    })
+    const second = item({
+      path: "/pinokio/api/app/models/second.bin",
+      relative_path: "models/second.bin",
+      status: "duplicate",
+      shareable: true
+    })
+    const unavailable = item({
+      path: "/pinokio/api/app/models/unavailable.bin",
+      relative_path: "models/unavailable.bin",
+      status: "duplicate",
+      shareable: false,
+      unavailable_reason: "metadata"
+    })
+    const status = fixture([first, second, unavailable])
+    status.inventory.source_counts.duplicates["app:app"] = 3
+    status.inventory.shareable_by_source["app:app"] = 2
+    const grouped = JSON.parse(JSON.stringify(status))
+    grouped.items = [{
+      kind: "duplicate_group",
+      hash: first.hash,
+      path: first.path,
+      size: first.size,
+      total_count: 4,
+      eligible_count: 2,
+      can_save: first.size + second.size,
+      source_id: first.source_id,
+      source_kind: first.source_kind,
+      source_label: first.source_label,
+      relative_path: first.relative_path
+    }]
+    grouped.inventory.total = 1
+    grouped.inventory.end = 1
+    const childItems = [
+      Object.assign({}, first, {
+        kind: "duplicate_path",
+        registry_status: "duplicate",
+        selectable: true
+      }),
+      Object.assign({}, second, {
+        kind: "duplicate_path",
+        registry_status: "duplicate",
+        selectable: true
+      }),
+      Object.assign({}, unavailable, {
+        kind: "duplicate_path",
+        registry_status: "unavailable",
+        selectable: false
+      }),
+      item({
+        kind: "duplicate_path",
+        path: "/pinokio/api/app/models/reference.bin",
+        relative_path: "models/reference.bin",
+        status: "tracked",
+        registry_status: "reference",
+        shareable: false,
+        selectable: false
+      })
+    ]
+
+    const { dom, requests } = await makePage((url) => {
+      if (url.includes("group_select=1")) {
+        return {
+          hash: first.hash,
+          paths: [first.path, second.path],
+          exceeded: false
+        }
+      }
+      if (url.includes("group_hash=")) {
+        return {
+          hash: first.hash,
+          total: childItems.length,
+          next_cursor: null,
+          items: childItems
+        }
+      }
+      return url.includes("display_mode=files") ? grouped : status
+    })
+    const document = dom.window.document
+
+    document.querySelector('[data-view="duplicates"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+
+    let checkboxes = document.querySelectorAll(
+      "[data-select-duplicate]")
+    assert.equal(checkboxes.length, 2)
+    const selectPage = document.querySelector(
+      "[data-select-duplicate-page]")
+    assert.ok(selectPage)
+    assert.equal(selectPage.checked, false)
+
+    checkboxes[0].click()
+    assert.equal(selectPage.indeterminate, true)
+    assert.equal(
+      document.querySelector("[data-deduplicate-selected]")
+        .textContent.trim(),
+      `Deduplicate selected file (${dom.window.PinokioFormatStorageSize(
+        first.size
+      )})`
+    )
+    assert.equal(document.querySelector("[data-deduplicate-all]"), null)
+
+    document.querySelector('[data-display-mode="files"]').click()
+    await waitFor(() => document.querySelector(
+      ".vault-table.duplicate-files"))
+    assert.equal(document.querySelector(
+      "[data-select-duplicate-page]"), null)
+    const groupCheckbox = document.querySelector(
+      "[data-select-duplicate-group]")
+    assert.ok(groupCheckbox)
+    assert.equal(groupCheckbox.checked, false)
+    assert.equal(groupCheckbox.indeterminate, false)
+    assert.equal(document.querySelector(
+      "[data-deduplicate-selected]"), null)
+
+    document.querySelector("[data-expand-duplicate-group]").click()
+    await waitFor(() => document.querySelectorAll(
+      "[data-select-duplicate]").length === 2)
+    checkboxes = document.querySelectorAll("[data-select-duplicate]")
+    assert.equal(checkboxes[0].checked, false)
+    assert.equal(checkboxes[1].checked, false)
+    checkboxes[0].click()
+    assert.equal(document.querySelector(
+      "[data-select-duplicate-group]").indeterminate, true)
+
+    document.querySelector("[data-select-duplicate-group]").click()
+    await waitFor(() => document.querySelector(
+      "[data-deduplicate-selected]") &&
+      document.querySelector("[data-deduplicate-selected]")
+        .textContent.includes("2 selected"))
+    const selectedAction = document.querySelector(
+      "[data-deduplicate-selected]")
+    assert.equal(
+      selectedAction.textContent.trim(),
+      `Deduplicate 2 selected files (${dom.window.PinokioFormatStorageSize(
+        first.size + second.size
+      )})`
+    )
+    selectedAction.click()
+
+    await waitFor(() => requests.some((request) =>
+      request.action === "deduplicate_files"))
+    assert.deepEqual(
+      requests.find((request) =>
+        request.action === "deduplicate_files"),
+      {
+        action: "deduplicate_files",
+        paths: [first.path, second.path]
+      }
+    )
+    await settle()
+    dom.window.close()
+  })
+
+  test("an oversized content group is not partially selected", async () => {
+    const duplicate = item({
+      status: "duplicate",
+      shareable: true
+    })
+    const status = fixture([duplicate])
+    status.inventory.source_counts.duplicates["app:app"] = 501
+    status.inventory.shareable_by_source["app:app"] = 501
+    const grouped = JSON.parse(JSON.stringify(status))
+    grouped.items = [{
+      kind: "duplicate_group",
+      hash: duplicate.hash,
+      path: duplicate.path,
+      size: duplicate.size,
+      total_count: 502,
+      eligible_count: 501,
+      can_save: duplicate.size * 501,
+      source_id: duplicate.source_id,
+      source_kind: duplicate.source_kind,
+      source_label: duplicate.source_label,
+      relative_path: duplicate.relative_path
+    }]
+    grouped.inventory.current.count = 501
+    grouped.inventory.total = 1
+    grouped.inventory.end = 1
+
+    const { dom } = await makePage((url) => {
+      if (url.includes("group_select=1")) {
+        return {
+          hash: duplicate.hash,
+          paths: [],
+          exceeded: true
+        }
+      }
+      return url.includes("display_mode=files") ? grouped : status
+    })
+    const document = dom.window.document
+
+    document.querySelector('[data-view="duplicates"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+    document.querySelector('[data-display-mode="files"]').click()
+    await waitFor(() => document.querySelector(
+      "[data-select-duplicate-group]"))
+    document.querySelector("[data-select-duplicate-group]").click()
+
+    await waitFor(() => document.getElementById(
+      "vault-feedback").textContent.includes("up to 500"))
+    assert.equal(document.querySelector(
+      "[data-deduplicate-selected]"), null)
+    assert.equal(document.querySelector(
+      "[data-select-duplicate-group]").checked, false)
+
     dom.window.close()
   })
 

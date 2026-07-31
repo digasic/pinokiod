@@ -63,6 +63,12 @@ const unsafeStoragePath = (filePath) => {
   return error
 }
 
+const unavailableStorage = (message) => {
+  const error = new Error(message)
+  error.code = "EVAULTUNAVAILABLE"
+  return error
+}
+
 const isPathWithin = (root, target) => {
   const relative = path.relative(path.resolve(root), path.resolve(target))
   return relative === "" || (
@@ -125,6 +131,10 @@ class Vault {
     this._sources = []
     this._sourcesById = new Map()
     this._sourceBases = new Map()
+    this._anchorStores = []
+    this._anchorStoresById = new Map()
+    this._anchorStoresByDevice = new Map()
+    this._fallbackConfig = null
     this.operationTail = Promise.resolve()
     this.initializationPromise = null
     this.scanPromise = null
@@ -141,14 +151,81 @@ class Vault {
   }
 
   get blobRoot() {
-    return path.resolve(this.root, "sha256")
+    const store = this.defaultAnchorStore()
+    return store
+      ? path.resolve(store.root, "sha256")
+      : path.resolve(this.globalConfigRoot(), "vault", "sha256")
   }
 
-  storePathFor(hash) {
+  storePathFor(hash, storeId = null) {
     if (typeof hash !== "string" || !SHA256_RE.test(hash)) {
       throw new TypeError("Invalid vault content identifier.")
     }
-    return path.resolve(this.blobRoot, hash.slice(0, 2), hash)
+    const store = storeId
+      ? this._anchorStoresById.get(storeId)
+      : this.defaultAnchorStore()
+    if (!store) throw new Error("No anchor store is configured.")
+    return path.resolve(
+      store.root, "sha256", hash.slice(0, 2), hash)
+  }
+
+  globalConfigRoot() {
+    return this.kernel.store && typeof this.kernel.store.root === "string"
+      ? path.resolve(this.kernel.store.root)
+      : path.resolve(this.kernel.homedir, ".pinokio")
+  }
+
+  readConfig() {
+    const stored = this.kernel.store &&
+      typeof this.kernel.store.get === "function"
+      ? this.kernel.store.get("vault")
+      : this._fallbackConfig
+    const config = stored && typeof stored === "object" ? stored : {}
+    return {
+      locations: Array.isArray(config.locations)
+        ? config.locations.filter((item) => typeof item === "string")
+        : [],
+      anchor_stores: Array.isArray(config.anchor_stores)
+        ? config.anchor_stores.filter((item) =>
+          item &&
+          typeof item === "object" &&
+          typeof item.id === "string" &&
+          item.id &&
+          typeof item.root === "string" &&
+          typeof item.probe_path === "string")
+        : []
+    }
+  }
+
+  writeConfig(config) {
+    const value = {
+      locations: [...new Set((config.locations || [])
+        .filter((item) => typeof item === "string")
+        .map((item) => path.resolve(item)))],
+      anchor_stores: (config.anchor_stores || []).map((store) => ({
+        id: store.id,
+        root: path.resolve(store.root),
+        probe_path: path.resolve(store.probe_path)
+      }))
+    }
+    if (this.kernel.store && typeof this.kernel.store.set === "function") {
+      this.kernel.store.set("vault", value)
+    } else {
+      this._fallbackConfig = value
+    }
+    return value
+  }
+
+  configuredLocations() {
+    return this.readConfig().locations
+  }
+
+  defaultAnchorStore() {
+    const home = path.resolve(this.kernel.homedir)
+    return this._anchorStores.find((store) =>
+      store.available && isPathWithin(store.probe_path, home)) ||
+      this._anchorStores[0] ||
+      null
   }
 
   async directoryIfSafe(directory) {
@@ -173,12 +250,23 @@ class Vault {
   }
 
   async storeStatIfPresent(storePath, options = {}) {
-    if (!isPathWithin(this.blobRoot, storePath)) {
+    const store = options.store_id
+      ? this._anchorStoresById.get(options.store_id)
+      : this._anchorStores.find((candidate) =>
+        isPathWithin(path.resolve(candidate.root, "sha256"), storePath))
+    if (!store) {
       throw unsafeStoragePath(storePath)
     }
-    if (!await this.directoryIfSafe(this.root) ||
-        !await this.directoryIfSafe(this.blobRoot)) {
-      throw unsafeStoragePath(this.blobRoot)
+    const blobRoot = path.resolve(store.root, "sha256")
+    if (!isPathWithin(blobRoot, storePath)) {
+      throw unsafeStoragePath(storePath)
+    }
+    if (options.createParent) {
+      await this.ensureAnchorStore(store, options.dev)
+    }
+    if (!await this.directoryIfSafe(store.root) ||
+        !await this.directoryIfSafe(blobRoot)) {
+      return null
     }
     const shard = path.dirname(storePath)
     let shardStat = await this.directoryIfSafe(shard)
@@ -191,6 +279,91 @@ class Vault {
       throw unsafeStoragePath(storePath)
     }
     return stat
+  }
+
+  async ensureAnchorStore(store, expectedDev = null) {
+    if (!store) throw new Error("No anchor store is configured.")
+    const managementParent = path.dirname(store.root)
+    const parentStat = await lstatIfPresent(managementParent)
+    if (!parentStat) {
+      await fs.promises.mkdir(managementParent, {
+        recursive: true,
+        mode: 0o700
+      })
+    } else if (!parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+      throw unsafeStoragePath(managementParent)
+    }
+    await this.ensureDirectory(store.root)
+    const markerPath = path.resolve(store.root, "store.json")
+    const markerStat = await lstatIfPresent(markerPath)
+    if (markerStat && (!markerStat.isFile() || markerStat.isSymbolicLink())) {
+      throw unsafeStoragePath(markerPath)
+    }
+    if (markerStat) {
+      let marker
+      try {
+        marker = JSON.parse(await fs.promises.readFile(markerPath, "utf8"))
+      } catch (error) {
+        throw unsafeStoragePath(markerPath)
+      }
+      if (!marker || marker.id !== store.id || marker.version !== 1) {
+        throw unsafeStoragePath(markerPath)
+      }
+    } else {
+      await fs.promises.writeFile(
+        markerPath,
+        `${JSON.stringify({ id: store.id, version: 1 }, null, 2)}\n`,
+        { flag: "wx", mode: 0o600 }
+      )
+    }
+    const rootStat = await fs.promises.stat(store.root)
+    if (expectedDev !== null && rootStat.dev !== expectedDev) {
+      throw unavailableStorage(
+        "The configured anchor store is on a different filesystem.")
+    }
+    const mode = await this.probe(store.root)
+    store.available = true
+    store.dev = rootStat.dev
+    store.mode = mode
+    this._anchorStoresByDevice.set(rootStat.dev, store)
+    if (mode !== "link") {
+      throw unavailableStorage(
+        "This filesystem does not support hardlinks.")
+    }
+    await this.ensureDirectory(path.resolve(store.root, "sha256"))
+    return store
+  }
+
+  async validateAnchorStore(store, expectedDev = null) {
+    if (!store) throw new Error("No anchor store is configured.")
+    const markerPath = path.resolve(store.root, "store.json")
+    const [rootStat, markerStat] = await Promise.all([
+      this.directoryIfSafe(store.root),
+      lstatIfPresent(markerPath)
+    ])
+    if (!rootStat ||
+        !markerStat ||
+        !markerStat.isFile() ||
+        markerStat.isSymbolicLink()) {
+      throw unsafeStoragePath(store.root)
+    }
+    let marker
+    try {
+      marker = JSON.parse(await fs.promises.readFile(markerPath, "utf8"))
+    } catch (error) {
+      throw unsafeStoragePath(markerPath)
+    }
+    if (!marker || marker.id !== store.id || marker.version !== 1) {
+      throw unsafeStoragePath(markerPath)
+    }
+    const current = await fs.promises.stat(store.root)
+    if (expectedDev !== null && current.dev !== expectedDev) {
+      throw unavailableStorage(
+        "The configured anchor store is on a different filesystem.")
+    }
+    store.available = true
+    store.dev = current.dev
+    return current
   }
 
   runExclusive(operation) {
@@ -253,10 +426,15 @@ class Vault {
   async initializeStorage() {
     if (this.initialized) return { enabled: true, mode: this.mode }
     await this.ensureDirectory(this.root)
-    await this.ensureDirectory(this.blobRoot)
     this.registry = new Registry(this.root)
     await this.registry.load()
-    this.mode = await this.probe(this.root)
+    await this.importLegacyLocationConfig()
+    await this.refreshAnchorStores()
+    await this.migrateLegacyAnchorStore()
+    this.mode = this.defaultAnchorStore() &&
+      this.defaultAnchorStore().mode === "copy"
+      ? "copy"
+      : "link"
     await this.refreshSources()
     this.sweeper = new Sweeper(this)
     this.initialized = true
@@ -276,8 +454,224 @@ class Vault {
 
   async openWorkspace() {
     if (!this.initialized) return this.ensureInitialized()
+    await this.refreshAnchorStores()
     await this.refreshSources()
     return { enabled: true, mode: this.mode }
+  }
+
+  async importLegacyLocationConfig() {
+    const config = this.readConfig()
+    const legacy = await this.registry.externalSources()
+    const locations = [...new Set([
+      ...config.locations.map((item) => path.resolve(item)),
+      ...legacy.map((item) => path.resolve(item))
+    ])]
+    if (locations.length !== config.locations.length ||
+        locations.some((item, index) =>
+          item !== path.resolve(config.locations[index] || ""))) {
+      this.writeConfig(Object.assign({}, config, { locations }))
+    }
+  }
+
+  async migrateLegacyAnchorStore() {
+    const legacyRoot = path.resolve(this.root, "sha256")
+    const legacyStat = await lstatIfPresent(legacyRoot)
+    if (!legacyStat) return false
+    if (!legacyStat.isDirectory() || legacyStat.isSymbolicLink()) {
+      throw unsafeStoragePath(legacyRoot)
+    }
+    if (!(await fs.promises.readdir(legacyRoot)).length) {
+      await fs.promises.rmdir(legacyRoot)
+      return true
+    }
+    const store = this.anchorStoreForDevice(legacyStat.dev)
+    if (!store) {
+      throw unavailableStorage(
+        "The legacy anchor store has no configured store on its filesystem.")
+    }
+    const targetRoot = path.resolve(store.root, "sha256")
+    if (samePath(legacyRoot, targetRoot)) return false
+
+    await this.ensureAnchorStore(store, legacyStat.dev)
+    const targetEntries = await fs.promises.readdir(targetRoot)
+    if (targetEntries.length) {
+      throw unavailableStorage(
+        "Both the legacy and configured anchor stores contain files.")
+    }
+    await fs.promises.rmdir(targetRoot)
+    try {
+      await fs.promises.rename(legacyRoot, targetRoot)
+    } catch (error) {
+      await this.ensureDirectory(targetRoot).catch(() => {})
+      throw error
+    }
+    return true
+  }
+
+  async refreshAnchorStores() {
+    let config = this.readConfig()
+    const candidates = [
+      {
+        probe_path: path.resolve(this.kernel.homedir),
+        preferred_root: path.resolve(this.globalConfigRoot(), "vault"),
+        home: true
+      },
+      ...config.locations.map((location) => ({
+        probe_path: path.resolve(location),
+        home: false
+      }))
+    ]
+    const configured = []
+    for (const entry of config.anchor_stores) {
+      if (typeof entry.id !== "string" ||
+          !entry.id ||
+          typeof entry.root !== "string" ||
+          typeof entry.probe_path !== "string") continue
+      configured.push({
+        id: entry.id,
+        root: path.resolve(entry.root),
+        probe_path: path.resolve(entry.probe_path)
+      })
+    }
+
+    const observed = []
+    for (const store of configured) {
+      try {
+        const stat = await fs.promises.stat(store.probe_path)
+        if (stat.isDirectory()) observed.push({ store, dev: stat.dev })
+      } catch (error) {
+        if (!isMissingError(error)) throw error
+      }
+    }
+    let changed = configured.length !== config.anchor_stores.length
+    for (const candidate of candidates) {
+      let stat
+      try {
+        stat = await fs.promises.stat(candidate.probe_path)
+      } catch (error) {
+        if (isMissingError(error)) continue
+        throw error
+      }
+      if (!stat.isDirectory() ||
+          observed.some((item) => item.dev === stat.dev)) continue
+      const filesystemAnchor = candidate.home
+        ? null
+        : await this.filesystemAnchor(candidate.probe_path, stat.dev)
+      const store = {
+        id: crypto.randomUUID(),
+        root: candidate.home
+          ? candidate.preferred_root
+          : path.resolve(filesystemAnchor, ".pinokio", "vault"),
+        probe_path: candidate.probe_path
+      }
+      configured.push(store)
+      observed.push({ store, dev: stat.dev })
+      changed = true
+    }
+    if (changed) {
+      config = this.writeConfig(Object.assign({}, config, {
+        anchor_stores: configured
+      }))
+    }
+
+    const stores = []
+    for (const entry of config.anchor_stores) {
+      const store = {
+        id: entry.id,
+        root: path.resolve(entry.root),
+        probe_path: path.resolve(entry.probe_path),
+        available: false,
+        dev: null,
+        mode: null
+      }
+      try {
+        const probeStat = await fs.promises.stat(store.probe_path)
+        if (!probeStat.isDirectory()) {
+          stores.push(store)
+          continue
+        }
+        const rootStat = await lstatIfPresent(store.root)
+        if (rootStat &&
+            (!rootStat.isDirectory() || rootStat.isSymbolicLink())) {
+          throw unsafeStoragePath(store.root)
+        }
+        store.available = true
+        store.dev = probeStat.dev
+        store.mode = this.volumeModes.get(store.dev) || null
+      } catch (error) {
+        if (!isMissingError(error)) throw error
+      }
+      stores.push(store)
+    }
+    this._anchorStores = stores
+    this._anchorStoresById = new Map(
+      stores.map((store) => [store.id, store]))
+    this._anchorStoresByDevice = new Map()
+    for (const store of stores) {
+      if (!store.available || !Number.isFinite(store.dev)) continue
+      if (this._anchorStoresByDevice.has(store.dev)) {
+        store.available = false
+        store.error = "duplicate_device"
+        continue
+      }
+      this._anchorStoresByDevice.set(store.dev, store)
+    }
+    return stores
+  }
+
+  async filesystemAnchor(directory, expectedDev = null) {
+    let current = path.resolve(directory)
+    const first = await fs.promises.stat(current)
+    const dev = expectedDev === null ? first.dev : expectedDev
+    if (!first.isDirectory() || first.dev !== dev) {
+      throw new Error("The configured location is not on the expected filesystem.")
+    }
+    while (true) {
+      const parent = path.dirname(current)
+      if (parent === current) return current
+      let parentStat
+      try {
+        parentStat = await fs.promises.stat(parent)
+      } catch (error) {
+        if (isMissingError(error)) return current
+        throw error
+      }
+      if (parentStat.dev !== dev) return current
+      current = parent
+    }
+  }
+
+  anchorStoreForDevice(dev) {
+    return this._anchorStoresByDevice.get(dev) || null
+  }
+
+  anchorStores() {
+    return this._anchorStores
+  }
+
+  anchorStoreForPath(filePath) {
+    return this._anchorStores.find((store) =>
+      isPathWithin(path.resolve(store.root, "sha256"), filePath)) || null
+  }
+
+  storageRoots() {
+    const roots = [
+      this.root,
+      ...this._anchorStores.map((store) => store.root)
+    ].map((item) => path.resolve(item))
+    for (const root of [...roots]) {
+      try {
+        roots.push(path.resolve(fs.realpathSync(root)))
+      } catch (error) {
+        if (!isMissingError(error)) throw error
+      }
+    }
+    return [...new Set(roots)]
+  }
+
+  isStorageRoot(directory) {
+    const target = path.resolve(directory)
+    return this.storageRoots().some((root) => samePath(root, target))
   }
 
   async probe(directory) {
@@ -446,12 +840,6 @@ class Vault {
         root: null, parent_id: null
       }
     ]
-    let storeDev = null
-    try {
-      storeDev = (await fs.promises.stat(this.root)).dev
-    } catch (error) {
-      if (!isMissingError(error)) throw error
-    }
     const decorate = async (source) => {
       if (!source.root) return source
       try {
@@ -459,14 +847,16 @@ class Vault {
           fs.promises.lstat(source.root),
           fs.promises.realpath(source.root)
         ])
+        source.canonical_root = path.resolve(realRoot)
         source.dev = stat.dev
         source.available = stat.isDirectory() &&
           !stat.isSymbolicLink() &&
           (source.kind !== "external" || samePath(realRoot, source.root))
+        const store = this.anchorStoreForDevice(stat.dev)
         source.shareable = source.available &&
-          storeDev !== null &&
-          stat.dev === storeDev &&
-          this.mode === "link"
+          !!store &&
+          store.mode !== "copy"
+        source.store_id = store ? store.id : null
       } catch (error) {
         if (!isMissingError(error)) throw error
         source.available = false
@@ -493,7 +883,7 @@ class Vault {
       }))
     }
 
-    for (const configuredPath of await this.registry.externalSources()) {
+    for (const configuredPath of this.configuredLocations()) {
       sources.push(await decorate({
         id: sourceId("external", configuredPath),
         kind: "external",
@@ -531,12 +921,17 @@ class Vault {
     this._sourceBases = new Map()
     for (const source of sources) {
       if (!source.root || source.kind === "virtual") continue
-      const resolved = path.resolve(source.root)
-      const key = process.platform === "win32"
-        ? resolved.toLowerCase()
-        : resolved
-      if (!this._sourceBases.has(key)) this._sourceBases.set(key, [])
-      this._sourceBases.get(key).push(source)
+      const bases = new Set([
+        path.resolve(source.root),
+        source.canonical_root && path.resolve(source.canonical_root)
+      ].filter(Boolean))
+      for (const resolved of bases) {
+        const key = process.platform === "win32"
+          ? resolved.toLowerCase()
+          : resolved
+        if (!this._sourceBases.has(key)) this._sourceBases.set(key, [])
+        this._sourceBases.get(key).push(source)
+      }
     }
     return sources
   }
@@ -591,20 +986,44 @@ class Vault {
         ? [{ root: path.resolve(source.root), source_id: source.id }]
         : []
     }
-    const home = path.resolve(this.kernel.homedir)
-    const candidates = [{ root: home, source_id: "pinokio" }]
-    const external = this._sources
+    const pinokio = this._sourcesById.get("pinokio")
+    const candidates = [
+      {
+        root: path.resolve(pinokio && pinokio.root || this.kernel.homedir),
+        canonical_root: path.resolve(
+          pinokio && pinokio.canonical_root ||
+          pinokio && pinokio.root ||
+          this.kernel.homedir
+        ),
+        source_id: "pinokio"
+      },
+      ...this._sources
       .filter((source) =>
         source.kind === "external" && source.available && source.root)
-      .sort((left, right) =>
-        path.resolve(left.root).length - path.resolve(right.root).length)
-    for (const source of external) {
-      const canonical = path.resolve(source.root)
-      if (candidates.some((candidate) =>
-        isPathWithin(candidate.root, canonical))) continue
-      candidates.push({ root: canonical, source_id: source.id })
+      .map((source) => ({
+        root: path.resolve(source.root),
+        canonical_root: path.resolve(source.canonical_root || source.root),
+        source_id: source.id
+      }))
+    ].sort((left, right) =>
+      left.canonical_root.length - right.canonical_root.length ||
+      left.canonical_root.localeCompare(right.canonical_root))
+    const roots = []
+    for (const candidate of candidates) {
+      const canonical = candidate.canonical_root
+      if (roots.some((root) =>
+        isPathWithin(root.canonical_root, canonical))) continue
+      for (let index = roots.length - 1; index >= 0; index--) {
+        if (isPathWithin(canonical, roots[index].canonical_root)) {
+          roots.splice(index, 1)
+        }
+      }
+      roots.push(candidate)
     }
-    return candidates
+    return roots.map(({ root, source_id: sourceIdValue }) => ({
+      root,
+      source_id: sourceIdValue
+    }))
   }
 
   scopeSourceIds(scopeId = null, locationId = null) {
@@ -643,7 +1062,12 @@ class Vault {
         relative_path: path.basename(filePath)
       }
     }
-    const relative = path.relative(source.root, path.resolve(filePath))
+    const resolvedPath = path.resolve(filePath)
+    const sourceBase = source.canonical_root &&
+      isPathWithin(source.canonical_root, resolvedPath)
+      ? source.canonical_root
+      : source.root
+    const relative = path.relative(sourceBase, resolvedPath)
       .split(path.sep).join("/") || path.basename(filePath)
     return {
       source_id: source.id,
@@ -664,7 +1088,7 @@ class Vault {
     if (!stat.isDirectory()) throw new Error("Choose a folder, not a file.")
 
     const home = path.resolve(await fs.promises.realpath(this.kernel.homedir))
-    if (isPathWithin(home, canonical) || isPathWithin(canonical, home)) {
+    if (isPathWithin(home, canonical)) {
       throw new Error(
         "That folder is already inside Pinokio and is included in scans.")
     }
@@ -675,7 +1099,11 @@ class Vault {
       samePath(source.root, canonical))
     if (existing) return { created: false, source: existing }
 
-    await this.registry.addExternalSource(canonical)
+    const config = this.readConfig()
+    this.writeConfig(Object.assign({}, config, {
+      locations: [...config.locations, canonical]
+    }))
+    await this.refreshAnchorStores()
     await this.refreshSources()
     const source = this._sources.find((candidate) =>
       candidate.kind === "external" &&
@@ -692,7 +1120,13 @@ class Vault {
     if (!source) {
       return { error: "That external folder is no longer configured." }
     }
+    const config = this.readConfig()
+    this.writeConfig(Object.assign({}, config, {
+      locations: config.locations.filter((item) =>
+        !samePath(item, source.root))
+    }))
     await this.registry.removeExternalSourceState(source.root, source.id)
+    await this.refreshAnchorStores()
     await this.refreshSources()
     return {
       removed: true,
@@ -821,6 +1255,22 @@ class Vault {
           files_completed: 0
         }, (progress) => this.deduplicateScope(scopeId, { progress })))
       }
+      case "deduplicate_files": {
+        if (!Array.isArray(payload.paths) ||
+            payload.paths.length === 0 ||
+            payload.paths.length > MAX_BULK_FILE_ACTIONS ||
+            payload.paths.some((item) =>
+              typeof item !== "string" || !item)) {
+          return { error: "Choose valid duplicate files to deduplicate." }
+        }
+        const paths = [...new Set(payload.paths.map((item) =>
+          path.resolve(item)))]
+        return this.runMutation(() => this.runFileAction({
+          kind: "deduplicate-files",
+          files_total: paths.length,
+          files_completed: 0
+        }, (progress) => this.deduplicateFiles(paths, progress)))
+      }
       case "detach":
         if (typeof payload.path !== "string" || !payload.path) {
           return { status: "not-found" }
@@ -863,7 +1313,8 @@ class Vault {
           this.separateMatchingFiles(selection, progress)))
       }
       case "reclaim":
-        return this.runMutation(() => this.reclaim(payload.hash))
+        return this.runMutation(() =>
+          this.reclaim(payload.hash, payload.store_id))
       case "reclaim_all":
         return this.runMutation(() => this.reclaimAll())
       default:
@@ -885,9 +1336,14 @@ class Vault {
     })
   }
 
-  async refreshInodeSnapshots(hash, dev, ino) {
-    const storePath = this.storePathFor(hash)
-    const storeStat = await this.storeStatIfPresent(storePath)
+  async refreshInodeSnapshots(hash, dev, ino, storeId = null) {
+    const store = storeId
+      ? this._anchorStoresById.get(storeId)
+      : this.anchorStoreForDevice(dev)
+    const storePath = store ? this.storePathFor(hash, store.id) : null
+    const storeStat = storePath
+      ? await this.storeStatIfPresent(storePath, { store_id: store.id })
+      : null
     let inodeStat = storeStat &&
       storeStat.dev === dev &&
       storeStat.ino === ino
@@ -912,43 +1368,71 @@ class Vault {
     if (content) {
       await this.registry.upsertContent(Object.assign({}, content, {
         hash,
-        size: storeStat ? storeStat.size : content.size,
-        anchor_present: !!storeStat,
-        anchor_dev: storeStat ? storeStat.dev : null,
-        anchor_ino: storeStat ? storeStat.ino : null,
-        anchor_size: storeStat ? storeStat.size : null,
-        anchor_mtime: storeStat ? storeStat.mtimeMs : null,
-        anchor_ctime: storeStat ? storeStat.ctimeMs : null,
-        anchor_nlink: storeStat ? storeStat.nlink : null
+        size: storeStat ? storeStat.size : content.size
       }))
+    }
+    if (store && storeStat) {
+      await this.registry.upsertAnchor({
+        store_id: store.id,
+        hash,
+        path: storePath,
+        verified_at: Date.now(),
+        dev: storeStat.dev,
+        ino: storeStat.ino,
+        size: storeStat.size,
+        mtime: storeStat.mtimeMs,
+        ctime: storeStat.ctimeMs,
+        nlink: storeStat.nlink,
+        mode: storeStat.mode,
+        uid: storeStat.uid,
+        gid: storeStat.gid
+      })
+    } else if (store) {
+      await this.registry.removeAnchor(store.id, hash)
     }
   }
 
   async reclassifyHashes(hashes) {
-    const storeDev = (await fs.promises.stat(this.root)).dev
+    const stores = this.anchorStores()
+      .filter((store) =>
+        store.available && Number.isFinite(store.dev))
+      .map((store) => ({
+        store_id: store.id,
+        dev: store.dev,
+        can_link: store.mode !== "copy"
+      }))
     for (const hash of new Set(hashes)) {
-      const storeStat = await this.storeStatIfPresent(
-        this.storePathFor(hash))
+      const anchorSnapshots = []
+      for (const store of this.anchorStores()) {
+        const storePath = this.storePathFor(hash, store.id)
+        const stat = await this.storeStatIfPresent(storePath, {
+          store_id: store.id
+        })
+        if (stat) anchorSnapshots.push(fileSnapshot(stat))
+      }
       await this.registry.reclassifyHash(
         hash,
-        storeDev,
-        this.mode === "link",
-        storeStat ? fileSnapshot(storeStat) : null
+        stores,
+        anchorSnapshots
       )
     }
   }
 
-  async verifyStoreContent(hash, storePath, storeStat) {
+  async verifyStoreContent(hash, storePath, storeStat, storeId = null) {
     if (!storeStat || !storeStat.isFile()) return { valid: false }
+    const store = storeId
+      ? this._anchorStoresById.get(storeId)
+      : this.anchorStoreForPath(storePath)
+    if (!store) return { valid: false }
     const content = await this.registry.getContent(hash)
-    if (content &&
-        content.anchor_verified_at &&
-        content.anchor_present &&
-        content.anchor_dev === storeStat.dev &&
-        content.anchor_ino === storeStat.ino &&
-        content.anchor_size === storeStat.size &&
-        content.anchor_mtime === storeStat.mtimeMs &&
-        content.anchor_ctime === storeStat.ctimeMs) {
+    const anchor = await this.registry.getAnchor(store.id, hash)
+    if (anchor &&
+        anchor.verified_at &&
+        anchor.dev === storeStat.dev &&
+        anchor.ino === storeStat.ino &&
+        anchor.size === storeStat.size &&
+        anchor.mtime === storeStat.mtimeMs &&
+        anchor.ctime === storeStat.ctimeMs) {
       return { valid: true, snapshot: fileSnapshot(storeStat) }
     }
     const before = fileSnapshot(storeStat)
@@ -969,31 +1453,53 @@ class Vault {
       hash,
       size: after.size,
       first_seen: content && content.first_seen,
+      verified_at: Date.now()
+    })
+    await this.registry.upsertAnchor({
+      store_id: store.id,
+      hash,
+      path: storePath,
       verified_at: Date.now(),
-      anchor_verified_at: Date.now(),
-      anchor_present: true,
-      anchor_dev: after.dev,
-      anchor_ino: after.ino,
-      anchor_size: after.size,
-      anchor_mtime: after.mtimeMs,
-      anchor_ctime: after.ctimeMs,
-      anchor_nlink: after.nlink
+      dev: after.dev,
+      ino: after.ino,
+      size: after.size,
+      mtime: after.mtimeMs,
+      ctime: after.ctimeMs,
+      nlink: after.nlink,
+      mode: after.mode,
+      uid: after.uid,
+      gid: after.gid
     })
     return { valid: true, snapshot: fileSnapshot(after) }
   }
 
-  async adopt(filePath, hash, expected) {
+  async adopt(filePath, hash, expected, selectedStore = null) {
     const current = await lstatIfPresent(filePath)
     if (!current ||
         !current.isFile() ||
         !sameSnapshot(expected, current)) {
       return { status: "stale" }
     }
-    if (this.mode !== "link") return { status: "unavailable" }
-    const storePath = this.storePathFor(hash)
-    let storeStat = await this.storeStatIfPresent(storePath, {
-      createParent: true
-    })
+    const store = selectedStore || this.anchorStoreForDevice(current.dev)
+    if (!store) return { status: "unavailable" }
+    const storePath = this.storePathFor(hash, store.id)
+    let storeStat
+    try {
+      storeStat = await this.storeStatIfPresent(storePath, {
+        createParent: true,
+        dev: current.dev,
+        store_id: store.id
+      })
+    } catch (error) {
+      if (error && (
+        error.code === "EVAULTUNAVAILABLE" ||
+        NO_LINK_CODES.has(error.code) ||
+        LOCK_CODES.has(error.code)
+      )) {
+        return { status: "unavailable" }
+      }
+      throw error
+    }
     if (storeStat) {
       if (sameIdentity(storeStat, current)) return { status: "ready" }
       return { status: "exists" }
@@ -1006,7 +1512,9 @@ class Vault {
       }
       throw error
     }
-    storeStat = await this.storeStatIfPresent(storePath)
+    storeStat = await this.storeStatIfPresent(storePath, {
+      store_id: store.id
+    })
     const after = await lstatIfPresent(filePath)
     if (!storeStat ||
         !after ||
@@ -1020,14 +1528,22 @@ class Vault {
       hash,
       size: storeStat.size,
       verified_at: Date.now(),
-      anchor_verified_at: Date.now(),
-      anchor_present: true,
-      anchor_dev: storeStat.dev,
-      anchor_ino: storeStat.ino,
-      anchor_size: storeStat.size,
-      anchor_mtime: storeStat.mtimeMs,
-      anchor_ctime: storeStat.ctimeMs,
-      anchor_nlink: storeStat.nlink
+      first_seen: Date.now()
+    })
+    await this.registry.upsertAnchor({
+      store_id: store.id,
+      hash,
+      path: storePath,
+      verified_at: Date.now(),
+      dev: storeStat.dev,
+      ino: storeStat.ino,
+      size: storeStat.size,
+      mtime: storeStat.mtimeMs,
+      ctime: storeStat.ctimeMs,
+      nlink: storeStat.nlink,
+      mode: storeStat.mode,
+      uid: storeStat.uid,
+      gid: storeStat.gid
     })
     await this.registry.upsertFile(Object.assign({}, existing, {
       path: filePath,
@@ -1041,20 +1557,38 @@ class Vault {
       app: existing && existing.app,
       status: "linked"
     }))
-    await this.refreshInodeSnapshots(hash, after.dev, after.ino)
-    return { status: "ready" }
+    await this.refreshInodeSnapshots(hash, after.dev, after.ino, store.id)
+    return { status: "ready", store_id: store.id }
   }
 
   async ensureAnchorForHash(hash, targetStat) {
     const dev = targetStat.dev
-    const storePath = this.storePathFor(hash)
-    const existingStore = await this.storeStatIfPresent(storePath)
+    const store = this.anchorStoreForDevice(dev)
+    if (!store) return { status: "unavailable" }
+    const storePath = this.storePathFor(hash, store.id)
+    let existingStore
+    try {
+      existingStore = await this.storeStatIfPresent(storePath, {
+        store_id: store.id
+      })
+      if (existingStore) await this.validateAnchorStore(store, dev)
+    } catch (error) {
+      if (error && (
+        error.code === "EVAULTPATH" ||
+        error.code === "EVAULTUNAVAILABLE" ||
+        NO_LINK_CODES.has(error.code) ||
+        LOCK_CODES.has(error.code)
+      )) {
+        return { status: "unavailable" }
+      }
+      throw error
+    }
     if (existingStore) {
       if (existingStore.dev !== dev) return { status: "unavailable" }
       const verified = await this.verifyStoreContent(
-        hash, storePath, existingStore)
+        hash, storePath, existingStore, store.id)
       return verified.valid
-        ? { status: "ready", stat: existingStore }
+        ? { status: "ready", stat: existingStore, store_id: store.id }
         : { status: "stale" }
     }
 
@@ -1086,11 +1620,14 @@ class Vault {
       return { status: "stale" }
     }
     const adopted = await this.adopt(
-      candidate.path, hash, fileSnapshot(after))
+      candidate.path, hash, fileSnapshot(after), store)
     if (adopted.status !== "ready") return adopted
     return {
       status: "ready",
-      stat: await this.storeStatIfPresent(storePath)
+      store_id: store.id,
+      stat: await this.storeStatIfPresent(storePath, {
+        store_id: store.id
+      })
     }
   }
 
@@ -1116,9 +1653,15 @@ class Vault {
       return { status: "stale" }
     }
     const prepared = await this.ensureAnchorForHash(target.hash, targetStat)
-    if (prepared.status !== "ready") return prepared
+    if (prepared.status !== "ready") {
+      if (prepared.status === "unavailable") {
+        await this.reclassifyHashes([target.hash])
+      }
+      return prepared
+    }
+    const storePath = this.storePathFor(target.hash, prepared.store_id)
     let storeStat = await this.storeStatIfPresent(
-      this.storePathFor(target.hash))
+      storePath, { store_id: prepared.store_id })
     if (!storeStat) return { status: "stale" }
     if (storeStat.dev !== targetStat.dev) {
       return { status: "unavailable" }
@@ -1136,14 +1679,14 @@ class Vault {
       return { status: "metadata-mismatch" }
     }
     const verified = await this.verifyStoreContent(
-      target.hash, this.storePathFor(target.hash), storeStat)
+      target.hash, storePath, storeStat, prepared.store_id)
     if (!verified.valid) return { status: "stale" }
 
     const temporary = `${target.path}${TMP_SUFFIX}`
     let temporaryStat = null
     let committedStat = null
     try {
-      await fs.promises.link(this.storePathFor(target.hash), temporary)
+      await fs.promises.link(storePath, temporary)
       temporaryStat = await fs.promises.lstat(temporary)
       if (this.sourceAppIsRunning(source)) {
         await unlinkIfSame(temporary, temporaryStat)
@@ -1152,7 +1695,9 @@ class Vault {
       const [currentTarget, currentStore, currentTemporary] =
         await Promise.all([
           lstatIfPresent(target.path),
-          this.storeStatIfPresent(this.storePathFor(target.hash)),
+          this.storeStatIfPresent(storePath, {
+            store_id: prepared.store_id
+          }),
           lstatIfPresent(temporary)
         ])
       if (!currentTarget ||
@@ -1186,7 +1731,9 @@ class Vault {
       if (!committedStat) throw error
       finalStat = committedStat
     }
-    storeStat = await this.storeStatIfPresent(this.storePathFor(target.hash))
+    storeStat = await this.storeStatIfPresent(storePath, {
+      store_id: prepared.store_id
+    })
     if (!storeStat || !sameIdentity(finalStat, storeStat)) {
       return { status: "stale" }
     }
@@ -1199,7 +1746,7 @@ class Vault {
       status: "linked"
     }))
     await this.refreshInodeSnapshots(
-      target.hash, finalStat.dev, finalStat.ino)
+      target.hash, finalStat.dev, finalStat.ino, prepared.store_id)
     return {
       status: "converted",
       bytes_saved: finalStat.size,
@@ -1269,9 +1816,8 @@ class Vault {
     return result
   }
 
-  async deduplicateScope(scopeId = null, options = {}) {
-    const sourceIds = this.scopeSourceIds(scopeId)
-    const summary = {
+  deduplicationSummary() {
+    return {
       converted: 0,
       bytes_saved: 0,
       locked: 0,
@@ -1280,6 +1826,84 @@ class Vault {
       unavailable: 0,
       failed: 0
     }
+  }
+
+  addDeduplicationResult(summary, result) {
+    if (result.status === "converted") {
+      summary.converted += 1
+      summary.bytes_saved += result.bytes_saved || 0
+    } else if (result.status === "already") {
+      // Another selected path already caused this inode to be shared.
+    } else if (result.status === "locked") {
+      summary.locked += 1
+    } else if (result.status === "metadata-mismatch") {
+      summary.incompatible += 1
+    } else if (result.status === "unavailable") {
+      summary.unavailable += 1
+    } else {
+      summary.stale += 1
+    }
+  }
+
+  async recordDeduplicationSummary(
+    summary,
+    representative = null,
+    sourceId = null
+  ) {
+    if (!summary.converted) return
+    const event = {
+      kind: "convert",
+      bytes: summary.bytes_saved,
+      files: summary.converted
+    }
+    if (summary.converted === 1 && representative) {
+      event.hash = representative.hash
+      event.path = representative.path
+      event.app = representative.app
+      event.source_id = representative.source_id
+    } else if (sourceId) {
+      event.source_id = sourceId
+    }
+    if (!await this.recordEvent(event)) summary.activity_warning = true
+  }
+
+  async deduplicateFiles(filePaths, progress = null) {
+    const summary = Object.assign(this.deduplicationSummary(), {
+      results: []
+    })
+    let representative = null
+    let commonSourceId
+    for (const filePath of new Set(filePaths.map((item) =>
+      path.resolve(item)))) {
+      try {
+        const result = await this.convert(filePath)
+        this.addDeduplicationResult(summary, result)
+        if (result.status === "converted") {
+          if (!representative) representative = result
+          const sourceId = result.source_id || null
+          commonSourceId = commonSourceId === undefined
+            ? sourceId
+            : commonSourceId === sourceId ? commonSourceId : null
+        }
+        summary.results.push({ path: filePath, status: result.status })
+      } catch (error) {
+        summary.failed += 1
+        summary.results.push({ path: filePath, status: "failed" })
+      } finally {
+        if (progress) progress.files_completed += 1
+      }
+    }
+    await this.recordDeduplicationSummary(
+      summary,
+      representative,
+      commonSourceId
+    )
+    return summary
+  }
+
+  async deduplicateScope(scopeId = null, options = {}) {
+    const sourceIds = this.scopeSourceIds(scopeId)
+    const summary = this.deduplicationSummary()
     if (scopeId && !sourceIds.length) return summary
     let cursor = ""
     while (true) {
@@ -1290,20 +1914,7 @@ class Vault {
         cursor = row.path
         try {
           const result = await this.convert(row.path)
-          if (result.status === "converted") {
-            summary.converted += 1
-            summary.bytes_saved += result.bytes_saved || 0
-          } else if (result.status === "already") {
-            // Another selected path already caused this inode to be shared.
-          } else if (result.status === "locked") {
-            summary.locked += 1
-          } else if (result.status === "metadata-mismatch") {
-            summary.incompatible += 1
-          } else if (result.status === "unavailable") {
-            summary.unavailable += 1
-          } else {
-            summary.stale += 1
-          }
+          this.addDeduplicationResult(summary, result)
         } catch (error) {
           summary.failed += 1
         }
@@ -1314,16 +1925,13 @@ class Vault {
       const scopedSource = scopeId
         ? this._sources.find((source) => source.id === scopeId)
         : null
-      if (!await this.recordEvent({
-        kind: "convert",
-        bytes: summary.bytes_saved,
-        files: summary.converted,
-        source_id: scopedSource && scopedSource.kind !== "virtual"
+      await this.recordDeduplicationSummary(
+        summary,
+        null,
+        scopedSource && scopedSource.kind !== "virtual"
           ? scopeId
           : null
-      })) {
-        summary.activity_warning = true
-      }
+      )
     }
     return summary
   }
@@ -1577,48 +2185,45 @@ class Vault {
     return summary
   }
 
-  async reclaim(hash) {
+  async reclaim(hash, storeId = null) {
     if (typeof hash !== "string" || !SHA256_RE.test(hash)) {
       return { status: "not-found" }
     }
-    const content = await this.registry.getContent(hash)
-    if (!content || !content.anchor_present) {
-      return { status: "not-found" }
+    const anchors = await this.registry.anchorsForHash(hash)
+    const anchor = storeId
+      ? anchors.find((item) => item.store_id === storeId)
+      : anchors.length === 1 ? anchors[0] : null
+    if (!anchor) return { status: "not-found" }
+    const store = this._anchorStoresById.get(anchor.store_id)
+    if (!store) return { status: "unavailable" }
+    const storePath = this.storePathFor(hash, store.id)
+    if (!samePath(storePath, anchor.path)) return { status: "stale" }
+    try {
+      await this.validateAnchorStore(store, anchor.dev)
+    } catch (error) {
+      return { status: "stale" }
     }
-    const storePath = this.storePathFor(hash)
-    const stat = await this.storeStatIfPresent(storePath)
+    const stat = await this.storeStatIfPresent(storePath, {
+      store_id: store.id
+    })
     if (!stat) {
-      await this.registry.upsertContent(Object.assign({}, content, {
-        hash,
-        anchor_present: false,
-        anchor_verified_at: null
-      }))
+      await this.registry.removeAnchor(store.id, hash)
       return { status: "gone" }
     }
     const expected = {
-      size: content.anchor_size,
-      mtime: content.anchor_mtime,
-      ctime: content.anchor_ctime,
-      dev: content.anchor_dev,
-      ino: content.anchor_ino
+      size: anchor.size,
+      mtime: anchor.mtime,
+      ctime: anchor.ctime,
+      dev: anchor.dev,
+      ino: anchor.ino
     }
     if (!sameSnapshot(expected, stat)) return { status: "stale" }
     if (stat.nlink !== 1) return { status: "in-use" }
     await fs.promises.unlink(storePath)
+    await this.registry.removeAnchor(store.id, hash)
     const hasFiles = await this.registry.hasFilesForHash(hash)
-    if (hasFiles) {
-      await this.registry.upsertContent(Object.assign({}, content, {
-        hash,
-        anchor_present: false,
-        anchor_verified_at: null,
-        anchor_dev: null,
-        anchor_ino: null,
-        anchor_size: null,
-        anchor_mtime: null,
-        anchor_ctime: null,
-        anchor_nlink: null
-      }))
-    } else {
+    const remainingAnchors = await this.registry.anchorsForHash(hash)
+    if (!hasFiles && !remainingAnchors.length) {
       await this.registry.removeContent(hash)
     }
     const result = { status: "reclaimed", bytes_freed: stat.size }
@@ -1632,14 +2237,14 @@ class Vault {
 
   async reclaimAll() {
     const summary = { reclaimed: 0, bytes_freed: 0, failed: 0 }
-    let cursor = ""
+    let cursor = { store_id: "", hash: "" }
     while (true) {
-      const hashes = await this.registry.reclaimableBatch(cursor, 100)
-      if (!hashes.length) break
-      for (const row of hashes) {
-        cursor = row.hash
+      const anchors = await this.registry.reclaimableBatch(cursor, 100)
+      if (!anchors.length) break
+      for (const row of anchors) {
+        cursor = { store_id: row.store_id, hash: row.hash }
         try {
-          const result = await this.reclaim(row.hash)
+          const result = await this.reclaim(row.hash, row.store_id)
           if (result.status === "reclaimed") {
             summary.reclaimed += 1
             summary.bytes_freed += result.bytes_freed || 0
@@ -1789,9 +2394,103 @@ class Vault {
     })
   }
 
+  publicDuplicateGroupItems(page) {
+    return (page.rows || []).map((row) => Object.assign({
+      kind: "duplicate_group",
+      hash: row.hash,
+      path: row.representative_path,
+      size: Number(row.size) || 0,
+      total_count: Number(row.total_count) || 0,
+      eligible_count: Number(row.eligible_count) || 0,
+      can_save: Number(row.can_save) || 0,
+      app: row.representative_app || null
+    }, this.locationForPath(
+      row.representative_path,
+      row.representative_source_id
+    )))
+  }
+
+  publicDuplicateChildItems(rows) {
+    const publicStatus = {
+      reference: "tracked",
+      duplicate: "duplicate",
+      unavailable: "duplicate",
+      linked: "shared"
+    }
+    return (rows || []).map((row) => Object.assign({
+      kind: "duplicate_path",
+      path: row.path,
+      hash: row.hash,
+      size: Number(row.size) || 0,
+      app: row.app || null,
+      status: publicStatus[row.status],
+      registry_status: row.status,
+      shareable: row.status === "duplicate",
+      selectable: !!row.selectable,
+      unavailable_reason: row.status === "unavailable"
+        ? row.unavailable_reason || "different_disk"
+        : null
+    }, this.locationForPath(row.path, row.source_id)))
+  }
+
+  async duplicateGroupChildren(scopeId, hash, options = {}) {
+    if (typeof hash !== "string" || !SHA256_RE.test(hash)) {
+      throw new TypeError("Invalid vault content identifier.")
+    }
+    const locationId = typeof options.location_id === "string" &&
+      options.location_id
+      ? options.location_id
+      : null
+    const query = String(options.query || "").slice(0, 500).trim()
+    const cursor = typeof options.cursor === "string"
+      ? options.cursor.slice(0, 2048)
+      : ""
+    const pageSize = boundedInteger(
+      options.page_size, 100, 1, STATUS_PAGE_SIZE)
+    const result = await this.registry.duplicateGroupChildren({
+      hash,
+      sourceIds: this.scopeSourceIds(scopeId),
+      activeSourceIds: this.scopeSourceIds(scopeId, locationId),
+      query,
+      cursor,
+      pageSize,
+      unrestricted: !scopeId,
+      activeUnrestricted: !scopeId && !locationId
+    })
+    return {
+      hash,
+      items: this.publicDuplicateChildItems(result.rows),
+      total: Number(result.total) || 0,
+      next_cursor: result.nextCursor || null
+    }
+  }
+
+  async duplicateGroupSelection(scopeId, hash, options = {}) {
+    if (typeof hash !== "string" || !SHA256_RE.test(hash)) {
+      throw new TypeError("Invalid vault content identifier.")
+    }
+    const locationId = typeof options.location_id === "string" &&
+      options.location_id
+      ? options.location_id
+      : null
+    const result = await this.registry.duplicateGroupSelection({
+      hash,
+      sourceIds: this.scopeSourceIds(scopeId, locationId),
+      query: String(options.query || "").slice(0, 500).trim(),
+      unrestricted: !scopeId && !locationId
+    })
+    return {
+      hash,
+      paths: result.paths || [],
+      exceeded: !!result.exceeded
+    }
+  }
+
   async status(scopeId = null, options = {}) {
     if (!this.enabled || !this.registry) return { enabled: false }
     const view = STATUS_VIEWS.has(options.view) ? options.view : "all"
+    const groupDuplicates =
+      view === "duplicates" && options.display_mode === "files"
     const statusFilter = STATUS_FILTERS.has(options.status_filter)
       ? options.status_filter
       : "all"
@@ -1822,7 +2521,10 @@ class Vault {
       statusFilter,
       query,
       pageSize,
-      sizeSort: options.size_sort,
+      sizeSort: groupDuplicates
+        ? options.size_sort || "desc"
+        : options.size_sort,
+      groupDuplicates,
       cursor
     })
     let items
@@ -1836,6 +2538,8 @@ class Vault {
       ))
     } else if (view === "reclaimable") {
       items = snapshot.page.rows || []
+    } else if (groupDuplicates) {
+      items = this.publicDuplicateGroupItems(snapshot.page)
     } else {
       items = this.publicFileItems(snapshot.page)
     }
@@ -1845,8 +2549,9 @@ class Vault {
       ? lastScan.bytes_total
       : 0
     const saved = Math.max(0, Number(snapshot.saved) || 0)
-    const total = Number(snapshot.total) || 0
-    const pages = Math.max(1, Math.ceil(total / pageSize))
+    const currentCount = Number(snapshot.total) || 0
+    const pageTotal = Number(snapshot.pageTotal) || 0
+    const pages = Math.max(1, Math.ceil(pageTotal / pageSize))
     const publicSources = this._sources
       .filter((source) => !scopeId || source.id === scopeId)
       .map((source) => ({
@@ -1888,10 +2593,12 @@ class Vault {
         duplicate_locations:
           Number(snapshot.duplicateLocations) || 0,
         current: {
-          count: total,
+          count: currentCount,
           locations: Number(snapshot.currentLocations) || 0,
           shareable_bytes:
             Number(snapshot.currentShareableBytes) || 0,
+          deduplicate_bytes:
+            Number(snapshot.currentDeduplicateBytes) || 0,
           separate_count:
             Number(snapshot.currentSeparateCount) || 0,
           separate_bytes:
@@ -1900,8 +2607,11 @@ class Vault {
         page: requestedPage,
         page_size: pageSize,
         start: requestedPage * pageSize,
-        end: Math.min((requestedPage * pageSize) + items.length, total),
-        total,
+        end: Math.min(
+          (requestedPage * pageSize) + items.length,
+          pageTotal
+        ),
+        total: pageTotal,
         pages,
         cursor: cursor || null,
         next_cursor: snapshot.page.nextCursor || null,

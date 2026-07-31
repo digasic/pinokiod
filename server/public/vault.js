@@ -19,7 +19,7 @@ const COPY = {
   folder_picker_error: "The folder picker could not be opened.",
   external_added: "Added to Locations. Run a scan when you’re ready.",
   external_exists: "That folder is already in Locations.",
-  external_other_disk: "Added to Locations. It can be scanned, but files on this disk cannot be deduplicated with files in your Pinokio folder.",
+  external_other_disk: "Added to Locations. It can be scanned, but this filesystem does not support file sharing.",
   remove_external_folder: "Remove from Locations",
   remove_external_confirm: "Remove “{name}” from Locations? This does not delete or modify any files.",
   external_removed: "Removed from Locations. No files were changed.",
@@ -88,7 +88,6 @@ const COPY = {
   status_request_failed: "Couldn’t load Save space status ({status})",
   action_request_failed: "The Save space action failed ({status})",
   all_statuses: "All statuses",
-  by_location: "By location",
   name: "Name",
   location_column: "Location",
   size: "Size",
@@ -104,12 +103,14 @@ const COPY = {
   file_pages: "File pages",
   status: "Deduplication status",
   matches: "Matches",
+  copies: "Copies",
+  size_each: "Size each",
   can_save: "Can save",
   can_free: "Can free",
   duplicate: "Duplicate",
   tracked: "No action needed",
   different_disk: "Different disk",
-  can_save_suffix: "can save",
+  can_save_suffix: "available to save",
   unavailable: "Unavailable",
   sharing_unavailable: "Deduplication is unavailable on this disk",
   permissions_differ: "File permissions or ownership differ",
@@ -137,9 +138,23 @@ const COPY = {
   files: "files",
   location: "location",
   deduplicate: "Deduplicate",
+  deduplicate_all: "Deduplicate all {count}",
+  deduplicate_selected_file: "Deduplicate selected file ({size})",
+  deduplicate_selected_files: "Deduplicate {count} selected files ({size})",
   deduplicating: "Deduplicating files",
   deduplicating_file: "Deduplicating file",
   deduplication_progress: "{done} of {total} files",
+  duplicate_selection_limit: "You can deduplicate up to 500 selected files at once.",
+  select_for_deduplication: "Select to deduplicate",
+  select_duplicate_group: "Select every eligible copy in this group",
+  content_group: "content group",
+  content_groups: "content groups",
+  can_be_deduplicated: "can be deduplicated",
+  reference_copy: "Reference copy",
+  outside_results: "Outside current results",
+  selected_copy: "Selected",
+  loading_copies: "Loading copies…",
+  show_more_copies: "Show {count} more copies",
   making_separate: "Making file separate",
   make_separate: "Make separate",
   reclaim: "Clean up",
@@ -195,7 +210,9 @@ const COPY = {
 
 const SCOPE_ID = document.body.dataset.vaultScope || null
 const IS_APP_MODE = document.body.dataset.vaultMode === "app" && !!SCOPE_ID
+const MAX_BULK_DEDUPLICATE_FILES = 500
 const MAX_BULK_SEPARATE_FILES = 500
+const DUPLICATE_CHILD_PAGE_SIZE = 100
 const statusUrl = (progress = false) => {
   const query = new URLSearchParams()
   if (progress) query.set("progress", "1")
@@ -206,6 +223,9 @@ const statusUrl = (progress = false) => {
     if (state.query) query.set("q", state.query)
     if (state.statusFilter !== "all") query.set("status_filter", state.statusFilter)
     if (state.sizeSort) query.set("size_sort", state.sizeSort)
+    if (state.view === "duplicates" && state.displayMode === "files") {
+      query.set("display_mode", "files")
+    }
     query.set("page", String(state.page))
     const cursor = state.pageCursors[state.page]
     if (cursor) query.set("cursor", cursor)
@@ -213,6 +233,20 @@ const statusUrl = (progress = false) => {
   }
   const suffix = query.toString()
   return `/info/dedup${suffix ? `?${suffix}` : ""}`
+}
+const duplicateGroupUrl = (hash, options = {}) => {
+  const query = new URLSearchParams()
+  if (SCOPE_ID) query.set("scope_id", SCOPE_ID)
+  query.set("group_hash", hash)
+  if (state.sourceId) query.set("location_id", state.sourceId)
+  if (state.query) query.set("q", state.query)
+  if (options.select) {
+    query.set("group_select", "1")
+  } else {
+    if (options.cursor) query.set("cursor", options.cursor)
+    query.set("page_size", String(DUPLICATE_CHILD_PAGE_SIZE))
+  }
+  return `/info/dedup?${query.toString()}`
 }
 const reviewedScanKey = `pinokio:vault:reviewed-scan:${SCOPE_ID || "global"}`
 const candidateSizeKey = "pinokio:vault:candidate-size"
@@ -234,6 +268,10 @@ const state = {
   collapsedSources: new Set(),
   collapsedDirs: new Set(),
   expandedFiles: new Set(),
+  expandedDuplicateGroups: new Set(),
+  duplicateGroupChildren: new Map(),
+  duplicateGroupGeneration: 0,
+  selectedDuplicateFiles: new Map(),
   selectedSeparateFiles: new Set(),
   separateAllMatching: false,
   scanRequested: false,
@@ -252,11 +290,21 @@ const state = {
 const resetPage = () => {
   state.page = 0
   state.pageCursors = [""]
+  state.expandedDuplicateGroups.clear()
+  state.duplicateGroupChildren.clear()
+  state.duplicateGroupGeneration += 1
 }
 
 const clearSeparateSelection = () => {
   state.selectedSeparateFiles.clear()
   state.separateAllMatching = false
+}
+const clearDuplicateSelection = () => {
+  state.selectedDuplicateFiles.clear()
+}
+const clearFileSelections = () => {
+  clearDuplicateSelection()
+  clearSeparateSelection()
 }
 
 const el = (id) => document.getElementById(id)
@@ -421,12 +469,45 @@ const scopeDuplicateCount = (sourceId, shareableOnly = false) => {
 const bulkDeduplicationCount = () => state.sourceId
   ? scopeDuplicateCount(state.sourceId, true)
   : Number(state.data.inventory.shareable_duplicates) || 0
+const selectedDeduplicationBytes = () => {
+  let bytes = 0
+  for (const selection of state.selectedDuplicateFiles.values()) {
+    bytes += Math.max(0, Number(selection.size) || 0)
+  }
+  return bytes
+}
+const allDeduplicationBytes = () => {
+  const current = state.data.inventory.current || {}
+  const exact = Number(current.deduplicate_bytes)
+  if (Number.isFinite(exact)) return Math.max(0, exact)
+  if (!state.sourceId || IS_APP_MODE) {
+    return Math.max(0, Number(state.data.pending_bytes) || 0)
+  }
+  if (!state.query) {
+    return Math.max(0, Number(current.shareable_bytes) || 0)
+  }
+  return null
+}
 const bulkDeduplicationAction = () => {
   if (state.view !== "duplicates") return ""
+  const selected = state.selectedDuplicateFiles.size
+  if (selected) {
+    const size = fmt(selectedDeduplicationBytes())
+    const label = selected === 1
+      ? COPY.deduplicate_selected_file.replace("{size}", size)
+      : COPY.deduplicate_selected_files
+        .replace("{count}", selected)
+        .replace("{size}", size)
+    return `<button class="vault-button primary" type="button" data-deduplicate-selected aria-label="${attr(label)}">${esc(label)}</button>`
+  }
   const count = bulkDeduplicationCount()
   if (!count) return ""
   const context = state.sourceId || ""
-  const label = `${COPY.deduplicate} ${countLabel(count)}`
+  const bytes = allDeduplicationBytes()
+  const label = `${COPY.deduplicate_all.replace(
+    "{count}",
+    countLabel(count)
+  )}${bytes == null ? "" : ` (${fmt(bytes)})`}`
   return `<button class="vault-button primary" type="button" data-deduplicate-all data-deduplicate-context="${attr(context)}" aria-label="${attr(label)}" title="${attr(label)}">${esc(label)}</button>`
 }
 const bulkSeparateAction = () => {
@@ -455,7 +536,7 @@ const removeSourceAction = (source) => source && source.removable
 const toolbarSummary = () => {
   const current = state.data.inventory.current || {}
   if (state.view === "duplicates") {
-    return `${countLabel(Number(current.count) || 0)} · ${countLabel(Number(current.locations) || 0, COPY.location, COPY.locations_lower)} · ${fmt(Number(current.shareable_bytes) || 0)} ${COPY.can_save_suffix}`
+    return `${countLabel(Number(current.count) || 0)} · ${countLabel(Number(current.locations) || 0, COPY.location, COPY.locations_lower)}`
   }
   if (state.view === "activity") {
     return countLabel(Number(current.count) || 0, COPY.event, COPY.events)
@@ -474,7 +555,9 @@ const searchPlaceholder = () => {
   const source = selectedSource()
   return source && source.kind === "app" ? COPY.search_in.replace("{location}", source.label) : COPY.search_all
 }
-const supportsDisplayMode = () => state.view === "all" || state.view === "shared" ||
+const supportsDisplayMode = () => state.view === "all" ||
+  state.view === "duplicates" ||
+  state.view === "shared" ||
   state.view === "tracked"
 const displayModeControl = () => supportsDisplayMode() ? `<div class="vault-display-mode" role="group" aria-label="${attr(COPY.display_mode)}">
   <button type="button" data-display-mode="folders" aria-pressed="${state.displayMode === "folders"}" class="${state.displayMode === "folders" ? "selected" : ""}">${esc(COPY.folders)}</button>
@@ -497,7 +580,7 @@ const renderToolbar = () => {
       <option value="duplicate" ${state.statusFilter === "duplicate" ? "selected" : ""}>${esc(COPY.duplicates)}</option>
       <option value="shared" ${state.statusFilter === "shared" ? "selected" : ""}>${esc(COPY.shared)}</option>
       <option value="tracked" ${state.statusFilter === "tracked" ? "selected" : ""}>${esc(COPY.tracked)}</option>
-    </select>` : state.view === "duplicates" ? `<span class="vault-select">${esc(COPY.by_location)}</span>` : ""}
+    </select>` : ""}
     ${displayModeControl()}
     ${descriptionMarkup}
     <span class="vault-toolbar-count" id="vault-toolbar-summary">${esc(toolbarSummary())}</span>
@@ -506,16 +589,28 @@ const renderToolbar = () => {
     ${removeSourceAction(source)}`
 }
 
+const unavailableLabel = (item) =>
+  item.unavailable_reason === "metadata"
+    ? COPY.permissions_differ
+    : item.unavailable_reason === "different_disk"
+      ? COPY.different_disk
+      : COPY.sharing_unavailable
 const statusMarkup = (item) => {
   if (item.status === "duplicate") {
-    const unavailable = item.unavailable_reason === "metadata"
-      ? COPY.permissions_differ
-      : item.unavailable_reason === "different_disk" ? COPY.different_disk : COPY.sharing_unavailable
     return item.shareable
       ? `<span class="vault-status"><span class="vault-status-dot warning"></span>${esc(COPY.duplicate)}</span>`
-      : `<span class="vault-status"><i class="fa-regular fa-circle-xmark"></i>${esc(unavailable)}</span>`
+      : `<span class="vault-status"><i class="fa-regular fa-circle-xmark"></i>${esc(unavailableLabel(item))}</span>`
   }
-  if (item.status === "shared") return `<span class="vault-status"><i class="fa-solid fa-link"></i>${esc(COPY.shared)} · ${Math.max(item.locations.length, Number(item.location_count) || 0)} ${esc(COPY.locations_lower)}</span>`
+  if (item.status === "shared") {
+    const locations = Array.isArray(item.locations)
+      ? item.locations.length
+      : 0
+    const count = Math.max(
+      locations,
+      Number(item.location_count) || 0
+    )
+    return `<span class="vault-status"><i class="fa-solid fa-link"></i>${esc(COPY.shared)}${count ? ` · ${count} ${esc(COPY.locations_lower)}` : ""}</span>`
+  }
   return `<span class="vault-status"><i class="fa-regular fa-circle-check"></i>${esc(COPY.tracked)}</span>`
 }
 const spaceMarkup = (item) => {
@@ -544,6 +639,14 @@ const fileDetail = (item) => {
 const separateCheckbox = (item) => item.status === "shared"
   ? `<input class="vault-row-checkbox" type="checkbox" data-select-separate="${attr(item.path)}" aria-label="${attr(`${COPY.select_for_separation}: ${basename(item.relative_path)}`)}" ${state.separateAllMatching || state.selectedSeparateFiles.has(item.path) ? "checked" : ""} />`
   : ""
+const duplicateCheckbox = (item) =>
+  state.view === "duplicates" &&
+  item.status === "duplicate" &&
+  item.shareable
+    ? `<input class="vault-row-checkbox" type="checkbox" data-select-duplicate="${attr(item.path)}" data-duplicate-hash="${attr(item.hash || "")}" data-duplicate-size="${attr(item.size || 0)}" aria-label="${attr(`${COPY.select_for_deduplication}: ${basename(item.relative_path)}`)}" ${state.selectedDuplicateFiles.has(item.path) ? "checked" : ""} />`
+    : ""
+const rowSelectionCheckbox = (item) =>
+  duplicateCheckbox(item) || separateCheckbox(item)
 
 const renderFileRow = (item, depth = 0, showMatch = false) => {
   const directoryPath = dirname(item.relative_path)
@@ -556,7 +659,7 @@ const renderFileRow = (item, depth = 0, showMatch = false) => {
     : sharingControl(item)
   return `<div class="vault-file-row">
     <div class="vault-name-cell indent-${Math.min(depth, 2)}">
-      ${separateCheckbox(item)}
+      ${rowSelectionCheckbox(item)}
       ${expandable ? `<button class="vault-disclosure" type="button" data-expand-file="${attr(item.path)}" aria-label="${state.expandedFiles.has(item.path) ? COPY.collapse : COPY.expand}" aria-expanded="${state.expandedFiles.has(item.path)}"><i class="fa-solid fa-chevron-${state.expandedFiles.has(item.path) ? "down" : "right"}"></i></button>` : `<span class="vault-disclosure"></span>`}
       <i class="fa-regular fa-file vault-name-icon"></i>
       <span class="vault-name-copy"><span class="vault-file-name">${esc(basename(item.relative_path))}</span>${directoryPath && depth === 0 ? `<span class="vault-file-path">${esc(directoryPath)}</span>` : ""}</span>
@@ -658,6 +761,79 @@ const renderFlatFiles = (items) => [...items]
       ${sharingControl(item)}
     </div>${fileDetail(item)}`
   }).join("")
+const duplicateGroupSelectedCount = (hash) => {
+  let count = 0
+  for (const selection of state.selectedDuplicateFiles.values()) {
+    if (selection.hash === hash) count += 1
+  }
+  return count
+}
+const duplicateChildStatus = (item) => {
+  if (item.selectable) {
+    return state.selectedDuplicateFiles.has(item.path)
+      ? `${COPY.selected_copy} · ${fmt(item.size)}`
+      : COPY.duplicate
+  }
+  if (item.registry_status === "unavailable") {
+    return unavailableLabel(item)
+  }
+  if (item.registry_status === "linked") return COPY.shared
+  if (item.registry_status === "reference") return COPY.reference_copy
+  return COPY.outside_results
+}
+const renderDuplicateGroupChildren = (group) => {
+  if (!state.expandedDuplicateGroups.has(group.hash)) return ""
+  const children = state.duplicateGroupChildren.get(group.hash)
+  if (!children || (children.loading && !children.loaded)) {
+    return `<div class="vault-duplicate-children"><div class="vault-duplicate-children-state"><i class="fa-solid fa-circle-notch fa-spin"></i>${esc(COPY.loading_copies)}</div></div>`
+  }
+  if (children.error) {
+    return `<div class="vault-duplicate-children"><div class="vault-duplicate-children-state error">${esc(children.error)}</div></div>`
+  }
+  const rows = children.items.map((item) => {
+    const location = externalLocation(item) ||
+      [groupTitle(sourceById(item.source_id)), item.relative_path]
+        .filter(Boolean).join(" / ")
+    const checkbox = item.selectable
+      ? `<input class="vault-row-checkbox" type="checkbox" data-select-duplicate="${attr(item.path)}" data-duplicate-hash="${attr(group.hash)}" data-duplicate-size="${attr(item.size || 0)}" aria-label="${attr(`${COPY.select_for_deduplication}: ${basename(item.relative_path)}`)}" ${state.selectedDuplicateFiles.has(item.path) ? "checked" : ""} />`
+      : `<span class="vault-row-checkbox-placeholder"></span>`
+    return `<div class="vault-duplicate-child ${item.selectable ? "" : "context-only"}">
+      ${checkbox}
+      <i class="fa-regular fa-file"></i>
+      <span class="vault-duplicate-child-path" title="${attr(location)}">${esc(location)}</span>
+      <span class="vault-duplicate-child-status ${state.selectedDuplicateFiles.has(item.path) ? "selected" : ""}">${esc(duplicateChildStatus(item))}</span>
+    </div>`
+  }).join("")
+  const remaining = Math.max(
+    0,
+    Number(children.total) - children.items.length
+  )
+  const more = children.nextCursor
+    ? `<button class="vault-text-button vault-duplicate-more" type="button" data-more-duplicate-group="${attr(group.hash)}" ${children.loading ? "disabled" : ""}>${esc(COPY.show_more_copies.replace("{count}", Math.min(remaining, DUPLICATE_CHILD_PAGE_SIZE)))}</button>`
+    : ""
+  return `<div class="vault-duplicate-children">${rows}${more}</div>`
+}
+const renderGroupedDuplicates = (groups) => groups.map((group) => {
+  const expanded = state.expandedDuplicateGroups.has(group.hash)
+  const selected = duplicateGroupSelectedCount(group.hash)
+  const eligible = Math.max(0, Number(group.eligible_count) || 0)
+  const checkbox = eligible
+    ? `<input class="vault-row-checkbox" type="checkbox" data-select-duplicate-group="${attr(group.hash)}" data-duplicate-size="${attr(group.size || 0)}" data-selected-count="${selected}" data-eligible-count="${eligible}" aria-label="${attr(`${COPY.select_duplicate_group}: ${basename(group.relative_path)}`)}" ${selected === eligible ? "checked" : ""} />`
+    : `<span class="vault-row-checkbox-placeholder"></span>`
+  const copies = Math.max(0, Number(group.total_count) || 0)
+  const meta = `${countLabel(copies, "identical copy", "identical copies")} · ${eligible} ${COPY.can_be_deduplicated}`
+  return `<div class="vault-file-row vault-duplicate-content-group">
+    <div class="vault-name-cell">
+      ${checkbox}
+      <button class="vault-disclosure" type="button" data-expand-duplicate-group="${attr(group.hash)}" aria-label="${expanded ? COPY.collapse : COPY.expand}" aria-expanded="${expanded}"><i class="fa-solid fa-chevron-${expanded ? "down" : "right"}"></i></button>
+      <i class="fa-regular fa-file vault-name-icon"></i>
+      <span class="vault-name-copy"><span class="vault-file-name">${esc(basename(group.relative_path))}</span><span class="vault-file-path">${esc(meta)}</span></span>
+    </div>
+    <span class="vault-copy-count">${copies}</span>
+    <span class="vault-size">${group.size ? fmt(group.size) : "—"}</span>
+    <span class="vault-space">${group.can_save ? fmt(group.can_save) : "—"}</span>
+  </div>${renderDuplicateGroupChildren(group)}`
+}).join("")
 const renderDuplicateGroups = (items) => {
   const groups = new Map()
   for (const item of items) {
@@ -714,7 +890,7 @@ const emptyState = (view) => {
 
 const renderReclaimable = (blobs) => {
   if (!blobs.length) return emptyState("reclaimable")
-  return blobs.map((blob) => `<div class="vault-file-row"><div class="vault-name-cell"><span class="vault-disclosure"></span><i class="fa-regular fa-file vault-name-icon"></i><span class="vault-name-copy"><span class="vault-file-name">${esc(`${blob.hash.slice(0, 12)}…`)}</span></span></div><span class="vault-size">${fmt(blob.size)}</span><span class="vault-space">${fmt(blob.size)}</span><span class="vault-row-action"><button class="vault-text-button" type="button" data-reclaim="${attr(blob.hash)}">${esc(COPY.reclaim)}</button></span></div>`).join("")
+  return blobs.map((blob) => `<div class="vault-file-row"><div class="vault-name-cell"><span class="vault-disclosure"></span><i class="fa-regular fa-file vault-name-icon"></i><span class="vault-name-copy"><span class="vault-file-name">${esc(`${blob.hash.slice(0, 12)}…`)}</span></span></div><span class="vault-size">${fmt(blob.size)}</span><span class="vault-space">${fmt(blob.size)}</span><span class="vault-row-action"><button class="vault-text-button" type="button" data-reclaim="${attr(blob.hash)}" data-reclaim-store="${attr(blob.store_id)}">${esc(COPY.reclaim)}</button></span></div>`).join("")
 }
 
 const renderActivity = (items) => {
@@ -734,6 +910,10 @@ const renderActivity = (items) => {
 const selectablePagePaths = (items) => items
   .filter((item) => item.status === "shared")
   .map((item) => item.path)
+const selectableDuplicatePagePaths = (items) => items
+  .filter((item) =>
+    item.status === "duplicate" && item.shareable)
+  .map((item) => item.path)
 
 const syncPageSelectionCheckbox = () => {
   const selectPage = document.querySelector("[data-select-separate-page]")
@@ -748,6 +928,37 @@ const syncPageSelectionCheckbox = () => {
     selected === pageCheckboxes.length
   selectPage.indeterminate = selected > 0 &&
     selected < pageCheckboxes.length
+}
+const syncDuplicatePageSelectionCheckbox = () => {
+  const selectPage = document.querySelector(
+    "[data-select-duplicate-page]")
+  if (!selectPage) return
+  const pageCheckboxes = [
+    ...document.querySelectorAll("[data-select-duplicate]")
+  ]
+  const selected = pageCheckboxes.filter((checkbox) =>
+    state.selectedDuplicateFiles.has(
+      checkbox.dataset.selectDuplicate)).length
+  selectPage.checked = pageCheckboxes.length > 0 &&
+    selected === pageCheckboxes.length
+  selectPage.indeterminate = selected > 0 &&
+    selected < pageCheckboxes.length
+}
+const syncDuplicateGroupCheckboxes = () => {
+  for (const checkbox of document.querySelectorAll(
+    "[data-select-duplicate-group]"
+  )) {
+    const selected = Math.max(
+      0,
+      Number(checkbox.dataset.selectedCount) || 0
+    )
+    const eligible = Math.max(
+      0,
+      Number(checkbox.dataset.eligibleCount) || 0
+    )
+    checkbox.checked = eligible > 0 && selected === eligible
+    checkbox.indeterminate = selected > 0 && selected < eligible
+  }
 }
 
 const renderSeparateSelectionBanner = (
@@ -787,9 +998,24 @@ const renderTable = (items) => {
   let tableClass = "inventory"
   let headers = [COPY.name, COPY.size, COPY.status]
   if (state.view === "duplicates") {
-    tableClass = "matches"
-    headers = [COPY.name, COPY.size, COPY.matches, COPY.can_save, ""]
-    body = items.length ? renderDuplicateGroups(items) : emptyState("duplicates")
+    if (state.displayMode === "files") {
+      tableClass = "duplicate-files duplicate-content-groups"
+      headers = [
+        COPY.name,
+        COPY.copies,
+        COPY.size_each,
+        COPY.can_save
+      ]
+      body = items.length
+        ? renderGroupedDuplicates(items)
+        : emptyState("duplicates")
+    } else {
+      tableClass = "matches"
+      headers = [COPY.name, COPY.size, COPY.matches, COPY.can_save, ""]
+      body = items.length
+        ? renderDuplicateGroups(items)
+        : emptyState("duplicates")
+    }
   } else if (state.view === "reclaimable") {
     tableClass = "reclaimable"
     headers = [COPY.name, COPY.size, COPY.can_free, ""]
@@ -808,21 +1034,36 @@ const renderTable = (items) => {
   const sortableSize = tableClass === "flat" || state.view === "duplicates" || state.view === "reclaimable"
   const sizeSortLabel = state.sizeSort === "desc" ? COPY.sort_smallest : COPY.sort_largest
   const sizeSortIcon = state.sizeSort === "desc" ? "fa-arrow-down-wide-short" : state.sizeSort === "asc" ? "fa-arrow-up-short-wide" : "fa-sort"
-  const pagePaths = selectablePagePaths(items)
+  const separatePagePaths = selectablePagePaths(items)
+  const duplicatePagePaths = state.view === "duplicates"
+    ? selectableDuplicatePagePaths(items)
+    : []
+  const pagePaths = duplicatePagePaths.length
+    ? duplicatePagePaths
+    : separatePagePaths
+  const selectedPaths = duplicatePagePaths.length
+    ? state.selectedDuplicateFiles
+    : state.selectedSeparateFiles
   const allPageSelected = pagePaths.length > 0 && pagePaths.every((filePath) =>
-    state.selectedSeparateFiles.has(filePath))
+    selectedPaths.has(filePath))
+  const pageSelectionAttribute = duplicatePagePaths.length
+    ? "data-select-duplicate-page"
+    : "data-select-separate-page"
   const headerMarkup = headers.map((header, index) => index === 0 && pagePaths.length
-    ? `<span class="vault-name-header"><input class="vault-row-checkbox" type="checkbox" data-select-separate-page aria-label="${attr(COPY.select_all_on_page)}" title="${attr(COPY.select_all_on_page)}" ${allPageSelected ? "checked" : ""} /><span>${esc(header)}</span></span>`
-    : header === COPY.size && sortableSize
+    ? `<span class="vault-name-header"><input class="vault-row-checkbox" type="checkbox" ${pageSelectionAttribute} aria-label="${attr(COPY.select_all_on_page)}" title="${attr(COPY.select_all_on_page)}" ${allPageSelected ? "checked" : ""} /><span>${esc(header)}</span></span>`
+    : (header === COPY.size || header === COPY.size_each) && sortableSize
       ? `<span class="vault-sort-column" role="columnheader" aria-sort="${state.sizeSort === "desc" ? "descending" : state.sizeSort === "asc" ? "ascending" : "none"}"><button class="vault-sort-button ${state.sizeSort ? "active" : ""}" type="button" data-sort-size aria-label="${attr(sizeSortLabel)}">${esc(header)}<i class="fa-solid ${sizeSortIcon}" aria-hidden="true"></i></button></span>`
       : `<span>${esc(header)}</span>`).join("")
   el("vault-table-wrap").innerHTML = `<div class="vault-table ${tableClass}"><div class="vault-columns">${headerMarkup}</div>${body}</div>`
-  renderSeparateSelectionBanner(pagePaths)
+  renderSeparateSelectionBanner(separatePagePaths)
   syncPageSelectionCheckbox()
+  syncDuplicatePageSelectionCheckbox()
+  syncDuplicateGroupCheckboxes()
 }
 
 const orderedItems = (items) => {
   if (state.view === "activity") return items
+  if (items.some((item) => item.kind === "duplicate_group")) return items
   if (state.view === "reclaimable") {
     return [...items].sort((a, b) => compareRows(a, b,
       (blob) => blob.hash))
@@ -852,6 +1093,22 @@ const pagedItems = (items) => {
 }
 
 const paneFooterText = () => {
+  if (state.view === "duplicates" &&
+      state.displayMode === "files") {
+    const groupCount = Math.max(
+      0,
+      Number(state.data.inventory.total) || 0
+    )
+    const count = countLabel(
+      groupCount,
+      COPY.content_group,
+      COPY.content_groups
+    )
+    const order = state.sizeSort === "asc"
+      ? COPY.sorted_smallest
+      : COPY.sorted_largest
+    return `${count} · ${order}`
+  }
   if (state.displayMode === "files" && supportsDisplayMode()) {
     const itemCount = Number(state.data.inventory.current && state.data.inventory.current.count) || 0
     const count = state.view === "shared"
@@ -1099,7 +1356,7 @@ const renderFeedback = () => {
   feedback.className = `vault-feedback show ${state.feedback.error ? "error" : ""}`
   feedback.innerHTML = `<i class="fa-solid fa-${state.feedback.error ? "triangle-exclamation" : "circle-check"}"></i><span>${esc(state.feedback.message)}</span>`
 }
-const fileActionButtons = () => document.querySelectorAll("[data-deduplicate-all], [data-deduplicate-scope], [data-deduplicate-file], [data-detach], [data-separate-selected]")
+const fileActionButtons = () => document.querySelectorAll("[data-deduplicate-all], [data-deduplicate-selected], [data-deduplicate-scope], [data-deduplicate-file], [data-detach], [data-separate-selected]")
 const fileActionLabel = (action) => ({
   "deduplicate-file": COPY.deduplicating_file,
   "make-separate": COPY.making_separate
@@ -1110,6 +1367,13 @@ const serverFileAction = (action) => {
     return {
       kind: action.kind,
       scope_id: action.scope_id || null,
+      files_completed: Math.max(0, Number(action.files_completed) || 0),
+      files_total: Math.max(0, Number(action.files_total) || 0)
+    }
+  }
+  if (action.kind === "deduplicate-files") {
+    return {
+      kind: action.kind,
       files_completed: Math.max(0, Number(action.files_completed) || 0),
       files_total: Math.max(0, Number(action.files_total) || 0)
     }
@@ -1139,6 +1403,8 @@ const renderActionProgress = () => {
         (button.hasAttribute("data-deduplicate-all") &&
           (button.dataset.deduplicateContext || null) === action.scope_id)
       )) ||
+      (action.kind === "deduplicate-files" &&
+        button.hasAttribute("data-deduplicate-selected")) ||
       (action.kind === "deduplicate-file" && button.dataset.deduplicateFile === action.path) ||
       (action.kind === "separate-files" && button.hasAttribute("data-separate-selected")) ||
       (action.kind === "make-separate" &&
@@ -1161,7 +1427,9 @@ const renderActionProgress = () => {
   let label
   let detail
   let progress
-  if (action.kind === "deduplicate" || action.kind === "separate-files") {
+  if (action.kind === "deduplicate" ||
+      action.kind === "deduplicate-files" ||
+      action.kind === "separate-files") {
     const completed = Math.max(0, Number(action.files_completed) || 0)
     const total = Math.max(completed, Number(action.files_total) || 0)
     const ratio = total ? Math.min(1, completed / total) : 0
@@ -1213,13 +1481,27 @@ const render = () => {
   }
   el("vault-explorer").style.display = ""
   const items = buildItems()
-  const visiblePaths = new Set(selectablePagePaths(items))
+  const groupedDuplicates = state.view === "duplicates" &&
+    state.displayMode === "files" &&
+    items.some((item) => item.kind === "duplicate_group")
+  const visibleSeparatePaths = new Set(selectablePagePaths(items))
+  const visibleDuplicatePaths = new Set(
+    selectableDuplicatePagePaths(items))
   if (state.separateAllMatching &&
       !(Number(state.data.inventory.current.separate_count) > 0)) {
     clearSeparateSelection()
   }
   for (const filePath of state.selectedSeparateFiles) {
-    if (!visiblePaths.has(filePath)) state.selectedSeparateFiles.delete(filePath)
+    if (!visibleSeparatePaths.has(filePath)) {
+      state.selectedSeparateFiles.delete(filePath)
+    }
+  }
+  if (!groupedDuplicates) {
+    for (const filePath of state.selectedDuplicateFiles.keys()) {
+      if (!visibleDuplicatePaths.has(filePath)) {
+        state.selectedDuplicateFiles.delete(filePath)
+      }
+    }
   }
   renderViews()
   renderLocations()
@@ -1246,6 +1528,45 @@ const fetchJson = async (url) => {
   if (!response.ok) throw new Error(COPY.status_request_failed.replace("{status}", response.status))
   return response.json()
 }
+const loadDuplicateGroupChildren = async (hash, append = false) => {
+  const generation = state.duplicateGroupGeneration
+  const current = state.duplicateGroupChildren.get(hash) || {
+    items: [],
+    total: 0,
+    nextCursor: null,
+    loaded: false,
+    loading: false,
+    error: null
+  }
+  if (current.loading) return
+  current.loading = true
+  current.error = null
+  state.duplicateGroupChildren.set(hash, current)
+  render()
+  try {
+    const result = await fetchJson(duplicateGroupUrl(hash, {
+      cursor: append ? current.nextCursor : null
+    }))
+    if (generation !== state.duplicateGroupGeneration) return
+    const items = Array.isArray(result.items) ? result.items : []
+    current.items = append ? current.items.concat(items) : items
+    current.total = Math.max(0, Number(result.total) || 0)
+    current.nextCursor = result.next_cursor || null
+    current.loaded = true
+  } catch (error) {
+    if (generation !== state.duplicateGroupGeneration) return
+    current.error = error && error.message
+      ? error.message
+      : String(error)
+  } finally {
+    if (generation === state.duplicateGroupGeneration) {
+      current.loading = false
+      render()
+    }
+  }
+}
+const duplicateGroupSelectionPaths = async (hash) =>
+  fetchJson(duplicateGroupUrl(hash, { select: true }))
 const applyFullData = (data) => {
   const scanning = scanActive(data.scan)
   const contextualScan = !IS_APP_MODE || !data.scan || data.scan.scope_id === SCOPE_ID
@@ -1442,6 +1763,56 @@ const trackDeduplication = (scopeId, total = null) => {
   }
 }
 
+const showSelectedDeduplicationProgress = (progress, fallbackTotal) => {
+  const completed = Math.max(0, Number(progress.files_completed) || 0)
+  const total = Math.max(
+    completed,
+    Number(progress.files_total) || fallbackTotal
+  )
+  const current = state.actionProgress
+  if (current &&
+      current.kind === "deduplicate-files" &&
+      current.files_completed === completed &&
+      current.files_total === total) return
+  state.actionProgress = {
+    kind: "deduplicate-files",
+    files_completed: completed,
+    files_total: total
+  }
+  renderActionProgress()
+}
+
+const trackSelectedDeduplication = (total) => {
+  let stopped = false
+  let timer = null
+  showSelectedDeduplicationProgress({
+    files_completed: 0,
+    files_total: total
+  }, total)
+  const poll = async () => {
+    try {
+      const status = await fetchJson(statusUrl(true))
+      const action = serverFileAction(status.file_action)
+      if (!stopped &&
+          action &&
+          action.kind === "deduplicate-files") {
+        showSelectedDeduplicationProgress(action, total)
+      }
+    } catch (error) {}
+    if (!stopped) timer = setTimeout(poll, 250)
+  }
+  poll()
+  return () => {
+    stopped = true
+    clearTimeout(timer)
+    if (state.actionProgress &&
+        state.actionProgress.kind === "deduplicate-files") {
+      state.actionProgress = null
+    }
+    renderActionProgress()
+  }
+}
+
 const showBulkSeparateProgress = (progress, fallbackTotal) => {
   const completed = Math.max(0, Number(progress.files_completed) || 0)
   const total = Math.max(completed, Number(progress.files_total) || fallbackTotal)
@@ -1577,8 +1948,9 @@ document.addEventListener("click", async (event) => {
     syncPageSelectionCheckbox()
     return
   }
-  if (state.actionProgress && (target.hasAttribute("data-deduplicate-all") || target.dataset.deduplicateScope || target.dataset.deduplicateFile || target.dataset.detach || target.hasAttribute("data-separate-selected"))) return
+  if (state.actionProgress && (target.hasAttribute("data-deduplicate-all") || target.hasAttribute("data-deduplicate-selected") || target.dataset.deduplicateScope || target.dataset.deduplicateFile || target.dataset.detach || target.hasAttribute("data-separate-selected"))) return
   if (target.dataset.page) {
+    clearFileSelections()
     if (target.dataset.page === "next") {
       const cursor = state.data.inventory.next_cursor
       if (!cursor) return
@@ -1590,17 +1962,19 @@ document.addEventListener("click", async (event) => {
     await refresh(true)
     el("vault-table-wrap").scrollTop = 0
   } else if (target.hasAttribute("data-sort-size")) {
+    clearFileSelections()
     state.sizeSort = state.sizeSort === "desc" ? "asc" : "desc"
     resetPage()
     await refresh(true)
   } else if (target.dataset.displayMode) {
+    clearFileSelections()
     state.displayMode = target.dataset.displayMode === "files" ? "files" : "folders"
     state.sizeSort = state.displayMode === "files" ? "desc" : null
     resetPage()
     await refresh(true)
   } else if (target.dataset.view || target.id === "btn-review-cleanup") {
     state.view = target.dataset.view || "reclaimable"
-    clearSeparateSelection()
+    clearFileSelections()
     state.sourceId = SCOPE_ID
     state.query = ""
     state.statusFilter = "all"
@@ -1613,7 +1987,7 @@ document.addEventListener("click", async (event) => {
     resetPage()
     await refresh(true)
   } else if (target.hasAttribute("data-source")) {
-    clearSeparateSelection()
+    clearFileSelections()
     const sourceId = target.dataset.source || null
     state.sourceId = IS_APP_MODE
       ? SCOPE_ID
@@ -1630,6 +2004,24 @@ document.addEventListener("click", async (event) => {
     if (state.collapsedDirs.has(key)) state.collapsedDirs.delete(key)
     else state.collapsedDirs.add(key)
     render()
+  } else if (target.dataset.expandDuplicateGroup) {
+    const hash = target.dataset.expandDuplicateGroup
+    if (state.expandedDuplicateGroups.has(hash)) {
+      state.expandedDuplicateGroups.delete(hash)
+      render()
+    } else {
+      state.expandedDuplicateGroups.add(hash)
+      render()
+      const children = state.duplicateGroupChildren.get(hash)
+      if (!children || !children.loaded) {
+        await loadDuplicateGroupChildren(hash)
+      }
+    }
+  } else if (target.dataset.moreDuplicateGroup) {
+    await loadDuplicateGroupChildren(
+      target.dataset.moreDuplicateGroup,
+      true
+    )
   } else if (target.dataset.expandFile) {
     const file = target.dataset.expandFile
     if (state.expandedFiles.has(file)) state.expandedFiles.delete(file)
@@ -1737,10 +2129,25 @@ document.addEventListener("click", async (event) => {
     state.sizeSort = null
     state.sourceId = SCOPE_ID
     state.query = ""
-    clearSeparateSelection()
+    clearFileSelections()
     state.scanResult = null
     resetPage()
     await refresh(true)
+  } else if (target.hasAttribute("data-deduplicate-selected")) {
+    const paths = [...state.selectedDuplicateFiles.keys()]
+    const stopTracking = trackSelectedDeduplication(paths.length)
+    state.actionRequest = true
+    try {
+      await runAction(
+        { action: "deduplicate_files", paths },
+        deduplicateFeedback
+      )
+      clearDuplicateSelection()
+      render()
+    } finally {
+      state.actionRequest = false
+      stopTracking()
+    }
   } else if (target.hasAttribute("data-deduplicate-all")) {
     const scopeId = target.dataset.deduplicateContext || null
     const total = bulkDeduplicationCount()
@@ -1808,7 +2215,7 @@ document.addEventListener("click", async (event) => {
       renderActionProgress()
     }
   } else if (target.dataset.reclaim) {
-    await runAction({ action: "reclaim", hash: target.dataset.reclaim }, (result) => result.status === "reclaimed"
+    await runAction({ action: "reclaim", hash: target.dataset.reclaim, store_id: target.dataset.reclaimStore }, (result) => result.status === "reclaimed"
       ? `${COPY.reclaimed}: ${fmt(result.bytes_freed || 0)}`
       : { error: true, message: COPY.unavailable })
   } else if (target.id === "btn-reclaim-all") {
@@ -1862,13 +2269,134 @@ document.addEventListener("click", async (event) => {
 
 document.addEventListener("input", (event) => {
   if (event.target.id !== "vault-search") return
-  clearSeparateSelection()
+  clearFileSelections()
   state.query = event.target.value
   resetPage()
   clearTimeout(window.__vaultSearchRefresh)
   window.__vaultSearchRefresh = setTimeout(() => refresh(true), 250)
 })
-document.addEventListener("change", (event) => {
+document.addEventListener("change", async (event) => {
+  if (event.target.dataset.selectDuplicateGroup) {
+    const checkbox = event.target
+    const hash = checkbox.dataset.selectDuplicateGroup
+    const size = Math.max(
+      0,
+      Number(checkbox.dataset.duplicateSize) || 0
+    )
+    if (!checkbox.checked) {
+      for (const [filePath, selection] of state.selectedDuplicateFiles) {
+        if (selection.hash !== hash) continue
+        state.selectedDuplicateFiles.delete(filePath)
+      }
+      render()
+      return
+    }
+    checkbox.disabled = true
+    const generation = state.duplicateGroupGeneration
+    try {
+      const result = await duplicateGroupSelectionPaths(hash)
+      if (generation !== state.duplicateGroupGeneration) return
+      const paths = Array.isArray(result.paths) ? result.paths : []
+      const combined = new Set(state.selectedDuplicateFiles.keys())
+      for (const filePath of paths) combined.add(filePath)
+      if (result.exceeded ||
+          combined.size > MAX_BULK_DEDUPLICATE_FILES) {
+        state.feedback = {
+          error: true,
+          message: COPY.duplicate_selection_limit
+        }
+      } else {
+        for (const filePath of paths) {
+          state.selectedDuplicateFiles.set(filePath, { hash, size })
+        }
+      }
+    } catch (error) {
+      if (generation === state.duplicateGroupGeneration) {
+        state.feedback = {
+          error: true,
+          message: error && error.message
+            ? error.message
+            : String(error)
+        }
+      }
+    } finally {
+      if (generation === state.duplicateGroupGeneration) render()
+    }
+    return
+  }
+  if (event.target.hasAttribute("data-select-duplicate-page")) {
+    const pageCheckboxes = [
+      ...document.querySelectorAll("[data-select-duplicate]")
+    ]
+    if (event.target.checked &&
+        pageCheckboxes.length > MAX_BULK_DEDUPLICATE_FILES) {
+      event.target.checked = false
+      state.feedback = {
+        error: true,
+        message: COPY.duplicate_selection_limit
+      }
+      renderFeedback()
+      return
+    }
+    for (const checkbox of pageCheckboxes) {
+      checkbox.checked = event.target.checked
+      if (event.target.checked) {
+        const filePath = checkbox.dataset.selectDuplicate
+        state.selectedDuplicateFiles.set(
+          filePath,
+          {
+            hash: checkbox.dataset.duplicateHash || "",
+            size: Math.max(
+              0,
+              Number(checkbox.dataset.duplicateSize) || 0
+            )
+          }
+        )
+      } else {
+        const filePath = checkbox.dataset.selectDuplicate
+        state.selectedDuplicateFiles.delete(filePath)
+      }
+    }
+    renderToolbar()
+    syncDuplicatePageSelectionCheckbox()
+    return
+  }
+  if (event.target.dataset.selectDuplicate) {
+    const filePath = event.target.dataset.selectDuplicate
+    if (event.target.checked &&
+        state.selectedDuplicateFiles.size >=
+          MAX_BULK_DEDUPLICATE_FILES) {
+      event.target.checked = false
+      state.feedback = {
+        error: true,
+        message: COPY.duplicate_selection_limit
+      }
+      renderFeedback()
+      return
+    }
+    if (event.target.checked) {
+      state.selectedDuplicateFiles.set(
+        filePath,
+        {
+          hash: event.target.dataset.duplicateHash || "",
+          size: Math.max(
+            0,
+            Number(event.target.dataset.duplicateSize) || 0
+          )
+        }
+      )
+    } else {
+      state.selectedDuplicateFiles.delete(filePath)
+    }
+    if (state.view === "duplicates" &&
+        state.displayMode === "files") {
+      render()
+    } else {
+      renderToolbar()
+      syncDuplicatePageSelectionCheckbox()
+    }
+    return
+  }
   if (event.target.hasAttribute("data-select-separate-page")) {
     const pageCheckboxes = [
       ...document.querySelectorAll("[data-select-separate]")
@@ -1918,7 +2446,7 @@ document.addEventListener("change", (event) => {
     return
   }
   if (event.target.id !== "vault-status-filter") return
-  clearSeparateSelection()
+  clearFileSelections()
   state.statusFilter = event.target.value
   resetPage()
   refresh(true)

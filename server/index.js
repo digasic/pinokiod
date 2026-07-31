@@ -15761,12 +15761,31 @@ class Server {
         res.json(await vault.progressStatus(scopeId))
         return
       }
+      const groupHash = req.query &&
+        typeof req.query.group_hash === "string"
+        ? req.query.group_hash
+        : null
+      if (groupHash) {
+        const options = {
+          location_id: req.query && req.query.location_id,
+          query: req.query && req.query.q,
+          cursor: req.query && req.query.cursor,
+          page_size: req.query && req.query.page_size
+        }
+        res.json(req.query && req.query.group_select === "1"
+          ? await vault.duplicateGroupSelection(
+              scopeId, groupHash, options)
+          : await vault.duplicateGroupChildren(
+              scopeId, groupHash, options))
+        return
+      }
       res.json(await vault.status(scopeId, {
         view: req.query && req.query.view,
         location_id: req.query && req.query.location_id,
         query: req.query && req.query.q,
         status_filter: req.query && req.query.status_filter,
         size_sort: req.query && req.query.size_sort,
+        display_mode: req.query && req.query.display_mode,
         page: req.query && req.query.page,
         cursor: req.query && req.query.cursor,
         page_size: req.query && req.query.page_size

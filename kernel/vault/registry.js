@@ -91,6 +91,10 @@ for (const method of [
   "getContent",
   "upsertContent",
   "removeContent",
+  "getAnchor",
+  "anchorsForHash",
+  "upsertAnchor",
+  "removeAnchor",
   "files",
   "updateInodeSnapshots",
   "externalSources",
@@ -121,6 +125,8 @@ for (const method of [
   "fileBatch",
   "hasFilesForHash",
   "reclaimableBatch",
+  "duplicateGroupChildren",
+  "duplicateGroupSelection",
   "statusSnapshot",
   "clearFiles"
 ]) {

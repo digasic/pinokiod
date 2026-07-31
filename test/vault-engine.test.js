@@ -119,6 +119,89 @@ describe("Save Space engine", () => {
     await close(vault)
   })
 
+  test("locations and anchor stores persist in global config, not only SQLite", async () => {
+    const base = await makeHome()
+    const home = path.join(base, "pinokio")
+    let external = path.join(base, "Documents")
+    await fs.promises.mkdir(path.join(home, "api"), { recursive: true })
+    await fs.promises.mkdir(external)
+    external = await fs.promises.realpath(external)
+    const values = {}
+    const store = {
+      root: path.join(base, ".pinokio"),
+      get: (key) => values[key],
+      set: (key, value) => {
+        values[key] = JSON.parse(JSON.stringify(value))
+      }
+    }
+    const firstKernel = {
+      homedir: home,
+      platform: process.platform,
+      store
+    }
+    const first = new Vault(firstKernel)
+    firstKernel.vault = first
+    await first.init()
+    const added = await first.addExternalSource(external)
+
+    assert.equal(added.created, true)
+    assert.deepEqual(values.vault.locations, [external])
+    assert.equal(values.vault.anchor_stores.length, 1)
+    assert.deepEqual(await first.registry.externalSources(), [])
+    assert.equal(fs.existsSync(first.blobRoot), false)
+    await close(first)
+
+    const secondKernel = {
+      homedir: home,
+      platform: process.platform,
+      store
+    }
+    const second = new Vault(secondKernel)
+    secondKernel.vault = second
+    await second.init()
+    assert.equal(second.sources().some((source) =>
+      source.kind === "external" && source.root === external), true)
+    assert.equal(second.anchorStores().length, 1)
+    assert.equal(
+      (await fs.promises.readdir(second.root)).every((name) =>
+        name.startsWith("registry.sqlite3")),
+      true
+    )
+    await close(second)
+  })
+
+  test("an existing central anchor tree moves intact to the home-filesystem store", async () => {
+    const home = await makeHome()
+    const contents = crypto.randomBytes(4096)
+    const hash = crypto.createHash("sha256").update(contents).digest("hex")
+    const legacyAnchor = await write(
+      path.join(home, "vault", "sha256", hash.slice(0, 2), hash),
+      contents
+    )
+    const visible = path.join(home, "api", "app", "model.bin")
+    await fs.promises.mkdir(path.dirname(visible), { recursive: true })
+    await fs.promises.link(legacyAnchor, visible)
+    const before = await fs.promises.stat(legacyAnchor)
+    const kernel = { homedir: home, platform: process.platform }
+    const vault = new Vault(kernel)
+    kernel.vault = vault
+
+    await vault.init()
+
+    const migrated = vault.storePathFor(hash)
+    assert.equal(fs.existsSync(legacyAnchor), false)
+    assert.equal((await fs.promises.stat(migrated)).ino, before.ino)
+    assert.equal(
+      (await fs.promises.readdir(vault.root)).every((name) =>
+        name.startsWith("registry.sqlite3")),
+      true
+    )
+    vault.sizeThreshold = contents.length * 2
+    await vault.sweeper.scan()
+    assert.equal((await vault.registry.getFile(visible)).status, "linked")
+    await close(vault)
+  })
+
   test("explicit deduplication creates the first anchor and changes one path atomically", async () => {
     const { home, vault } = await makeVault()
     const pair = await duplicatePair(home)
@@ -130,7 +213,7 @@ describe("Save Space engine", () => {
     assert.ok(duplicate)
     assert.equal((await fs.promises.stat(pair.first)).nlink, 1)
     assert.equal((await fs.promises.stat(pair.second)).nlink, 1)
-    assert.deepEqual(await fs.promises.readdir(vault.blobRoot), [])
+    assert.equal(fs.existsSync(vault.blobRoot), false)
 
     const result = await vault.perform("deduplicate", {
       path: duplicate.path
@@ -147,6 +230,212 @@ describe("Save Space engine", () => {
       fs.existsSync(vault.storePathFor(duplicate.hash)),
       true
     )
+    const marker = JSON.parse(await fs.promises.readFile(
+      path.resolve(path.dirname(vault.blobRoot), "store.json"),
+      "utf8"
+    ))
+    assert.equal(marker.id, vault.defaultAnchorStore().id)
+    assert.equal(marker.version, 1)
+    await close(vault)
+  })
+
+  test("bulk Deduplicate changes only the selected duplicate paths", async () => {
+    const { home, vault } = await makeVault()
+    await duplicatePair(home, "first.bin")
+    await duplicatePair(home, "second.bin")
+    await duplicatePair(home, "unselected.bin")
+    await vault.sweeper.scan()
+
+    const pending = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })]
+    assert.equal(pending.length, 3)
+    const selected = pending.slice(0, 2)
+    const unselected = pending[2]
+
+    const result = await vault.perform("deduplicate_files", {
+      paths: selected.map((entry) => entry.path)
+    })
+
+    assert.equal(result.converted, 2)
+    assert.equal(result.failed, 0)
+    assert.equal(result.results.length, 2)
+    for (const entry of selected) {
+      assert.equal(
+        (await vault.registry.getFile(entry.path)).status,
+        "linked"
+      )
+    }
+    assert.equal(
+      (await vault.registry.getFile(unselected.path)).status,
+      "duplicate"
+    )
+    const tooMany = await vault.perform("deduplicate_files", {
+      paths: Array.from({ length: 501 }, (_, index) =>
+        path.join(home, `file-${index}.bin`))
+    })
+    assert.match(tooMany.error, /valid duplicate files/)
+    await close(vault)
+  })
+
+  test("Duplicate Files pages content groups and lazily resolves exact paths", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "first", "original.bin"), contents)
+    const copy = await write(
+      path.join(home, "api", "second", "copy.bin"), contents)
+    await write(path.join(home, "api", "third", "another-name.bin"), contents)
+    const otherContents = crypto.randomBytes(2048)
+    await write(path.join(home, "api", "fourth", "other.bin"), otherContents)
+    await write(path.join(home, "api", "fifth", "other.bin"), otherContents)
+    await vault.sweeper.scan()
+
+    const pending = await vault.registry.files({
+      statuses: ["duplicate"]
+    })
+    assert.equal(pending.length, 3)
+    const hash = (await vault.registry.getFile(copy)).hash
+    const scopedDuplicate = pending.find((entry) => entry.hash === hash)
+    const grouped = await vault.status(null, {
+      view: "duplicates",
+      display_mode: "files",
+      size_sort: "desc",
+      page_size: 500
+    })
+
+    assert.equal(grouped.inventory.current.count, 3)
+    assert.equal(
+      grouped.inventory.current.deduplicate_bytes,
+      (contents.length * 2) + otherContents.length
+    )
+    assert.equal(grouped.inventory.total, 2)
+    assert.equal(grouped.items.length, 2)
+    const contentGroup = grouped.items.find((entry) => entry.hash === hash)
+    assert.equal(contentGroup.kind, "duplicate_group")
+    assert.equal(contentGroup.total_count, 3)
+    assert.equal(contentGroup.eligible_count, 2)
+    assert.equal(contentGroup.can_save, contents.length * 2)
+    const firstGroupPage = await vault.status(null, {
+      view: "duplicates",
+      display_mode: "files",
+      size_sort: "desc",
+      page_size: 1
+    })
+    const secondGroupPage = await vault.status(null, {
+      view: "duplicates",
+      display_mode: "files",
+      size_sort: "desc",
+      page_size: 1,
+      cursor: firstGroupPage.inventory.next_cursor,
+      page: 1
+    })
+    assert.ok(firstGroupPage.inventory.next_cursor)
+    assert.notEqual(
+      firstGroupPage.items[0].hash,
+      secondGroupPage.items[0].hash
+    )
+    const searched = await vault.status(null, {
+      view: "duplicates",
+      display_mode: "files",
+      query: "copy.bin",
+      page_size: 500
+    })
+    assert.equal(searched.inventory.current.count, 1)
+    assert.equal(searched.inventory.current.shareable_bytes, contents.length)
+    assert.equal(
+      searched.inventory.current.deduplicate_bytes,
+      (contents.length * 2) + otherContents.length
+    )
+    assert.equal(searched.inventory.total, 1)
+    assert.equal(searched.items[0].path, copy)
+    assert.equal(searched.items[0].total_count, 3)
+    assert.equal(searched.items[0].eligible_count, 1)
+
+    const children = await vault.duplicateGroupChildren(null, hash)
+    assert.equal(children.total, 3)
+    assert.equal(children.items.length, 3)
+    assert.equal(children.items.filter((entry) => entry.selectable).length, 2)
+    assert.equal(children.items.some((entry) =>
+      entry.registry_status === "reference"), true)
+    const firstChildPage = await vault.duplicateGroupChildren(null, hash, {
+      page_size: 1
+    })
+    const secondChildPage = await vault.duplicateGroupChildren(null, hash, {
+      page_size: 1,
+      cursor: firstChildPage.next_cursor
+    })
+    assert.ok(firstChildPage.next_cursor)
+    assert.notEqual(
+      firstChildPage.items[0].path,
+      secondChildPage.items[0].path
+    )
+
+    const scoped = await vault.status(null, {
+      view: "duplicates",
+      display_mode: "files",
+      location_id: scopedDuplicate.source_id,
+      page_size: 500
+    })
+    assert.equal(scoped.items[0].total_count, 3)
+    assert.equal(scoped.items[0].eligible_count, 1)
+    const scopedChildren = await vault.duplicateGroupChildren(null, hash, {
+      location_id: scopedDuplicate.source_id
+    })
+    assert.equal(scopedChildren.items.length, 3)
+    assert.equal(scopedChildren.items.filter((entry) =>
+      entry.selectable).length, 1)
+    const selection = await vault.duplicateGroupSelection(null, hash, {
+      location_id: scopedDuplicate.source_id
+    })
+    assert.deepEqual(selection.paths, [scopedDuplicate.path])
+    assert.equal(selection.exceeded, false)
+
+    const appGrouped = await vault.status(scopedDuplicate.source_id, {
+      view: "duplicates",
+      display_mode: "files",
+      page_size: 500
+    })
+    assert.equal(appGrouped.items.length, 1)
+    assert.equal(appGrouped.items[0].total_count, 1)
+    assert.equal(appGrouped.items[0].eligible_count, 1)
+    const appChildren = await vault.duplicateGroupChildren(
+      scopedDuplicate.source_id,
+      hash
+    )
+    assert.deepEqual(
+      appChildren.items.map((entry) => entry.path),
+      [scopedDuplicate.path]
+    )
+    const appSelection = await vault.duplicateGroupSelection(
+      scopedDuplicate.source_id,
+      hash
+    )
+    assert.deepEqual(appSelection.paths, [scopedDuplicate.path])
+
+    await close(vault)
+  })
+
+  test("an unsupported filesystem leaves files unchanged and becomes unavailable", async () => {
+    const { home, vault } = await makeVault()
+    const pair = await duplicatePair(home)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    const before = await fs.promises.stat(duplicate.path)
+    vault.probe = async () => "copy"
+
+    const result = await vault.perform("deduplicate", {
+      path: duplicate.path
+    })
+
+    assert.equal(result.status, "unavailable")
+    assert.equal((await fs.promises.stat(duplicate.path)).ino, before.ino)
+    assert.deepEqual(await fs.promises.readFile(duplicate.path), pair.contents)
+    const rows = await vault.registry.files({ hash: duplicate.hash })
+    assert.equal(rows.every((row) =>
+      row.status === "unavailable" &&
+      row.unavailable_reason === "hardlinks"), true)
     await close(vault)
   })
 

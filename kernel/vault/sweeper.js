@@ -156,7 +156,8 @@ class Sweeper {
         throw new Error("That scan location is no longer available.")
       }
 
-      await this.stageAnchors(runId)
+      const anchorStores = this.anchorStoresForScope(scopeId)
+      await this.stageAnchors(runId, anchorStores)
       this.checkpoint()
 
       const walkStarted = Date.now()
@@ -187,14 +188,20 @@ class Sweeper {
       this.state.phase = "publishing"
       this.state.duration_ms = Date.now() - this.state.started
       const metadata = this.scanMetadata(scopeId, outcome)
-      const storeStat = await fs.promises.stat(this.vault.root)
+      const stores = anchorStores
+        .filter((store) =>
+          store.available && Number.isFinite(store.dev))
+        .map((store) => ({
+          store_id: store.id,
+          dev: store.dev,
+          can_link: store.mode !== "copy",
+          root: store.root
+        }))
       await registry.publishScan(
         runId,
         this.publicationSourceIds(scopeId),
         metadata,
-        storeStat.dev,
-        this.vault.mode === "link",
-        this.vault.blobRoot
+        stores
       )
     } catch (error) {
       await registry.abortScan(runId).catch(() => {})
@@ -344,44 +351,65 @@ class Sweeper {
     this.state.hash_bytes_completed += entry.size
   }
 
-  async stageAnchors(runId) {
-    const blobRoot = this.vault.blobRoot
-    let stat
-    try {
-      stat = await fs.promises.lstat(blobRoot)
-    } catch (error) {
-      if (error && (error.code === "ENOENT" || error.code === "ENOTDIR")) return
-      if (this.recordExclusion(error, blobRoot)) return
-      throw error
-    }
-    if (!stat.isDirectory() || stat.isSymbolicLink()) return
+  anchorStoresForScope(scopeId) {
+    const available = this.vault.anchorStores().filter((store) =>
+      store.available && Number.isFinite(store.dev))
+    if (!scopeId) return available
+    const source = this.vault.scanSource(scopeId)
+    return source && Number.isFinite(source.dev)
+      ? available.filter((store) => store.dev === source.dev)
+      : []
+  }
 
-    for await (const directoryResults of walkBatches(blobRoot, {
-      concurrency: this.dirConcurrency,
-      strictErrors: true,
-      onError: (error, filePath) =>
-        this.recordExclusion(error, filePath)
-    })) {
-      this.checkpoint()
-      const files = directoryResults.flatMap((group) =>
-        group.files.map((file) => file.path))
-      const stats = await statMany(files, this.statConcurrency, null, {
-        followSymlinks: false,
+  async stageAnchors(runId, stores = this.vault.anchorStores()) {
+    for (const store of stores) {
+      const blobRoot = path.resolve(store.root, "sha256")
+      let stat
+      try {
+        stat = await fs.promises.lstat(blobRoot)
+      } catch (error) {
+        if (error &&
+            (error.code === "ENOENT" || error.code === "ENOTDIR")) continue
+        if (this.recordExclusion(error, blobRoot)) continue
+        throw error
+      }
+      if (!stat.isDirectory() || stat.isSymbolicLink()) continue
+      try {
+        await this.vault.validateAnchorStore(store, stat.dev)
+      } catch (error) {
+        if (this.recordExclusion(error, blobRoot, null, "anchor_store")) {
+          continue
+        }
+        throw error
+      }
+
+      for await (const directoryResults of walkBatches(blobRoot, {
+        concurrency: this.dirConcurrency,
         strictErrors: true,
         onError: (error, filePath) =>
           this.recordExclusion(error, filePath)
-      })
-      const anchors = []
-      for (let index = 0; index < files.length; index++) {
-        const filePath = files[index]
-        const fileStat = stats[index]
-        const hash = path.basename(filePath)
-        if (!fileStat || !fileStat.isFile() || !SHA256_RE.test(hash)) continue
-        if (path.basename(path.dirname(filePath)) !== hash.slice(0, 2)) continue
-        anchors.push(anchorEntry(filePath, hash, fileStat))
+      })) {
+        this.checkpoint()
+        const files = directoryResults.flatMap((group) =>
+          group.files.map((file) => file.path))
+        const stats = await statMany(files, this.statConcurrency, null, {
+          followSymlinks: false,
+          strictErrors: true,
+          onError: (error, filePath) =>
+            this.recordExclusion(error, filePath)
+        })
+        const anchors = []
+        for (let index = 0; index < files.length; index++) {
+          const filePath = files[index]
+          const fileStat = stats[index]
+          const hash = path.basename(filePath)
+          if (!fileStat || !fileStat.isFile() || !SHA256_RE.test(hash)) continue
+          if (path.basename(path.dirname(filePath)) !== hash.slice(0, 2)) continue
+          anchors.push(anchorEntry(store.id, filePath, hash, fileStat))
+        }
+        const staged = await this.vault.registry.stageAnchors(runId, anchors)
+        this.applyHashWork(staged && staged.work)
       }
-      const staged = await this.vault.registry.stageAnchors(runId, anchors)
-      this.applyHashWork(staged && staged.work)
     }
   }
 
@@ -390,7 +418,7 @@ class Sweeper {
     await rootHandle.close()
     for await (const directoryResults of walkBatches(root, {
       concurrency: this.dirConcurrency,
-      skipDirectory: (full) => full === this.vault.root,
+      skipDirectory: (full) => this.vault.isStorageRoot(full),
       strictErrors: true,
       strictRoot: true,
       onError: (error, filePath) =>
@@ -618,18 +646,19 @@ const stageSnapshot = (entry) => ({
   ino: entry.ino
 })
 
-const anchorEntry = (filePath, hash, stat) => ({
-    hash_name: hash,
-    path: filePath,
-    size: stat.size,
-    mtime: stat.mtimeMs,
-    ctime: stat.ctimeMs,
-    dev: stat.dev,
-    ino: stat.ino,
-    nlink: stat.nlink,
-    mode: stat.mode,
-    uid: stat.uid,
-    gid: stat.gid
+const anchorEntry = (storeId, filePath, hash, stat) => ({
+  store_id: storeId,
+  hash_name: hash,
+  path: filePath,
+  size: stat.size,
+  mtime: stat.mtimeMs,
+  ctime: stat.ctimeMs,
+  dev: stat.dev,
+  ino: stat.ino,
+  nlink: stat.nlink,
+  mode: stat.mode,
+  uid: stat.uid,
+  gid: stat.gid
 })
 
 module.exports = Sweeper

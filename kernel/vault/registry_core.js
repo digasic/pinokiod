@@ -111,6 +111,29 @@ class RegistryCore {
         anchor_nlink INTEGER
       );
 
+      CREATE TABLE IF NOT EXISTS anchors (
+        store_id TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        path TEXT NOT NULL,
+        verified_at INTEGER,
+        dev INTEGER NOT NULL,
+        ino INTEGER NOT NULL,
+        size INTEGER NOT NULL,
+        mtime REAL NOT NULL,
+        ctime REAL NOT NULL,
+        nlink INTEGER NOT NULL,
+        mode INTEGER NOT NULL,
+        uid INTEGER NOT NULL,
+        gid INTEGER NOT NULL,
+        PRIMARY KEY (store_id, hash),
+        UNIQUE (path),
+        FOREIGN KEY (hash) REFERENCES content(hash) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS anchors_reclaimable_page_idx
+        ON anchors(nlink, size DESC, store_id, hash);
+      CREATE INDEX IF NOT EXISTS anchors_inode_idx
+        ON anchors(dev, ino);
+
       CREATE TABLE IF NOT EXISTS files (
         path TEXT PRIMARY KEY,
         hash TEXT,
@@ -146,9 +169,6 @@ class RegistryCore {
       CREATE INDEX IF NOT EXISTS files_source_status_size_path_idx
         ON files(source_id, status, size, path);
       CREATE INDEX IF NOT EXISTS files_size_path_idx ON files(size, path);
-      CREATE INDEX IF NOT EXISTS content_reclaimable_page_idx
-        ON content(anchor_present, anchor_nlink, size DESC, hash);
-
       CREATE TABLE IF NOT EXISTS file_summaries (
         source_id TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -195,40 +215,6 @@ class RegistryCore {
         activity_count INTEGER NOT NULL
       );
 
-      CREATE TRIGGER IF NOT EXISTS content_summary_insert
-      AFTER INSERT ON content
-      WHEN NEW.anchor_present = 1 AND NEW.anchor_nlink = 1 BEGIN
-        UPDATE global_summary SET
-          reclaimable_count = reclaimable_count + 1,
-          reclaimable_bytes = reclaimable_bytes + NEW.size
-        WHERE id = 1;
-      END;
-
-      CREATE TRIGGER IF NOT EXISTS content_summary_delete
-      AFTER DELETE ON content
-      WHEN OLD.anchor_present = 1 AND OLD.anchor_nlink = 1 BEGIN
-        UPDATE global_summary SET
-          reclaimable_count = reclaimable_count - 1,
-          reclaimable_bytes = reclaimable_bytes - OLD.size
-        WHERE id = 1;
-      END;
-
-      CREATE TRIGGER IF NOT EXISTS content_summary_update
-      AFTER UPDATE OF anchor_present, anchor_nlink, size ON content BEGIN
-        UPDATE global_summary SET
-          reclaimable_count = reclaimable_count -
-            CASE WHEN OLD.anchor_present = 1 AND OLD.anchor_nlink = 1
-              THEN 1 ELSE 0 END +
-            CASE WHEN NEW.anchor_present = 1 AND NEW.anchor_nlink = 1
-              THEN 1 ELSE 0 END,
-          reclaimable_bytes = reclaimable_bytes -
-            CASE WHEN OLD.anchor_present = 1 AND OLD.anchor_nlink = 1
-              THEN OLD.size ELSE 0 END +
-            CASE WHEN NEW.anchor_present = 1 AND NEW.anchor_nlink = 1
-              THEN NEW.size ELSE 0 END
-        WHERE id = 1;
-      END;
-
       CREATE TABLE IF NOT EXISTS scans (
         scope_id TEXT PRIMARY KEY,
         completed_at INTEGER NOT NULL,
@@ -269,7 +255,57 @@ class RegistryCore {
       );
 
     `)
+    this.database.exec(`
+      DROP TRIGGER IF EXISTS content_summary_insert;
+      DROP TRIGGER IF EXISTS content_summary_delete;
+      DROP TRIGGER IF EXISTS content_summary_update;
+
+      CREATE TRIGGER IF NOT EXISTS anchors_summary_insert
+      AFTER INSERT ON anchors
+      WHEN NEW.nlink = 1 BEGIN
+        UPDATE global_summary SET
+          reclaimable_count = reclaimable_count + 1,
+          reclaimable_bytes = reclaimable_bytes + NEW.size
+        WHERE id = 1;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS anchors_summary_delete
+      AFTER DELETE ON anchors
+      WHEN OLD.nlink = 1 BEGIN
+        UPDATE global_summary SET
+          reclaimable_count = reclaimable_count - 1,
+          reclaimable_bytes = reclaimable_bytes - OLD.size
+        WHERE id = 1;
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS anchors_summary_update
+      AFTER UPDATE OF nlink, size ON anchors BEGIN
+        UPDATE global_summary SET
+          reclaimable_count = reclaimable_count -
+            CASE WHEN OLD.nlink = 1 THEN 1 ELSE 0 END +
+            CASE WHEN NEW.nlink = 1 THEN 1 ELSE 0 END,
+          reclaimable_bytes = reclaimable_bytes -
+            CASE WHEN OLD.nlink = 1 THEN OLD.size ELSE 0 END +
+            CASE WHEN NEW.nlink = 1 THEN NEW.size ELSE 0 END
+        WHERE id = 1;
+      END;
+    `)
+    this.rebuildAnchorSummaries()
     this.recreateFileTriggers()
+  }
+
+  rebuildAnchorSummaries() {
+    const row = this.database.prepare(`
+      SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes
+      FROM anchors
+      WHERE nlink = 1
+    `).get()
+    this.database.prepare(`
+      UPDATE global_summary SET
+        reclaimable_count = ?,
+        reclaimable_bytes = ?
+      WHERE id = 1
+    `).run(Number(row.count) || 0, Number(row.bytes) || 0)
   }
 
   dropLegacyScanSchema() {
@@ -340,6 +376,7 @@ class RegistryCore {
 
       CREATE TEMP TABLE scan_anchors (
         run_id TEXT NOT NULL,
+        store_id TEXT NOT NULL,
         hash_name TEXT NOT NULL,
         path TEXT NOT NULL,
         size INTEGER NOT NULL,
@@ -353,7 +390,7 @@ class RegistryCore {
         gid INTEGER NOT NULL,
         verified_hash TEXT,
         verify_attempted INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (run_id, hash_name),
+        PRIMARY KEY (run_id, store_id, hash_name),
         FOREIGN KEY (run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
       ) WITHOUT ROWID;
       CREATE INDEX temp.scan_anchors_inode_idx
@@ -373,11 +410,23 @@ class RegistryCore {
       ) WITHOUT ROWID;
       CREATE INDEX temp.scan_linked_groups_hash_idx
         ON scan_linked_groups(run_id, hash, dev);
+
+      CREATE TEMP TABLE scan_stores (
+        run_id TEXT NOT NULL,
+        store_id TEXT NOT NULL,
+        dev INTEGER NOT NULL,
+        can_link INTEGER NOT NULL,
+        root TEXT NOT NULL,
+        PRIMARY KEY (run_id, store_id),
+        UNIQUE (run_id, dev),
+        FOREIGN KEY (run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
+      ) WITHOUT ROWID;
     `)
   }
 
   resetScanSchema() {
     this.database.exec(`
+      DROP TABLE IF EXISTS temp.scan_stores;
       DROP TABLE IF EXISTS temp.scan_linked_groups;
       DROP TABLE IF EXISTS temp.scan_anchors;
       DROP TABLE IF EXISTS temp.scan_files;
@@ -787,6 +836,62 @@ class RegistryCore {
       .run(hash).changes > 0
   }
 
+  getAnchor(storeId, hash) {
+    return this.database.prepare(`
+      SELECT * FROM anchors WHERE store_id = ? AND hash = ?
+    `).get(storeId, hash) || null
+  }
+
+  anchorsForHash(hash) {
+    return this.database.prepare(`
+      SELECT * FROM anchors WHERE hash = ? ORDER BY store_id
+    `).all(hash)
+  }
+
+  upsertAnchor(entry) {
+    this.database.prepare(`
+      INSERT INTO anchors (
+        store_id, hash, path, verified_at, dev, ino, size, mtime, ctime,
+        nlink, mode, uid, gid
+      ) VALUES (
+        @store_id, @hash, @path, @verified_at, @dev, @ino, @size, @mtime,
+        @ctime, @nlink, @mode, @uid, @gid
+      )
+      ON CONFLICT(store_id, hash) DO UPDATE SET
+        path = excluded.path,
+        verified_at = excluded.verified_at,
+        dev = excluded.dev,
+        ino = excluded.ino,
+        size = excluded.size,
+        mtime = excluded.mtime,
+        ctime = excluded.ctime,
+        nlink = excluded.nlink,
+        mode = excluded.mode,
+        uid = excluded.uid,
+        gid = excluded.gid
+    `).run({
+      store_id: entry.store_id,
+      hash: entry.hash,
+      path: path.resolve(entry.path),
+      verified_at: entry.verified_at || null,
+      dev: Number(entry.dev) || 0,
+      ino: Number(entry.ino) || 0,
+      size: Math.max(0, Number(entry.size) || 0),
+      mtime: Number(entry.mtime) || 0,
+      ctime: Number(entry.ctime) || 0,
+      nlink: Math.max(0, Number(entry.nlink) || 0),
+      mode: Number(entry.mode) || 0,
+      uid: Number(entry.uid) || 0,
+      gid: Number(entry.gid) || 0
+    })
+  }
+
+  removeAnchor(storeId, hash) {
+    return this.database.prepare(`
+      DELETE FROM anchors WHERE store_id = ? AND hash = ?
+    `).run(storeId, hash).changes > 0
+  }
+
   files(options = {}) {
     const where = []
     const values = []
@@ -831,7 +936,7 @@ class RegistryCore {
     })
   }
 
-  reclassifyHash(hash, storeDev, canLink = true, anchorSnapshot = null) {
+  reclassifyHash(hash, stores = [], anchorSnapshots = []) {
     const rows = this.database.prepare(`
       SELECT * FROM files
       WHERE hash = ?
@@ -845,11 +950,13 @@ class RegistryCore {
       const key = `${row.dev}:${row.ino}`
       inodeCounts.set(key, (inodeCounts.get(key) || 0) + 1)
     }
-    const anchor = anchorSnapshot &&
-      Number.isFinite(anchorSnapshot.dev) &&
-      Number.isFinite(anchorSnapshot.ino)
-      ? anchorSnapshot
-      : null
+    const anchors = (anchorSnapshots || []).filter((anchor) =>
+      anchor &&
+      Number.isFinite(anchor.dev) &&
+      Number.isFinite(anchor.ino))
+    const storesByDevice = new Map((stores || [])
+      .filter((store) => store && Number.isFinite(store.dev))
+      .map((store) => [store.dev, store]))
     const metadataKey = (row) =>
       `${Number(row.mode) & 0o7777}:${Number(row.uid)}:${Number(row.gid)}`
     const pathOrder = (left, right) => Buffer.compare(
@@ -861,7 +968,8 @@ class RegistryCore {
     for (const row of rows) {
       const inodeKey = `${row.dev}:${row.ino}`
       if ((inodeCounts.get(inodeKey) || 0) > 1 ||
-          (anchor && row.dev === anchor.dev && row.ino === anchor.ino)) {
+          anchors.some((anchor) =>
+            row.dev === anchor.dev && row.ino === anchor.ino)) {
         states.set(row.path, {
           status: "linked",
           unavailable_reason: null
@@ -869,40 +977,45 @@ class RegistryCore {
       }
     }
 
-    const unlinked = rows.filter((row) => !states.has(row.path))
-    const hasOtherContent = rows.length > 1 || !!anchor
-    if (!hasOtherContent) {
-      states.set(unlinked[0].path, {
-        status: "reference",
-        unavailable_reason: null
-      })
-    } else {
+    const rowsByDevice = new Map()
+    for (const row of rows) {
+      if (!rowsByDevice.has(row.dev)) rowsByDevice.set(row.dev, [])
+      rowsByDevice.get(row.dev).push(row)
+    }
+    for (const [dev, deviceRows] of rowsByDevice) {
+      const unlinked = deviceRows.filter((row) => !states.has(row.path))
+      if (!unlinked.length) continue
+      const deviceAnchors = anchors.filter((anchor) => anchor.dev === dev)
+      const hasOtherContent = deviceRows.length > 1 ||
+        deviceAnchors.length > 0
+      if (!hasOtherContent) {
+        states.set(unlinked[0].path, {
+          status: "reference",
+          unavailable_reason: null
+        })
+        continue
+      }
+      const store = storesByDevice.get(dev)
+      if (!store || store.can_link === false) {
+        for (const row of unlinked) {
+          states.set(row.path, {
+            status: "unavailable",
+            unavailable_reason: store ? "hardlinks" : "different_disk"
+          })
+        }
+        continue
+      }
       const eligible = []
       for (const row of unlinked) {
-        if (!canLink) {
-          states.set(row.path, {
-            status: "unavailable",
-            unavailable_reason: "hardlinks"
-          })
-        } else if (row.dev !== storeDev) {
-          states.set(row.path, {
-            status: "unavailable",
-            unavailable_reason: "different_disk"
-          })
-        } else {
-          eligible.push(row)
-        }
+        eligible.push(row)
       }
 
-      const linkedMetadata = rows
+      const linkedMetadata = deviceRows
         .filter((row) =>
           states.get(row.path) &&
-          states.get(row.path).status === "linked" &&
-          row.dev === storeDev)
+          states.get(row.path).status === "linked")
         .map(metadataKey)
-      if (anchor && anchor.dev === storeDev) {
-        linkedMetadata.push(metadataKey(anchor))
-      }
+      linkedMetadata.push(...deviceAnchors.map(metadataKey))
 
       if (linkedMetadata.length) {
         const compatible = new Set(linkedMetadata)
@@ -911,7 +1024,7 @@ class RegistryCore {
             ? { status: "duplicate", unavailable_reason: null }
             : { status: "unavailable", unavailable_reason: "metadata" })
         }
-      } else if (eligible.length) {
+      } else {
         const groups = new Map()
         for (const row of eligible) {
           const key = metadataKey(row)
@@ -988,9 +1101,11 @@ class RegistryCore {
       this.removeScan(sourceId)
       this.database.prepare(`
         DELETE FROM content
-        WHERE anchor_present = 0
-          AND NOT EXISTS (
+        WHERE NOT EXISTS (
             SELECT 1 FROM files WHERE files.hash = content.hash
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM anchors WHERE anchors.hash = content.hash
           )
       `).run()
       this.rebuildSavings()
@@ -1156,22 +1271,32 @@ class RegistryCore {
     const values = [...new Set(hashes.filter(Boolean))]
     if (!values.length) return new Map()
     return new Map(this.database.prepare(`
+      WITH device_groups AS (
+        SELECT
+          hash,
+          dev,
+          MAX(size) AS size,
+          MIN(path) AS representative_path,
+          COUNT(*) AS locations,
+          COUNT(DISTINCT CASE
+            WHEN ino != 0 THEN printf('%lld:%lld', dev, ino)
+            ELSE path
+          END) AS inode_count
+        FROM scan_files
+        WHERE run_id = ?
+          AND hash IN (${placeholders(values)})
+        GROUP BY hash, dev
+      )
       SELECT
         hash,
         MAX(size) AS size,
-        MIN(path) AS representative_path,
-        COUNT(*) AS locations,
-        COUNT(DISTINCT CASE
-          WHEN ino != 0 THEN printf('%lld:%lld', dev, ino)
-          ELSE path
-        END) AS inode_count
-      FROM scan_files
-      WHERE run_id = ?
-        AND hash IN (${placeholders(values)})
+        MIN(representative_path) AS representative_path,
+        SUM(locations) AS locations,
+        SUM(MAX(0, inode_count - 1)) AS duplicate_files
+      FROM device_groups
       GROUP BY hash
     `).all(runId, ...values).map((row) => {
-      const duplicateFiles = Math.max(
-        0, Number(row.inode_count) - 1)
+      const duplicateFiles = Math.max(0, Number(row.duplicate_files) || 0)
       return [row.hash, {
         hash: row.hash,
         size: Number(row.size) || 0,
@@ -1458,17 +1583,18 @@ class RegistryCore {
 
   stageAnchors(runId, entries) {
     if (!entries.length) return { work: this.scanHashWork() }
-    const previousContent = this.database.prepare(
-      "SELECT * FROM content WHERE hash = ?")
+    const previousAnchor = this.database.prepare(`
+      SELECT * FROM anchors WHERE store_id = ? AND hash = ?
+    `)
     const insert = this.database.prepare(`
       INSERT INTO scan_anchors (
-        run_id, hash_name, path, size, mtime, ctime, dev, ino, nlink,
+        run_id, store_id, hash_name, path, size, mtime, ctime, dev, ino, nlink,
         mode, uid, gid, verified_hash
       ) VALUES (
-        @run_id, @hash_name, @path, @size, @mtime, @ctime, @dev, @ino,
-        @nlink, @mode, @uid, @gid, @verified_hash
+        @run_id, @store_id, @hash_name, @path, @size, @mtime, @ctime, @dev,
+        @ino, @nlink, @mode, @uid, @gid, @verified_hash
       )
-      ON CONFLICT(run_id, hash_name) DO UPDATE SET
+      ON CONFLICT(run_id, store_id, hash_name) DO UPDATE SET
         path = excluded.path,
         size = excluded.size,
         mtime = excluded.mtime,
@@ -1483,16 +1609,17 @@ class RegistryCore {
     `)
     this.transaction(() => {
       for (const entry of entries) {
-        const previous = previousContent.get(entry.hash_name)
-        const unchanged = previous && previous.anchor_verified_at &&
-          previous.anchor_present &&
-          previous.anchor_dev === entry.dev &&
-          previous.anchor_ino === entry.ino &&
-          previous.anchor_size === entry.size &&
-          previous.anchor_mtime === entry.mtime &&
-          previous.anchor_ctime === entry.ctime
+        const previous = previousAnchor.get(
+          entry.store_id, entry.hash_name)
+        const unchanged = previous && previous.verified_at &&
+          previous.dev === entry.dev &&
+          previous.ino === entry.ino &&
+          previous.size === entry.size &&
+          previous.mtime === entry.mtime &&
+          previous.ctime === entry.ctime
         insert.run({
           run_id: runId,
+          store_id: entry.store_id,
           hash_name: entry.hash_name,
           path: path.resolve(entry.path),
           size: entry.size,
@@ -1543,8 +1670,14 @@ class RegistryCore {
       UPDATE scan_anchors SET
         verified_hash = CASE WHEN hash_name = ? THEN ? END,
         verify_attempted = 1
-      WHERE run_id = ? AND hash_name = ?
-    `).run(verifiedHash, verifiedHash, runId, anchor.hash_name)
+      WHERE run_id = ? AND store_id = ? AND hash_name = ?
+    `).run(
+      verifiedHash,
+      verifiedHash,
+      runId,
+      anchor.store_id,
+      anchor.hash_name
+    )
   }
 
   markAnchorVerificationFailed(runId, anchor) {
@@ -1552,8 +1685,8 @@ class RegistryCore {
     this.transaction(() => {
       this.database.prepare(`
         UPDATE scan_anchors SET verify_attempted = 1
-        WHERE run_id = ? AND hash_name = ?
-      `).run(runId, anchor.hash_name)
+        WHERE run_id = ? AND store_id = ? AND hash_name = ?
+      `).run(runId, anchor.store_id, anchor.hash_name)
       if (!(anchor.nlink > 1) || anchor.ino === 0) return
       retryAvailable = !!this.database.prepare(`
         SELECT 1
@@ -1708,10 +1841,16 @@ class RegistryCore {
               AND inode_peer.ino = anchor.ino
               AND inode_peer.verified_hash IS NULL
               AND inode_peer.verify_attempted = 0
-              AND inode_peer.hash_name < anchor.hash_name
+              AND (
+                inode_peer.store_id < anchor.store_id OR
+                (
+                  inode_peer.store_id = anchor.store_id AND
+                  inode_peer.hash_name < anchor.hash_name
+                )
+              )
           )
         )
-      ORDER BY anchor.hash_name
+      ORDER BY anchor.store_id, anchor.hash_name
       LIMIT ?
     `).all(runId, limit)
   }
@@ -1720,35 +1859,27 @@ class RegistryCore {
     runId,
     sourceIds,
     metadata,
-    storeDev,
-    canLink = true,
-    anchorRoot = ""
+    stores = []
   ) {
     const sourceList = [...new Set(sourceIds.filter(Boolean))]
-    const resolvedAnchorRoot = anchorRoot ? path.resolve(anchorRoot) : ""
     const now = Date.now()
     this.transaction(() => {
-      if (!canLink) {
-        this.database.prepare(`
-          UPDATE scan_files AS candidate
-          SET status = 'unavailable', unavailable_reason = 'hardlinks'
-          WHERE candidate.run_id = ?
-            AND candidate.status IS NULL
-            AND candidate.hash IS NOT NULL
-            AND (
-              EXISTS (
-                SELECT 1 FROM scan_files peer
-                WHERE peer.run_id = candidate.run_id
-                  AND peer.hash = candidate.hash
-                  AND peer.path != candidate.path
-              )
-              OR EXISTS (
-                SELECT 1 FROM scan_anchors anchor
-                WHERE anchor.run_id = candidate.run_id
-                  AND anchor.verified_hash = candidate.hash
-              )
-            )
-        `).run(runId)
+      const insertStore = this.database.prepare(`
+        INSERT INTO scan_stores (
+          run_id, store_id, dev, can_link, root
+        ) VALUES (?, ?, ?, ?, ?)
+      `)
+      for (const store of stores) {
+        if (!store ||
+            typeof store.store_id !== "string" ||
+            !Number.isFinite(store.dev)) continue
+        insertStore.run(
+          runId,
+          store.store_id,
+          store.dev,
+          store.can_link === false ? 0 : 1,
+          path.resolve(store.root)
+        )
       }
 
       this.database.prepare(`
@@ -1757,37 +1888,54 @@ class RegistryCore {
         WHERE candidate.run_id = ?
           AND candidate.status IS NULL
           AND candidate.hash IS NOT NULL
-          AND candidate.dev = ?
           AND EXISTS (
             SELECT 1 FROM scan_anchors anchor
             WHERE anchor.run_id = candidate.run_id
+              AND anchor.dev = candidate.dev
               AND anchor.hash_name = candidate.hash
               AND anchor.verify_attempted = 1
               AND anchor.verified_hash IS NULL
           )
-      `).run(runId, storeDev)
+      `).run(runId)
 
       this.database.prepare(`
         UPDATE scan_files AS candidate
-        SET status = 'unavailable', unavailable_reason = 'different_disk'
+        SET
+          status = 'unavailable',
+          unavailable_reason = CASE
+            WHEN EXISTS (
+              SELECT 1 FROM scan_stores store
+              WHERE store.run_id = candidate.run_id
+                AND store.dev = candidate.dev
+            )
+            THEN 'hardlinks'
+            ELSE 'different_disk'
+          END
         WHERE candidate.run_id = ?
           AND candidate.status IS NULL
           AND candidate.hash IS NOT NULL
-          AND candidate.dev != ?
+          AND NOT EXISTS (
+            SELECT 1 FROM scan_stores store
+            WHERE store.run_id = candidate.run_id
+              AND store.dev = candidate.dev
+              AND store.can_link = 1
+          )
           AND (
             EXISTS (
               SELECT 1 FROM scan_files peer
-              WHERE peer.run_id = candidate.run_id
-                AND peer.hash = candidate.hash
-                AND peer.path != candidate.path
+                WHERE peer.run_id = candidate.run_id
+                  AND peer.hash = candidate.hash
+                  AND peer.dev = candidate.dev
+                  AND peer.path != candidate.path
+              )
+              OR EXISTS (
+                SELECT 1 FROM scan_anchors anchor
+                WHERE anchor.run_id = candidate.run_id
+                  AND anchor.verified_hash = candidate.hash
+                  AND anchor.dev = candidate.dev
+              )
             )
-            OR EXISTS (
-              SELECT 1 FROM scan_anchors anchor
-              WHERE anchor.run_id = candidate.run_id
-                AND anchor.verified_hash = candidate.hash
-            )
-          )
-      `).run(runId, storeDev)
+      `).run(runId)
 
       this.database.prepare(`
         INSERT OR IGNORE INTO scan_linked_groups (
@@ -1819,7 +1967,12 @@ class RegistryCore {
         WHERE candidate.run_id = ?
           AND candidate.status IS NULL
           AND candidate.hash IS NOT NULL
-          AND candidate.dev = ?
+          AND EXISTS (
+            SELECT 1 FROM scan_stores store
+            WHERE store.run_id = candidate.run_id
+              AND store.dev = candidate.dev
+              AND store.can_link = 1
+          )
           AND EXISTS (
             SELECT 1 FROM scan_linked_groups linked
             WHERE linked.run_id = candidate.run_id
@@ -1829,7 +1982,7 @@ class RegistryCore {
               AND linked.uid = candidate.uid
               AND linked.gid = candidate.gid
           )
-      `).run(runId, storeDev)
+      `).run(runId)
 
       this.database.prepare(`
         UPDATE scan_files AS candidate
@@ -1837,14 +1990,19 @@ class RegistryCore {
         WHERE candidate.run_id = ?
           AND candidate.status IS NULL
           AND candidate.hash IS NOT NULL
-          AND candidate.dev = ?
+          AND EXISTS (
+            SELECT 1 FROM scan_stores store
+            WHERE store.run_id = candidate.run_id
+              AND store.dev = candidate.dev
+              AND store.can_link = 1
+          )
           AND EXISTS (
             SELECT 1 FROM scan_linked_groups linked
             WHERE linked.run_id = candidate.run_id
               AND linked.hash = candidate.hash
               AND linked.dev = candidate.dev
           )
-      `).run(runId, storeDev)
+      `).run(runId)
 
       this.database.prepare(`
         WITH metadata_groups AS (
@@ -1860,7 +2018,12 @@ class RegistryCore {
           WHERE run_id = ?
             AND status IS NULL
             AND hash IS NOT NULL
-            AND dev = ?
+            AND EXISTS (
+              SELECT 1 FROM scan_stores store
+              WHERE store.run_id = scan_files.run_id
+                AND store.dev = scan_files.dev
+                AND store.can_link = 1
+            )
           GROUP BY hash, dev, (mode & 4095), uid, gid
         ),
         chosen_groups AS (
@@ -1899,45 +2062,19 @@ class RegistryCore {
           AND candidate.status IS NULL
           AND candidate.hash = chosen.hash
           AND candidate.dev = chosen.dev
-      `).run(runId, storeDev, runId)
+      `).run(runId, runId)
 
       this.database.prepare(`
-        UPDATE content SET
-          anchor_verified_at = NULL,
-          anchor_present = 0,
-          anchor_dev = NULL,
-          anchor_ino = NULL,
-          anchor_size = NULL,
-          anchor_mtime = NULL,
-          anchor_ctime = NULL,
-          anchor_nlink = NULL
-      `).run()
-
-      this.database.prepare(`
-        INSERT INTO content (
-          hash, size, first_seen, verified_at, anchor_verified_at,
-          anchor_present, anchor_dev, anchor_ino, anchor_size, anchor_mtime,
-          anchor_ctime, anchor_nlink
-        )
+        INSERT INTO content (hash, size, first_seen, verified_at)
         SELECT
           hash_name, size, ?,
-          CASE WHEN verified_hash = hash_name THEN ? END,
-          CASE WHEN verified_hash = hash_name THEN ? END,
-          1, dev, ino, size, mtime, ctime, nlink
+          CASE WHEN verified_hash = hash_name THEN ? END
         FROM scan_anchors
         WHERE run_id = ? AND verified_hash = hash_name
         ON CONFLICT(hash) DO UPDATE SET
           size = excluded.size,
-          verified_at = COALESCE(excluded.verified_at, content.verified_at),
-          anchor_verified_at = excluded.anchor_verified_at,
-          anchor_present = 1,
-          anchor_dev = excluded.anchor_dev,
-          anchor_ino = excluded.anchor_ino,
-          anchor_size = excluded.anchor_size,
-          anchor_mtime = excluded.anchor_mtime,
-          anchor_ctime = excluded.anchor_ctime,
-          anchor_nlink = excluded.anchor_nlink
-      `).run(now, now, now, runId)
+          verified_at = COALESCE(excluded.verified_at, content.verified_at)
+      `).run(now, now, runId)
 
       this.database.prepare(`
         INSERT INTO content(hash, size, first_seen, verified_at)
@@ -1949,6 +2086,24 @@ class RegistryCore {
           size = excluded.size,
           verified_at = excluded.verified_at
       `).run(now, now, runId)
+
+      this.database.prepare(`
+        DELETE FROM anchors
+        WHERE store_id IN (
+          SELECT store_id FROM scan_stores WHERE run_id = ?
+        )
+      `).run(runId)
+      this.database.prepare(`
+        INSERT INTO anchors (
+          store_id, hash, path, verified_at, dev, ino, size, mtime, ctime,
+          nlink, mode, uid, gid
+        )
+        SELECT
+          store_id, hash_name, path, ?, dev, ino, size, mtime, ctime,
+          nlink, mode, uid, gid
+        FROM scan_anchors
+        WHERE run_id = ? AND verified_hash = hash_name
+      `).run(now, runId)
 
       this.dropFileTriggers()
       this.database.prepare(`
@@ -2128,30 +2283,13 @@ class RegistryCore {
 
       this.database.prepare(`
         DELETE FROM content
-        WHERE anchor_present = 0
-          AND NOT EXISTS (SELECT 1 FROM files WHERE files.hash = content.hash)
+        WHERE NOT EXISTS (
+          SELECT 1 FROM files WHERE files.hash = content.hash
+        )
           AND NOT EXISTS (
-            SELECT 1
-            FROM scan_exclusions excluded
-            WHERE excluded.run_id = @run_id
-              AND (
-                (
-                  @anchor_root || @separator ||
-                  substr(content.hash, 1, 2) || @separator || content.hash
-                ) = excluded.path
-                OR substr(
-                  @anchor_root || @separator ||
-                  substr(content.hash, 1, 2) || @separator || content.hash,
-                  1,
-                  length(excluded.prefix)
-                ) = excluded.prefix
-              )
+            SELECT 1 FROM anchors WHERE anchors.hash = content.hash
           )
-      `).run({
-        run_id: runId,
-        anchor_root: resolvedAnchorRoot,
-        separator: path.sep
-      })
+      `).run()
       this.rebuildSavings()
       this.resetScanSchema()
     })
@@ -2315,14 +2453,21 @@ class RegistryCore {
   }
 
   reclaimableBatch(cursor = "", limit = 100) {
+    const decoded = typeof cursor === "object" && cursor
+      ? cursor
+      : { store_id: "", hash: String(cursor || "") }
     return this.database.prepare(`
-      SELECT hash FROM content
-      WHERE anchor_present = 1
-        AND anchor_nlink = 1
-        AND hash > ?
-      ORDER BY hash
+      SELECT store_id, hash FROM anchors
+      WHERE nlink = 1
+        AND (store_id > ? OR (store_id = ? AND hash > ?))
+      ORDER BY store_id, hash
       LIMIT ?
-    `).all(cursor, limit)
+    `).all(
+      decoded.store_id || "",
+      decoded.store_id || "",
+      decoded.hash || "",
+      limit
+    )
   }
 
   clearFiles() {
@@ -2416,6 +2561,40 @@ class RegistryCore {
     }
     if (query) {
       where.push("LOWER(path) LIKE ? ESCAPE '\\'")
+      values.push(`%${String(query).toLowerCase()
+        .replace(/\\/g, "\\\\")
+        .replace(/%/g, "\\%")
+        .replace(/_/g, "\\_")}%`)
+    }
+    return { where, values }
+  }
+
+  duplicateGroupFilter(
+    sourceIds,
+    query,
+    unrestricted,
+    alias,
+    statuses = ["duplicate", "unavailable"]
+  ) {
+    const column = (name) => `${alias}.${name}`
+    const where = [`${column("unavailable_reason")} IS NOT 'stale'`]
+    const values = []
+    if (statuses && statuses.length) {
+      where.push(
+        `${column("status")} IN (${placeholders(statuses)})`)
+      values.push(...statuses)
+    }
+    if (!unrestricted) {
+      if (sourceIds.length) {
+        where.push(
+          `${column("source_id")} IN (${placeholders(sourceIds)})`)
+        values.push(...sourceIds)
+      } else {
+        where.push("0")
+      }
+    }
+    if (query) {
+      where.push(`LOWER(${column("path")}) LIKE ? ESCAPE '\\'`)
       values.push(`%${String(query).toLowerCase()
         .replace(/\\/g, "\\\\")
         .replace(/%/g, "\\%")
@@ -2704,21 +2883,230 @@ class RegistryCore {
     return { rows, hashSiblings, inodeSiblings, nextCursor }
   }
 
+  duplicateGroupPage(options = {}) {
+    const sourceIds = [...new Set(
+      (options.sourceIds || []).filter(Boolean))]
+    const authorizedSourceIds = [...new Set(
+      (options.authorizedSourceIds || []).filter(Boolean))]
+    const pageSize = Math.max(
+      1, Math.min(500, Number(options.pageSize) || 500))
+    const direction = options.sizeSort === "asc" ? "asc" : "desc"
+    const active = this.duplicateGroupFilter(
+      sourceIds,
+      String(options.query || ""),
+      !!options.unrestricted,
+      "candidate"
+    )
+    active.where.push("candidate.hash IS NOT NULL")
+    const authorized = this.duplicateGroupFilter(
+      authorizedSourceIds,
+      "",
+      !!options.authorizedUnrestricted,
+      "visible",
+      null
+    )
+    const decoded = this.decodeCursor(options.cursor)
+    const cursorWhere = []
+    const cursorValues = []
+    if (decoded &&
+        decoded.sort === `duplicate-groups-${direction}` &&
+        Number.isFinite(decoded.size) &&
+        typeof decoded.hash === "string") {
+      cursorWhere.push(direction === "asc"
+        ? "(content_group.size > ? OR (content_group.size = ? AND content_group.hash > ?))"
+        : "(content_group.size < ? OR (content_group.size = ? AND content_group.hash > ?))")
+      cursorValues.push(decoded.size, decoded.size, decoded.hash)
+    }
+    const order = direction === "asc"
+      ? "content_group.size ASC, content_group.hash ASC"
+      : "content_group.size DESC, content_group.hash ASC"
+    const rows = this.database.prepare(`
+      WITH content_group AS (
+        SELECT
+          candidate.hash,
+          MAX(candidate.size) AS size,
+          MIN(candidate.path) AS representative_path,
+          SUM(CASE
+            WHEN candidate.status = 'duplicate' THEN 1 ELSE 0
+          END) AS eligible_count,
+          COALESCE(SUM(CASE
+            WHEN candidate.status = 'duplicate'
+            THEN candidate.size ELSE 0
+          END), 0) AS can_save
+        FROM files candidate
+        WHERE ${active.where.join(" AND ")}
+        GROUP BY candidate.hash
+      )
+      SELECT
+        content_group.*,
+        representative.source_id AS representative_source_id,
+        representative.app AS representative_app,
+        (
+          SELECT COUNT(*)
+          FROM files visible
+          WHERE visible.hash = content_group.hash
+            AND ${authorized.where.join(" AND ")}
+        ) AS total_count
+      FROM content_group
+      JOIN files representative
+        ON representative.path = content_group.representative_path
+      ${cursorWhere.length
+        ? `WHERE ${cursorWhere.join(" AND ")}`
+        : ""}
+      ORDER BY ${order}
+      LIMIT ?
+    `).all(
+      ...active.values,
+      ...authorized.values,
+      ...cursorValues,
+      pageSize + 1
+    )
+    const hasMore = rows.length > pageSize
+    if (hasMore) rows.pop()
+    const last = rows[rows.length - 1]
+    const total = Number(this.database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM (
+        SELECT candidate.hash
+        FROM files candidate
+        WHERE ${active.where.join(" AND ")}
+        GROUP BY candidate.hash
+      )
+    `).get(...active.values).count) || 0
+    return {
+      rows,
+      total,
+      nextCursor: hasMore && last
+        ? this.encodeCursor({
+            sort: `duplicate-groups-${direction}`,
+            size: Number(last.size) || 0,
+            hash: last.hash
+          })
+        : null
+    }
+  }
+
+  duplicateGroupChildren(options = {}) {
+    const sourceIds = [...new Set(
+      (options.sourceIds || []).filter(Boolean))]
+    const activeSourceIds = [...new Set(
+      (options.activeSourceIds || []).filter(Boolean))]
+    const pageSize = Math.max(
+      1, Math.min(500, Number(options.pageSize) || 100))
+    const authorized = this.duplicateGroupFilter(
+      sourceIds,
+      "",
+      !!options.unrestricted,
+      "child",
+      null
+    )
+    const active = this.duplicateGroupFilter(
+      activeSourceIds,
+      String(options.query || ""),
+      !!options.activeUnrestricted,
+      "child",
+      ["duplicate"]
+    )
+    const decoded = this.decodeCursor(options.cursor)
+    const cursorWhere = []
+    const cursorValues = []
+    if (decoded &&
+        decoded.sort === "duplicate-children" &&
+        decoded.hash === options.hash &&
+        typeof decoded.path === "string") {
+      cursorWhere.push("child.path > ?")
+      cursorValues.push(decoded.path)
+    }
+    const rows = this.database.prepare(`
+      SELECT child.*,
+        CASE WHEN ${active.where.join(" AND ")}
+          THEN 1 ELSE 0
+        END AS selectable
+      FROM files child
+      WHERE child.hash = ?
+        AND ${authorized.where.join(" AND ")}
+        ${cursorWhere.length
+          ? `AND ${cursorWhere.join(" AND ")}`
+          : ""}
+      ORDER BY child.path
+      LIMIT ?
+    `).all(
+      ...active.values,
+      options.hash,
+      ...authorized.values,
+      ...cursorValues,
+      pageSize + 1
+    )
+    const hasMore = rows.length > pageSize
+    if (hasMore) rows.pop()
+    const last = rows[rows.length - 1]
+    const total = Number(this.database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM files child
+      WHERE child.hash = ?
+        AND ${authorized.where.join(" AND ")}
+    `).get(options.hash, ...authorized.values).count) || 0
+    return {
+      rows,
+      total,
+      nextCursor: hasMore && last
+        ? this.encodeCursor({
+            sort: "duplicate-children",
+            hash: options.hash,
+            path: last.path
+          })
+        : null
+    }
+  }
+
+  duplicateGroupSelection(options = {}) {
+    const sourceIds = [...new Set(
+      (options.sourceIds || []).filter(Boolean))]
+    const active = this.duplicateGroupFilter(
+      sourceIds,
+      String(options.query || ""),
+      !!options.unrestricted,
+      "candidate",
+      ["duplicate"]
+    )
+    const rows = this.database.prepare(`
+      SELECT candidate.path
+      FROM files candidate
+      WHERE candidate.hash = ?
+        AND ${active.where.join(" AND ")}
+      ORDER BY candidate.path
+      LIMIT 501
+    `).all(options.hash, ...active.values)
+    return {
+      paths: rows.slice(0, 500).map((row) => row.path),
+      exceeded: rows.length > 500
+    }
+  }
+
   reclaimablePage(pageSize, cursor) {
     const decoded = this.decodeCursor(cursor)
-    const where = ["anchor_present = 1", "anchor_nlink = 1"]
+    const where = ["nlink = 1"]
     const values = []
     if (decoded && decoded.sort === "reclaimable" &&
         Number.isFinite(decoded.size) &&
+        typeof decoded.store_id === "string" &&
         typeof decoded.hash === "string") {
-      where.push("(size < ? OR (size = ? AND hash > ?))")
-      values.push(decoded.size, decoded.size, decoded.hash)
+      where.push(`(
+        size < ? OR
+        (size = ? AND store_id > ?) OR
+        (size = ? AND store_id = ? AND hash > ?)
+      )`)
+      values.push(
+        decoded.size,
+        decoded.size, decoded.store_id,
+        decoded.size, decoded.store_id, decoded.hash
+      )
     }
     const rows = this.database.prepare(`
-      SELECT hash, size, anchor_nlink AS nlink, 1 AS orphan
-      FROM content
+      SELECT store_id, hash, size, nlink, 1 AS orphan
+      FROM anchors
       WHERE ${where.join(" AND ")}
-      ORDER BY size DESC, hash
+      ORDER BY size DESC, store_id, hash
       LIMIT ?
     `).all(...values, pageSize + 1)
     const hasMore = rows.length > pageSize
@@ -2730,6 +3118,7 @@ class RegistryCore {
         ? this.encodeCursor({
           sort: "reclaimable",
           size: last.size,
+          store_id: last.store_id,
           hash: last.hash
         })
         : null
@@ -2817,6 +3206,9 @@ class RegistryCore {
       scopeSourceIds, !!options.scopeUnrestricted)
     const locationRows = this.summaryRows(
       locationSourceIds, !!options.locationUnrestricted)
+    const currentDeduplicateBytes = locationRows
+      .filter((row) => row.status === "duplicate")
+      .reduce((sum, row) => sum + Number(row.bytes), 0)
     const countsByStatus = {}
     for (const row of scopeRows) {
       countsByStatus[row.status] =
@@ -2865,6 +3257,7 @@ class RegistryCore {
     let currentShareableBytes = 0
     let currentSeparateCount = 0
     let currentSeparateBytes = 0
+    let pageTotal = null
     let page
     if (view === "reclaimable") {
       total = counts.reclaimable
@@ -2926,16 +3319,30 @@ class RegistryCore {
           .filter((row) => row.status === "linked")
           .reduce((sum, row) => sum + Number(row.bytes), 0)
       }
-      page = this.filePage({
-        view,
-        statusFilter,
-        sourceIds: locationSourceIds,
-        query,
-        pageSize,
-        sizeSort: options.sizeSort,
-        cursor: options.cursor,
-        unrestricted: !!options.locationUnrestricted
-      })
+      if (view === "duplicates" && options.groupDuplicates) {
+        page = this.duplicateGroupPage({
+          sourceIds: locationSourceIds,
+          authorizedSourceIds: scopeSourceIds,
+          query,
+          pageSize,
+          sizeSort: options.sizeSort,
+          cursor: options.cursor,
+          unrestricted: !!options.locationUnrestricted,
+          authorizedUnrestricted: !!options.scopeUnrestricted
+        })
+        pageTotal = page.total
+      } else {
+        page = this.filePage({
+          view,
+          statusFilter,
+          sourceIds: locationSourceIds,
+          query,
+          pageSize,
+          sizeSort: options.sizeSort,
+          cursor: options.cursor,
+          unrestricted: !!options.locationUnrestricted
+        })
+      }
     }
     return {
       counts,
@@ -2948,8 +3355,10 @@ class RegistryCore {
         : Number(global.reclaimable_bytes) || 0,
       saved,
       total,
+      pageTotal: pageTotal == null ? total : pageTotal,
       currentLocations,
       currentShareableBytes,
+      currentDeduplicateBytes,
       currentSeparateCount,
       currentSeparateBytes,
       page
