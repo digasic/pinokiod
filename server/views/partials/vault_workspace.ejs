@@ -16,19 +16,8 @@
       <div class='vault-feedback' id='vault-feedback' role='status' aria-live='polite'></div>
       <div class='vault-cleanup-notice' id='vault-cleanup-notice' role='status'></div>
       <section class='vault-explorer' id='vault-explorer'>
-        <aside class='vault-rail <%= appMode ? "vault-rail-app" : "vault-rail-global" %>'>
-          <% if (appMode) { %>
-          <div class='vault-rail-section'>
-            <div class='vault-rail-label' id='views-label'></div>
-            <div class='vault-nav-list' id='vault-views'></div>
-          </div>
-          <div class='vault-rail-section'>
-            <div class='vault-rail-heading'>
-              <div class='vault-rail-label' id='locations-label'></div>
-            </div>
-            <div id='vault-locations'></div>
-          </div>
-          <% } else { %>
+        <% if (!appMode) { %>
+        <aside class='vault-rail vault-rail-global'>
           <div class='vault-rail-scope'>
             <div class='vault-rail-label' id='locations-label'></div>
             <button class='vault-button vault-rail-action' id='btn-add-source' type='button'>
@@ -41,15 +30,13 @@
           <div class='vault-location-tree'>
             <div id='vault-locations'></div>
           </div>
-          <% } %>
         </aside>
+        <% } %>
         <section class='vault-pane' id='vault-pane'>
-          <% if (!appMode) { %>
           <nav class='vault-view-tabs' aria-labelledby='views-label'>
             <span class='task-sr-only' id='views-label'></span>
             <div class='vault-nav-list' id='vault-views'></div>
           </nav>
-          <% } %>
           <div class='vault-toolbar' id='vault-toolbar'></div>
           <div class='vault-selection-state' id='vault-selection-state' role='status'></div>
           <div class='vault-table-wrap' id='vault-table-wrap'></div>

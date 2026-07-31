@@ -456,7 +456,10 @@ const renderSourceNode = (source, depth, counts) => {
 }
 
 const renderLocations = () => {
-  el("locations-label").textContent = COPY.locations
+  const label = el("locations-label")
+  const locations = el("vault-locations")
+  if (!label || !locations) return
+  label.textContent = COPY.locations
   const pinokio = sourceById("pinokio")
   const external = sourceById("external")
   const inventoryCounts = state.data.inventory.source_counts
@@ -464,23 +467,19 @@ const renderLocations = () => {
     duplicates: new Map(Object.entries(inventoryCounts.duplicates || {})),
     tracked: new Map(Object.entries(inventoryCounts.all || {}))
   }
-  let html
-  if (IS_APP_MODE) {
-    const source = sourceById(SCOPE_ID)
-    html = source ? renderSourceNode(source, 0, counts) : ""
-  } else {
-    const allCount = state.view === "duplicates"
-      ? Number(state.data.inventory.counts.duplicates) || 0
-      : Number(state.data.inventory.counts.all) || 0
-    html = `<button class="vault-nav-row vault-all-locations ${state.sourceId ? "" : "selected"}" type="button" data-source="" ${state.sourceId ? "" : 'aria-current="page"'}>
-      <i class="fa-solid fa-hard-drive"></i>
-      <span class="vault-nav-copy"><span class="vault-nav-name">${esc(COPY.all_locations)}</span></span>
-      <span class="vault-nav-count ${state.view === "duplicates" && allCount ? "attention" : ""}">${allCount || ""}</span>
-    </button>`
-    if (pinokio) html += renderSourceNode(pinokio, 0, counts)
-    if (external && sourceChildren("external").length) html += renderSourceNode(external, 0, counts)
+  const allCount = state.view === "duplicates"
+    ? Number(state.data.inventory.counts.duplicates) || 0
+    : Number(state.data.inventory.counts.all) || 0
+  let html = `<button class="vault-nav-row vault-all-locations ${state.sourceId ? "" : "selected"}" type="button" data-source="" ${state.sourceId ? "" : 'aria-current="page"'}>
+    <i class="fa-solid fa-hard-drive"></i>
+    <span class="vault-nav-copy"><span class="vault-nav-name">${esc(COPY.all_locations)}</span></span>
+    <span class="vault-nav-count ${state.view === "duplicates" && allCount ? "attention" : ""}">${allCount || ""}</span>
+  </button>`
+  if (pinokio) html += renderSourceNode(pinokio, 0, counts)
+  if (external && sourceChildren("external").length) {
+    html += renderSourceNode(external, 0, counts)
   }
-  el("vault-locations").innerHTML = html
+  locations.innerHTML = html
 }
 
 const selectedSource = () => state.sourceId ? sourceById(state.sourceId) : null

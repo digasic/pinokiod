@@ -130,15 +130,19 @@ const waitFor = async (condition) => {
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 30))
 
-const makePage = async (status) => {
+const makePage = async (status, options = {}) => {
+  const appMode = !!options.appMode
+  const scopeId = appMode ? (options.scopeId || "app:app") : ""
   const workspace = ejs.render(await source(workspacePath), {
-    appMode: false
+    appMode
   })
   const dom = new JSDOM(
-    `<body data-platform="${process.platform}" data-agent="electron" data-vault-mode="global">${workspace}</body>`,
+    `<body data-platform="${process.platform}" data-agent="electron" data-vault-mode="${appMode ? "app" : "global"}" data-vault-scope="${scopeId}">${workspace}</body>`,
     {
       runScripts: "outside-only",
-      url: "http://localhost/vault"
+      url: appMode
+        ? "http://localhost/vault/app/app"
+        : "http://localhost/vault"
     }
   )
   const requests = []
@@ -677,18 +681,33 @@ describe("Save Space interface", () => {
     dom.window.close()
   })
 
-  test("app mode keeps its existing rail structure", async () => {
-    const workspace = ejs.render(await source(workspacePath), {
-      appMode: true
+  test("app mode uses full-width results without redundant locations", async () => {
+    const status = fixture([item()])
+    const { dom, requests } = await makePage(status, {
+      appMode: true,
+      scopeId: "app:app"
     })
+    const document = dom.window.document
 
-    assert.match(workspace, /vault-rail-app/)
-    assert.match(workspace, /id='vault-views'/)
-    assert.match(workspace, /id='vault-locations'/)
-    assert.match(workspace, /vault-overview-actions/)
-    assert.match(workspace, /id='btn-scan'/)
-    assert.doesNotMatch(workspace, /id='btn-rail-scan'/)
-    assert.doesNotMatch(workspace, /class='vault-view-tabs'/)
+    assert.equal(document.querySelector(".vault-rail"), null)
+    assert.equal(document.getElementById("vault-locations"), null)
+    assert.equal(document.getElementById("btn-add-source"), null)
+    assert.ok(document.querySelector(".vault-view-tabs"))
+    assert.equal(document.querySelectorAll(
+      ".vault-view-tabs [data-view]").length, 5)
+    assert.equal(document.querySelector(
+      '[data-view="reclaimable"]'), null)
+    assert.ok(document.querySelector(
+      ".vault-overview-actions #btn-scan"))
+
+    document.getElementById("btn-scan").click()
+    await waitFor(() => requests.some((request) =>
+      request.action === "scan"))
+    const scan = requests.find((request) => request.action === "scan")
+    assert.equal(scan.scope_id, "app:app")
+
+    await settle()
+    dom.window.close()
   })
 
   test("the header checkbox selects every Deduplicated row on the page", async () => {
