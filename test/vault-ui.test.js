@@ -129,9 +129,12 @@ const waitFor = async (condition) => {
 }
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 30))
-
 const makePage = async (status, options = {}) => {
   const appMode = !!options.appMode
+  const deferFolderDiscoverySelection =
+    !!options.deferFolderDiscoverySelection
+  const deferFolderDiscoveryAdd = !!options.deferFolderDiscoveryAdd
+  const folderDiscoveryChildren = options.folderDiscoveryChildren || {}
   const scopeId = appMode ? (options.scopeId || "app:app") : ""
   const workspace = ejs.render(await source(workspacePath), {
     appMode
@@ -146,16 +149,121 @@ const makePage = async (status, options = {}) => {
     }
   )
   const requests = []
+  const selectedSources = new Set(options.folderDiscoverySelected || [])
+  const recommendedSources = new Set()
   const confirmations = []
+  const pickerRequests = []
+  const pendingPickers = []
+  const pendingFolderDiscoverySelections = []
+  const pendingFolderDiscoveryAdds = []
+  const within = (ancestor, candidate) => ancestor === candidate ||
+    candidate.startsWith(`${ancestor.replace(/\/$/, "")}/`)
+  const discoveryResultsFrom = (response) =>
+    response && response.folder_discovery_results
+  const seedDiscoverySelection = (response) => {
+    const results = discoveryResultsFrom(response)
+    const recommendations = results && results.recommendations
+    for (const item of Array.isArray(recommendations && recommendations.items)
+      ? recommendations.items
+      : []) {
+      recommendedSources.add(item.folder)
+    }
+  }
+  const decorateDiscoveryNode = (node) => {
+    if (!node || typeof node.folder !== "string") return node
+    node.selected = selectedSources.has(node.folder)
+    node.selected_inside = [...selectedSources]
+      .filter((folder) => folder !== node.folder && within(node.folder, folder))
+      .length
+    node.recommended = recommendedSources.has(node.folder)
+    node.broader = !node.recommended && [...recommendedSources]
+      .some((folder) => within(node.folder, folder))
+    for (const child of Array.isArray(node.children) ? node.children : []) {
+      decorateDiscoveryNode(child)
+    }
+    return node
+  }
+  const decorateDiscoveryResponse = (response) => {
+    seedDiscoverySelection(response)
+    const results = discoveryResultsFrom(response)
+    if (results) {
+      decorateDiscoveryNode(results.root)
+      for (const item of Array.isArray(results.items) ? results.items : []) {
+        decorateDiscoveryNode(item)
+      }
+    } else if (response && Array.isArray(response.items)) {
+      for (const item of response.items) decorateDiscoveryNode(item)
+    }
+    return response
+  }
+  const selectionMutationResult = (payload) => {
+    if (payload.selected) {
+      for (const folder of [...selectedSources]) {
+        if (within(payload.path, folder) || within(folder, payload.path)) {
+          selectedSources.delete(folder)
+        }
+      }
+      selectedSources.add(payload.path)
+    } else {
+      selectedSources.delete(payload.path)
+    }
+    const nodes = []
+    let current = payload.path
+    while (within(payload.root, current)) {
+      nodes.push(decorateDiscoveryNode({ folder: current }))
+      if (current === payload.root) break
+      const parent = path.dirname(current)
+      if (parent === current) break
+      current = parent
+    }
+    const results = typeof status === "function"
+      ? null
+      : status.folder_discovery_results
+    const original = results && results.selection || {}
+    return {
+      nodes,
+      selected_count: selectedSources.size,
+      selected_files: Math.max(
+        selectedSources.size,
+        Number(original.selected_files) || selectedSources.size),
+      potential_savings: Number(original.potential_savings) || 0
+    }
+  }
   dom.window.confirm = (message) => {
     confirmations.push(message)
     return true
   }
-  dom.window.Socket = class {}
+  dom.window.Socket = class {
+    run(payload, callback) {
+      pickerRequests.push(payload)
+      if (options.deferPicker) {
+        return new Promise((resolve) => {
+          pendingPickers.push({ callback, resolve })
+        })
+      }
+      if (options.pickedPath) {
+        callback({
+          type: "result",
+          data: { paths: [options.pickedPath] }
+        })
+      }
+      return Promise.resolve()
+    }
+    close() {}
+  }
   dom.window.fetch = async (url, options = {}) => {
     if (options.method === "POST") {
       const payload = JSON.parse(options.body)
       requests.push(payload)
+      if (deferFolderDiscoverySelection &&
+          payload.action === "update_folder_discovery_selection") {
+        await new Promise((resolve) =>
+          pendingFolderDiscoverySelections.push(resolve))
+      }
+      if (deferFolderDiscoveryAdd &&
+          payload.action === "add_folder_discovery_sources") {
+        await new Promise((resolve) => pendingFolderDiscoveryAdds.push(resolve))
+      }
       const result = payload.action === "reveal"
         ? { revealed: true }
         : payload.action === "deduplicate_files"
@@ -170,19 +278,94 @@ const makePage = async (status, options = {}) => {
           ? { separated: 1200, failed: 0, cancelled: false }
         : payload.action === "cancel_scan"
           ? { cancel_requested: true }
+        : payload.action === "find_folders"
+          ? { started: true, threshold: 100000000 }
+        : payload.action === "cancel_find_folders"
+          ? { cancel_requested: true }
+        : payload.action === "clear_find_folders"
+          ? { cleared: true }
+        : payload.action === "add_source"
+          ? {
+              created: true,
+              source: {
+                id: "external:found",
+                label: "Found",
+                target_path: payload.path,
+                shareable: true
+              }
+            }
+        : payload.action === "update_folder_discovery_selection"
+          ? selectionMutationResult(payload)
+        : payload.action === "add_folder_discovery_sources"
+          ? {
+              created_count: selectedSources.size,
+              existing_count: 0,
+              sources: [...selectedSources].map((folderPath, index) => ({
+                id: `external:found-${index}`,
+                label: path.basename(folderPath),
+                target_path: folderPath,
+                shareable: true
+              }))
+            }
           : {}
       return { ok: true, status: 200, json: async () => result }
     }
+    const parsed = new URL(url, "http://localhost")
+    const parent = parsed.searchParams.get("folder_discovery_parent")
+    const childPage = Number(
+      parsed.searchParams.get("folder_discovery_child_page")) || 0
+    const childManifest = parent
+      ? folderDiscoveryChildren[parent]
+      : null
+    const response = parent
+      ? typeof childManifest === "function"
+        ? childManifest(childPage)
+        : childManifest || {
+            folder: parent,
+            items: [],
+            total: 0,
+            page: childPage,
+            page_size: 500,
+            pages: 1
+          }
+      : typeof status === "function" ? status(url) : status
     return {
       ok: true,
       status: 200,
-      json: async () => typeof status === "function" ? status(url) : status
+      json: async () => decorateDiscoveryResponse(response)
     }
   }
   dom.window.eval(await source(path.join(publicRoot, "storage-size.js")))
   dom.window.eval(await source(path.join(publicRoot, "vault.js")))
   await waitFor(() => dom.window.document.querySelector(".vault-table"))
-  return { dom, requests, confirmations }
+  const choosePickedPath = (folderPath) => {
+    const pending = pendingPickers.shift()
+    if (!pending) throw new Error("No folder picker is waiting for a selection.")
+    pending.callback({
+      type: "result",
+      data: { paths: folderPath ? [folderPath] : [] }
+    })
+    pending.resolve()
+  }
+  const releaseFolderDiscoverySelection = async () => {
+    await waitFor(() => pendingFolderDiscoverySelections.length > 0)
+    const pending = pendingFolderDiscoverySelections.shift()
+    pending()
+  }
+  const releaseFolderDiscoveryAdd = async () => {
+    await waitFor(() => pendingFolderDiscoveryAdds.length > 0)
+    const pending = pendingFolderDiscoveryAdds.shift()
+    pending()
+  }
+  return {
+    dom,
+    requests,
+    confirmations,
+    pickerRequests,
+    choosePickedPath,
+    releaseFolderDiscoverySelection,
+    releaseFolderDiscoveryAdd
+  }
 }
 
 describe("Save Space interface", () => {
@@ -217,9 +400,23 @@ describe("Save Space interface", () => {
     assert.match(combined, /Provisional until the scan completes/)
     assert.doesNotMatch(combined, /Scan all locations/)
     assert.doesNotMatch(combined,
+      /data-choose-find-root|find_folders_intro|choose_folder_or_drive/)
+    assert.match(combined, /No folders with duplicate files found/)
+    assert.match(combined,
+      /No duplicate files found in folders that could be checked/)
+    assert.doesNotMatch(combined,
       /btn-empty-scan|vault-rail-footer|vault-visually-hidden/)
+    assert.doesNotMatch(combined, /Scan files \{size\}\+|scan_files_over/)
     assert.match(vaultCss,
       /body\.vault-page \.vault-view-tabs\s*\{[^}]*padding:\s*0;/s)
+    assert.match(vaultCss,
+      /body\.dark\.vault-page\s*\{[^}]*--task-panel:\s*var\(--pinokio-sidebar-tabbar-bg\);/s)
+    assert.match(vaultCss,
+      /\.vault-scan-control\s*>\s*\.vault-scan-action\s*\{[^}]*border-radius:\s*7px 0 0 7px;/s)
+    assert.match(vaultCss,
+      /\.vault-scan-size-menu\s*>\s*\.vault-scan-size-trigger\s*\{[^}]*border-radius:\s*0 7px 7px 0;/s)
+    assert.match(vaultCss,
+      /\.vault-scan-control\s*>\s*\.vault-scan-size-menu\s*>\s*\.vault-scan-size-trigger\.primary/)
   })
 
   test("global mode makes the existing location hierarchy primary", async () => {
@@ -265,15 +462,47 @@ describe("Save Space interface", () => {
     assert.ok(tabs.querySelector("#vault-views"))
     assert.match(tabs.textContent, /All files/)
     assert.match(tabs.textContent, /Duplicates/)
+    const addMenu = document.getElementById("vault-add-menu")
+    assert.ok(addMenu)
+    assert.match(addMenu.querySelector("summary").textContent, /Add/)
+    assert.ok(addMenu.contains(document.getElementById("btn-add-source")))
     assert.match(document.getElementById("btn-add-source").textContent,
       /Add folder/)
+    assert.ok(addMenu.contains(document.getElementById("btn-find-folders")))
+    assert.match(document.getElementById("btn-find-folders").textContent,
+      /Find more savings/)
+    assert.equal(document.getElementById("btn-find-folders").disabled,
+      false)
     assert.equal(document.querySelectorAll("#btn-scan").length, 1)
-    assert.equal(document.querySelectorAll("#vault-candidate-size").length, 1)
-    assert.ok(rail.querySelector("#btn-scan"))
-    assert.ok(rail.querySelector("#vault-candidate-size"))
-    assert.equal(document.querySelector(".vault-overview #btn-scan"), null)
+    assert.equal(document.querySelectorAll("#vault-candidate-size").length, 0)
+    assert.equal(rail.querySelector("#btn-scan"), null)
+    assert.equal(rail.querySelector("#vault-candidate-size"), null)
+    assert.ok(document.querySelector(".vault-overview #btn-scan"))
+    assert.ok(document.querySelector(".vault-overview .vault-scan-control"))
+    assert.ok(document.getElementById("vault-scan-size-menu"))
     assert.match(document.getElementById("btn-scan").textContent,
       /Scan again/)
+    assert.equal(document.getElementById("btn-scan").classList
+      .contains("primary"), false)
+    assert.equal(document.querySelector("#vault-scan-size-menu > summary")
+      .classList.contains("primary"), false)
+    assert.match(document.getElementById("vault-scan-size-label").textContent,
+      /100 MB\+/)
+    assert.match(document.getElementById("vault-scan-size-options").textContent,
+      /Minimum file size/)
+
+    const candidateBase = process.platform === "win32" ? 1024 : 1000
+    document.querySelector(`[data-candidate-size="${10 * candidateBase ** 2}"]`).click()
+    assert.match(document.getElementById("vault-scan-size-label").textContent,
+      /10 MB\+/)
+    assert.match(document.getElementById("btn-scan").textContent,
+      /Scan again/)
+    assert.equal(requests.some((request) => request.action === "scan"), false)
+    document.querySelector('[data-candidate-size="0"]').click()
+    assert.match(document.getElementById("vault-scan-size-label").textContent,
+      /All files/)
+    assert.equal(requests.some((request) => request.action === "scan"), false)
+    document.querySelector(`[data-candidate-size="${100 * candidateBase ** 2}"]`).click()
     assert.ok(document.querySelector('.vault-all-locations[data-source=""]'))
     assert.ok(document.querySelector('[data-source="pinokio"]'))
     assert.ok(document.querySelector('[data-source="apps"]'))
@@ -300,14 +529,14 @@ describe("Save Space interface", () => {
       request.action === "scan"))
     const scan = requests.find((request) => request.action === "scan")
     assert.equal(scan.scope_id, null)
-    assert.equal(scan.candidate_size, 100 *
-      (process.platform === "win32" ? 1024 : 1000) ** 2)
+    assert.equal(scan.candidate_size, 100 * candidateBase ** 2)
     await settle()
     dom.window.close()
   })
 
   test("the external-folder prompt appears after a scan and respects dismissal", async () => {
-    const { dom } = await makePage(fixture([item()]))
+    const scanned = fixture([item()])
+    const { dom } = await makePage(scanned)
     const document = dom.window.document
     const prompt = document.getElementById("vault-external-prompt")
 
@@ -315,18 +544,28 @@ describe("Save Space interface", () => {
     assert.equal(prompt.hidden, false)
     assert.match(prompt.textContent, /Save space outside Pinokio/)
     assert.match(prompt.textContent,
-      /Add folders used by other apps to find duplicates with Pinokio\./)
-    assert.ok(prompt.querySelector("[data-add-source]"))
+      /Some files may be taking up space more than once\./)
+    assert.match(prompt.querySelector("[data-find-folders]").textContent,
+      /Find more savings/)
+    assert.ok(prompt.querySelector("[data-find-folders]"))
 
     prompt.querySelector("[data-dismiss-external-prompt]").click()
     assert.equal(prompt.hidden, true)
+    assert.equal(document.getElementById("btn-find-folders").disabled,
+      false)
     assert.equal(dom.window.localStorage.getItem(
-      "pinokio:vault:external-prompt-dismissed"), "1")
+      "pinokio:vault:external-prompt-dismissed"),
+      String(scanned.last_scan.ts))
 
     document.querySelector('[data-view="duplicates"]').click()
     await waitFor(() => document.querySelector(
       '[data-view="duplicates"].selected'))
     assert.equal(prompt.hidden, true)
+
+    scanned.last_scan.ts += 1
+    document.querySelector('[data-view="all"]').click()
+    await waitFor(() => document.querySelector('[data-view="all"].selected'))
+    assert.equal(prompt.hidden, false)
 
     dom.window.close()
 
@@ -334,7 +573,654 @@ describe("Save Space interface", () => {
     const { dom: unscannedDom } = await makePage(withoutScan)
     assert.equal(unscannedDom.window.document.getElementById(
       "vault-external-prompt").hidden, true)
+    assert.equal(unscannedDom.window.document.getElementById(
+      "btn-find-folders").disabled, true)
     unscannedDom.window.close()
+
+    const scanning = fixture([item()])
+    scanning.scan = Object.assign({}, scanning.scan, {
+      active: true,
+      phase: "hashing"
+    })
+    const { dom: scanningDom } = await makePage(scanning)
+    const scanningDocument = scanningDom.window.document
+    assert.equal(scanningDocument.getElementById(
+      "btn-find-folders").disabled, true)
+    assert.equal(scanningDocument.querySelector(
+      "[data-find-folders]").disabled, true)
+    assert.match(scanningDocument.getElementById(
+      "btn-find-folders").title, /current scan/i)
+    scanningDom.window.close()
+  })
+
+  test("Find folders opens the native picker before any dialog", async () => {
+    const status = fixture([item()])
+    const { dom, requests, pickerRequests, choosePickedPath } = await makePage(status, {
+      deferPicker: true
+    })
+    const document = dom.window.document
+
+    document.getElementById("btn-find-folders").click()
+    await waitFor(() => pickerRequests.length === 1)
+    assert.equal(document.getElementById("vault-find-overlay").hidden, true)
+    assert.equal(requests.some((request) =>
+      request.action === "find_folders"), false)
+    choosePickedPath("/Users/test")
+    await waitFor(() => requests.some((request) =>
+      request.action === "find_folders"))
+    const request = requests.find((entry) =>
+      entry.action === "find_folders")
+    assert.equal(request.path, "/Users/test")
+    await settle()
+    dom.window.close()
+  })
+
+  test("Find folders shows truthful live discovery and determinate verification progress", async () => {
+    const discovering = fixture([item()])
+    discovering.folder_discovery = {
+      active: true,
+      pending: false,
+      phase: "discovering",
+      root: "/Users/test",
+      started: Date.now() - 125000,
+      threshold: 100000000,
+      dirs: 1234,
+      files: 32013427,
+      candidates: 0,
+      candidates_known: false,
+      current_folder: "/Users/test/Library/Application Support",
+      last_activity: Date.now()
+    }
+    const initialFiles = discovering.folder_discovery.files
+    const { dom: discoveringDom } = await makePage((url) => {
+      if (url.includes("progress=1")) {
+        discovering.folder_discovery.files = initialFiles + 1500
+      }
+      return discovering
+    }, {
+      pickedPath: "/Users/test"
+    })
+    const discoveringDocument = discoveringDom.window.document
+    discoveringDocument.getElementById("btn-find-folders").click()
+    await waitFor(() => discoveringDocument.getElementById(
+      "vault-find-body").textContent.includes("32,013,427"))
+    const discoveryBody = discoveringDocument.getElementById("vault-find-body")
+    assert.deepEqual([...discoveryBody.querySelectorAll(
+      ".vault-find-stage > span:last-child"
+    )].map((stage) => stage.textContent), [
+      "Searching", "Verifying", "Suggestions"
+    ])
+    assert.equal(discoveryBody.querySelector(
+      ".vault-find-stage[aria-current='step'] > span:last-child"
+    ).textContent, "Searching")
+    assert.match(discoveryBody.textContent, /1,234 folders checked/)
+    assert.match(discoveryBody.textContent,
+      /Currently scanning\/Users\/test\/Library\/Application Support/)
+    assert.match(discoveryBody.textContent, /Active now/)
+    assert.equal(discoveryBody.textContent.includes("files/sec"), false)
+    assert.match(discoveryBody.textContent, /2m \d+s elapsed/)
+    assert.equal(discoveryBody.textContent.includes("Updated"), false)
+    assert.equal(discoveryBody.textContent.includes("possible matches"), false)
+    assert.equal(discoveryBody.querySelector("[aria-live]"), null)
+    assert.equal(discoveryBody.querySelector("[role='progressbar']"), null)
+    await new Promise((resolve) => setTimeout(resolve, 1500))
+    await waitFor(() => discoveryBody.textContent.includes("files/sec"))
+    assert.match(discoveryBody.textContent, /[\d,]+ files\/sec/)
+    discoveringDom.window.close()
+
+    const liveDiscovery = fixture([item()])
+    liveDiscovery.folder_discovery = Object.assign(
+      {}, discovering.folder_discovery, {
+        candidates: 42,
+        candidates_known: true
+      })
+    const { dom: liveDiscoveryDom } = await makePage(liveDiscovery, {
+      pickedPath: "/Users/test"
+    })
+    const liveDiscoveryDocument = liveDiscoveryDom.window.document
+    liveDiscoveryDocument.getElementById("btn-find-folders").click()
+    await waitFor(() => liveDiscoveryDocument.getElementById(
+      "vault-find-body").textContent.includes(
+      "42 possible matches queued for verification"))
+    liveDiscoveryDom.window.close()
+
+    const stalledDiscovery = fixture([item()])
+    stalledDiscovery.folder_discovery = Object.assign(
+      {}, discovering.folder_discovery, {
+        last_activity: Date.now() - 15000
+      })
+    const { dom: stalledDiscoveryDom } = await makePage(stalledDiscovery, {
+      pickedPath: "/Users/test"
+    })
+    const stalledDiscoveryDocument = stalledDiscoveryDom.window.document
+    stalledDiscoveryDocument.getElementById("btn-find-folders").click()
+    await waitFor(() => stalledDiscoveryDocument.getElementById(
+      "vault-find-body").textContent.includes("No activity for"))
+    assert.match(stalledDiscoveryDocument.getElementById(
+      "vault-find-body").textContent, /No activity for \d+s/)
+    assert.ok(stalledDiscoveryDocument.querySelector(
+      ".vault-find-progress-heading .fa-clock"))
+    stalledDiscoveryDom.window.close()
+
+    const verifying = fixture([item()])
+    verifying.folder_discovery = {
+      active: true,
+      pending: false,
+      phase: "hashing",
+      root: "/Users/test",
+      started: Date.now() - 125000,
+      threshold: 100000000,
+      candidates: 992,
+      candidates_known: true,
+      processed: 423,
+      verified_files: 37,
+      verified_bytes: 18400000000,
+      current_file: "model.bin",
+      last_activity: Date.now()
+    }
+    const { dom: verifyingDom } = await makePage(verifying, {
+      pickedPath: "/Users/test"
+    })
+    const verifyingDocument = verifyingDom.window.document
+    verifyingDocument.getElementById("btn-find-folders").click()
+    await waitFor(() => verifyingDocument.getElementById(
+      "vault-find-body").textContent.includes("423 of 992"))
+    const verifyingBody = verifyingDocument.getElementById("vault-find-body")
+    assert.match(verifyingBody.textContent,
+      /423 of 992 candidates checked/)
+    assert.match(verifyingBody.textContent,
+      /37 identical files · 18.4 GB matched so far/)
+    assert.match(verifyingBody.textContent,
+      /Currently verifyingmodel\.bin/)
+    assert.equal(verifyingBody.querySelector("[aria-live]"), null)
+    const progress = verifyingBody.querySelector("[role='progressbar']")
+    assert.equal(progress.getAttribute("aria-label"),
+      "423 of 992 candidates checked")
+    assert.equal(progress.getAttribute("aria-valuenow"), "423")
+    assert.equal(progress.getAttribute("aria-valuemax"), "992")
+    verifyingDom.window.close()
+  })
+
+  test("Find folders locks and adds verified partial recommendations", async () => {
+    const status = fixture([item()])
+    status.folder_discovery = {
+      active: false,
+      pending: false,
+      phase: "completed_with_exclusions",
+      root: "/Users/test",
+      started: 101,
+      threshold: 100000000,
+      result_count: 1,
+      result_files: 23,
+      result_bytes: 8400000000,
+      partial: true
+    }
+    status.folder_discovery_results = {
+      root: {
+        folder: "/Users/test",
+        name: "test",
+        file_count: 23,
+        bytes: 8400000000,
+        eligible_file_count: 100,
+        eligible_bytes: 15000000000,
+        child_count: 1
+      },
+      items: [{
+        folder: "/Users/test/Library/OtherApp",
+        parent: "/Users/test",
+        name: "OtherApp",
+        file_count: 23,
+        bytes: 8400000000,
+        eligible_file_count: 80,
+        eligible_bytes: 12000000000,
+        child_count: 1
+      }],
+      total: 1,
+      page: 0,
+      page_size: 500,
+      pages: 1,
+      recommendations: {
+        items: [{
+          folder: "/Users/test/Library/OtherApp/models",
+          name: "models",
+          file_count: 23,
+          bytes: 8400000000
+        }],
+        total: 1,
+        page: 0,
+        page_size: 500,
+        pages: 1
+      },
+      selection: {
+        selected_count: 0,
+        selected_files: 0,
+        potential_savings: 0
+      }
+    }
+    const childManifest = {
+      folder: "/Users/test/Library/OtherApp",
+      items: [{
+            folder: "/Users/test/Library/OtherApp/models",
+            parent: "/Users/test/Library/OtherApp",
+            name: "models",
+            file_count: 23,
+            bytes: 8400000000,
+            eligible_file_count: 24,
+            eligible_bytes: 8500000000,
+            child_count: 0
+      }],
+      total: 1,
+      page: 0,
+      page_size: 500,
+      pages: 1
+    }
+    const {
+      dom,
+      requests,
+      releaseFolderDiscoveryAdd
+    } = await makePage(status, {
+      pickedPath: "/Users/test",
+      deferFolderDiscoveryAdd: true,
+      folderDiscoveryChildren: {
+        "/Users/test/Library/OtherApp": childManifest
+      }
+    })
+    const document = dom.window.document
+
+    document.getElementById("btn-find-folders").click()
+    await waitFor(() => document.querySelector(
+      "[data-add-found-folders]"))
+    const modal = document.getElementById("vault-find-body")
+    assert.equal(document.getElementById("vault-find-title").textContent,
+      "Suggested locations")
+    assert.match(modal.textContent, /Verified identical files only/)
+    assert.match(modal.textContent, /Partial results/)
+    assert.match(modal.textContent, /Choose locations to add/)
+    assert.match(modal.textContent, /Select the locations you want to add\./)
+    assert.match(modal.textContent, /Broader scan/)
+    assert.match(modal.textContent, /23 identical files/)
+    assert.match(modal.querySelector(".vault-find-results-footer").textContent,
+      /0 locations selected0 identical files · Can save 0 B/)
+    assert.equal(document.querySelector("[data-add-found-folders]").disabled,
+      true)
+    const rootRow = document.querySelector(
+      '[data-select-found-folder="/Users/test"]'
+    ).closest(".vault-find-tree-row")
+    assert.doesNotMatch(rootRow.textContent, /selected inside/)
+    assert.equal([...modal.querySelectorAll(".vault-find-tree-badge")]
+      .some((badge) => badge.textContent === "Recommended"), false)
+    assert.equal(document.querySelector(
+      '[data-select-found-folder="/Users/test/Library/OtherApp/models"]'),
+    null)
+    const clusterToggle = document.querySelector(
+      '[data-toggle-found-folder="/Users/test/Library/OtherApp"]')
+    assert.equal(clusterToggle.getAttribute("aria-expanded"), "false")
+    clusterToggle.click()
+    await waitFor(() => document.querySelector(
+      '[data-select-found-folder="/Users/test/Library/OtherApp/models"]'))
+    assert.equal(document.querySelector(
+      '[data-toggle-found-folder="/Users/test/Library/OtherApp"]')
+      .getAttribute("aria-expanded"), "true")
+    assert.match(modal.textContent, /80 files · 12 GB scan scope/)
+    const expandedParentRow = document.querySelector(
+      '[data-select-found-folder="/Users/test/Library/OtherApp"]'
+    ).closest(".vault-find-tree-row")
+    assert.doesNotMatch(expandedParentRow.textContent, /selected inside/)
+    assert.equal([...modal.querySelectorAll(".vault-find-tree-badge")]
+      .some((badge) => badge.textContent === "Recommended"), true)
+    assert.match(modal.textContent, /modelsRecommended/)
+    document.querySelector(
+      '[data-toggle-found-folder="/Users/test/Library/OtherApp"]')
+      .click()
+    assert.equal(document.querySelector(
+      '[data-select-found-folder="/Users/test/Library/OtherApp/models"]'),
+    null)
+    document.querySelector(
+      '[data-toggle-found-folder="/Users/test/Library/OtherApp"]')
+      .click()
+    const parent = document.querySelector(
+      '[data-select-found-folder="/Users/test/Library/OtherApp"]')
+    const root = document.querySelector(
+      '[data-select-found-folder="/Users/test"]')
+    const recommended = document.querySelector(
+      '[data-select-found-folder="/Users/test/Library/OtherApp/models"]')
+    assert.equal(root.indeterminate, false)
+    assert.equal(parent.indeterminate, false)
+    assert.equal(recommended.checked, false)
+    assert.equal(modal.querySelector("[aria-checked='mixed']"), null)
+    recommended.click()
+    await waitFor(() => document.querySelector(
+      '[data-select-found-folder="/Users/test/Library/OtherApp/models"]')
+      .checked)
+    document.querySelector(
+      '[data-select-found-folder="/Users/test"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-select-found-folder="/Users/test"]')
+      .checked)
+    assert.equal(document.querySelector(
+      '[data-select-found-folder="/Users/test/Library/OtherApp/models"]')
+      .checked, false)
+    document.querySelector(
+      '[data-select-found-folder="/Users/test/Library/OtherApp/models"]')
+      .click()
+    await waitFor(() => !document.querySelector(
+      '[data-select-found-folder="/Users/test"]')
+      .checked)
+
+    document.querySelector("[data-add-found-folders]").click()
+    await waitFor(() => requests.some((request) =>
+      request.action === "add_folder_discovery_sources"))
+    const dialog = document.querySelector(".vault-find-dialog")
+    assert.equal(dialog.getAttribute("aria-busy"), "true")
+    assert.equal(document.querySelector(".vault-find-close").disabled, true)
+    assert.ok([...document.querySelectorAll(
+      "#vault-find-body button, #vault-find-body input"
+    )].every((control) => control.disabled))
+    await releaseFolderDiscoveryAdd()
+    await settle()
+    dom.window.close()
+  })
+
+  test("Find folders allows a parent or descendant without overlapping selections", async () => {
+    const status = fixture([item()])
+    status.folder_discovery = {
+      active: false,
+      pending: false,
+      phase: "complete",
+      root: "/Users/test",
+      started: 123,
+      result_count: 1,
+      result_files: 2,
+      result_bytes: 8000,
+      partial: false
+    }
+    status.folder_discovery_results = {
+      root: {
+        folder: "/Users/test",
+        name: "test",
+        file_count: 2,
+        bytes: 8000,
+        eligible_file_count: 75,
+        eligible_bytes: 300000,
+        child_count: 1
+      },
+      items: [{
+        folder: "/Users/test/.comfycraft",
+        parent: "/Users/test",
+        name: ".comfycraft",
+        file_count: 2,
+        bytes: 8000,
+        eligible_file_count: 50,
+        eligible_bytes: 200000,
+        child_count: 1
+      }],
+      total: 1,
+      page: 0,
+      page_size: 500,
+      pages: 1,
+      recommendations: {
+        items: [{
+          folder: "/Users/test/.comfycraft/kits",
+          name: "kits",
+          file_count: 2,
+          bytes: 8000
+        }],
+        total: 1,
+        page: 0,
+        page_size: 500,
+        pages: 1
+      },
+      selection: {
+        selected_count: 0,
+        selected_files: 0,
+        potential_savings: 0
+      }
+    }
+    const { dom, requests } = await makePage(status, {
+      pickedPath: "/Users/test",
+      folderDiscoveryChildren: {
+        "/Users/test/.comfycraft": {
+          folder: "/Users/test/.comfycraft",
+          items: [{
+            folder: "/Users/test/.comfycraft/kits",
+            parent: "/Users/test/.comfycraft",
+            name: "kits",
+            file_count: 2,
+            bytes: 8000,
+            eligible_file_count: 4,
+            eligible_bytes: 16000,
+            child_count: 1
+          }],
+          total: 1, page: 0, page_size: 500, pages: 1
+        },
+        "/Users/test/.comfycraft/kits": {
+          folder: "/Users/test/.comfycraft/kits",
+          items: [{
+            folder: "/Users/test/.comfycraft/kits/ace",
+            parent: "/Users/test/.comfycraft/kits",
+            name: "ace",
+            file_count: 1,
+            bytes: 4000,
+            eligible_file_count: 2,
+            eligible_bytes: 8000,
+            child_count: 0
+          }],
+          total: 1, page: 0, page_size: 500, pages: 1
+        }
+      }
+    })
+    const document = dom.window.document
+    document.getElementById("btn-find-folders").click()
+    await waitFor(() => document.querySelector(
+      '[data-select-found-folder="/Users/test/.comfycraft"]'))
+
+    const parent = document.querySelector(
+      '[data-select-found-folder="/Users/test/.comfycraft"]')
+    parent.click()
+    await waitFor(() => document.querySelector(
+      '[data-select-found-folder="/Users/test/.comfycraft"]')
+      .checked)
+    assert.equal(document.querySelector(
+      '[data-select-found-folder="/Users/test/.comfycraft/kits"]'), null)
+    document.querySelector(
+      '[data-toggle-found-folder="/Users/test/.comfycraft"]')
+      .click()
+    await waitFor(() => document.querySelector(
+      '[data-select-found-folder="/Users/test/.comfycraft/kits"]'))
+    assert.equal(document.querySelector(
+      '[data-select-found-folder="/Users/test/.comfycraft/kits"]')
+      .checked, false)
+
+    document.querySelector(
+      '[data-toggle-found-folder="/Users/test/.comfycraft/kits"]')
+      .click()
+    await waitFor(() => document.querySelector(
+      '[data-select-found-folder="/Users/test/.comfycraft/kits/ace"]'))
+    const child = document.querySelector(
+      '[data-select-found-folder="/Users/test/.comfycraft/kits/ace"]')
+    child.click()
+    await waitFor(() => document.querySelector(
+      '[data-select-found-folder="/Users/test/.comfycraft/kits/ace"]')
+      .checked)
+    assert.equal(document.querySelector(
+      '[data-select-found-folder="/Users/test/.comfycraft"]')
+      .checked, false)
+
+    document.querySelector("[data-add-found-folders]").click()
+    await waitFor(() => requests.some((request) =>
+      request.action === "add_folder_discovery_sources"))
+    assert.equal(requests.filter((request) =>
+      request.action === "update_folder_discovery_selection").length, 2)
+    await settle()
+    dom.window.close()
+  })
+
+  test("Find folders leaves recommendations unselected until the user chooses one", async () => {
+    const status = fixture([item()])
+    status.folder_discovery = {
+      active: false,
+      pending: false,
+      phase: "complete",
+      root: "/Users/test",
+      started: 456,
+      result_count: 2,
+      result_files: 2,
+      result_bytes: 12000,
+      partial: false
+    }
+    const resultBase = {
+      root: {
+        folder: "/Users/test",
+        name: "test",
+        file_count: 2,
+        bytes: 12000,
+        eligible_file_count: 20,
+        eligible_bytes: 50000
+      },
+      items: [{
+        folder: "/Users/test/first",
+        name: "first",
+        file_count: 1,
+        bytes: 7000,
+        eligible_file_count: 2,
+        eligible_bytes: 8000
+      }],
+      total: 2,
+      page: 0,
+      page_size: 1,
+      pages: 2,
+      recommendations: {
+        items: [{
+          folder: "/Users/test/first",
+          name: "first",
+          file_count: 1,
+          bytes: 7000
+        }],
+        total: 1,
+        page: 0,
+        page_size: 500,
+        pages: 1
+      },
+      selection: {
+        selected_count: 0,
+        selected_files: 0,
+        potential_savings: 0
+      }
+    }
+    const response = () => Object.assign({}, status, {
+      folder_discovery_results: resultBase
+    })
+    const { dom, requests } = await makePage(response, {
+      pickedPath: "/Users/test"
+    })
+    const document = dom.window.document
+    document.getElementById("btn-find-folders").click()
+    await waitFor(() => document.querySelector(
+      '[data-select-found-folder="/Users/test/first"]'))
+    const recommendation = document.querySelector(
+      '[data-select-found-folder="/Users/test/first"]')
+    const add = document.querySelector("[data-add-found-folders]")
+    assert.equal(recommendation.checked, false)
+    assert.equal(add.disabled, true)
+    assert.match(document.querySelector(".vault-find-results-footer")
+      .textContent, /0 locations selected/)
+    assert.match(recommendation.closest(".vault-find-tree-row").textContent,
+      /Recommended/)
+
+    recommendation.click()
+    await waitFor(() => requests.some((request) =>
+      request.action === "update_folder_discovery_selection"))
+    await waitFor(() => document.querySelector(
+      '[data-select-found-folder="/Users/test/first"]').checked)
+    assert.equal(document.querySelector("[data-add-found-folders]").disabled,
+      false)
+    await settle()
+    dom.window.close()
+  })
+
+  test("Find folders traps modal focus, preserves row focus, and restores its opener", async () => {
+    const status = fixture([item()])
+    status.folder_discovery = {
+      active: false,
+      pending: false,
+      phase: "complete",
+      root: "/Users/test",
+      started: 789,
+      result_count: 1,
+      result_files: 1,
+      result_bytes: 4096,
+      partial: false
+    }
+    status.folder_discovery_results = {
+      root: {
+        folder: "/Users/test",
+        name: "test",
+        file_count: 1,
+        bytes: 4096,
+        eligible_file_count: 2,
+        eligible_bytes: 8192
+      },
+      items: [{
+        folder: "/Users/test/models",
+        file_count: 1,
+        bytes: 4096,
+        eligible_file_count: 1,
+        eligible_bytes: 4096
+      }],
+      total: 1,
+      page: 0,
+      page_size: 500,
+      pages: 1,
+      recommendations: {
+        items: [{
+          folder: "/Users/test/models",
+          name: "models",
+          file_count: 1,
+          bytes: 4096
+        }],
+        total: 1,
+        page: 0,
+        page_size: 500,
+        pages: 1
+      }
+    }
+    const { dom } = await makePage(status, {
+      pickedPath: "/Users/test"
+    })
+    const document = dom.window.document
+    const opener = document.querySelector(".vault-external-prompt-action")
+    opener.click()
+    await waitFor(() => document.querySelector(
+      "[data-select-found-folder]"))
+    assert.equal(document.activeElement.classList.contains(
+      "vault-find-dialog"), true)
+    document.dispatchEvent(new dom.window.KeyboardEvent("keydown", {
+      key: "Tab",
+      bubbles: true
+    }))
+    assert.equal(document.activeElement.hasAttribute(
+      "data-close-find-folders"), true)
+
+    const checkbox = document.querySelector(
+      '[data-select-found-folder="/Users/test/models"]')
+    checkbox.focus()
+    checkbox.click()
+    await waitFor(() => {
+      const current = document.querySelector(
+        '[data-select-found-folder="/Users/test/models"]')
+      return current && !current.disabled
+    })
+    assert.equal(document.activeElement.dataset.selectFoundFolder,
+      "/Users/test/models")
+
+    document.dispatchEvent(new dom.window.KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true
+    }))
+    await waitFor(() => document.getElementById(
+      "vault-find-overlay").hidden)
+    assert.equal(document.activeElement, opener)
+    dom.window.close()
   })
 
   test("search keeps focus while debounced results refresh", async () => {
@@ -724,7 +1610,7 @@ describe("Save Space interface", () => {
     dom.window.close()
   })
 
-  test("the fresh empty state keeps the rail as the only scan action", async () => {
+  test("the fresh empty state keeps the header as the only scan action", async () => {
     const status = fixture([], {
       last_scan: null,
       bytes_without_sharing: 0,
@@ -737,8 +1623,17 @@ describe("Save Space interface", () => {
 
     assert.equal(document.querySelectorAll("#btn-scan").length, 1)
     assert.equal(document.getElementById("btn-empty-scan"), null)
-    assert.ok(document.querySelector(".vault-rail-global #btn-scan"))
-    assert.match(document.getElementById("btn-scan").textContent, /Scan now/)
+    assert.ok(document.querySelector(".vault-overview #btn-scan"))
+    assert.equal(document.querySelector(".vault-rail-global #btn-scan"), null)
+    assert.match(document.getElementById("btn-scan").textContent, /Scan/)
+    assert.doesNotMatch(document.getElementById("btn-scan").textContent,
+      /again/)
+    assert.match(document.getElementById("vault-scan-size-label").textContent,
+      /100 MB\+/)
+    assert.equal(document.getElementById("btn-scan").classList
+      .contains("primary"), true)
+    assert.equal(document.querySelector("#vault-scan-size-menu > summary")
+      .classList.contains("primary"), true)
     assert.match(document.querySelector(".vault-empty").textContent, /No files/)
 
     dom.window.close()
@@ -762,6 +1657,8 @@ describe("Save Space interface", () => {
       '[data-view="reclaimable"]'), null)
     assert.ok(document.querySelector(
       ".vault-overview-actions #btn-scan"))
+    assert.ok(document.getElementById("vault-candidate-size"))
+    assert.equal(document.getElementById("vault-scan-control"), null)
 
     document.getElementById("btn-scan").click()
     await waitFor(() => requests.some((request) =>
@@ -921,7 +1818,11 @@ describe("Save Space interface", () => {
     const progress = document.querySelector(
       "#vault-scan-state [role='progressbar']")
 
-    assert.match(button.textContent, /Cancel/)
+    assert.match(button.textContent, /Cancel scan/)
+    assert.equal(button.classList.contains("primary"), false)
+    assert.equal(document.getElementById("vault-scan-size-menu").hidden, true)
+    assert.equal(document.getElementById("vault-scan-control").classList
+      .contains("single"), true)
     assert.ok(progress.querySelector(".vault-progress-bar.indeterminate"))
     assert.doesNotMatch(
       document.getElementById("vault-metrics").textContent,

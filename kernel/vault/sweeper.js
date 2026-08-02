@@ -1,54 +1,11 @@
-const fs = require("fs")
 const path = require("path")
-const { walkBatches, statMany } = require("./walker")
-const { fileSnapshot, sameSnapshot } = require("./snapshot")
 const {
-  DIR_CONCURRENCY,
-  STAT_CONCURRENCY,
-  SHA256_RE
-} = require("./constants")
+  cancelledError,
+  exclusionReason,
+  isPathError
+} = require("./operation_errors")
 
 const PREVIEW_GROUP_LIMIT = 20
-
-const PATH_ERROR_CODES = new Set([
-  "EACCES",
-  "EAGAIN",
-  "EBUSY",
-  "EIO",
-  "EISDIR",
-  "ELOOP",
-  "ENODATA",
-  "ENOENT",
-  "ENOTDIR",
-  "ENXIO",
-  "EPERM",
-  "EROFS",
-  "ESTALE",
-  "ETIMEDOUT",
-  "EWOULDBLOCK"
-])
-
-const isPathError = (error) => !!(
-  error && PATH_ERROR_CODES.has(error.code))
-
-const exclusionReason = (error) => {
-  if (!error) return "unreadable"
-  if (error.code === "EACCES" || error.code === "EPERM") {
-    return "permission_denied"
-  }
-  if (error.code === "ENOENT" || error.code === "ENOTDIR") {
-    return "disappeared"
-  }
-  if (["EAGAIN", "ENODATA", "ETIMEDOUT", "EWOULDBLOCK"]
-    .includes(error.code)) return "not_resident"
-  return "unreadable"
-}
-
-const cancelledError = () => {
-  const error = new Error("Scan cancelled.")
-  error.code = "EVAULTCANCELLED"
-  return error
-}
 
 class Sweeper {
   constructor(vault) {
@@ -56,8 +13,6 @@ class Sweeper {
     this.state = this.idleState()
     this.currentHash = null
     this.cancelRequested = false
-    this.statConcurrency = vault.statConcurrency || STAT_CONCURRENCY
-    this.dirConcurrency = vault.dirConcurrency || DIR_CONCURRENCY
     this.exclusions = new Map()
     this.previewGroups = new Map()
     this.completedHashInodes = new Set()
@@ -108,7 +63,7 @@ class Sweeper {
   }
 
   checkpoint() {
-    if (this.cancelRequested) throw cancelledError()
+    if (this.cancelRequested) throw cancelledError("Scan cancelled.")
   }
 
   publicationSourceIds(scopeId) {
@@ -362,99 +317,36 @@ class Sweeper {
   }
 
   async stageAnchors(runId, stores = this.vault.anchorStores()) {
-    for (const store of stores) {
-      const blobRoot = path.resolve(store.root, "sha256")
-      let stat
-      try {
-        stat = await fs.promises.lstat(blobRoot)
-      } catch (error) {
-        if (error &&
-            (error.code === "ENOENT" || error.code === "ENOTDIR")) continue
-        if (this.recordExclusion(error, blobRoot)) continue
-        throw error
-      }
-      if (!stat.isDirectory() || stat.isSymbolicLink()) continue
-      try {
-        await this.vault.validateAnchorStore(store, stat.dev)
-      } catch (error) {
-        if (this.recordExclusion(error, blobRoot, null, "anchor_store")) {
-          continue
-        }
-        throw error
-      }
-
-      for await (const directoryResults of walkBatches(blobRoot, {
-        concurrency: this.dirConcurrency,
-        strictErrors: true,
-        onError: (error, filePath) =>
-          this.recordExclusion(error, filePath)
-      })) {
-        this.checkpoint()
-        const files = directoryResults.flatMap((group) =>
-          group.files.map((file) => file.path))
-        const stats = await statMany(files, this.statConcurrency, null, {
-          followSymlinks: false,
-          strictErrors: true,
-          onError: (error, filePath) =>
-            this.recordExclusion(error, filePath)
-        })
-        const anchors = []
-        for (let index = 0; index < files.length; index++) {
-          const filePath = files[index]
-          const fileStat = stats[index]
-          const hash = path.basename(filePath)
-          if (!fileStat || !fileStat.isFile() || !SHA256_RE.test(hash)) continue
-          if (path.basename(path.dirname(filePath)) !== hash.slice(0, 2)) continue
-          anchors.push(anchorEntry(store.id, filePath, hash, fileStat))
-        }
-        const staged = await this.vault.registry.stageAnchors(runId, anchors)
+    await this.vault.scanner.walkAnchors(stores, {
+      checkpoint: () => this.checkpoint(),
+      onError: (error, filePath, reason = null) =>
+        this.recordExclusion(error, filePath, null, reason),
+      onEntries: async (anchors) => {
+        const staged = await this.vault.registry.stageAnchors(
+          runId, anchors)
         this.applyHashWork(staged && staged.work)
       }
-    }
+    })
   }
 
   async walk(root, runId, preferredSourceId = null) {
-    const rootHandle = await fs.promises.opendir(root)
-    await rootHandle.close()
-    for await (const directoryResults of walkBatches(root, {
-      concurrency: this.dirConcurrency,
+    await this.vault.scanner.walk(root, {
+      checkpoint: () => this.checkpoint(),
       skipDirectory: (full) => this.vault.isStorageRoot(full),
-      strictErrors: true,
-      strictRoot: true,
       onError: (error, filePath) =>
-        this.recordExclusion(error, filePath, preferredSourceId)
-    })) {
-      this.checkpoint()
-      this.state.dirs += directoryResults
-        .filter((group) => group.firstChunk).length
-      const files = directoryResults.flatMap((group) =>
-        group.files.map((file) => file.path))
-      await this.considerFiles(files, runId, preferredSourceId)
-    }
-  }
-
-  async considerFiles(filePaths, runId, preferredSourceId) {
-    const stats = await statMany(filePaths, this.statConcurrency, null, {
-      followSymlinks: false,
-      strictErrors: true,
-      onError: (error, filePath) =>
-        this.recordExclusion(error, filePath, preferredSourceId)
-    })
-    const entries = []
-    for (let index = 0; index < filePaths.length; index++) {
-      this.checkpoint()
-      const stat = stats[index]
-      if (stat && stat.isFile()) {
-        const entry = this.considerStat(
-          filePaths[index], stat, preferredSourceId)
-        if (entry) entries.push(entry)
+        this.recordExclusion(error, filePath, preferredSourceId),
+      onBatch: async ({ files, directories }) => {
+        this.state.dirs += directories
+        const entries = files.map((file) =>
+          this.considerStat(file.path, file.stat, preferredSourceId))
+          .filter(Boolean)
+        const staged = await this.vault.registry.stageFiles(
+          runId, entries, this.vault.sizeThreshold)
+        this.state.candidates += Number(staged && staged.changes) || 0
+        this.applyPreview(staged && staged.preview)
+        this.applyHashWork(staged && staged.work)
       }
-    }
-    const staged = await this.vault.registry.stageFiles(
-      runId, entries, this.vault.sizeThreshold)
-    this.state.candidates += Number(staged && staged.changes) || 0
-    this.applyPreview(staged && staged.preview)
-    this.applyHashWork(staged && staged.work)
+    })
   }
 
   considerStat(filePath, stat, preferredSourceId) {
@@ -524,8 +416,7 @@ class Sweeper {
         bytes: 0
       }
       try {
-        const expected = stageSnapshot(candidate)
-        const result = await this.vault.hashFile(candidate.path, {
+        const verified = await this.vault.scanner.hashStable(candidate, {
           onProgress: (bytes) => {
             if (this.currentHash &&
                 this.currentHash.path === candidate.path) {
@@ -533,9 +424,7 @@ class Sweeper {
             }
           }
         })
-        const current = await fs.promises.lstat(candidate.path)
-        if (result.size !== current.size ||
-            !sameSnapshot(expected, current)) {
+        if (!verified.stable) {
           this.state.unstable_hashes += 1
           const retry = await this.vault.registry.markStageHashFailed(
             runId, candidate)
@@ -552,11 +441,11 @@ class Sweeper {
         }
         const updated = candidate.nlink > 1 && candidate.ino !== 0
           ? await this.vault.registry.setStageInodeHash(
-            runId, candidate.dev, candidate.ino, result.hash)
+            runId, candidate.dev, candidate.ino, verified.result.hash)
           : await this.vault.registry.setStageHash(
-            runId, candidate.path, result.hash)
+            runId, candidate.path, verified.result.hash)
         this.state.hashed += 1
-        this.state.hash_bytes += result.size
+        this.state.hash_bytes += verified.result.size
         this.state.inode_reuses += Math.max(0, updated.changes - 1)
         this.applyPreview(updated.preview)
         candidate = null
@@ -591,14 +480,13 @@ class Sweeper {
       for (const anchor of anchors) {
         this.checkpoint()
         let completeWork = false
-        const expected = stageSnapshot(anchor)
         this.currentHash = {
           path: anchor.path,
           size: anchor.size,
           bytes: 0
         }
         try {
-          const result = await this.vault.hashFile(anchor.path, {
+          const verified = await this.vault.scanner.hashStable(anchor, {
             onProgress: (bytes) => {
               if (this.currentHash &&
                   this.currentHash.path === anchor.path) {
@@ -606,12 +494,9 @@ class Sweeper {
               }
             }
           })
-          const current = await fs.promises.lstat(anchor.path)
-          const unchanged = result.size === current.size &&
-            sameSnapshot(expected, current)
-          if (unchanged) {
+          if (verified.stable) {
             await this.vault.registry.markAnchorChecked(
-              runId, anchor, result.hash)
+              runId, anchor, verified.result.hash)
             completeWork = true
           } else {
             const retry =
@@ -637,28 +522,5 @@ class Sweeper {
     }
   }
 }
-
-const stageSnapshot = (entry) => ({
-  size: entry.size,
-  mtime: entry.mtime,
-  ctime: entry.ctime,
-  dev: entry.dev,
-  ino: entry.ino
-})
-
-const anchorEntry = (storeId, filePath, hash, stat) => ({
-  store_id: storeId,
-  hash_name: hash,
-  path: filePath,
-  size: stat.size,
-  mtime: stat.mtimeMs,
-  ctime: stat.ctimeMs,
-  dev: stat.dev,
-  ino: stat.ino,
-  nlink: stat.nlink,
-  mode: stat.mode,
-  uid: stat.uid,
-  gid: stat.gid
-})
 
 module.exports = Sweeper

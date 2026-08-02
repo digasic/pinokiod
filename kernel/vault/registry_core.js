@@ -4,7 +4,7 @@ const crypto = require("crypto")
 const Database = require("better-sqlite3")
 
 const DATABASE_APPLICATION_ID = 0x5641554c
-const DATABASE_VERSION = 2
+const DATABASE_VERSION = 3
 
 const isMissing = (error) => !!(error &&
   (error.code === "ENOENT" || error.code === "ENOTDIR"))
@@ -64,6 +64,7 @@ class RegistryCore {
       this.createSchema()
       this.dropLegacyScanSchema()
       this.createScanSchema()
+      this.createFolderDiscoverySchema()
       this.database.pragma(`application_id = ${DATABASE_APPLICATION_ID}`)
       this.database.pragma(`user_version = ${DATABASE_VERSION}`)
     } catch (error) {
@@ -249,11 +250,6 @@ class RegistryCore {
       CREATE INDEX IF NOT EXISTS events_source_idx
         ON events(source_id, id);
 
-      CREATE TABLE IF NOT EXISTS external_sources (
-        root TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL
-      );
-
     `)
     this.database.exec(`
       DROP TRIGGER IF EXISTS content_summary_insert;
@@ -422,6 +418,185 @@ class RegistryCore {
         FOREIGN KEY (run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
       ) WITHOUT ROWID;
     `)
+  }
+
+  createFolderDiscoverySchema() {
+    this.database.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS folder_discovery_runs (
+        id TEXT PRIMARY KEY,
+        threshold INTEGER NOT NULL,
+        root TEXT NOT NULL,
+        file_count INTEGER NOT NULL DEFAULT 0,
+        bytes INTEGER NOT NULL DEFAULT 0,
+        eligible_file_count INTEGER NOT NULL DEFAULT 0,
+        eligible_bytes INTEGER NOT NULL DEFAULT 0
+      ) WITHOUT ROWID;
+
+      CREATE TEMP TABLE IF NOT EXISTS folder_discovery_devices (
+        run_id TEXT NOT NULL,
+        dev INTEGER NOT NULL,
+        PRIMARY KEY (run_id, dev),
+        FOREIGN KEY (run_id) REFERENCES folder_discovery_runs(id)
+          ON DELETE CASCADE
+      ) WITHOUT ROWID;
+
+      CREATE TEMP TABLE IF NOT EXISTS folder_discovery_references (
+        run_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        hash TEXT,
+        hash_attempted INTEGER NOT NULL DEFAULT 0,
+        size INTEGER NOT NULL,
+        mtime REAL NOT NULL,
+        ctime REAL NOT NULL,
+        dev INTEGER NOT NULL,
+        ino INTEGER NOT NULL,
+        mode INTEGER NOT NULL,
+        uid INTEGER NOT NULL,
+        gid INTEGER NOT NULL,
+        PRIMARY KEY (run_id, path),
+        FOREIGN KEY (run_id) REFERENCES folder_discovery_runs(id)
+          ON DELETE CASCADE
+      ) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS temp.folder_discovery_reference_match_idx
+        ON folder_discovery_references(
+          run_id, size, dev, hash_attempted, hash, mode, uid, gid, path
+        );
+
+      CREATE TEMP TABLE IF NOT EXISTS folder_discovery_anchors (
+        run_id TEXT NOT NULL,
+        store_id TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        path TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        mtime REAL NOT NULL,
+        ctime REAL NOT NULL,
+        dev INTEGER NOT NULL,
+        ino INTEGER NOT NULL,
+        mode INTEGER NOT NULL,
+        uid INTEGER NOT NULL,
+        gid INTEGER NOT NULL,
+        valid INTEGER NOT NULL DEFAULT 0,
+        checked INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (run_id, store_id, hash),
+        FOREIGN KEY (run_id) REFERENCES folder_discovery_runs(id)
+          ON DELETE CASCADE
+      ) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS temp.folder_discovery_anchor_match_idx
+        ON folder_discovery_anchors(
+          run_id, size, dev, hash, mode, uid, gid, checked
+        );
+
+      CREATE TEMP TABLE IF NOT EXISTS folder_discovery_files (
+        run_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        parent TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        mtime REAL NOT NULL,
+        ctime REAL NOT NULL,
+        dev INTEGER NOT NULL,
+        ino INTEGER NOT NULL,
+        nlink INTEGER NOT NULL,
+        mode INTEGER NOT NULL,
+        uid INTEGER NOT NULL,
+        gid INTEGER NOT NULL,
+        match_candidate INTEGER NOT NULL DEFAULT 0,
+        hash TEXT,
+        hash_attempted INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (run_id, path),
+        FOREIGN KEY (run_id) REFERENCES folder_discovery_runs(id)
+          ON DELETE CASCADE
+      ) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS temp.folder_discovery_file_work_idx
+        ON folder_discovery_files(
+          run_id, match_candidate, hash_attempted, size, dev, ino, path
+        );
+      CREATE INDEX IF NOT EXISTS temp.folder_discovery_file_group_idx
+        ON folder_discovery_files(run_id, size, dev, ino, path);
+      CREATE INDEX IF NOT EXISTS temp.folder_discovery_file_hash_idx
+        ON folder_discovery_files(
+          run_id, hash, size, dev, mode, uid, gid, path
+        );
+
+      CREATE TEMP TABLE IF NOT EXISTS folder_discovery_matches (
+        run_id TEXT NOT NULL,
+        identity TEXT NOT NULL,
+        path TEXT NOT NULL,
+        parent TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        hash TEXT NOT NULL,
+        dev INTEGER NOT NULL,
+        mode INTEGER NOT NULL,
+        uid INTEGER NOT NULL,
+        gid INTEGER NOT NULL,
+        PRIMARY KEY (run_id, identity),
+        FOREIGN KEY (run_id) REFERENCES folder_discovery_runs(id)
+          ON DELETE CASCADE
+      ) WITHOUT ROWID;
+
+      CREATE TEMP TABLE IF NOT EXISTS folder_discovery_nodes (
+        run_id TEXT NOT NULL,
+        folder TEXT NOT NULL,
+        parent TEXT,
+        direct_file_count INTEGER NOT NULL DEFAULT 0,
+        direct_bytes INTEGER NOT NULL DEFAULT 0,
+        scope_file_count INTEGER NOT NULL DEFAULT 0,
+        scope_bytes INTEGER NOT NULL DEFAULT 0,
+        file_count INTEGER NOT NULL,
+        bytes INTEGER NOT NULL,
+        eligible_file_count INTEGER NOT NULL,
+        eligible_bytes INTEGER NOT NULL,
+        child_count INTEGER NOT NULL DEFAULT 0,
+        selected INTEGER NOT NULL DEFAULT 0,
+        selected_inside INTEGER NOT NULL DEFAULT 0,
+        recommended INTEGER NOT NULL DEFAULT 0,
+        broader INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (run_id, folder),
+        FOREIGN KEY (run_id) REFERENCES folder_discovery_runs(id)
+          ON DELETE CASCADE
+      ) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS temp.folder_discovery_node_parent_idx
+        ON folder_discovery_nodes(
+          run_id, parent, bytes DESC, file_count DESC, folder
+        );
+
+      CREATE TEMP TABLE IF NOT EXISTS folder_discovery_recommendations (
+        run_id TEXT NOT NULL,
+        folder TEXT NOT NULL,
+        file_count INTEGER NOT NULL,
+        bytes INTEGER NOT NULL,
+        PRIMARY KEY (run_id, folder),
+        FOREIGN KEY (run_id) REFERENCES folder_discovery_runs(id)
+          ON DELETE CASCADE
+      ) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS temp.folder_discovery_recommendation_page_idx
+        ON folder_discovery_recommendations(
+          run_id, bytes DESC, file_count DESC, folder
+        );
+
+      CREATE TEMP TABLE IF NOT EXISTS folder_discovery_selected_paths (
+        run_id TEXT NOT NULL,
+        folder TEXT NOT NULL,
+        prefix TEXT NOT NULL,
+        PRIMARY KEY (run_id, folder),
+        FOREIGN KEY (run_id) REFERENCES folder_discovery_runs(id)
+          ON DELETE CASCADE
+      ) WITHOUT ROWID;
+    `)
+  }
+
+  resetFolderDiscoverySchema() {
+    this.database.exec(`
+      DROP TABLE IF EXISTS temp.folder_discovery_selected_paths;
+      DROP TABLE IF EXISTS temp.folder_discovery_recommendations;
+      DROP TABLE IF EXISTS temp.folder_discovery_nodes;
+      DROP TABLE IF EXISTS temp.folder_discovery_matches;
+      DROP TABLE IF EXISTS temp.folder_discovery_files;
+      DROP TABLE IF EXISTS temp.folder_discovery_anchors;
+      DROP TABLE IF EXISTS temp.folder_discovery_references;
+      DROP TABLE IF EXISTS temp.folder_discovery_devices;
+      DROP TABLE IF EXISTS temp.folder_discovery_runs;
+    `)
+    this.createFolderDiscoverySchema()
   }
 
   resetScanSchema() {
@@ -1076,26 +1251,8 @@ class RegistryCore {
     return { files: rows.length }
   }
 
-  externalSources() {
-    return this.database.prepare(
-      "SELECT root FROM external_sources ORDER BY created_at, root"
-    ).all().map((row) => row.root)
-  }
-
-  addExternalSource(root) {
-    this.database.prepare(`
-      INSERT OR IGNORE INTO external_sources(root, created_at) VALUES (?, ?)
-    `).run(path.resolve(root), Date.now())
-  }
-
-  removeExternalSource(root) {
-    this.database.prepare("DELETE FROM external_sources WHERE root = ?")
-      .run(path.resolve(root))
-  }
-
-  removeExternalSourceState(root, sourceId) {
+  removeExternalSourceState(sourceId) {
     this.transaction(() => {
-      this.removeExternalSource(root)
       this.database.prepare("DELETE FROM files WHERE source_id = ?")
         .run(sourceId)
       this.removeScan(sourceId)
@@ -1110,6 +1267,1262 @@ class RegistryCore {
       `).run()
       this.rebuildSavings()
     })
+  }
+
+  beginFolderDiscovery(root, threshold, sourceIds = [], devices = []) {
+    const id = crypto.randomUUID()
+    const sources = [...new Set(sourceIds.filter((value) =>
+      typeof value === "string" && value))]
+    const allowedDevices = [...new Set(devices.filter(Number.isFinite))]
+    this.transaction(() => {
+      this.resetFolderDiscoverySchema()
+      this.database.prepare(`
+        INSERT INTO folder_discovery_runs(id, threshold, root)
+        VALUES (?, ?, ?)
+      `).run(
+        id,
+        Math.max(0, Number(threshold) || 0),
+        path.resolve(root)
+      )
+      const insertDevice = this.database.prepare(`
+        INSERT INTO folder_discovery_devices(run_id, dev) VALUES (?, ?)
+      `)
+      for (const dev of allowedDevices) insertDevice.run(id, dev)
+      if (!allowedDevices.length) return
+      if (sources.length) {
+        this.database.prepare(`
+          INSERT INTO folder_discovery_references (
+            run_id, path, hash, hash_attempted, size, mtime, ctime, dev, ino,
+            mode, uid, gid
+          )
+          SELECT ?, path, hash, CASE WHEN hash IS NULL THEN 0 ELSE 1 END,
+            size, mtime, ctime, dev, ino,
+            mode, uid, gid
+          FROM files
+          WHERE source_id IN (${placeholders(sources)})
+            AND dev IN (${placeholders(allowedDevices)})
+            AND unavailable_reason IS NOT 'stale'
+            AND size > 0
+            AND size >= ?
+        `).run(
+          id,
+          ...sources,
+          ...allowedDevices,
+          Math.max(0, Number(threshold) || 0)
+        )
+      }
+      this.database.prepare(`
+        INSERT INTO folder_discovery_anchors (
+          run_id, store_id, hash, path, size, mtime, ctime, dev, ino,
+          mode, uid, gid
+        )
+        SELECT ?, store_id, hash, path, size, mtime, ctime, dev, ino,
+          mode, uid, gid
+        FROM anchors
+        WHERE dev IN (${placeholders(allowedDevices)})
+          AND size > 0
+          AND size >= ?
+      `).run(
+        id,
+        ...allowedDevices,
+        Math.max(0, Number(threshold) || 0)
+      )
+    })
+    return { id }
+  }
+
+  abortFolderDiscovery(runId = null) {
+    const exists = runId
+      ? this.database.prepare(
+        "SELECT 1 FROM folder_discovery_runs WHERE id = ?").get(runId)
+      : this.database.prepare(
+        "SELECT 1 FROM folder_discovery_runs LIMIT 1").get()
+    if (exists) this.resetFolderDiscoverySchema()
+    return { changes: exists ? 1 : 0 }
+  }
+
+  folderDiscoveryWorkSummary(runId) {
+    const row = this.database.prepare(`
+      SELECT COUNT(*) AS files
+      FROM (
+        SELECT 1
+        FROM folder_discovery_files
+        WHERE run_id = ?
+          AND match_candidate = 1
+        GROUP BY CASE
+          WHEN ino = 0 THEN 'path:' || path
+          ELSE 'inode:' || dev || ':' || ino
+        END
+      )
+    `).get(runId)
+    return { files: Number(row.files) || 0 }
+  }
+
+  stageFolderDiscoveryFiles(runId, entries = []) {
+    if (!Array.isArray(entries) || !entries.length) {
+      return { changes: 0 }
+    }
+    const insert = this.database.prepare(`
+      INSERT OR IGNORE INTO folder_discovery_files (
+        run_id, path, parent, size, mtime, ctime, dev, ino, nlink, mode, uid,
+        gid, match_candidate
+      )
+      SELECT
+        @run_id, @path, @parent, @size, @mtime, @ctime, @dev, @ino,
+        @nlink, @mode, @uid, @gid, 0
+      WHERE @size > 0
+        AND @size >= (
+          SELECT threshold FROM folder_discovery_runs WHERE id = @run_id
+        )
+        AND EXISTS (
+          SELECT 1 FROM folder_discovery_devices device
+          WHERE device.run_id = @run_id AND device.dev = @dev
+        )
+    `)
+    const promoteCandidates = this.database.prepare(`
+      UPDATE folder_discovery_files AS candidate
+      SET match_candidate = 1
+      WHERE candidate.run_id = @run_id
+        AND candidate.size = @size
+        AND candidate.dev = @dev
+        AND candidate.match_candidate = 0
+        AND (
+          EXISTS (
+            SELECT 1 FROM folder_discovery_references reference
+            WHERE reference.run_id = candidate.run_id
+              AND reference.size = candidate.size
+              AND reference.dev = candidate.dev
+              AND (
+                candidate.ino = 0 OR reference.ino = 0 OR
+                reference.ino != candidate.ino
+              )
+          )
+          OR EXISTS (
+            SELECT 1 FROM folder_discovery_anchors anchor
+            WHERE anchor.run_id = candidate.run_id
+              AND anchor.size = candidate.size
+              AND anchor.dev = candidate.dev
+              AND (
+                candidate.ino = 0 OR anchor.ino = 0 OR
+                anchor.ino != candidate.ino
+              )
+          )
+          OR EXISTS (
+            SELECT 1 FROM folder_discovery_files peer
+            WHERE peer.run_id = candidate.run_id
+              AND peer.size = candidate.size
+              AND peer.dev = candidate.dev
+              AND peer.path != candidate.path
+              AND (
+                candidate.ino = 0 OR peer.ino = 0 OR
+                peer.ino != candidate.ino
+              )
+          )
+        )
+    `)
+    let changes = 0
+    const touchedGroups = new Map()
+    this.transaction(() => {
+      for (const entry of entries) {
+        if (!entry || typeof entry.path !== "string" ||
+            !Number.isFinite(entry.size) || entry.size <= 0 ||
+            !Number.isFinite(entry.dev) ||
+            !Number.isFinite(entry.ino)) continue
+        const resolvedPath = path.resolve(entry.path)
+        const result = insert.run({
+          run_id: runId,
+          path: resolvedPath,
+          parent: path.dirname(resolvedPath),
+          size: entry.size,
+          mtime: entry.mtime,
+          ctime: entry.ctime,
+          dev: entry.dev,
+          ino: entry.ino,
+          nlink: Math.max(1, Number(entry.nlink) || 1),
+          mode: Number(entry.mode) || 0,
+          uid: Number(entry.uid) || 0,
+          gid: Number(entry.gid) || 0
+        })
+        changes += result.changes
+        if (result.changes) {
+          touchedGroups.set(`${entry.size}:${entry.dev}`, {
+            run_id: runId,
+            size: entry.size,
+            dev: entry.dev
+          })
+        }
+      }
+      for (const group of touchedGroups.values()) {
+        promoteCandidates.run(group)
+      }
+    })
+    return { changes }
+  }
+
+  folderDiscoveryHashBatch(runId, limit = 128) {
+    return this.database.prepare(`
+      SELECT candidate.*
+      FROM folder_discovery_files candidate
+      WHERE candidate.run_id = ?
+        AND candidate.match_candidate = 1
+        AND candidate.hash_attempted = 0
+        AND (
+          candidate.ino = 0 OR
+          NOT EXISTS (
+            SELECT 1 FROM folder_discovery_files peer
+            WHERE peer.run_id = candidate.run_id
+              AND peer.dev = candidate.dev
+              AND peer.ino = candidate.ino
+              AND peer.hash_attempted = 0
+              AND peer.path < candidate.path
+          )
+        )
+      ORDER BY candidate.size, candidate.dev, candidate.ino, candidate.path
+      LIMIT ?
+    `).all(runId, Math.max(1, Math.min(1024, Number(limit) || 128)))
+  }
+
+  setFolderDiscoveryHash(runId, candidate, hash) {
+    if (candidate.ino !== 0) {
+      return this.database.prepare(`
+        UPDATE folder_discovery_files
+        SET hash = ?, hash_attempted = 1
+        WHERE run_id = ? AND dev = ? AND ino = ?
+      `).run(hash, runId, candidate.dev, candidate.ino).changes
+    }
+    return this.database.prepare(`
+      UPDATE folder_discovery_files
+      SET hash = ?, hash_attempted = 1
+      WHERE run_id = ? AND path = ?
+    `).run(hash, runId, path.resolve(candidate.path)).changes
+  }
+
+  markFolderDiscoveryHashFailed(runId, candidate) {
+    if (candidate.ino !== 0) {
+      return this.database.prepare(`
+        UPDATE folder_discovery_files
+        SET hash_attempted = 1
+        WHERE run_id = ? AND dev = ? AND ino = ?
+      `).run(runId, candidate.dev, candidate.ino).changes
+    }
+    return this.database.prepare(`
+      UPDATE folder_discovery_files
+      SET hash_attempted = 1
+      WHERE run_id = ? AND path = ?
+    `).run(runId, path.resolve(candidate.path)).changes
+  }
+
+  folderDiscoveryReferences(runId, candidate, hash, limit = 32) {
+    return this.database.prepare(`
+      SELECT * FROM folder_discovery_references
+      WHERE run_id = ?
+        AND hash = ?
+        AND size = ?
+        AND dev = ?
+        AND ino != ?
+        AND (mode & 4095) = (? & 4095)
+        AND uid = ?
+        AND gid = ?
+      ORDER BY path
+      LIMIT ?
+    `).all(
+      runId,
+      hash,
+      candidate.size,
+      candidate.dev,
+      candidate.ino,
+      candidate.mode,
+      candidate.uid,
+      candidate.gid,
+      Math.max(1, Math.min(256, Number(limit) || 32))
+    )
+  }
+
+  folderDiscoveryReferenceHashBatch(runId, candidate, limit = 32) {
+    return this.database.prepare(`
+      SELECT * FROM folder_discovery_references
+      WHERE run_id = ?
+        AND size = ?
+        AND dev = ?
+        AND ino != ?
+        AND (mode & 4095) = (? & 4095)
+        AND uid = ?
+        AND gid = ?
+        AND hash IS NULL
+        AND hash_attempted = 0
+      ORDER BY path
+      LIMIT ?
+    `).all(
+      runId,
+      candidate.size,
+      candidate.dev,
+      candidate.ino,
+      candidate.mode,
+      candidate.uid,
+      candidate.gid,
+      Math.max(1, Math.min(256, Number(limit) || 32))
+    )
+  }
+
+  setFolderDiscoveryReferenceHash(runId, filePath, hash) {
+    return this.database.prepare(`
+      UPDATE folder_discovery_references
+      SET hash = ?, hash_attempted = 1
+      WHERE run_id = ? AND path = ?
+    `).run(hash, runId, path.resolve(filePath)).changes
+  }
+
+  markFolderDiscoveryReferenceHashFailed(runId, filePath) {
+    return this.database.prepare(`
+      UPDATE folder_discovery_references
+      SET hash = NULL, hash_attempted = 1
+      WHERE run_id = ? AND path = ?
+    `).run(runId, path.resolve(filePath)).changes
+  }
+
+  folderDiscoveryAnchors(runId, candidate, hash, limit = 32) {
+    return this.database.prepare(`
+      SELECT * FROM folder_discovery_anchors
+      WHERE run_id = ?
+        AND hash = ?
+        AND size = ?
+        AND dev = ?
+        AND (? = 0 OR ino = 0 OR ino != ?)
+        AND (mode & 4095) = (? & 4095)
+        AND uid = ?
+        AND gid = ?
+        AND checked = 0
+      ORDER BY store_id, path
+      LIMIT ?
+    `).all(
+      runId,
+      hash,
+      candidate.size,
+      candidate.dev,
+      Number(candidate.ino) || 0,
+      Number(candidate.ino) || 0,
+      candidate.mode,
+      candidate.uid,
+      candidate.gid,
+      Math.max(1, Math.min(256, Number(limit) || 32))
+    )
+  }
+
+  markFolderDiscoveryAnchorChecked(
+    runId,
+    storeId,
+    hash,
+    valid
+  ) {
+    return this.database.prepare(`
+      UPDATE folder_discovery_anchors
+      SET checked = 1, valid = ?
+      WHERE run_id = ? AND store_id = ? AND hash = ?
+    `).run(valid ? 1 : 0, runId, storeId, hash).changes
+  }
+
+  folderDiscoveryParticipantsCte() {
+    return `
+      WITH participants AS (
+        SELECT
+          candidate.*,
+          CASE
+            WHEN candidate.ino = 0 THEN 'path:' || candidate.path
+            ELSE 'inode:' || candidate.dev || ':' || candidate.ino
+          END AS identity
+        FROM folder_discovery_files candidate
+        WHERE candidate.run_id = ?
+          AND candidate.hash IS NOT NULL
+          AND (
+            EXISTS (
+              SELECT 1 FROM folder_discovery_references reference
+              WHERE reference.run_id = candidate.run_id
+                AND reference.hash = candidate.hash
+                AND reference.size = candidate.size
+                AND reference.dev = candidate.dev
+                AND (reference.mode & 4095) = (candidate.mode & 4095)
+                AND reference.uid = candidate.uid
+                AND reference.gid = candidate.gid
+                AND (
+                  candidate.ino = 0 OR reference.ino = 0 OR
+                  reference.ino != candidate.ino
+                )
+            )
+            OR EXISTS (
+              SELECT 1 FROM folder_discovery_anchors anchor
+              WHERE anchor.run_id = candidate.run_id
+                AND anchor.valid = 1
+                AND anchor.hash = candidate.hash
+                AND anchor.size = candidate.size
+                AND anchor.dev = candidate.dev
+                AND (anchor.mode & 4095) = (candidate.mode & 4095)
+                AND anchor.uid = candidate.uid
+                AND anchor.gid = candidate.gid
+                AND (
+                  candidate.ino = 0 OR anchor.ino = 0 OR
+                  anchor.ino != candidate.ino
+                )
+            )
+            OR EXISTS (
+              SELECT 1 FROM folder_discovery_files peer
+              WHERE peer.run_id = candidate.run_id
+                AND peer.hash = candidate.hash
+                AND peer.size = candidate.size
+                AND peer.dev = candidate.dev
+                AND (peer.mode & 4095) = (candidate.mode & 4095)
+                AND peer.uid = candidate.uid
+                AND peer.gid = candidate.gid
+                AND peer.path != candidate.path
+                AND (
+                  candidate.ino = 0 OR peer.ino = 0 OR
+                  peer.ino != candidate.ino
+                )
+            )
+          )
+      )
+    `
+  }
+
+  folderDiscoveryVerifiedSummary(runId) {
+    const row = this.database.prepare(`
+      ${this.folderDiscoveryParticipantsCte()}
+      SELECT COUNT(*) AS files, COALESCE(SUM(size), 0) AS bytes
+      FROM (
+        SELECT size,
+          ROW_NUMBER() OVER (PARTITION BY identity ORDER BY path) AS rank
+        FROM participants
+      )
+      WHERE rank = 1
+    `).get(runId)
+    return {
+      files: Number(row.files) || 0,
+      bytes: Number(row.bytes) || 0
+    }
+  }
+
+  finalizeFolderDiscoveryMatches(runId) {
+    this.transaction(() => {
+      this.database.prepare(
+        "DELETE FROM folder_discovery_matches WHERE run_id = ?"
+      ).run(runId)
+      this.database.prepare(`
+        ${this.folderDiscoveryParticipantsCte()}, ranked AS (
+          SELECT participants.*,
+            ROW_NUMBER() OVER (PARTITION BY identity ORDER BY path) AS rank
+          FROM participants
+        )
+        INSERT INTO folder_discovery_matches (
+          run_id, identity, path, parent, size, hash, dev, mode, uid, gid
+        )
+        SELECT
+          run_id, identity, path, parent, size, hash, dev, mode, uid, gid
+        FROM ranked
+        WHERE rank = 1
+      `).run(runId)
+    })
+    const row = this.database.prepare(`
+      SELECT COUNT(*) AS files, COALESCE(SUM(size), 0) AS bytes
+      FROM folder_discovery_matches WHERE run_id = ?
+    `).get(runId)
+    return {
+      files: Number(row.files) || 0,
+      bytes: Number(row.bytes) || 0
+    }
+  }
+
+  rebuildFolderDiscoverySelectionState(runId) {
+    this.database.prepare(`
+      UPDATE folder_discovery_nodes AS node
+      SET selected = CASE WHEN EXISTS (
+        SELECT 1 FROM folder_discovery_selected_paths selection
+        WHERE selection.run_id = node.run_id
+          AND selection.folder = node.folder
+      ) THEN 1 ELSE 0 END,
+      selected_inside = 0
+      WHERE node.run_id = ?
+    `).run(runId)
+    this.database.prepare(`
+      WITH RECURSIVE ancestors(folder) AS (
+        SELECT node.parent
+        FROM folder_discovery_selected_paths selection
+        JOIN folder_discovery_nodes node
+          ON node.run_id = selection.run_id
+          AND node.folder = selection.folder
+        WHERE selection.run_id = ? AND node.parent IS NOT NULL
+        UNION ALL
+        SELECT node.parent
+        FROM ancestors
+        JOIN folder_discovery_nodes node
+          ON node.run_id = ? AND node.folder = ancestors.folder
+        WHERE node.parent IS NOT NULL
+      ), counts AS (
+        SELECT folder, COUNT(*) AS count
+        FROM ancestors
+        GROUP BY folder
+      )
+      UPDATE folder_discovery_nodes AS node
+      SET selected_inside = COALESCE((
+        SELECT counts.count FROM counts WHERE counts.folder = node.folder
+      ), 0)
+      WHERE node.run_id = ?
+    `).run(runId, runId, runId)
+  }
+
+  finalizeFolderDiscoveryRecommendationState(runId) {
+    this.database.prepare(`
+      UPDATE folder_discovery_nodes AS node
+      SET recommended = CASE WHEN EXISTS (
+        SELECT 1 FROM folder_discovery_recommendations recommendation
+        WHERE recommendation.run_id = node.run_id
+          AND recommendation.folder = node.folder
+      ) THEN 1 ELSE 0 END,
+      broader = 0
+      WHERE node.run_id = ?
+    `).run(runId)
+    this.database.prepare(`
+      WITH RECURSIVE ancestors(folder) AS (
+        SELECT node.parent
+        FROM folder_discovery_recommendations recommendation
+        JOIN folder_discovery_nodes node
+          ON node.run_id = recommendation.run_id
+          AND node.folder = recommendation.folder
+        WHERE recommendation.run_id = ? AND node.parent IS NOT NULL
+        UNION
+        SELECT node.parent
+        FROM ancestors
+        JOIN folder_discovery_nodes node
+          ON node.run_id = ? AND node.folder = ancestors.folder
+        WHERE node.parent IS NOT NULL
+      )
+      UPDATE folder_discovery_nodes
+      SET broader = 1
+      WHERE run_id = ?
+        AND recommended = 0
+        AND folder IN (SELECT folder FROM ancestors)
+    `).run(runId, runId, runId)
+  }
+
+  prepareFolderDiscoveryResults(runId, selectedRoot) {
+    const root = path.resolve(selectedRoot)
+    const comparable = (value) => process.platform === "win32"
+      ? path.resolve(value).toLowerCase()
+      : path.resolve(value)
+    const contains = (ancestor, candidate) => {
+      const relative = path.relative(comparable(ancestor), comparable(candidate))
+      return relative === "" || (
+        relative !== ".." &&
+        !relative.startsWith(`..${path.sep}`) &&
+        !path.isAbsolute(relative)
+      )
+    }
+    const insertNode = this.database.prepare(`
+      INSERT OR IGNORE INTO folder_discovery_nodes (
+        run_id, folder, parent, file_count, bytes,
+        eligible_file_count, eligible_bytes
+      ) VALUES (?, ?, ?, 0, 0, 0, 0)
+    `)
+    const nodeExists = this.database.prepare(`
+      SELECT 1 FROM folder_discovery_nodes
+      WHERE run_id = ? AND folder = ?
+    `)
+    const addDirect = this.database.prepare(`
+      UPDATE folder_discovery_nodes
+      SET direct_file_count = direct_file_count + ?,
+        direct_bytes = direct_bytes + ?
+      WHERE run_id = ? AND folder = ?
+    `)
+    const addScope = this.database.prepare(`
+      UPDATE folder_discovery_nodes
+      SET scope_file_count = scope_file_count + ?,
+        scope_bytes = scope_bytes + ?
+      WHERE run_id = ? AND folder = ?
+    `)
+    const insertRecommendation = this.database.prepare(`
+      INSERT INTO folder_discovery_recommendations (
+        run_id, folder, file_count, bytes
+      ) VALUES (?, ?, ?, ?)
+    `)
+    let recommendationCount = 0
+    this.transaction(() => {
+      this.database.prepare(
+        "DELETE FROM folder_discovery_nodes WHERE run_id = ?"
+      ).run(runId)
+      this.database.prepare(
+        "DELETE FROM folder_discovery_recommendations WHERE run_id = ?"
+      ).run(runId)
+      this.database.prepare(
+        "DELETE FROM folder_discovery_selected_paths WHERE run_id = ?"
+      ).run(runId)
+      insertNode.run(runId, root, null)
+
+      const ensureAncestors = (folder) => {
+        let current = path.resolve(folder)
+        if (!contains(root, current)) return false
+        while (true) {
+          const parent = comparable(current) === comparable(root)
+            ? null
+            : path.dirname(current)
+          insertNode.run(runId, current, parent)
+          if (!parent) break
+          current = parent
+        }
+        return true
+      }
+
+      for (const row of this.database.prepare(`
+        SELECT parent AS folder, COUNT(*) AS file_count,
+          COALESCE(SUM(size), 0) AS bytes
+        FROM folder_discovery_matches
+        WHERE run_id = ?
+        GROUP BY parent
+        ORDER BY parent
+      `).all(runId)) {
+        if (!ensureAncestors(row.folder)) continue
+        addDirect.run(
+          Math.max(0, Number(row.file_count) || 0),
+          Math.max(0, Number(row.bytes) || 0),
+          runId,
+          path.resolve(row.folder)
+        )
+      }
+
+      for (const row of this.database.prepare(`
+        SELECT parent AS folder, COUNT(*) AS file_count,
+          COALESCE(SUM(size), 0) AS bytes
+        FROM folder_discovery_files
+        WHERE run_id = ?
+        GROUP BY parent
+        ORDER BY parent
+      `).all(runId)) {
+        let folder = path.resolve(row.folder)
+        if (!contains(root, folder)) continue
+        while (!nodeExists.get(runId, folder) &&
+            comparable(folder) !== comparable(root)) {
+          const parent = path.dirname(folder)
+          if (comparable(parent) === comparable(folder)) break
+          folder = parent
+        }
+        if (!nodeExists.get(runId, folder)) continue
+        addScope.run(
+          Math.max(0, Number(row.file_count) || 0),
+          Math.max(0, Number(row.bytes) || 0),
+          runId,
+          folder
+        )
+      }
+
+      this.database.prepare(`
+        WITH RECURSIVE contributions AS (
+          SELECT run_id, folder AS ancestor,
+            direct_file_count AS file_count,
+            direct_bytes AS bytes,
+            scope_file_count AS eligible_file_count,
+            scope_bytes AS eligible_bytes
+          FROM folder_discovery_nodes
+          WHERE run_id = ?
+          UNION ALL
+          SELECT contribution.run_id, node.parent,
+            contribution.file_count, contribution.bytes,
+            contribution.eligible_file_count, contribution.eligible_bytes
+          FROM contributions contribution
+          JOIN folder_discovery_nodes node
+            ON node.run_id = contribution.run_id
+            AND node.folder = contribution.ancestor
+          WHERE node.parent IS NOT NULL
+        ), totals AS (
+          SELECT run_id, ancestor AS folder,
+            SUM(file_count) AS file_count,
+            SUM(bytes) AS bytes,
+            SUM(eligible_file_count) AS eligible_file_count,
+            SUM(eligible_bytes) AS eligible_bytes
+          FROM contributions
+          GROUP BY run_id, ancestor
+        )
+        UPDATE folder_discovery_nodes AS node
+        SET file_count = totals.file_count,
+          bytes = totals.bytes,
+          eligible_file_count = totals.eligible_file_count,
+          eligible_bytes = totals.eligible_bytes
+        FROM totals
+        WHERE node.run_id = totals.run_id
+          AND node.folder = totals.folder
+      `).run(runId)
+      this.database.prepare(`
+        UPDATE folder_discovery_nodes AS node
+        SET child_count = (
+          SELECT COUNT(*) FROM folder_discovery_nodes child
+          WHERE child.run_id = node.run_id
+            AND child.parent = node.folder
+            AND child.file_count > 0
+        )
+        WHERE node.run_id = ?
+      `).run(runId)
+
+      const nodeFor = this.database.prepare(`
+        SELECT * FROM folder_discovery_nodes
+        WHERE run_id = ? AND folder = ?
+      `)
+      const childrenFor = this.database.prepare(`
+        SELECT * FROM folder_discovery_nodes
+        WHERE run_id = ? AND parent = ? AND file_count > 0
+        ORDER BY bytes DESC, file_count DESC, folder
+      `)
+      const pending = [root]
+      while (pending.length) {
+        const folder = pending.pop()
+        const node = nodeFor.get(runId, folder)
+        if (!node || !(Number(node.file_count) > 0)) continue
+        const children = childrenFor.all(runId, folder)
+        let recommend = Number(node.direct_file_count) > 0 ||
+          !children.length
+        if (!recommend && children.length > 1) {
+          const unrelatedBytes = Math.max(
+            0, Number(node.eligible_bytes) - Number(node.bytes))
+          const unrelatedFiles = Math.max(
+            0, Number(node.eligible_file_count) - Number(node.file_count))
+          recommend = unrelatedBytes <= Number(node.bytes) &&
+            unrelatedFiles <= Number(node.file_count)
+        }
+        if (recommend) {
+          insertRecommendation.run(
+            runId, node.folder, node.file_count, node.bytes)
+          recommendationCount += 1
+          continue
+        }
+        for (let index = children.length - 1; index >= 0; index--) {
+          pending.push(children[index].folder)
+        }
+      }
+
+      this.rebuildFolderDiscoverySelectionState(runId)
+      this.finalizeFolderDiscoveryRecommendationState(runId)
+
+      const rootNode = nodeFor.get(runId, root)
+      this.database.prepare(`
+        UPDATE folder_discovery_runs
+        SET root = ?, file_count = ?, bytes = ?,
+          eligible_file_count = ?, eligible_bytes = ?
+        WHERE id = ?
+      `).run(
+        root,
+        Number(rootNode && rootNode.file_count) || 0,
+        Number(rootNode && rootNode.bytes) || 0,
+        Number(rootNode && rootNode.eligible_file_count) || 0,
+        Number(rootNode && rootNode.eligible_bytes) || 0,
+        runId
+      )
+    })
+    return { recommendations: recommendationCount }
+  }
+
+  folderDiscoveryResults(
+    runId,
+    page = 0,
+    limit = 500
+  ) {
+    const pageSize = Math.max(1, Math.min(500, Number(limit) || 500))
+    const pageNumber = Math.max(0, Math.floor(Number(page) || 0))
+    const rootRow = this.database.prepare(`
+      SELECT run.root, run.file_count, run.bytes,
+        run.eligible_file_count, run.eligible_bytes,
+        node.selected, node.selected_inside, node.recommended, node.broader
+      FROM folder_discovery_runs run
+      LEFT JOIN folder_discovery_nodes node
+        ON node.run_id = run.id AND node.folder = run.root
+      WHERE run.id = ?
+    `).get(runId)
+    const totalRow = this.database.prepare(`
+      SELECT COUNT(*) AS count FROM folder_discovery_nodes
+      WHERE run_id = ? AND parent = ? AND file_count > 0
+    `).get(runId, rootRow ? rootRow.root : "")
+    const total = Number(totalRow.count) || 0
+    const items = this.database.prepare(`
+      SELECT folder, parent, file_count, bytes, eligible_file_count,
+        eligible_bytes, child_count, selected, selected_inside,
+        recommended, broader
+      FROM folder_discovery_nodes
+      WHERE run_id = ? AND parent = ? AND file_count > 0
+      ORDER BY bytes DESC, file_count DESC, folder
+      LIMIT ? OFFSET ?
+    `).all(
+      runId,
+      rootRow ? rootRow.root : "",
+      pageSize,
+      pageNumber * pageSize
+    ).map((row) => ({
+      folder: row.folder,
+      parent: row.parent,
+      name: path.basename(row.folder) || row.folder,
+      file_count: Number(row.file_count) || 0,
+      bytes: Number(row.bytes) || 0,
+      eligible_file_count: Number(row.eligible_file_count) || 0,
+      eligible_bytes: Number(row.eligible_bytes) || 0,
+      child_count: Number(row.child_count) || 0,
+      selected: !!row.selected,
+      selected_inside: Number(row.selected_inside) || 0,
+      recommended: !!row.recommended,
+      broader: !!row.broader
+    }))
+    return {
+      root: rootRow
+        ? {
+            folder: rootRow.root,
+            name: path.basename(rootRow.root) || rootRow.root,
+            file_count: Number(rootRow.file_count) || 0,
+            bytes: Number(rootRow.bytes) || 0,
+            eligible_file_count:
+              Number(rootRow.eligible_file_count) || 0,
+            eligible_bytes: Number(rootRow.eligible_bytes) || 0,
+            child_count: total,
+            selected: !!rootRow.selected,
+            selected_inside: Number(rootRow.selected_inside) || 0,
+            recommended: !!rootRow.recommended,
+            broader: !!rootRow.broader
+          }
+        : null,
+      items,
+      total,
+      page: pageNumber,
+      page_size: pageSize,
+      pages: Math.max(1, Math.ceil(total / pageSize)),
+      selection: this.folderDiscoverySelectionSummary(runId)
+    }
+  }
+
+  folderDiscoveryChildren(runId, folder, page = 0, limit = 500) {
+    const pageSize = Math.max(1, Math.min(500, Number(limit) || 500))
+    const pageNumber = Math.max(0, Math.floor(Number(page) || 0))
+    const run = this.database.prepare(
+      "SELECT root FROM folder_discovery_runs WHERE id = ?"
+    ).get(runId)
+    if (!run || typeof folder !== "string" || !path.isAbsolute(folder)) {
+      throw new Error("These folder suggestions are no longer current.")
+    }
+    const parent = path.resolve(folder)
+    const known = this.database.prepare(`
+      SELECT 1 FROM folder_discovery_nodes
+      WHERE run_id = ? AND folder = ?
+    `).get(runId, parent)
+    if (!known) throw new Error("That suggested folder is no longer current.")
+    const total = Number(this.database.prepare(`
+      SELECT COUNT(*) AS count FROM folder_discovery_nodes
+      WHERE run_id = ? AND parent = ? AND file_count > 0
+    `).get(runId, parent).count) || 0
+    const items = this.database.prepare(`
+      SELECT folder, parent, file_count, bytes, eligible_file_count,
+        eligible_bytes, child_count, selected, selected_inside,
+        recommended, broader
+      FROM folder_discovery_nodes
+      WHERE run_id = ? AND parent = ? AND file_count > 0
+      ORDER BY bytes DESC, file_count DESC, folder
+      LIMIT ? OFFSET ?
+    `).all(runId, parent, pageSize, pageNumber * pageSize).map((row) => ({
+      folder: row.folder,
+      parent: row.parent,
+      name: path.basename(row.folder) || row.folder,
+      file_count: Number(row.file_count) || 0,
+      bytes: Number(row.bytes) || 0,
+      eligible_file_count: Number(row.eligible_file_count) || 0,
+      eligible_bytes: Number(row.eligible_bytes) || 0,
+      child_count: Number(row.child_count) || 0,
+      selected: !!row.selected,
+      selected_inside: Number(row.selected_inside) || 0,
+      recommended: !!row.recommended,
+      broader: !!row.broader
+    }))
+    return {
+      folder: parent,
+      items,
+      total,
+      page: pageNumber,
+      page_size: pageSize,
+      pages: Math.max(1, Math.ceil(total / pageSize))
+    }
+  }
+
+  folderDiscoveryRecommendations(runId, page = 0, limit = 500) {
+    const pageSize = Math.max(1, Math.min(500, Number(limit) || 500))
+    const pageNumber = Math.max(0, Math.floor(Number(page) || 0))
+    const totalRow = this.database.prepare(`
+      SELECT COUNT(*) AS count FROM folder_discovery_recommendations
+      WHERE run_id = ?
+    `).get(runId)
+    const total = Number(totalRow.count) || 0
+    const items = this.database.prepare(`
+      SELECT folder, file_count, bytes
+      FROM folder_discovery_recommendations
+      WHERE run_id = ?
+      ORDER BY bytes DESC, file_count DESC, folder
+      LIMIT ? OFFSET ?
+    `).all(runId, pageSize, pageNumber * pageSize).map((row) => ({
+      folder: row.folder,
+      name: path.basename(row.folder) || row.folder,
+      file_count: Number(row.file_count) || 0,
+      bytes: Number(row.bytes) || 0
+    }))
+    return {
+      items,
+      total,
+      page: pageNumber,
+      page_size: pageSize,
+      pages: Math.max(1, Math.ceil(total / pageSize))
+    }
+  }
+
+  updateFolderDiscoverySelection(runId, folder, selected) {
+    if (typeof folder !== "string" || !path.isAbsolute(folder.trim())) {
+      throw new Error("Choose a valid suggested location.")
+    }
+    const target = path.resolve(folder.trim())
+    const node = this.database.prepare(`
+      SELECT folder FROM folder_discovery_nodes
+      WHERE run_id = ? AND folder = ? AND file_count > 0
+    `).get(runId, target)
+    if (!node) throw new Error("That suggested folder is no longer current.")
+    const prefix = target.endsWith(path.sep)
+      ? target
+      : `${target}${path.sep}`
+    this.transaction(() => {
+      if (selected) {
+        this.database.prepare(`
+          DELETE FROM folder_discovery_selected_paths
+          WHERE run_id = ? AND (
+            folder = ? OR
+            substr(folder, 1, length(?)) = ? OR
+            substr(?, 1, length(prefix)) = prefix
+          )
+        `).run(runId, target, prefix, prefix, target)
+        this.database.prepare(`
+          INSERT INTO folder_discovery_selected_paths(run_id, folder, prefix)
+          VALUES (?, ?, ?)
+        `).run(runId, target, prefix)
+      } else {
+        this.database.prepare(`
+          DELETE FROM folder_discovery_selected_paths
+          WHERE run_id = ? AND folder = ?
+        `).run(runId, target)
+      }
+      this.rebuildFolderDiscoverySelectionState(runId)
+    })
+    const nodes = this.database.prepare(`
+      WITH RECURSIVE lineage AS (
+        SELECT folder, parent, selected, selected_inside
+        FROM folder_discovery_nodes
+        WHERE run_id = ? AND folder = ?
+        UNION ALL
+        SELECT parent.folder, parent.parent,
+          parent.selected, parent.selected_inside
+        FROM lineage child
+        JOIN folder_discovery_nodes parent
+          ON parent.run_id = ? AND parent.folder = child.parent
+      )
+      SELECT folder, selected, selected_inside FROM lineage
+    `).all(runId, target, runId).map((row) => ({
+      folder: row.folder,
+      selected: !!row.selected,
+      selected_inside: Number(row.selected_inside) || 0
+    }))
+    return Object.assign(
+      { nodes },
+      this.folderDiscoverySelectionSummary(runId)
+    )
+  }
+
+  folderDiscoverySelectionSummary(runId) {
+    const row = this.database.prepare(`
+      WITH selected AS (
+        SELECT match.*
+        FROM folder_discovery_matches match
+        WHERE match.run_id = ?
+          AND EXISTS (
+            SELECT 1 FROM folder_discovery_selected_paths selection
+            WHERE selection.run_id = match.run_id
+              AND (
+                match.path = selection.folder OR
+                substr(match.path, 1, length(selection.prefix)) =
+                  selection.prefix
+              )
+          )
+      ), selected_groups AS (
+        SELECT hash, dev, (mode & 4095) AS mode_bits, uid, gid,
+          MAX(size) AS size, COUNT(*) AS inode_count
+        FROM selected
+        GROUP BY hash, dev, (mode & 4095), uid, gid
+      ), contexts AS (
+        SELECT hash, dev, (mode & 4095) AS mode_bits, uid, gid,
+          CASE
+            WHEN ino = 0 THEN 'path:' || path
+            ELSE 'inode:' || dev || ':' || ino
+          END AS identity
+        FROM folder_discovery_references
+        WHERE run_id = ? AND hash IS NOT NULL
+        UNION
+        SELECT hash, dev, (mode & 4095) AS mode_bits, uid, gid,
+          CASE
+            WHEN ino = 0 THEN 'path:' || path
+            ELSE 'inode:' || dev || ':' || ino
+          END AS identity
+        FROM folder_discovery_anchors
+        WHERE run_id = ? AND valid = 1
+      ), external_context_groups AS (
+        SELECT DISTINCT context.hash, context.dev, context.mode_bits,
+          context.uid, context.gid
+        FROM contexts context
+        WHERE NOT EXISTS (
+          SELECT 1 FROM selected
+          WHERE selected.hash = context.hash
+            AND selected.dev = context.dev
+            AND (selected.mode & 4095) = context.mode_bits
+            AND selected.uid = context.uid
+            AND selected.gid = context.gid
+            AND selected.identity = context.identity
+        )
+      )
+      SELECT
+        (SELECT COUNT(*) FROM folder_discovery_selected_paths
+          WHERE run_id = ?) AS location_count,
+        COALESCE(SUM(selected_groups.inode_count), 0) AS file_count,
+        COALESCE(SUM(
+          CASE
+            WHEN external_context_groups.hash IS NOT NULL
+            THEN selected_groups.inode_count
+            ELSE MAX(0, selected_groups.inode_count - 1)
+          END * selected_groups.size
+        ), 0) AS bytes
+      FROM selected_groups
+      LEFT JOIN external_context_groups
+        USING (hash, dev, mode_bits, uid, gid)
+    `).get(runId, runId, runId, runId)
+    return {
+      selected_count: Number(row.location_count) || 0,
+      selected_files: Number(row.file_count) || 0,
+      potential_savings: Number(row.bytes) || 0
+    }
+  }
+
+  folderDiscoverySelectedHashes(runId) {
+    return this.database.prepare(`
+      SELECT DISTINCT candidate.hash
+      FROM folder_discovery_files candidate
+      WHERE candidate.run_id = ?
+        AND candidate.hash IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM folder_discovery_selected_paths selection
+          WHERE selection.run_id = candidate.run_id
+            AND (
+              candidate.path = selection.folder OR
+              substr(candidate.path, 1, length(selection.prefix)) =
+                selection.prefix
+            )
+        )
+      ORDER BY candidate.hash
+    `).all(runId).map((row) => row.hash)
+  }
+
+  publishFolderDiscoverySelection(
+    runId,
+    sources = [],
+    stores = [],
+    classifications = []
+  ) {
+    const selectedSources = (Array.isArray(sources) ? sources : [])
+      .filter((source) => source && typeof source.id === "string" &&
+        typeof source.root === "string")
+      .map((source) => ({
+        id: source.id,
+        root: path.resolve(source.root),
+        prefix: path.resolve(source.root).endsWith(path.sep)
+          ? path.resolve(source.root)
+          : `${path.resolve(source.root)}${path.sep}`,
+        app: typeof source.app === "string" ? source.app : null
+      }))
+    if (!selectedSources.length) {
+      throw new Error("Choose at least one location to add.")
+    }
+    const classificationByHash = new Map(
+      (Array.isArray(classifications) ? classifications : [])
+        .filter((item) => item && typeof item.hash === "string")
+        .map((item) => [item.hash,
+          Array.isArray(item.anchors) ? item.anchors : []])
+    )
+    let hashes = []
+    let files = 0
+    this.transaction(() => {
+      const selected = this.folderDiscoverySelectionPaths(runId)
+      const selectedKeys = new Set(selected.map((folder) => path.resolve(folder)))
+      if (selectedSources.some((source) => !selectedKeys.has(source.root))) {
+        throw new Error("The selected locations changed before they were added.")
+      }
+      this.dropFileTriggers()
+      try {
+        const now = Date.now()
+        this.database.prepare(`
+          INSERT INTO content(hash, size, first_seen, verified_at)
+          SELECT hash, MAX(size), ?, ?
+          FROM folder_discovery_references
+          WHERE run_id = ? AND hash IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM folder_discovery_files candidate
+              WHERE candidate.run_id = folder_discovery_references.run_id
+                AND candidate.hash = folder_discovery_references.hash
+                AND EXISTS (
+                  SELECT 1 FROM folder_discovery_selected_paths selection
+                  WHERE selection.run_id = candidate.run_id
+                    AND (
+                      candidate.path = selection.folder OR
+                      substr(candidate.path, 1, length(selection.prefix)) =
+                        selection.prefix
+                    )
+                )
+            )
+          GROUP BY hash
+          ON CONFLICT(hash) DO UPDATE SET
+            size = excluded.size,
+            verified_at = excluded.verified_at
+        `).run(now, now, runId)
+        this.database.prepare(`
+          UPDATE files AS published
+          SET
+            hash = reference.hash,
+            updated_at = ?
+          FROM folder_discovery_references AS reference
+          WHERE reference.run_id = ?
+            AND reference.hash IS NOT NULL
+            AND EXISTS (
+              SELECT 1 FROM folder_discovery_files candidate
+              WHERE candidate.run_id = reference.run_id
+                AND candidate.hash = reference.hash
+                AND EXISTS (
+                  SELECT 1 FROM folder_discovery_selected_paths selection
+                  WHERE selection.run_id = candidate.run_id
+                    AND (
+                      candidate.path = selection.folder OR
+                      substr(candidate.path, 1, length(selection.prefix)) =
+                        selection.prefix
+                    )
+                )
+            )
+            AND published.path = reference.path
+            AND published.dev = reference.dev
+            AND published.ino = reference.ino
+            AND published.size = reference.size
+            AND published.mtime = reference.mtime
+            AND published.ctime = reference.ctime
+        `).run(now, runId)
+        const upsertContent = this.database.prepare(`
+          INSERT INTO content(hash, size, first_seen, verified_at)
+          SELECT hash, MAX(size), ?, ?
+          FROM folder_discovery_files
+          WHERE run_id = ?
+            AND hash IS NOT NULL
+            AND (
+              path = ? OR substr(path, 1, length(?)) = ?
+            )
+          GROUP BY hash
+          ON CONFLICT(hash) DO UPDATE SET
+            size = excluded.size,
+            verified_at = excluded.verified_at
+        `)
+        const upsertFiles = this.database.prepare(`
+          INSERT INTO files (
+            path, hash, size, mtime, ctime, dev, ino, mode, uid, gid,
+            source_id, app, status, unavailable_reason, updated_at
+          )
+          SELECT
+            candidate.path,
+            candidate.hash,
+            candidate.size,
+            candidate.mtime,
+            candidate.ctime,
+            candidate.dev,
+            candidate.ino,
+            candidate.mode,
+            candidate.uid,
+            candidate.gid,
+            ?, ?,
+            CASE WHEN EXISTS (
+              SELECT 1 FROM folder_discovery_files peer
+              WHERE peer.run_id = candidate.run_id
+                AND peer.dev = candidate.dev
+                AND peer.ino = candidate.ino
+                AND peer.ino != 0
+                AND peer.path != candidate.path
+                AND (
+                  peer.path = ? OR
+                  substr(peer.path, 1, length(?)) = ?
+                )
+            ) THEN 'linked' ELSE 'reference' END,
+            NULL, ?
+          FROM folder_discovery_files candidate
+          WHERE candidate.run_id = ?
+            AND (
+              candidate.path = ? OR
+              substr(candidate.path, 1, length(?)) = ?
+            )
+          ON CONFLICT(path) DO UPDATE SET
+            hash = excluded.hash,
+            size = excluded.size,
+            mtime = excluded.mtime,
+            ctime = excluded.ctime,
+            dev = excluded.dev,
+            ino = excluded.ino,
+            mode = excluded.mode,
+            uid = excluded.uid,
+            gid = excluded.gid,
+            source_id = excluded.source_id,
+            app = excluded.app,
+            status = excluded.status,
+            unavailable_reason = NULL,
+            updated_at = excluded.updated_at
+        `)
+        for (const source of selectedSources) {
+          upsertContent.run(
+            now, now, runId,
+            source.root, source.prefix, source.prefix
+          )
+          upsertFiles.run(
+            source.id, source.app,
+            source.root, source.prefix, source.prefix,
+            now, runId,
+            source.root, source.prefix, source.prefix
+          )
+        }
+        hashes = this.folderDiscoverySelectedHashes(runId)
+        for (const hash of hashes) {
+          this.reclassifyHash(
+            hash,
+            stores,
+            classificationByHash.get(hash) || []
+          )
+        }
+        this.rebuildFileSummaries()
+        this.rebuildGroupSummaries()
+        files = Number(this.database.prepare(`
+          SELECT COUNT(*) AS count FROM folder_discovery_files candidate
+          WHERE candidate.run_id = ?
+            AND EXISTS (
+              SELECT 1 FROM folder_discovery_selected_paths selection
+              WHERE selection.run_id = candidate.run_id
+                AND (
+                  candidate.path = selection.folder OR
+                  substr(candidate.path, 1, length(selection.prefix)) =
+                    selection.prefix
+                )
+            )
+        `).get(runId).count) || 0
+      } finally {
+        this.createFileTriggers()
+      }
+    })
+    return { files, hashes }
+  }
+
+  folderDiscoverySelectionPaths(runId) {
+    return this.database.prepare(`
+      SELECT folder FROM folder_discovery_selected_paths
+      WHERE run_id = ?
+      ORDER BY folder
+    `).all(runId).map((row) => row.folder)
   }
 
   scanFor(scopeId = null) {
@@ -2477,16 +3890,28 @@ class RegistryCore {
     })
   }
 
-  summaryRows(sourceIds, unrestricted = false) {
+  externalSourceFilter(alias, sourceIds = []) {
+    const ids = [...new Set(sourceIds.filter(Boolean))]
+    const column = alias ? `${alias}.source_id` : "source_id"
+    return {
+      where: `(${column} NOT LIKE 'external:%' OR ${column} IN (
+        SELECT value FROM json_each(?)
+      ))`,
+      values: [JSON.stringify(ids)]
+    }
+  }
+
+  summaryRows(sourceIds, unrestricted = false, externalSourceIds = []) {
     const ids = [...new Set(sourceIds.filter(Boolean))]
     if (!unrestricted && !ids.length) return []
+    const external = this.externalSourceFilter(null, externalSourceIds)
     return this.database.prepare(`
       SELECT source_id, status, file_count, bytes
       FROM file_summaries
       WHERE ${unrestricted
-        ? "file_count > 0"
+        ? `${external.where} AND file_count > 0`
         : `source_id IN (${placeholders(ids)}) AND file_count > 0`}
-    `).all(...(unrestricted ? [] : ids))
+    `).all(...(unrestricted ? external.values : ids))
   }
 
   activityCount(sourceIds, scoped) {
@@ -2532,7 +3957,8 @@ class RegistryCore {
     statusFilter,
     sourceIds,
     query,
-    unrestricted = false
+    unrestricted = false,
+    externalSourceIds = []
   ) {
     const where = ["unavailable_reason IS NOT 'stale'"]
     const values = []
@@ -2552,7 +3978,9 @@ class RegistryCore {
       values.push(...statuses)
     }
     if (unrestricted) {
-      // The registry is the completed global scan snapshot.
+      const external = this.externalSourceFilter(null, externalSourceIds)
+      where.push(external.where)
+      values.push(...external.values)
     } else if (sourceIds.length) {
       where.push(`source_id IN (${placeholders(sourceIds)})`)
       values.push(...sourceIds)
@@ -2574,7 +4002,8 @@ class RegistryCore {
     query,
     unrestricted,
     alias,
-    statuses = ["duplicate", "unavailable"]
+    statuses = ["duplicate", "unavailable"],
+    externalSourceIds = []
   ) {
     const column = (name) => `${alias}.${name}`
     const where = [`${column("unavailable_reason")} IS NOT 'stale'`]
@@ -2584,7 +4013,11 @@ class RegistryCore {
         `${column("status")} IN (${placeholders(statuses)})`)
       values.push(...statuses)
     }
-    if (!unrestricted) {
+    if (unrestricted) {
+      const external = this.externalSourceFilter(alias, externalSourceIds)
+      where.push(external.where)
+      values.push(...external.values)
+    } else {
       if (sourceIds.length) {
         where.push(
           `${column("source_id")} IN (${placeholders(sourceIds)})`)
@@ -2624,13 +4057,18 @@ class RegistryCore {
       query,
       sort,
       cursor,
-      limit
+      limit,
+      externalSourceIds
     } = options
     const where = ["unavailable_reason IS NOT 'stale'"]
     const values = []
     if (sourceId) {
       where.push("source_id = ?")
       values.push(sourceId)
+    } else {
+      const external = this.externalSourceFilter(null, externalSourceIds)
+      where.push(external.where)
+      values.push(...external.values)
     }
     if (status) {
       where.push("status = ?")
@@ -2676,7 +4114,8 @@ class RegistryCore {
       query,
       sort,
       cursor,
-      pageSize
+      pageSize,
+      externalSourceIds
     } = options
     const sources = unrestricted
       ? [null]
@@ -2709,7 +4148,8 @@ class RegistryCore {
         query,
         sort,
         cursor: stream.cursor,
-        limit
+        limit,
+        externalSourceIds
       })
       stream.rows.push(...rows)
       if (rows.length < limit) stream.exhausted = true
@@ -2767,7 +4207,8 @@ class RegistryCore {
       pageSize,
       sizeSort,
       cursor,
-      unrestricted
+      unrestricted,
+      externalSourceIds
     } = options
     const sort = sizeSort === "asc" || sizeSort === "desc"
       ? sizeSort
@@ -2779,7 +4220,8 @@ class RegistryCore {
       query,
       sort,
       cursor,
-      pageSize
+      pageSize,
+      externalSourceIds
     })
     const hasMore = rows.length > pageSize
     if (hasMore) rows.pop()
@@ -2796,6 +4238,10 @@ class RegistryCore {
       .filter((row) => row.status !== "linked")
       .map((row) => row.hash)
       .filter(Boolean))]
+    const hashSampleExternal = this.externalSourceFilter(
+      "sample", externalSourceIds)
+    const hashCountExternal = this.externalSourceFilter(
+      "countable", externalSourceIds)
     const hashSiblings = hashes.length
       ? this.database.prepare(`
         WITH selected(hash) AS (
@@ -2807,6 +4253,7 @@ class RegistryCore {
               SELECT path FROM files sample
               WHERE sample.hash = selected.hash
                 AND sample.unavailable_reason IS NOT 'stale'
+                AND ${hashSampleExternal.where}
               ORDER BY path
               LIMIT 1
             ) AS first_path
@@ -2819,19 +4266,30 @@ class RegistryCore {
               WHERE sample.hash = first_sample.hash
                 AND sample.path > first_sample.first_path
                 AND sample.unavailable_reason IS NOT 'stale'
+                AND ${hashSampleExternal.where}
               ORDER BY path
               LIMIT 1
             ) AS second_path
           FROM first_sample
         )
-        SELECT files.*, hash_summaries.file_count AS location_count
+        SELECT files.*,
+          (
+            SELECT COUNT(*) FROM files countable
+            WHERE countable.hash = files.hash
+              AND countable.unavailable_reason IS NOT 'stale'
+              AND ${hashCountExternal.where}
+          ) AS location_count
         FROM samples
-        JOIN hash_summaries USING (hash)
         JOIN files
           ON files.path = samples.first_path
           OR files.path = samples.second_path
         ORDER BY files.hash, files.path
-      `).all(...hashes)
+      `).all(
+        ...hashes,
+        ...hashSampleExternal.values,
+        ...hashSampleExternal.values,
+        ...hashCountExternal.values
+      )
       : []
     const linkedInodes = [...new Map(rows
       .filter((row) => row.status === "linked")
@@ -2839,6 +4297,10 @@ class RegistryCore {
         `${row.dev}:${row.ino}`,
         { dev: row.dev, ino: row.ino }
       ])).values()]
+    const inodeSampleExternal = this.externalSourceFilter(
+      "sample", externalSourceIds)
+    const inodeCountExternal = this.externalSourceFilter(
+      "countable", externalSourceIds)
     const inodeSiblings = linkedInodes.length
       ? this.database.prepare(`
         WITH selected(dev, ino) AS (
@@ -2852,6 +4314,7 @@ class RegistryCore {
                 AND sample.ino = selected.ino
                 AND sample.status = 'linked'
                 AND sample.unavailable_reason IS NOT 'stale'
+                AND ${inodeSampleExternal.where}
               ORDER BY path
               LIMIT 1
             ) AS first_path
@@ -2866,19 +4329,32 @@ class RegistryCore {
                 AND sample.status = 'linked'
                 AND sample.unavailable_reason IS NOT 'stale'
                 AND sample.path > first_sample.first_path
+                AND ${inodeSampleExternal.where}
               ORDER BY path
               LIMIT 1
             ) AS second_path
           FROM first_sample
         )
-        SELECT files.*, inode_summaries.file_count AS location_count
+        SELECT files.*,
+          (
+            SELECT COUNT(*) FROM files countable
+            WHERE countable.dev = files.dev
+              AND countable.ino = files.ino
+              AND countable.status = 'linked'
+              AND countable.unavailable_reason IS NOT 'stale'
+              AND ${inodeCountExternal.where}
+          ) AS location_count
         FROM samples
-        JOIN inode_summaries USING (dev, ino)
         JOIN files
           ON files.path = samples.first_path
           OR files.path = samples.second_path
         ORDER BY files.dev, files.ino, files.path
-      `).all(...linkedInodes.flatMap((inode) => [inode.dev, inode.ino]))
+      `).all(
+        ...linkedInodes.flatMap((inode) => [inode.dev, inode.ino]),
+        ...inodeSampleExternal.values,
+        ...inodeSampleExternal.values,
+        ...inodeCountExternal.values
+      )
       : []
     return { rows, hashSiblings, inodeSiblings, nextCursor }
   }
@@ -2888,6 +4364,8 @@ class RegistryCore {
       (options.sourceIds || []).filter(Boolean))]
     const authorizedSourceIds = [...new Set(
       (options.authorizedSourceIds || []).filter(Boolean))]
+    const externalSourceIds = [...new Set(
+      (options.externalSourceIds || []).filter(Boolean))]
     const pageSize = Math.max(
       1, Math.min(500, Number(options.pageSize) || 500))
     const direction = options.sizeSort === "asc" ? "asc" : "desc"
@@ -2895,7 +4373,9 @@ class RegistryCore {
       sourceIds,
       String(options.query || ""),
       !!options.unrestricted,
-      "candidate"
+      "candidate",
+      ["duplicate", "unavailable"],
+      externalSourceIds
     )
     active.where.push("candidate.hash IS NOT NULL")
     const authorized = this.duplicateGroupFilter(
@@ -2903,7 +4383,8 @@ class RegistryCore {
       "",
       !!options.authorizedUnrestricted,
       "visible",
-      null
+      null,
+      externalSourceIds
     )
     const decoded = this.decodeCursor(options.cursor)
     const cursorWhere = []
@@ -2991,6 +4472,8 @@ class RegistryCore {
       (options.sourceIds || []).filter(Boolean))]
     const activeSourceIds = [...new Set(
       (options.activeSourceIds || []).filter(Boolean))]
+    const externalSourceIds = [...new Set(
+      (options.externalSourceIds || []).filter(Boolean))]
     const pageSize = Math.max(
       1, Math.min(500, Number(options.pageSize) || 100))
     const authorized = this.duplicateGroupFilter(
@@ -2998,14 +4481,16 @@ class RegistryCore {
       "",
       !!options.unrestricted,
       "child",
-      null
+      null,
+      externalSourceIds
     )
     const active = this.duplicateGroupFilter(
       activeSourceIds,
       String(options.query || ""),
       !!options.activeUnrestricted,
       "child",
-      ["duplicate"]
+      ["duplicate"],
+      externalSourceIds
     )
     const decoded = this.decodeCursor(options.cursor)
     const cursorWhere = []
@@ -3062,12 +4547,15 @@ class RegistryCore {
   duplicateGroupSelection(options = {}) {
     const sourceIds = [...new Set(
       (options.sourceIds || []).filter(Boolean))]
+    const externalSourceIds = [...new Set(
+      (options.externalSourceIds || []).filter(Boolean))]
     const active = this.duplicateGroupFilter(
       sourceIds,
       String(options.query || ""),
       !!options.unrestricted,
       "candidate",
-      ["duplicate"]
+      ["duplicate"],
+      externalSourceIds
     )
     const rows = this.database.prepare(`
       SELECT candidate.path
@@ -3198,14 +4686,16 @@ class RegistryCore {
       (options.scopeSourceIds || []).filter(Boolean))]
     const locationSourceIds = [...new Set(
       (options.locationSourceIds || []).filter(Boolean))]
+    const externalSourceIds = [...new Set(
+      (options.externalSourceIds || []).filter(Boolean))]
     const view = options.view || "all"
     const statusFilter = options.statusFilter || "all"
     const query = String(options.query || "")
     const pageSize = Math.max(1, Math.min(500, Number(options.pageSize) || 500))
     const scopeRows = this.summaryRows(
-      scopeSourceIds, !!options.scopeUnrestricted)
+      scopeSourceIds, !!options.scopeUnrestricted, externalSourceIds)
     const locationRows = this.summaryRows(
-      locationSourceIds, !!options.locationUnrestricted)
+      locationSourceIds, !!options.locationUnrestricted, externalSourceIds)
     const currentDeduplicateBytes = locationRows
       .filter((row) => row.status === "duplicate")
       .reduce((sum, row) => sum + Number(row.bytes), 0)
@@ -3239,11 +4729,14 @@ class RegistryCore {
       .filter((row) =>
         row.status === "duplicate" && Number(row.file_count) > 0)
       .map((row) => row.source_id)).size
+    const savedExternal = this.externalSourceFilter(
+      null, externalSourceIds)
     const saved = options.scopeUnrestricted
       ? Number(this.database.prepare(`
         SELECT COALESCE(SUM(bytes), 0) AS bytes
         FROM source_savings
-      `).get().bytes) || 0
+        WHERE ${savedExternal.where}
+      `).get(...savedExternal.values).bytes) || 0
       : scopeSourceIds.length
       ? Number(this.database.prepare(`
         SELECT COALESCE(SUM(bytes), 0) AS bytes
@@ -3278,7 +4771,8 @@ class RegistryCore {
           statusFilter,
           locationSourceIds,
           query,
-          !!options.locationUnrestricted
+          !!options.locationUnrestricted,
+          externalSourceIds
         )
         const row = this.database.prepare(`
           SELECT
@@ -3328,7 +4822,8 @@ class RegistryCore {
           sizeSort: options.sizeSort,
           cursor: options.cursor,
           unrestricted: !!options.locationUnrestricted,
-          authorizedUnrestricted: !!options.scopeUnrestricted
+          authorizedUnrestricted: !!options.scopeUnrestricted,
+          externalSourceIds
         })
         pageTotal = page.total
       } else {
@@ -3340,7 +4835,8 @@ class RegistryCore {
           pageSize,
           sizeSort: options.sizeSort,
           cursor: options.cursor,
-          unrestricted: !!options.locationUnrestricted
+          unrestricted: !!options.locationUnrestricted,
+          externalSourceIds
         })
       }
     }

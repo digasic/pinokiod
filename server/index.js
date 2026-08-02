@@ -15761,6 +15761,13 @@ class Server {
         res.json(await vault.progressStatus(scopeId))
         return
       }
+      if (!scopeId && req.query &&
+          typeof req.query.folder_discovery_parent === "string") {
+        res.json(await vault.folderDiscoveryChildren(
+          req.query.folder_discovery_parent,
+          req.query.folder_discovery_child_page))
+        return
+      }
       const groupHash = req.query &&
         typeof req.query.group_hash === "string"
         ? req.query.group_hash
@@ -15786,6 +15793,8 @@ class Server {
         status_filter: req.query && req.query.status_filter,
         size_sort: req.query && req.query.size_sort,
         display_mode: req.query && req.query.display_mode,
+        folder_discovery_page:
+          req.query && req.query.folder_discovery_page,
         page: req.query && req.query.page,
         cursor: req.query && req.query.cursor,
         page_size: req.query && req.query.page_size

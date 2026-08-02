@@ -4,7 +4,9 @@ const crypto = require("crypto")
 const { execFile } = require("child_process")
 const { Worker } = require("worker_threads")
 const Registry = require("./registry")
+const Scanner = require("./scanner")
 const Sweeper = require("./sweeper")
+const FolderFinder = require("./folder_finder")
 const { fileSnapshot, sameSnapshot, sameContentState } = require("./snapshot")
 const {
   SIZE_THRESHOLD,
@@ -27,6 +29,9 @@ const STATUS_VIEWS = new Set([
 ])
 const STATUS_FILTERS = new Set([
   "all", "duplicate", "shared", "tracked"
+])
+const FOLDER_DISCOVERY_COMPLETE_PHASES = new Set([
+  "complete", "completed_with_exclusions"
 ])
 
 const isMissingError = (error) => !!(error &&
@@ -79,13 +84,12 @@ const isPathWithin = (root, target) => {
   )
 }
 
-const samePath = (left, right) => {
-  const first = path.resolve(left)
-  const second = path.resolve(right)
-  return process.platform === "win32"
-    ? first.toLowerCase() === second.toLowerCase()
-    : first === second
+const pathKey = (value) => {
+  const resolved = path.resolve(value)
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved
 }
+
+const samePath = (left, right) => pathKey(left) === pathKey(right)
 
 const sameFileMetadata = (left, right) => {
   if (!left || !right) return false
@@ -142,6 +146,7 @@ class Vault {
     this.mode = null
     this.volumeModes = new Map()
     this.registry = null
+    this.scanner = new Scanner(this)
     this.sweeper = null
     this.worker = null
     this.workerJobs = new Map()
@@ -158,7 +163,6 @@ class Vault {
     this._anchorStores = []
     this._anchorStoresById = new Map()
     this._anchorStoresByDevice = new Map()
-    this._fallbackConfig = null
     this.operationTail = Promise.resolve()
     this.initializationPromise = null
     this.scanPromise = null
@@ -168,6 +172,10 @@ class Vault {
     this.lastScanCache = new Map()
     this.fileActionProgress = null
     this.fileActionCancelRequested = false
+    this.folderFinder = new FolderFinder(this)
+    this.folderDiscoveryPromise = null
+    this.folderDiscoveryCancelRequested = false
+    this.folderDiscoveryCommitPromise = null
   }
 
   get root() {
@@ -178,7 +186,11 @@ class Vault {
     const store = this.defaultAnchorStore()
     return store
       ? path.resolve(store.root, "sha256")
-      : path.resolve(this.globalConfigRoot(), "vault", "sha256")
+      : path.resolve(this.homeAnchorRoot(), "sha256")
+  }
+
+  get configPath() {
+    return path.resolve(this.root, "config.json")
   }
 
   storePathFor(hash, storeId = null) {
@@ -193,31 +205,79 @@ class Vault {
       store.root, "sha256", hash.slice(0, 2), hash)
   }
 
-  globalConfigRoot() {
-    return this.kernel.store && typeof this.kernel.store.root === "string"
+  homeAnchorRoot() {
+    const pinokioRoot = this.kernel.store &&
+      typeof this.kernel.store.root === "string"
       ? path.resolve(this.kernel.store.root)
       : path.resolve(this.kernel.homedir, ".pinokio")
+    return path.resolve(pinokioRoot, "vault")
+  }
+
+  userHomeRoot() {
+    return this.kernel.store && typeof this.kernel.store.root === "string"
+      ? path.dirname(path.resolve(this.kernel.store.root))
+      : path.resolve(this.kernel.homedir)
   }
 
   readConfig() {
-    const stored = this.kernel.store &&
-      typeof this.kernel.store.get === "function"
-      ? this.kernel.store.get("vault")
-      : this._fallbackConfig
-    const config = stored && typeof stored === "object" ? stored : {}
+    let raw
+    try {
+      const stat = fs.lstatSync(this.configPath)
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw unsafeStoragePath(this.configPath)
+      }
+      raw = fs.readFileSync(this.configPath, "utf8")
+    } catch (error) {
+      if (isMissingError(error)) throw error
+      if (error && error.code === "EVAULTPATH") throw error
+      const invalid = new Error(
+        `Disk Saver configuration cannot be read: ${this.configPath}`)
+      invalid.code = "EVAULTCONFIG"
+      throw invalid
+    }
+    let config
+    try {
+      config = JSON.parse(raw)
+    } catch (error) {
+      const invalid = new Error(
+        `Disk Saver configuration is invalid: ${this.configPath}`)
+      invalid.code = "EVAULTCONFIG"
+      throw invalid
+    }
+    if (!config || typeof config !== "object" ||
+        !Array.isArray(config.locations) ||
+        !Array.isArray(config.anchor_stores)) {
+      const invalid = new Error(
+        `Disk Saver configuration is invalid: ${this.configPath}`)
+      invalid.code = "EVAULTCONFIG"
+      throw invalid
+    }
+    if (config.locations.some((item) =>
+      typeof item !== "string" || !path.isAbsolute(item)) ||
+        config.anchor_stores.some((item) =>
+          !item ||
+          typeof item !== "object" ||
+          typeof item.id !== "string" ||
+          !item.id ||
+          item.version !== 1 ||
+          typeof item.root !== "string" ||
+          !path.isAbsolute(item.root) ||
+          typeof item.probe_path !== "string" ||
+          !path.isAbsolute(item.probe_path))) {
+      const invalid = new Error(
+        `Disk Saver configuration is invalid: ${this.configPath}`)
+      invalid.code = "EVAULTCONFIG"
+      throw invalid
+    }
     return {
-      locations: Array.isArray(config.locations)
-        ? config.locations.filter((item) => typeof item === "string")
-        : [],
-      anchor_stores: Array.isArray(config.anchor_stores)
-        ? config.anchor_stores.filter((item) =>
-          item &&
-          typeof item === "object" &&
-          typeof item.id === "string" &&
-          item.id &&
-          typeof item.root === "string" &&
-          typeof item.probe_path === "string")
-        : []
+      locations: [...new Set(config.locations.map((item) =>
+        path.resolve(item)))],
+      anchor_stores: config.anchor_stores.map((item) => ({
+        id: item.id,
+        version: 1,
+        root: path.resolve(item.root),
+        probe_path: path.resolve(item.probe_path)
+      }))
     }
   }
 
@@ -228,16 +288,49 @@ class Vault {
         .map((item) => path.resolve(item)))],
       anchor_stores: (config.anchor_stores || []).map((store) => ({
         id: store.id,
+        version: 1,
         root: path.resolve(store.root),
         probe_path: path.resolve(store.probe_path)
       }))
     }
-    if (this.kernel.store && typeof this.kernel.store.set === "function") {
-      this.kernel.store.set("vault", value)
-    } else {
-      this._fallbackConfig = value
+    const rootStat = fs.lstatSync(this.root)
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      throw unsafeStoragePath(this.root)
+    }
+    const temporary = path.resolve(
+      this.root,
+      `.config.${process.pid}.${crypto.randomUUID()}.tmp`
+    )
+    let descriptor = null
+    try {
+      descriptor = fs.openSync(temporary, "wx", 0o600)
+      fs.writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`)
+      fs.fsyncSync(descriptor)
+      fs.closeSync(descriptor)
+      descriptor = null
+      fs.renameSync(temporary, this.configPath)
+    } catch (error) {
+      if (descriptor !== null) fs.closeSync(descriptor)
+      try {
+        fs.unlinkSync(temporary)
+      } catch (cleanupError) {
+        if (!isMissingError(cleanupError)) error.cleanup_error = cleanupError
+      }
+      throw error
     }
     return value
+  }
+
+  async resetRegistryStorage() {
+    for (const suffix of ["", "-journal", "-shm", "-wal"]) {
+      const filePath = path.resolve(this.root, `registry.sqlite3${suffix}`)
+      const stat = await lstatIfPresent(filePath)
+      if (!stat) continue
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw unsafeStoragePath(filePath)
+      }
+      await fs.promises.unlink(filePath)
+    }
   }
 
   configuredLocations() {
@@ -318,30 +411,12 @@ class Vault {
       throw unsafeStoragePath(managementParent)
     }
     await this.ensureDirectory(store.root)
-    const markerPath = path.resolve(store.root, "store.json")
-    const markerStat = await lstatIfPresent(markerPath)
-    if (markerStat && (!markerStat.isFile() || markerStat.isSymbolicLink())) {
-      throw unsafeStoragePath(markerPath)
-    }
-    if (markerStat) {
-      let marker
-      try {
-        marker = JSON.parse(await fs.promises.readFile(markerPath, "utf8"))
-      } catch (error) {
-        throw unsafeStoragePath(markerPath)
-      }
-      if (!marker || marker.id !== store.id || marker.version !== 1) {
-        throw unsafeStoragePath(markerPath)
-      }
-    } else {
-      await fs.promises.writeFile(
-        markerPath,
-        `${JSON.stringify({ id: store.id, version: 1 }, null, 2)}\n`,
-        { flag: "wx", mode: 0o600 }
-      )
-    }
-    const rootStat = await fs.promises.stat(store.root)
-    if (expectedDev !== null && rootStat.dev !== expectedDev) {
+    const [rootStat, probeStat] = await Promise.all([
+      fs.promises.stat(store.root),
+      fs.promises.stat(store.probe_path)
+    ])
+    if (!probeStat.isDirectory() || rootStat.dev !== probeStat.dev ||
+        (expectedDev !== null && rootStat.dev !== expectedDev)) {
       throw unavailableStorage(
         "The configured anchor store is on a different filesystem.")
     }
@@ -360,34 +435,22 @@ class Vault {
 
   async validateAnchorStore(store, expectedDev = null) {
     if (!store) throw new Error("No anchor store is configured.")
-    const markerPath = path.resolve(store.root, "store.json")
-    const [rootStat, markerStat] = await Promise.all([
+    const [rootStat, blobStat, probeStat] = await Promise.all([
       this.directoryIfSafe(store.root),
-      lstatIfPresent(markerPath)
+      this.directoryIfSafe(path.resolve(store.root, "sha256")),
+      fs.promises.stat(store.probe_path)
     ])
-    if (!rootStat ||
-        !markerStat ||
-        !markerStat.isFile() ||
-        markerStat.isSymbolicLink()) {
+    if (!rootStat || !blobStat || !probeStat.isDirectory()) {
       throw unsafeStoragePath(store.root)
     }
-    let marker
-    try {
-      marker = JSON.parse(await fs.promises.readFile(markerPath, "utf8"))
-    } catch (error) {
-      throw unsafeStoragePath(markerPath)
-    }
-    if (!marker || marker.id !== store.id || marker.version !== 1) {
-      throw unsafeStoragePath(markerPath)
-    }
-    const current = await fs.promises.stat(store.root)
-    if (expectedDev !== null && current.dev !== expectedDev) {
+    if (rootStat.dev !== probeStat.dev ||
+        (expectedDev !== null && rootStat.dev !== expectedDev)) {
       throw unavailableStorage(
         "The configured anchor store is on a different filesystem.")
     }
     store.available = true
-    store.dev = current.dev
-    return current
+    store.dev = rootStat.dev
+    return rootStat
   }
 
   runExclusive(operation) {
@@ -450,11 +513,20 @@ class Vault {
   async initializeStorage() {
     if (this.initialized) return { enabled: true, mode: this.mode }
     await this.ensureDirectory(this.root)
+    const configStat = await lstatIfPresent(this.configPath)
+    if (configStat &&
+        (!configStat.isFile() || configStat.isSymbolicLink())) {
+      throw unsafeStoragePath(this.configPath)
+    }
+    if (!configStat) {
+      await this.resetRegistryStorage()
+      this.writeConfig({ locations: [], anchor_stores: [] })
+    } else {
+      this.readConfig()
+    }
     this.registry = new Registry(this.root)
     await this.registry.load()
-    await this.importLegacyLocationConfig()
     await this.refreshAnchorStores()
-    await this.migrateLegacyAnchorStore()
     this.mode = this.defaultAnchorStore() &&
       this.defaultAnchorStore().mode === "copy"
       ? "copy"
@@ -483,66 +555,14 @@ class Vault {
     return { enabled: true, mode: this.mode }
   }
 
-  async importLegacyLocationConfig() {
-    const config = this.readConfig()
-    const legacy = await this.registry.externalSources()
-    const locations = [...new Set([
-      ...config.locations.map((item) => path.resolve(item)),
-      ...legacy.map((item) => path.resolve(item))
-    ])]
-    if (locations.length !== config.locations.length ||
-        locations.some((item, index) =>
-          item !== path.resolve(config.locations[index] || ""))) {
-      this.writeConfig(Object.assign({}, config, { locations }))
-    }
-  }
-
-  async migrateLegacyAnchorStore() {
-    const legacyRoot = path.resolve(this.root, "sha256")
-    const legacyStat = await lstatIfPresent(legacyRoot)
-    if (!legacyStat) return false
-    if (!legacyStat.isDirectory() || legacyStat.isSymbolicLink()) {
-      throw unsafeStoragePath(legacyRoot)
-    }
-    if (!(await fs.promises.readdir(legacyRoot)).length) {
-      await fs.promises.rmdir(legacyRoot)
-      return true
-    }
-    const store = this.anchorStoreForDevice(legacyStat.dev)
-    if (!store) {
-      throw unavailableStorage(
-        "The legacy anchor store has no configured store on its filesystem.")
-    }
-    const targetRoot = path.resolve(store.root, "sha256")
-    if (samePath(legacyRoot, targetRoot)) return false
-
-    await this.ensureAnchorStore(store, legacyStat.dev)
-    const targetEntries = await fs.promises.readdir(targetRoot)
-    if (targetEntries.length) {
-      throw unavailableStorage(
-        "Both the legacy and configured anchor stores contain files.")
-    }
-    await fs.promises.rmdir(targetRoot)
-    try {
-      await fs.promises.rename(legacyRoot, targetRoot)
-    } catch (error) {
-      await this.ensureDirectory(targetRoot).catch(() => {})
-      throw error
-    }
-    return true
-  }
-
   async refreshAnchorStores() {
     let config = this.readConfig()
     const candidates = [
       {
-        probe_path: path.resolve(this.kernel.homedir),
-        preferred_root: path.resolve(this.globalConfigRoot(), "vault"),
-        home: true
+        probe_path: path.resolve(this.kernel.homedir)
       },
       ...config.locations.map((location) => ({
-        probe_path: path.resolve(location),
-        home: false
+        probe_path: path.resolve(location)
       }))
     ]
     const configured = []
@@ -553,6 +573,7 @@ class Vault {
           typeof entry.probe_path !== "string") continue
       configured.push({
         id: entry.id,
+        version: 1,
         root: path.resolve(entry.root),
         probe_path: path.resolve(entry.probe_path)
       })
@@ -568,6 +589,13 @@ class Vault {
       }
     }
     let changed = configured.length !== config.anchor_stores.length
+    let homeDevice = null
+    try {
+      const homeStat = await fs.promises.stat(this.userHomeRoot())
+      if (homeStat.isDirectory()) homeDevice = homeStat.dev
+    } catch (error) {
+      if (!isMissingError(error)) throw error
+    }
     for (const candidate of candidates) {
       let stat
       try {
@@ -578,15 +606,19 @@ class Vault {
       }
       if (!stat.isDirectory() ||
           observed.some((item) => item.dev === stat.dev)) continue
-      const filesystemAnchor = candidate.home
+      const onHomeFilesystem = homeDevice !== null && stat.dev === homeDevice
+      const filesystemAnchor = onHomeFilesystem
         ? null
         : await this.filesystemAnchor(candidate.probe_path, stat.dev)
       const store = {
         id: crypto.randomUUID(),
-        root: candidate.home
-          ? candidate.preferred_root
+        version: 1,
+        root: onHomeFilesystem
+          ? this.homeAnchorRoot()
           : path.resolve(filesystemAnchor, ".pinokio", "vault"),
-        probe_path: candidate.probe_path
+        probe_path: onHomeFilesystem
+          ? this.userHomeRoot()
+          : filesystemAnchor
       }
       configured.push(store)
       observed.push({ store, dev: stat.dev })
@@ -602,6 +634,7 @@ class Vault {
     for (const entry of config.anchor_stores) {
       const store = {
         id: entry.id,
+        version: 1,
         root: path.resolve(entry.root),
         probe_path: path.resolve(entry.probe_path),
         available: false,
@@ -618,6 +651,11 @@ class Vault {
         if (rootStat &&
             (!rootStat.isDirectory() || rootStat.isSymbolicLink())) {
           throw unsafeStoragePath(store.root)
+        }
+        if (rootStat && rootStat.dev !== probeStat.dev) {
+          store.error = "different_device"
+          stores.push(store)
+          continue
         }
         store.available = true
         store.dev = probeStat.dev
@@ -691,6 +729,28 @@ class Vault {
       }
     }
     return [...new Set(roots)]
+  }
+
+  folderDiscoveryExcludedRoots() {
+    const roots = [
+      path.resolve(this.kernel.homedir),
+      path.resolve(this.root),
+      ...this.storageRoots(),
+      ...this._sources
+        .filter((source) =>
+          source.kind !== "virtual" && source.root)
+        .map((source) =>
+          path.resolve(source.canonical_root || source.root))
+    ]
+    const seen = new Set()
+    return roots.filter((root) => {
+      const key = process.platform === "win32"
+        ? root.toLowerCase()
+        : root
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
   }
 
   isStorageRoot(directory) {
@@ -1059,6 +1119,13 @@ class Vault {
       .map((source) => source.id)
   }
 
+  configuredExternalSourceIds() {
+    return this._sources
+      .filter((source) =>
+        source.kind === "external" && source.configured === true)
+      .map((source) => source.id)
+  }
+
   async canonicalPathIsWithinSource(filePath, source) {
     if (!source || !source.root) return false
     try {
@@ -1132,7 +1199,7 @@ class Vault {
     }
   }
 
-  async addExternalSource(folderPath) {
+  async canonicalExternalSource(folderPath, home) {
     if (typeof folderPath !== "string" ||
         !path.isAbsolute(folderPath.trim())) {
       throw new Error("Choose a valid folder.")
@@ -1141,29 +1208,119 @@ class Vault {
       await fs.promises.realpath(folderPath.trim()))
     const stat = await fs.promises.stat(canonical)
     if (!stat.isDirectory()) throw new Error("Choose a folder, not a file.")
-
-    const home = path.resolve(await fs.promises.realpath(this.kernel.homedir))
     if (isPathWithin(home, canonical)) {
       throw new Error(
         "That folder is already inside Pinokio and is included in scans.")
     }
-    await this.refreshSources()
-    const existing = this._sources.find((source) =>
-      source.kind === "external" &&
-      source.root &&
-      samePath(source.root, canonical))
-    if (existing) return { created: false, source: existing }
+    return canonical
+  }
 
-    const config = this.readConfig()
-    this.writeConfig(Object.assign({}, config, {
-      locations: [...config.locations, canonical]
-    }))
-    await this.refreshAnchorStores()
+  async addExternalSources(folderPaths) {
+    const home = path.resolve(await fs.promises.realpath(this.kernel.homedir))
+    const canonicalByKey = new Map()
+    for (const folderPath of folderPaths) {
+      const resolved = await this.canonicalExternalSource(folderPath, home)
+      canonicalByKey.set(pathKey(resolved), resolved)
+    }
+    const canonical = [...canonicalByKey.values()]
     await this.refreshSources()
-    const source = this._sources.find((candidate) =>
-      candidate.kind === "external" &&
-      samePath(candidate.root, canonical))
-    return { created: true, source }
+    const existingRoots = new Set(this._sources.filter((source) =>
+      source.kind === "external" && source.root)
+      .map((source) => pathKey(source.root)))
+    const additions = canonical.filter((folder) =>
+      !existingRoots.has(pathKey(folder)))
+    const config = this.readConfig()
+    if (additions.length) {
+      this.writeConfig(Object.assign({}, config, {
+        locations: [...config.locations, ...additions]
+      }))
+      await this.refreshAnchorStores()
+      await this.refreshSources()
+    }
+    const sourceByRoot = new Map(this._sources.filter((source) =>
+      source.kind === "external" && source.root)
+      .map((source) => [pathKey(source.root), source]))
+    const sources = canonical.map((folder) => sourceByRoot.get(pathKey(folder)))
+      .filter(Boolean)
+    return {
+      created_count: additions.length,
+      existing_count: canonical.length - additions.length,
+      sources
+    }
+  }
+
+  async commitFolderDiscoverySources(runId) {
+    if (this.folderDiscoveryCommitPromise) {
+      throw new Error("Locations are already being added.")
+    }
+    const commit = this.runExclusive(async () => {
+      if (!this.folderFinder || this.folderFinder.runId !== runId ||
+          !FOLDER_DISCOVERY_COMPLETE_PHASES.has(
+            this.folderFinder.state.phase)) {
+        throw new Error("These folder suggestions are no longer current.")
+      }
+      const selected = await this.registry.folderDiscoverySelectionPaths(runId)
+      if (!selected.length) {
+        throw new Error("Choose at least one location to add.")
+      }
+      const result = await this.addExternalSources(selected)
+      const hashes = await this.registry.folderDiscoverySelectedHashes(runId)
+      const stores = this.anchorStores()
+        .filter((store) =>
+          store.available && Number.isFinite(store.dev))
+        .map((store) => ({
+          store_id: store.id,
+          dev: store.dev,
+          can_link: store.mode !== "copy"
+        }))
+      const classifications = []
+      for (const hash of hashes) {
+        const anchors = []
+        for (const store of this.anchorStores()) {
+          const stat = await this.storeStatIfPresent(
+            this.storePathFor(hash, store.id),
+            { store_id: store.id }
+          )
+          if (stat) anchors.push(fileSnapshot(stat))
+        }
+        classifications.push({ hash, anchors })
+      }
+      const published = await this.registry.publishFolderDiscoverySelection(
+        runId,
+        result.sources.map((source) => ({
+          id: source.id,
+          root: source.root,
+          app: source.kind === "app" ? source.app : null
+        })),
+        stores,
+        classifications
+      )
+      await this.registry.abortFolderDiscovery(runId).catch(() => {})
+      this.folderFinder.runId = null
+      this.folderFinder.currentHash = null
+      this.folderFinder.cancelRequested = false
+      this.folderFinder.exclusions.clear()
+      this.folderFinder.state = this.folderFinder.idleState()
+      return Object.assign(result, {
+        published_files: Number(published.files) || 0
+      })
+    })
+    this.folderDiscoveryCommitPromise = commit
+    try {
+      return await commit
+    } finally {
+      if (this.folderDiscoveryCommitPromise === commit) {
+        this.folderDiscoveryCommitPromise = null
+      }
+    }
+  }
+
+  async addExternalSource(folderPath) {
+    const result = await this.addExternalSources([folderPath])
+    return {
+      created: result.created_count > 0,
+      source: result.sources[0]
+    }
   }
 
   async removeExternalSource(sourceIdToRemove) {
@@ -1180,7 +1337,8 @@ class Vault {
       locations: config.locations.filter((item) =>
         !samePath(item, source.root))
     }))
-    await this.registry.removeExternalSourceState(source.root, source.id)
+    await this.refreshSources()
+    await this.registry.removeExternalSourceState(source.id)
     await this.refreshAnchorStores()
     await this.refreshSources()
     return {
@@ -1197,6 +1355,162 @@ class Vault {
     } catch (error) {
       return false
     }
+  }
+
+  async startFolderDiscovery(selectedRoot) {
+    if (!this.enabled || !this.folderFinder) {
+      return { started: false, disabled: true }
+    }
+    if (this.folderDiscoveryPromise) {
+      return { started: false, already_running: true }
+    }
+    if (this.folderDiscoveryCommitPromise) {
+      return { error: "Wait for the selected locations to finish being added." }
+    }
+    if (typeof selectedRoot !== "string" ||
+        !selectedRoot.trim() ||
+        !path.isAbsolute(selectedRoot.trim())) {
+      return { error: "Choose a valid folder or drive." }
+    }
+    if (this.scanPromise) {
+      return { error: "Wait for the current scan to finish." }
+    }
+    const globalScan = await this.scanForScope(null)
+    if (this.scanPromise) {
+      return { error: "Wait for the current scan to finish." }
+    }
+    if (!globalScan || !globalScan.ts) {
+      return { error: "Run a global scan before finding folders." }
+    }
+    const publishedThreshold = Number(globalScan.candidate_min_bytes)
+    const threshold = Number.isFinite(publishedThreshold) &&
+      publishedThreshold >= 0
+      ? publishedThreshold
+      : this.sizeThreshold
+    const partial = !!globalScan.partial || (
+      Array.isArray(globalScan.exclusions) &&
+      globalScan.exclusions.length > 0
+    )
+    const root = path.resolve(selectedRoot.trim())
+    this.folderDiscoveryCancelRequested = false
+    this.folderFinder.queue(root, threshold, partial)
+    this.folderDiscoveryPromise = this.runExclusive(async () => {
+      if (this.folderDiscoveryCancelRequested) {
+        this.folderFinder.state = Object.assign(
+          this.folderFinder.idleState(),
+          {
+            phase: "cancelled",
+            root,
+            threshold,
+            partial,
+            started: Date.now(),
+            duration_ms: 0
+          }
+        )
+        return { cancelled: true }
+      }
+      return this.folderFinder.search(root, { threshold, partial })
+    }).catch(() => null).finally(() => {
+      this.folderDiscoveryPromise = null
+      this.folderDiscoveryCancelRequested = false
+    })
+    return { started: true, threshold }
+  }
+
+  cancelFolderDiscovery() {
+    if (!this.folderDiscoveryPromise || !this.folderFinder) {
+      return { cancel_requested: false }
+    }
+    this.folderDiscoveryCancelRequested = true
+    if (this.folderFinder.state.active &&
+        this.folderFinder.currentHash &&
+        this.worker) {
+      const error = new Error("Folder search cancelled.")
+      error.code = "EVAULTCANCELLED"
+      this.failHashWorker(this.worker, error, true)
+    }
+    return {
+      cancel_requested: this.folderFinder.state.active
+        ? this.folderFinder.cancel()
+        : true
+    }
+  }
+
+  async clearFolderDiscovery() {
+    if (this.folderDiscoveryCommitPromise) {
+      return { error: "Wait for the selected locations to finish being added." }
+    }
+    if (this.folderDiscoveryPromise) {
+      return { error: "Cancel the current folder search first." }
+    }
+    if (this.folderFinder.runId) {
+      await this.registry.abortFolderDiscovery(this.folderFinder.runId)
+    }
+    this.folderFinder.runId = null
+    this.folderFinder.currentHash = null
+    this.folderFinder.cancelRequested = false
+    this.folderFinder.exclusions.clear()
+    this.folderFinder.state = this.folderFinder.idleState()
+    return { cleared: true }
+  }
+
+  folderDiscoveryStatus() {
+    if (!this.folderFinder) return null
+    const pending = !!this.folderDiscoveryPromise &&
+      !this.folderFinder.state.active
+    return Object.assign({}, this.folderFinder.state, {
+      pending,
+      current_file: this.folderFinder.currentHash
+        ? path.basename(this.folderFinder.currentHash.path)
+        : null,
+      current_file_bytes: this.folderFinder.currentHash
+        ? this.folderFinder.currentHash.bytes
+        : null,
+      current_file_size: this.folderFinder.currentHash
+        ? this.folderFinder.currentHash.size
+        : null
+    })
+  }
+
+  folderDiscoveryRunForAction(payload = {}) {
+    if (!this.folderFinder || !this.folderFinder.runId ||
+        !FOLDER_DISCOVERY_COMPLETE_PHASES.has(
+          this.folderFinder.state.phase) ||
+        typeof payload.root !== "string" ||
+        !samePath(payload.root, this.folderFinder.state.root) ||
+        Number(payload.started) !== this.folderFinder.state.started) {
+      return null
+    }
+    return this.folderFinder.runId
+  }
+
+  async folderDiscoveryResults(page = 0) {
+    if (!this.folderFinder || !this.folderFinder.runId) {
+      return {
+        root: null,
+        items: [],
+        total: 0,
+        page: 0,
+        page_size: 500,
+        pages: 1,
+        selection: {
+          selected_count: 0, selected_files: 0, potential_savings: 0
+        }
+      }
+    }
+    return this.registry.folderDiscoveryResults(
+      this.folderFinder.runId,
+      page,
+      STATUS_PAGE_SIZE
+    )
+  }
+
+  async folderDiscoveryChildren(folder, page = 0) {
+    if (!this.folderFinder || !this.folderFinder.runId) {
+      throw new Error("These folder suggestions are no longer current.")
+    }
+    return this.registry.folderDiscoveryChildren(
+      this.folderFinder.runId, folder, page, STATUS_PAGE_SIZE)
   }
 
   startScan(scopeId = null, sizeThreshold = this.sizeThreshold) {
@@ -1264,6 +1578,31 @@ class Vault {
           }
         }
       }
+      case "update_folder_discovery_selection": {
+        const runId = this.folderDiscoveryRunForAction(payload)
+        if (!runId) {
+          return { error: "These folder suggestions are no longer current." }
+        }
+        if (typeof payload.path !== "string" ||
+            !path.isAbsolute(payload.path.trim()) ||
+            typeof payload.selected !== "boolean") {
+          return { error: "Choose a valid suggested location." }
+        }
+        return this.registry.updateFolderDiscoverySelection(
+          runId, payload.path, payload.selected)
+      }
+      case "add_folder_discovery_sources": {
+        const runId = this.folderDiscoveryRunForAction(payload)
+        if (!runId) {
+          return { error: "These folder suggestions are no longer current." }
+        }
+        const result = await this.commitFolderDiscoverySources(runId)
+        return {
+          created_count: result.created_count,
+          existing_count: result.existing_count,
+          published_files: result.published_files
+        }
+      }
       case "remove_source":
         if (typeof payload.source_id !== "string" || !payload.source_id) {
           return { error: "Choose an external folder to remove." }
@@ -1285,6 +1624,12 @@ class Vault {
       }
       case "cancel_scan":
         return this.cancelScan()
+      case "find_folders":
+        return this.startFolderDiscovery(payload.path)
+      case "cancel_find_folders":
+        return this.cancelFolderDiscovery()
+      case "clear_find_folders":
+        return this.clearFolderDiscovery()
       case "cancel_file_action":
         return this.cancelFileAction()
       case "reveal":
@@ -2513,6 +2858,7 @@ class Vault {
       hash,
       sourceIds: this.scopeSourceIds(scopeId),
       activeSourceIds: this.scopeSourceIds(scopeId, locationId),
+      externalSourceIds: this.configuredExternalSourceIds(),
       query,
       cursor,
       pageSize,
@@ -2538,6 +2884,7 @@ class Vault {
     const result = await this.registry.duplicateGroupSelection({
       hash,
       sourceIds: this.scopeSourceIds(scopeId, locationId),
+      externalSourceIds: this.configuredExternalSourceIds(),
       query: String(options.query || "").slice(0, 500).trim(),
       unrestricted: !scopeId && !locationId
     })
@@ -2576,6 +2923,7 @@ class Vault {
     const snapshot = await this.registry.statusSnapshot({
       scopeSourceIds,
       locationSourceIds,
+      externalSourceIds: this.configuredExternalSourceIds(),
       scoped: !!scopeId,
       scopeUnrestricted: !scopeId,
       locationUnrestricted: !scopeId && !locationId,
@@ -2681,7 +3029,18 @@ class Vault {
         has_next: !!snapshot.page.nextCursor
       }
     }
-    if (scopeId) result.scope_id = scopeId
+    if (scopeId) {
+      result.scope_id = scopeId
+    } else {
+      result.folder_discovery = this.folderDiscoveryStatus()
+      if (options.folder_discovery_page != null &&
+          this.folderFinder && this.folderFinder.runId &&
+          ["complete", "completed_with_exclusions"].includes(
+            this.folderFinder.state.phase)) {
+        result.folder_discovery_results = await this.folderDiscoveryResults(
+          options.folder_discovery_page)
+      }
+    }
     return result
   }
 
@@ -2718,12 +3077,14 @@ class Vault {
   }
 
   async progressStatus(scopeId = null) {
-    return {
+    const result = {
       enabled: !!this.enabled,
       scan: this.scanStatus(),
       file_action: this.fileActionStatus(scopeId),
       last_scan: this.lastScanCache.get(scopeId || "") || null
     }
+    if (!scopeId) result.folder_discovery = this.folderDiscoveryStatus()
+    return result
   }
 }
 

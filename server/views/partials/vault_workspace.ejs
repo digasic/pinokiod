@@ -3,12 +3,23 @@
     <div class='vault-body'>
       <section class='vault-overview'>
         <div class='vault-metrics' id='vault-metrics'></div>
-        <% if (appMode) { %>
         <div class='vault-overview-actions'>
+          <% if (appMode) { %>
           <select class='vault-select' id='vault-candidate-size'></select>
           <button class='vault-button' id='btn-scan' type='button'></button>
+          <% } else { %>
+          <div class='vault-scan-control' id='vault-scan-control'>
+            <button class='vault-button vault-scan-action' id='btn-scan' type='button'></button>
+            <details class='vault-scan-size-menu' id='vault-scan-size-menu'>
+              <summary class='vault-button vault-scan-size-trigger'>
+                <span id='vault-scan-size-label'></span>
+                <i class='fa-solid fa-chevron-down vault-scan-size-chevron' aria-hidden='true'></i>
+              </summary>
+              <div class='vault-scan-size-popover' id='vault-scan-size-options'></div>
+            </details>
+          </div>
+          <% } %>
         </div>
-        <% } %>
       </section>
       <div class='vault-scan-state' id='vault-scan-state' aria-live='polite'></div>
       <div class='vault-action-state' id='vault-action-state' role='status' aria-live='polite'></div>
@@ -19,21 +30,34 @@
         <% if (!appMode) { %>
         <aside class='vault-rail vault-rail-global'>
           <div class='vault-rail-scope'>
-            <div class='vault-rail-label' id='locations-label'></div>
-            <button class='vault-button vault-rail-action' id='btn-add-source' type='button'>
-              <i class='fa-solid fa-plus' aria-hidden='true'></i>
-              <span>Add folder</span>
-            </button>
-            <select class='vault-select' id='vault-candidate-size'></select>
-            <button class='vault-button primary vault-rail-action' id='btn-scan' type='button'></button>
+            <div class='vault-rail-heading'>
+              <div class='vault-rail-label' id='locations-label'></div>
+              <details class='vault-add-menu' id='vault-add-menu'>
+                <summary class='vault-button vault-add-menu-trigger' aria-label='Add location'>
+                  <i class='fa-solid fa-plus' aria-hidden='true'></i>
+                  <span>Add</span>
+                  <i class='fa-solid fa-chevron-down vault-add-menu-chevron' aria-hidden='true'></i>
+                </summary>
+                <div class='vault-add-menu-popover'>
+                  <button class='vault-add-menu-item' id='btn-add-source' type='button'>
+                    <i class='fa-regular fa-folder-open' aria-hidden='true'></i>
+                    <span>Add folder</span>
+                  </button>
+                  <button class='vault-add-menu-item' id='btn-find-folders' type='button' disabled>
+                    <i class='fa-solid fa-magnifying-glass' aria-hidden='true'></i>
+                    <span>Find more savings</span>
+                  </button>
+                </div>
+              </details>
+            </div>
             <aside class='vault-external-prompt' id='vault-external-prompt' aria-labelledby='vault-external-prompt-title' hidden>
               <button class='vault-external-prompt-dismiss' type='button' data-dismiss-external-prompt aria-label='Dismiss'></button>
               <div class='vault-external-prompt-title' id='vault-external-prompt-title'>
                 <i class='fa-regular fa-folder-open' aria-hidden='true'></i>
                 <span>Save space outside Pinokio</span>
               </div>
-              <p>Add folders used by other apps to find duplicates with Pinokio.</p>
-              <button class='vault-button vault-external-prompt-action' type='button' data-add-source>Add folder</button>
+              <p>Some files may be taking up space more than once.</p>
+              <button class='vault-button vault-external-prompt-action' type='button' data-find-folders>Find more savings</button>
             </aside>
           </div>
           <div class='vault-location-tree'>
@@ -52,6 +76,19 @@
           <footer class='vault-pane-footer' id='vault-pane-footer'></footer>
         </section>
       </section>
+      <% if (!appMode) { %>
+      <div class='vault-find-overlay' id='vault-find-overlay' hidden>
+        <section class='vault-find-dialog' role='dialog' aria-modal='true' aria-labelledby='vault-find-title' tabindex='-1'>
+          <header class='vault-find-header'>
+            <h2 id='vault-find-title'>Find more savings</h2>
+            <button class='vault-icon-button vault-find-close' type='button' data-close-find-folders aria-label='Close'>
+              <i class='fa-solid fa-xmark' aria-hidden='true'></i>
+            </button>
+          </header>
+          <div class='vault-find-body' id='vault-find-body'></div>
+        </section>
+      </div>
+      <% } %>
     </div>
   </div>
 </section>

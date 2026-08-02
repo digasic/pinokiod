@@ -18,6 +18,13 @@ const makeHome = async () => {
   return home
 }
 
+const makeOutside = async () => {
+  const directory = await fs.promises.mkdtemp(
+    path.join(os.tmpdir(), "pinokio-vault-find-"))
+  homes.push(directory)
+  return directory
+}
+
 const makeVault = async () => {
   const home = await makeHome()
   const kernel = { homedir: home, platform: process.platform }
@@ -48,6 +55,14 @@ const close = async (vault) => {
   if (vault.registry) await vault.registry.close()
 }
 
+const waitForEngine = async (condition) => {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (condition()) return
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+  throw new Error("Timed out waiting for the Disk Saver engine.")
+}
+
 describe("Save Space engine", () => {
   beforeEach(() => {
     delete process.env.PINOKIO_VAULT
@@ -62,7 +77,7 @@ describe("Save Space engine", () => {
     }
   })
 
-  test("startup only reads the enable flag and defers all Vault storage", async () => {
+  test("startup only reads the enable flag and defers Disk Saver storage", async () => {
     const home = await makeHome()
     const vault = new Vault({ homedir: home, platform: process.platform })
 
@@ -119,20 +134,17 @@ describe("Save Space engine", () => {
     await close(vault)
   })
 
-  test("locations and anchor stores persist in global config, not only SQLite", async () => {
+  test("locations and anchor stores persist in the Disk Saver config", async () => {
     const base = await makeHome()
     const home = path.join(base, "pinokio")
     let external = path.join(base, "Documents")
     await fs.promises.mkdir(path.join(home, "api"), { recursive: true })
     await fs.promises.mkdir(external)
     external = await fs.promises.realpath(external)
-    const values = {}
     const store = {
       root: path.join(base, ".pinokio"),
-      get: (key) => values[key],
-      set: (key, value) => {
-        values[key] = JSON.parse(JSON.stringify(value))
-      }
+      get: () => { throw new Error("Global config must not be read.") },
+      set: () => { throw new Error("Global config must not be written.") }
     }
     const firstKernel = {
       homedir: home,
@@ -145,11 +157,14 @@ describe("Save Space engine", () => {
     const added = await first.addExternalSource(external)
 
     assert.equal(added.created, true)
-    assert.deepEqual(values.vault.locations, [external])
-    assert.equal(values.vault.anchor_stores.length, 1)
-    assert.deepEqual(await first.registry.externalSources(), [])
+    const saved = JSON.parse(await fs.promises.readFile(
+      path.join(home, "vault", "config.json"), "utf8"))
+    assert.deepEqual(saved.locations, [external])
+    assert.equal(saved.anchor_stores.length, 1)
+    assert.equal(saved.anchor_stores[0].version, 1)
     assert.equal(fs.existsSync(first.blobRoot), false)
     await close(first)
+    await fs.promises.unlink(path.join(home, "vault", "registry.sqlite3"))
 
     const secondKernel = {
       homedir: home,
@@ -162,44 +177,755 @@ describe("Save Space engine", () => {
     assert.equal(second.sources().some((source) =>
       source.kind === "external" && source.root === external), true)
     assert.equal(second.anchorStores().length, 1)
+    assert.equal(await second.registry.countFiles(), 0)
     assert.equal(
       (await fs.promises.readdir(second.root)).every((name) =>
-        name.startsWith("registry.sqlite3")),
+        name === "config.json" || name.startsWith("registry.sqlite3")),
       true
     )
     await close(second)
   })
 
-  test("an existing central anchor tree moves intact to the home-filesystem store", async () => {
-    const home = await makeHome()
+  test("removing a location revokes it before registry cleanup", async () => {
+    const { home, vault } = await makeVault()
+    const outside = await makeOutside()
     const contents = crypto.randomBytes(4096)
-    const hash = crypto.createHash("sha256").update(contents).digest("hex")
-    const legacyAnchor = await write(
-      path.join(home, "vault", "sha256", hash.slice(0, 2), hash),
+    await write(path.join(home, "api", "app", "model.bin"), contents)
+    const filePath = await write(
+      path.join(outside, "models", "model.bin"),
       contents
     )
-    const visible = path.join(home, "api", "app", "model.bin")
-    await fs.promises.mkdir(path.dirname(visible), { recursive: true })
-    await fs.promises.link(legacyAnchor, visible)
-    const before = await fs.promises.stat(legacyAnchor)
-    const kernel = { homedir: home, platform: process.platform }
-    const vault = new Vault(kernel)
-    kernel.vault = vault
-
-    await vault.init()
-
-    const migrated = vault.storePathFor(hash)
-    assert.equal(fs.existsSync(legacyAnchor), false)
-    assert.equal((await fs.promises.stat(migrated)).ino, before.ino)
-    assert.equal(
-      (await fs.promises.readdir(vault.root)).every((name) =>
-        name.startsWith("registry.sqlite3")),
-      true
-    )
-    vault.sizeThreshold = contents.length * 2
+    const canonicalFilePath = await fs.promises.realpath(filePath)
+    const added = await vault.addExternalSource(outside)
     await vault.sweeper.scan()
-    assert.equal((await vault.registry.getFile(visible)).status, "linked")
+    const externalRow = await vault.registry.getFile(canonicalFilePath)
+    assert.ok(externalRow && externalRow.hash)
+
+    const removeState = vault.registry.removeExternalSourceState
+    vault.registry.removeExternalSourceState = async () => {
+      throw new Error("Synthetic registry cleanup failure")
+    }
+    await assert.rejects(vault.perform("remove_source", {
+      source_id: added.source.id
+    }), /Synthetic registry cleanup failure/)
+    vault.registry.removeExternalSourceState = removeState
+
+    assert.deepEqual(vault.configuredLocations(), [])
+    assert.equal(vault.sources().some((source) =>
+      source.id === added.source.id), false)
+    assert.equal(vault.sourceForPath(
+      canonicalFilePath, added.source.id), null)
+    assert.match((await vault.perform("scan", {
+      scope_id: added.source.id
+    })).error, /no longer available/i)
+    assert.ok(await vault.registry.getFile(canonicalFilePath))
+    const status = await vault.status()
+    assert.equal(status.inventory.counts.all, 1)
+    assert.equal(status.items.some((item) =>
+      item.path === canonicalFilePath), false)
+    assert.equal(status.items.some((item) =>
+      (item.locations || []).some((location) =>
+        location.path === canonicalFilePath)), false)
+    const searched = await vault.status(null, { query: "model.bin" })
+    assert.equal(searched.inventory.current.count, 1)
+    assert.equal(searched.items.some((item) =>
+      item.path === canonicalFilePath), false)
+    const children = await vault.duplicateGroupChildren(
+      null, externalRow.hash)
+    assert.equal(children.items.some((item) =>
+      item.path === canonicalFilePath), false)
+    const selection = await vault.duplicateGroupSelection(
+      null, externalRow.hash)
+    assert.equal(selection.paths.includes(canonicalFilePath), false)
     await close(vault)
+
+    const restarted = new Vault({
+      homedir: home,
+      platform: process.platform
+    })
+    await restarted.init()
+    assert.ok(await restarted.registry.getFile(canonicalFilePath))
+    const restartedStatus = await restarted.status()
+    assert.equal(restartedStatus.inventory.counts.all, 1)
+    assert.equal(restartedStatus.items.some((item) =>
+      item.path === canonicalFilePath), false)
+    await close(restarted)
+  })
+
+  test("an anchor root on another device is unavailable when opened", async () => {
+    const { vault } = await makeVault()
+    const store = vault.anchorStores()[0]
+    await fs.promises.mkdir(
+      path.join(store.root, "sha256"), { recursive: true })
+    const originalLstat = fs.promises.lstat
+    fs.promises.lstat = async (filePath, ...args) => {
+      const stat = await originalLstat(filePath, ...args)
+      if (path.resolve(filePath) !== path.resolve(store.root)) return stat
+      return new Proxy(stat, {
+        get(target, property) {
+          if (property === "dev") return Number(target.dev) + 1
+          const value = Reflect.get(target, property, target)
+          return typeof value === "function" ? value.bind(target) : value
+        }
+      })
+    }
+    try {
+      await vault.refreshAnchorStores()
+    } finally {
+      fs.promises.lstat = originalLstat
+    }
+
+    const refreshed = vault.anchorStores().find((candidate) =>
+      candidate.id === store.id)
+    assert.equal(refreshed.available, false)
+    assert.equal(refreshed.dev, null)
+    assert.equal(refreshed.error, "different_device")
+    assert.equal(vault.anchorStoreForDevice(store.dev), null)
+    await close(vault)
+  })
+
+  test("Find folders verifies outside copies without publishing or changing files", async () => {
+    const { home, vault } = await makeVault()
+    const outside = await makeOutside()
+    const contents = crypto.randomBytes(4096)
+    const pinokioFile = await write(
+      path.join(home, "api", "app", "model.bin"), contents)
+    const direct = await write(
+      path.join(outside, "other-app", "model.bin"), contents)
+    const nested = await write(
+      path.join(outside, "other-app", "models", "model.bin"),
+      contents
+    )
+    const before = await Promise.all([
+      fs.promises.stat(pinokioFile),
+      fs.promises.stat(direct),
+      fs.promises.stat(nested)
+    ])
+
+    await vault.sweeper.scan()
+    assert.equal((await vault.registry.getFile(pinokioFile)).hash, null)
+    const publishedFiles = await vault.registry.countFiles()
+    const configBefore = vault.readConfig()
+    const refreshAnchorStores = vault.refreshAnchorStores.bind(vault)
+    let anchorRefreshes = 0
+    vault.refreshAnchorStores = async (...args) => {
+      anchorRefreshes += 1
+      return refreshAnchorStores(...args)
+    }
+    const workSummary = vault.registry.folderDiscoveryWorkSummary
+      .bind(vault.registry)
+    let workSummaries = 0
+    vault.registry.folderDiscoveryWorkSummary = async (...args) => {
+      workSummaries += 1
+      return workSummary(...args)
+    }
+
+    const started = await vault.perform("find_folders", { path: outside })
+    assert.equal(started.started, true)
+    await vault.folderDiscoveryPromise
+    vault.refreshAnchorStores = refreshAnchorStores
+
+    const discovery = vault.folderDiscoveryStatus()
+    assert.equal(discovery.phase, "complete", discovery.error)
+    assert.equal(discovery.result_count, 1)
+    assert.equal(discovery.result_files, 2)
+    assert.equal(discovery.result_bytes, contents.length * 2)
+    assert.equal(discovery.candidates_known, true)
+    assert.equal(discovery.processed, discovery.candidates)
+    assert.equal(discovery.verified_files, 2)
+    assert.equal(discovery.verified_bytes, contents.length * 2)
+    const results = await vault.folderDiscoveryResults()
+    assert.equal(results.total, 1)
+    assert.equal(results.root.folder,
+      await fs.promises.realpath(outside))
+    assert.equal(results.items[0].folder,
+      path.join(await fs.promises.realpath(outside), "other-app"))
+    assert.equal(results.items[0].file_count, 2)
+    assert.equal(results.items[0].bytes, contents.length * 2)
+    assert.equal(results.items[0].eligible_file_count, 2)
+    const recommendations = await vault.registry
+      .folderDiscoveryRecommendations(vault.folderFinder.runId)
+    assert.deepEqual(recommendations.items.map((entry) => entry.folder),
+      [results.items[0].folder])
+    assert.equal(Object.hasOwn(results.items[0], "tree"), false)
+    const children = await vault.folderDiscoveryChildren(
+      results.items[0].folder)
+    assert.equal(children.items[0].folder,
+      path.join(results.items[0].folder, "models"))
+    assert.equal(await vault.registry.countFiles(), publishedFiles)
+    assert.equal(vault.configuredLocations().length, 0)
+    assert.deepEqual(vault.readConfig(), configBefore)
+    assert.equal(anchorRefreshes, 0)
+    assert.ok(workSummaries >= 2)
+
+    const after = await Promise.all([
+      fs.promises.stat(pinokioFile),
+      fs.promises.stat(direct),
+      fs.promises.stat(nested)
+    ])
+    assert.deepEqual(after.map((stat) => [stat.dev, stat.ino, stat.nlink]),
+      before.map((stat) => [stat.dev, stat.ino, stat.nlink]))
+
+    const added = await vault.perform("add_source", {
+      path: results.items[0].folder
+    })
+    assert.equal(added.created, true)
+    assert.equal(await vault.registry.getFile(direct), null)
+    await close(vault)
+  })
+
+  test("Find folders returns navigable clusters and adds an exact non-overlapping batch", async () => {
+    const { home, vault } = await makeVault()
+    const outside = await makeOutside()
+    const first = crypto.randomBytes(4096)
+    const second = crypto.randomBytes(6144)
+    const unrelated = crypto.randomBytes(7168)
+    await write(path.join(home, "api", "first", "model.bin"), first)
+    await write(path.join(home, "api", "second", "model.bin"), second)
+    const unrelatedPath = await write(
+      path.join(home, "api", "unrelated-a", "model.bin"), unrelated)
+    await write(
+      path.join(home, "api", "unrelated-b", "model.bin"), unrelated)
+    const comfy = path.join(outside, ".comfycraft")
+    const release = path.join(outside, "pinokio_2026_0627")
+    await write(path.join(comfy, "kits", "ace", "model.bin"), first)
+    await write(path.join(comfy, "kits", "hello", "model.bin"), second)
+    await write(path.join(comfy, "logs", "history.bin"),
+      crypto.randomBytes(2048))
+    await write(path.join(release, "api", "first", "model.bin"), first)
+    await write(path.join(release, "api", "second", "model.bin"), second)
+
+    await vault.sweeper.scan()
+    const unrelatedHash = (await vault.registry.getFile(unrelatedPath)).hash
+    assert.ok(unrelatedHash)
+    assert.equal((await vault.perform("find_folders", {
+      path: outside
+    })).started, true)
+    await vault.folderDiscoveryPromise
+
+    const results = await vault.folderDiscoveryResults()
+    const canonicalOutside = await fs.promises.realpath(outside)
+    const canonicalComfy = path.join(canonicalOutside, ".comfycraft")
+    const canonicalRelease = path.join(
+      canonicalOutside, "pinokio_2026_0627")
+    assert.equal(results.total, 2)
+    const comfyResult = results.items.find((result) =>
+      result.folder === canonicalComfy)
+    const releaseResult = results.items.find((result) =>
+      result.folder === canonicalRelease)
+    assert.ok(comfyResult)
+    assert.ok(releaseResult)
+    const recommendations = await vault.registry
+      .folderDiscoveryRecommendations(vault.folderFinder.runId)
+    assert.deepEqual(recommendations.items.map((entry) => entry.folder),
+      [canonicalOutside])
+    assert.equal(results.root.recommended, true)
+    assert.equal(results.root.selected, false)
+    assert.equal(results.root.selected_inside, 0)
+    assert.equal(results.selection.selected_count, 0)
+    const comfyChildren = await vault.folderDiscoveryChildren(
+      comfyResult.folder)
+    assert.equal(comfyChildren.items[0].folder,
+      path.join(canonicalComfy, "kits"))
+    const kitChildren = await vault.folderDiscoveryChildren(
+      comfyChildren.items[0].folder)
+    assert.equal(kitChildren.items.length, 2)
+    assert.equal(comfyResult.eligible_file_count, 3)
+    assert.equal(comfyResult.file_count, 2)
+
+    const selected = [
+      path.join(canonicalComfy, "kits"),
+      path.join(canonicalRelease, "api")
+    ]
+    const discovery = vault.folderDiscoveryStatus()
+    await vault.perform("update_folder_discovery_selection", {
+      root: discovery.root,
+      started: discovery.started,
+      path: selected[0],
+      selected: true
+    })
+    const staged = await vault.perform("update_folder_discovery_selection", {
+      root: discovery.root,
+      started: discovery.started,
+      path: selected[1],
+      selected: true
+    })
+    assert.equal(staged.selected_count, 2)
+    const selectedResults = await vault.folderDiscoveryResults()
+    assert.equal(selectedResults.root.selected, false)
+    assert.equal(selectedResults.root.selected_inside, 2)
+    assert.equal(vault.configuredLocations().length, 0)
+    let configWrites = 0
+    const writeConfig = vault.writeConfig.bind(vault)
+    vault.writeConfig = (config) => {
+      configWrites += 1
+      return writeConfig(config)
+    }
+    let classifiedHashes = []
+    const publishSelection = vault.registry.publishFolderDiscoverySelection
+      .bind(vault.registry)
+    vault.registry.publishFolderDiscoverySelection = async (...args) => {
+      classifiedHashes = args[3].map((entry) => entry.hash)
+      return publishSelection(...args)
+    }
+    const added = await vault.perform("add_folder_discovery_sources", {
+      root: discovery.root,
+      started: discovery.started
+    })
+    assert.equal(added.created_count, 2)
+    assert.equal(added.published_files, 4)
+    assert.equal(configWrites, 1)
+    assert.equal(classifiedHashes.includes(unrelatedHash), false)
+    assert.deepEqual(vault.configuredLocations().sort(), selected.sort())
+    assert.equal(vault.folderFinder.runId, null)
+    assert.equal((await vault.folderDiscoveryResults()).total, 0)
+    for (const filePath of [
+      path.join(canonicalComfy, "kits", "ace", "model.bin"),
+      path.join(canonicalRelease, "api", "second", "model.bin")
+    ]) {
+      const published = await vault.registry.getFile(filePath)
+      assert.ok(published.hash)
+      assert.ok(["reference", "duplicate"].includes(published.status))
+    }
+    await close(vault)
+  })
+
+  test("Find folders detects outside-only groups and publishes them without rescanning", async () => {
+    const { home, vault } = await makeVault()
+    const outside = await makeOutside()
+    const contents = crypto.randomBytes(8192)
+    await write(path.join(home, "api", "baseline", "unique.bin"),
+      crypto.randomBytes(contents.length))
+    const first = await write(
+      path.join(outside, "first-app", "model.bin"), contents)
+    const second = await write(
+      path.join(outside, "second-app", "model.bin"), contents)
+
+    await vault.sweeper.scan()
+    assert.equal((await vault.perform("find_folders", {
+      path: outside
+    })).started, true)
+    await vault.folderDiscoveryPromise
+
+    const discovery = vault.folderDiscoveryStatus()
+    const results = await vault.folderDiscoveryResults()
+    assert.equal(discovery.result_files, 2)
+    assert.equal(discovery.result_bytes, contents.length * 2)
+    assert.equal(results.selection.selected_count, 0)
+    await vault.perform("update_folder_discovery_selection", {
+      root: discovery.root,
+      started: discovery.started,
+      path: results.root.folder,
+      selected: true
+    })
+    const staged = (await vault.folderDiscoveryResults()).selection
+    assert.equal(staged.selected_count, 1)
+    assert.equal(staged.selected_files, 2)
+    assert.equal(staged.potential_savings, contents.length)
+
+    vault.hashFile = async () => {
+      throw new Error("Adding staged results must not hash files again.")
+    }
+    const added = await vault.perform("add_folder_discovery_sources", {
+      root: discovery.root,
+      started: discovery.started
+    })
+    assert.equal(added.published_files, 2)
+    assert.equal(vault.folderFinder.runId, null)
+    const firstRow = await vault.registry.getFile(
+      await fs.promises.realpath(first))
+    const secondRow = await vault.registry.getFile(
+      await fs.promises.realpath(second))
+    assert.ok(firstRow, JSON.stringify(await vault.registry.files()))
+    assert.ok(secondRow, JSON.stringify(await vault.registry.files()))
+    assert.equal(firstRow.status, "reference")
+    assert.equal(secondRow.status, "duplicate")
+    await close(vault)
+  })
+
+  test("Find folders uses a valid anchor even when no published path remains", async () => {
+    const { home, vault } = await makeVault()
+    const outside = await makeOutside()
+    const pair = await duplicatePair(home)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    assert.equal((await vault.perform("deduplicate", {
+      path: duplicate.path
+    })).status, "converted")
+    await fs.promises.unlink(pair.first)
+    await fs.promises.unlink(pair.second)
+    await vault.sweeper.scan()
+    assert.equal((await vault.registry.files()).length, 0)
+
+    await write(path.join(outside, "models", "model.bin"), pair.contents)
+    assert.equal((await vault.perform("find_folders", {
+      path: outside
+    })).started, true)
+    await vault.folderDiscoveryPromise
+
+    const discovery = vault.folderDiscoveryStatus()
+    assert.equal(discovery.phase, "complete", discovery.error)
+    assert.equal(discovery.result_files, 1)
+    assert.equal(discovery.result_bytes, pair.contents.length)
+    const results = await vault.folderDiscoveryResults()
+    assert.equal(results.total, 1)
+    assert.equal(results.selection.selected_count, 0)
+    await vault.perform("update_folder_discovery_selection", {
+      root: discovery.root,
+      started: discovery.started,
+      path: results.items[0].folder,
+      selected: true
+    })
+    const selected = (await vault.folderDiscoveryResults()).selection
+    assert.equal(selected.selected_files, 1)
+    assert.equal(selected.potential_savings, pair.contents.length)
+    await close(vault)
+  })
+
+  test("a failed discovery publication keeps the selected configuration", async () => {
+    const { home, vault } = await makeVault()
+    const outside = await makeOutside()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "app", "model.bin"), contents)
+    const outsideFile = await write(
+      path.join(outside, "models", "model.bin"), contents)
+    const canonicalOutsideFile = await fs.promises.realpath(outsideFile)
+    await vault.sweeper.scan()
+    await vault.perform("find_folders", { path: outside })
+    await vault.folderDiscoveryPromise
+    const discovery = vault.folderDiscoveryStatus()
+    const results = await vault.folderDiscoveryResults()
+    await vault.perform("update_folder_discovery_selection", {
+      root: discovery.root,
+      started: discovery.started,
+      path: results.items[0].folder,
+      selected: true
+    })
+    const configBefore = vault.readConfig()
+    const publish = vault.registry.publishFolderDiscoverySelection
+    vault.registry.publishFolderDiscoverySelection = async () => {
+      throw new Error("Synthetic publication failure")
+    }
+    await assert.rejects(vault.perform("add_folder_discovery_sources", {
+      root: discovery.root,
+      started: discovery.started
+    }), /Synthetic publication failure/)
+    vault.registry.publishFolderDiscoverySelection = publish
+
+    const configured = vault.readConfig()
+    assert.deepEqual(configured.anchor_stores, configBefore.anchor_stores)
+    assert.deepEqual(configured.locations, [
+      await fs.promises.realpath(path.dirname(outsideFile))
+    ])
+    assert.equal(await vault.registry.getFile(canonicalOutsideFile), null)
+    assert.ok(vault.folderFinder.runId)
+    const retried = await vault.perform("add_folder_discovery_sources", {
+      root: discovery.root,
+      started: discovery.started
+    })
+    assert.equal(retried.created_count, 0)
+    assert.equal(retried.published_files, 1)
+    assert.ok(await vault.registry.getFile(canonicalOutsideFile))
+    await close(vault)
+  })
+
+  test("Find folders pages every cluster and recommendation without serializing descendants", async () => {
+    const { home, vault } = await makeVault()
+    const outside = await makeOutside()
+    const contents = crypto.randomBytes(64)
+    await write(path.join(home, "api", "context", "model.bin"), contents)
+    for (let index = 0; index < 501; index++) {
+      await write(path.join(
+        outside,
+        `app-${String(index).padStart(3, "0")}`,
+        "models",
+        "model.bin"
+      ), contents)
+    }
+    await write(path.join(outside, "unrelated.bin"),
+      crypto.randomBytes(contents.length * 1000))
+    await vault.sweeper.scan()
+    assert.equal((await vault.perform("find_folders", {
+      path: outside
+    })).started, true)
+    await vault.folderDiscoveryPromise
+
+    const first = await vault.folderDiscoveryResults(0)
+    const second = await vault.folderDiscoveryResults(1)
+    const firstRecommendations = await vault.registry
+      .folderDiscoveryRecommendations(vault.folderFinder.runId, 0, 500)
+    const secondRecommendations = await vault.registry
+      .folderDiscoveryRecommendations(vault.folderFinder.runId, 1, 500)
+    assert.equal(first.total, 501)
+    assert.equal(first.items.length, 500)
+    assert.equal(second.items.length, 1)
+    assert.equal(Object.hasOwn(first, "recommendations"), false)
+    assert.equal(firstRecommendations.total, 501)
+    assert.equal(firstRecommendations.items.length, 500)
+    assert.equal(secondRecommendations.items.length, 1)
+    assert.equal(Object.hasOwn(first.items[0], "tree"), false)
+    const children = await vault.folderDiscoveryChildren(
+      first.items[0].folder)
+    assert.equal(children.items.length, 1)
+    assert.equal(children.items[0].name, "models")
+
+    assert.equal(first.selection.selected_count, 0)
+    await close(vault)
+  })
+
+  test("Find folders splits a broad cluster when either scope dimension is disproportionate", async () => {
+    const discover = async (extraSizes) => {
+      const { home, vault } = await makeVault()
+      const outside = await makeOutside()
+      const first = crypto.randomBytes(1000)
+      const second = crypto.randomBytes(1000)
+      await write(path.join(home, "api", "first", "model.bin"), first)
+      await write(path.join(home, "api", "second", "model.bin"), second)
+      await write(path.join(outside, "group", "a", "model.bin"), first)
+      await write(path.join(outside, "group", "b", "model.bin"), second)
+      for (let index = 0; index < extraSizes.length; index++) {
+        await write(path.join(outside, "group", `extra-${index}.bin`),
+          crypto.randomBytes(extraSizes[index]))
+      }
+      await vault.sweeper.scan()
+      await vault.perform("find_folders", { path: outside })
+      await vault.folderDiscoveryPromise
+      const folders = (await vault.registry.folderDiscoveryRecommendations(
+        vault.folderFinder.runId)).items.map((entry) => entry.folder)
+      await close(vault)
+      return { outside: await fs.promises.realpath(outside), folders }
+    }
+
+    const byteSkew = await discover([5000])
+    assert.deepEqual(byteSkew.folders.sort(), ["a", "b"].map((name) =>
+      path.join(byteSkew.outside, "group", name)).sort())
+    const countSkew = await discover([1, 2, 3])
+    assert.deepEqual(countSkew.folders.sort(), ["a", "b"].map((name) =>
+      path.join(countSkew.outside, "group", name)).sort())
+    const balanced = await discover([1])
+    assert.deepEqual(balanced.folders,
+      [path.join(balanced.outside, "group")])
+  })
+
+  test("Find folders uses the exact published threshold and waits for active scans", async () => {
+    const { home, vault } = await makeVault()
+    const outside = await makeOutside()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "app", "model.bin"), contents)
+    await write(path.join(outside, "models", "model.bin"), contents)
+    await write(path.join(outside, "models", "below-threshold.bin"),
+      crypto.randomBytes(512))
+    vault.sizeThreshold = 1234
+    await vault.sweeper.scan()
+
+    const stageDiscoveryFiles = vault.registry.stageFolderDiscoveryFiles
+      .bind(vault.registry)
+    const stagedSizes = []
+    vault.registry.stageFolderDiscoveryFiles = async (runId, entries) => {
+      stagedSizes.push(...entries.map((entry) => entry.size))
+      return stageDiscoveryFiles(runId, entries)
+    }
+
+    vault.scanPromise = new Promise(() => {})
+    assert.match((await vault.perform("find_folders", {
+      path: outside
+    })).error, /current scan/i)
+    vault.scanPromise = null
+
+    const started = await vault.perform("find_folders", { path: outside })
+    assert.equal(started.threshold, 1234)
+    await vault.folderDiscoveryPromise
+    assert.equal(vault.folderDiscoveryStatus().threshold, 1234)
+    assert.equal(vault.folderDiscoveryStatus().result_count, 1)
+    assert.ok(stagedSizes.length > 0)
+    assert.ok(stagedSizes.every((size) => size >= 1234))
+    await close(vault)
+  })
+
+  test("Find folders treats a failure to open the selected root as fatal", async () => {
+    const { home, vault } = await makeVault()
+    const outside = await makeOutside()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "app", "model.bin"), contents)
+    await write(path.join(outside, "models", "model.bin"), contents)
+    await vault.sweeper.scan()
+
+    const canonicalRoot = await fs.promises.realpath(outside)
+    const openDirectory = fs.promises.opendir
+    fs.promises.opendir = async (directory, ...args) => {
+      if (path.resolve(directory) === canonicalRoot) {
+        const error = new Error("The selected root cannot be opened.")
+        error.code = "EACCES"
+        throw error
+      }
+      return openDirectory.call(fs.promises, directory, ...args)
+    }
+    try {
+      assert.equal((await vault.perform("find_folders", {
+        path: outside
+      })).started, true)
+      await vault.folderDiscoveryPromise
+    } finally {
+      fs.promises.opendir = openDirectory
+    }
+
+    assert.equal(vault.folderDiscoveryStatus().phase, "failed")
+    assert.match(vault.folderDiscoveryStatus().error, /cannot be opened/i)
+    assert.equal(vault.folderFinder.runId, null)
+    await close(vault)
+  })
+
+  test("Find folders continues past a stale known-reference batch", async () => {
+    const { home, vault } = await makeVault()
+    const outside = await makeOutside()
+    const contents = crypto.randomBytes(4096)
+    const stale = []
+    for (let index = 0; index < 32; index++) {
+      stale.push(await write(
+        path.join(home, "api", "app", `a${String(index).padStart(2, "0")}.bin`),
+        contents
+      ))
+    }
+    await write(path.join(home, "api", "app", "z-valid.bin"), contents)
+    await write(path.join(outside, "models", "model.bin"), contents)
+    await vault.sweeper.scan()
+
+    for (let index = 0; index < stale.length; index++) {
+      await fs.promises.writeFile(
+        stale[index], Buffer.alloc(contents.length, index + 1))
+      const changed = new Date(Date.now() + 10000 + index)
+      await fs.promises.utimes(stale[index], changed, changed)
+    }
+
+    assert.equal((await vault.perform("find_folders", {
+      path: outside
+    })).started, true)
+    await vault.folderDiscoveryPromise
+
+    assert.equal(vault.folderDiscoveryStatus().phase,
+      "completed_with_exclusions")
+    assert.equal(vault.folderDiscoveryStatus().result_count, 1)
+    const results = await vault.folderDiscoveryResults()
+    assert.equal(results.items[0].file_count, 1)
+    const discovery = vault.folderDiscoveryStatus()
+    assert.equal(results.selection.selected_count, 0)
+    await vault.perform("update_folder_discovery_selection", {
+      root: discovery.root,
+      started: discovery.started,
+      path: results.items[0].folder,
+      selected: true
+    })
+
+    let releasePublish
+    let publishStarted
+    const publishing = new Promise((resolve) => { publishStarted = resolve })
+    const publishGate = new Promise((resolve) => { releasePublish = resolve })
+    const publishSelection = vault.registry.publishFolderDiscoverySelection
+      .bind(vault.registry)
+    vault.registry.publishFolderDiscoverySelection = async (...args) => {
+      publishStarted()
+      await publishGate
+      return publishSelection(...args)
+    }
+    const adding = vault.perform("add_folder_discovery_sources", {
+      root: discovery.root,
+      started: discovery.started
+    })
+    await publishing
+    assert.match((await vault.clearFolderDiscovery()).error,
+      /finish being added/i)
+    assert.match((await vault.startFolderDiscovery(outside)).error,
+      /finish being added/i)
+    releasePublish()
+    assert.equal((await adding).created_count, 1)
+    assert.equal(vault.folderFinder.runId, null)
+    await close(vault)
+  })
+
+  test("Find folders requires a published global scan and rejects covered roots", async () => {
+    const { home, vault } = await makeVault()
+    assert.match((await vault.perform("find_folders", {
+      path: home
+    })).error, /global scan/i)
+
+    await write(path.join(home, "api", "app", "model.bin"),
+      crypto.randomBytes(4096))
+    await vault.sweeper.scan()
+    assert.equal((await vault.perform("find_folders", {
+      path: home
+    })).started, true)
+    await vault.folderDiscoveryPromise
+    assert.equal(vault.folderDiscoveryStatus().phase, "failed")
+    assert.match(vault.folderDiscoveryStatus().error,
+      /already in Locations/i)
+    assert.equal(vault.folderFinder.runId, null)
+    await close(vault)
+  })
+
+  test("Find folders cancellation discards its temporary staging", async () => {
+    const { home, vault } = await makeVault()
+    const outside = await makeOutside()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "app", "model.bin"), contents)
+    await write(path.join(outside, "models", "model.bin"), contents)
+    await vault.sweeper.scan()
+    const publishedFiles = await vault.registry.countFiles()
+    vault.hashFile = async () => {
+      await waitForEngine(() => vault.folderFinder.cancelRequested)
+      const error = new Error("Folder search cancelled.")
+      error.code = "EVAULTCANCELLED"
+      throw error
+    }
+
+    assert.equal((await vault.perform("find_folders", {
+      path: outside
+    })).started, true)
+    await waitForEngine(() => !!vault.folderFinder.currentHash)
+    assert.equal((await vault.perform(
+      "cancel_find_folders")).cancel_requested, true)
+    await vault.folderDiscoveryPromise
+
+    assert.equal(vault.folderDiscoveryStatus().phase, "cancelled")
+    assert.equal(vault.folderFinder.runId, null)
+    assert.equal((await vault.folderDiscoveryResults()).total, 0)
+    assert.equal(await vault.registry.countFiles(), publishedFiles)
+    await close(vault)
+  })
+
+  test("a missing Disk Saver config resets the registry but preserves anchors", async () => {
+    const { home, kernel, vault } = await makeVault()
+    const outside = await makeOutside()
+    const pair = await duplicatePair(home)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    await vault.perform("deduplicate", { path: duplicate.path })
+    await vault.addExternalSource(outside)
+    const anchorPath = vault.storePathFor(duplicate.hash)
+    assert.equal(fs.existsSync(anchorPath), true)
+    await close(vault)
+
+    await fs.promises.unlink(path.join(home, "vault", "config.json"))
+    const replacement = new Vault({
+      homedir: home,
+      platform: process.platform,
+      store: kernel.store
+    })
+    await replacement.init()
+    replacement.sizeThreshold = pair.contents.length * 2
+
+    assert.deepEqual(replacement.configuredLocations(), [])
+    assert.equal(await replacement.registry.countFiles(), 0)
+    assert.equal(fs.existsSync(anchorPath), true)
+    await replacement.sweeper.scan()
+    assert.equal(
+      (await replacement.registry.getFile(duplicate.path)).status,
+      "linked"
+    )
+    await close(replacement)
   })
 
   test("explicit deduplication creates the first anchor and changes one path atomically", async () => {
@@ -230,12 +956,10 @@ describe("Save Space engine", () => {
       fs.existsSync(vault.storePathFor(duplicate.hash)),
       true
     )
-    const marker = JSON.parse(await fs.promises.readFile(
-      path.resolve(path.dirname(vault.blobRoot), "store.json"),
-      "utf8"
-    ))
-    assert.equal(marker.id, vault.defaultAnchorStore().id)
-    assert.equal(marker.version, 1)
+    assert.deepEqual(
+      await fs.promises.readdir(path.dirname(vault.blobRoot)),
+      ["sha256"]
+    )
     await close(vault)
   })
 
@@ -850,6 +1574,10 @@ describe("Save Space engine", () => {
     const home = await makeHome()
     const root = path.join(home, "vault")
     await fs.promises.mkdir(root)
+    await fs.promises.writeFile(path.join(root, "config.json"), JSON.stringify({
+      locations: [],
+      anchor_stores: []
+    }))
     const databasePath = path.join(root, "registry.sqlite3")
     const database = new Database(databasePath)
     database.pragma("application_id = 0x5641554c")
@@ -871,5 +1599,22 @@ describe("Save Space engine", () => {
       WHERE type = 'table' AND name = 'files'
     `).get(), undefined)
     unchanged.close()
+  })
+
+  test("an invalid Disk Saver config is rejected without replacement", async () => {
+    const home = await makeHome()
+    const root = path.join(home, "vault")
+    const configPath = path.join(root, "config.json")
+    const databasePath = path.join(root, "registry.sqlite3")
+    await fs.promises.mkdir(root)
+    await fs.promises.writeFile(configPath, "{ invalid\n")
+    await fs.promises.writeFile(databasePath, "keep")
+
+    const vault = new Vault({ homedir: home, platform: process.platform })
+    await assert.rejects(vault.init(), (error) =>
+      error && error.code === "EVAULTCONFIG")
+
+    assert.equal(await fs.promises.readFile(configPath, "utf8"), "{ invalid\n")
+    assert.equal(await fs.promises.readFile(databasePath, "utf8"), "keep")
   })
 })

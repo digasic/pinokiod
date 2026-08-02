@@ -13,11 +13,63 @@ const COPY = {
   reclaimable_description: "Private links no longer used by any linked file.",
   activity_description: "A history of changes made by Disk Saver.",
   add_external_folder: "Add external folder",
+  find_folders: "Find more savings",
+  find_folders_title: "Find more savings",
+  suggested_locations: "Suggested locations",
+  find_folders_picker: "Choose where to search",
+  find_requires_scan: "Run a global scan before searching for more savings.",
+  find_wait_for_scan: "Wait for the current scan to finish.",
+  find_waiting: "Waiting to search",
+  find_searching: "Searching folders",
+  find_verifying: "Verifying identical files",
+  find_preparing: "Preparing results",
+  find_stage_searching: "Searching",
+  find_stage_verifying: "Verifying",
+  find_stage_suggestions: "Suggestions",
+  find_stages: "Folder search stages",
+  find_files_checked: "files checked",
+  find_folders_checked: "{count} folders checked",
+  find_candidate: "1 possible match queued for verification",
+  find_candidates: "{count} possible matches queued for verification",
+  find_current_folder: "Currently scanning",
+  find_current_file: "Currently verifying",
+  find_active: "Active now",
+  find_rate: "{count} files/sec",
+  find_stalled: "No activity for {time}",
+  find_elapsed: "{time} elapsed",
+  find_verified_progress: "{done} of {total} candidates checked",
+  find_verified_so_far: "{count} identical files · {size} matched so far",
+  verified_identical_only: "Verified identical files only",
+  matching_file: "1 identical file",
+  matching_files: "{count} identical files",
+  matching_bytes: "{size} matched",
+  can_save_selection: "Can save {size}",
+  calculating_savings: "Calculating savings…",
+  choose_locations: "Choose locations to add",
+  choose_locations_hint: "Select the locations you want to add.",
+  recommended: "Recommended",
+  broader_scan: "Broader scan",
+  scan_scope: "{count} files · {size} scan scope",
+  selected_inside: "{count} selected inside",
+  selected_location: "1 location selected",
+  selected_locations: "{count} locations selected",
+  add_selected_location: "Add location",
+  add_selected_locations: "Add {count} locations",
+  adding_locations: "Adding locations…",
+  loading_folders: "Loading folders…",
+  show_more_folders: "Show more folders",
+  external_locations_added: "Added {count} folders to Locations.",
+  search_somewhere_else: "Search somewhere else",
+  done: "Done",
+  no_matching_folders: "No folders with duplicate files found",
+  no_matching_folders_partial: "No duplicate files found in folders that could be checked",
+  no_matching_folders_hint: "Choose another folder or drive to search a different area.",
+  find_partial: "Partial results · Some files could not be checked.",
   all_locations: "All locations",
   other_folders: "Other folders",
   files_region: "Files",
   folder_picker_error: "The folder picker could not be opened.",
-  external_added: "Added to Locations. Run a scan when you’re ready.",
+  external_added: "Added to Locations.",
   external_exists: "That folder is already in Locations.",
   external_other_disk: "Added to Locations. It can be scanned, but this filesystem does not support file sharing.",
   remove_external_folder: "Remove from Locations",
@@ -39,11 +91,12 @@ const COPY = {
   find_app_savings: "Scan this app to find duplicate files and save disk space",
   last_scanned: "Last scanned",
   never: "Never",
-  scan: "Scan now",
+  scan: "Scan",
   scan_app: "Scan this app",
   scan_again: "Scan again",
+  cancel_scan: "Cancel scan",
   scanning: "Scanning…",
-  minimum_file_size: "Minimum file size to scan",
+  minimum_file_size: "Minimum file size",
   scanning_elsewhere: "Another location is being scanned",
   scanning_elsewhere_hint: "This app can be scanned when the current scan finishes.",
   cancel: "Cancel",
@@ -234,9 +287,19 @@ const statusUrl = (progress = false) => {
     const cursor = state.pageCursors[state.page]
     if (cursor) query.set("cursor", cursor)
     query.set("page_size", String(PAGE_SIZE))
+    if (!IS_APP_MODE && state.folderDiscoveryOpen) {
+      query.set("folder_discovery_page", String(state.folderDiscoveryPage))
+    }
   }
   const suffix = query.toString()
   return `/info/dedup${suffix ? `?${suffix}` : ""}`
+}
+const folderDiscoveryChildrenUrl = (folder, page = 0) => {
+  const query = new URLSearchParams({
+    folder_discovery_parent: folder,
+    folder_discovery_child_page: String(Math.max(0, Number(page) || 0))
+  })
+  return `/info/dedup?${query.toString()}`
 }
 const duplicateGroupUrl = (hash, options = {}) => {
   const query = new URLSearchParams()
@@ -264,6 +327,7 @@ const PAGE_SIZE = 500
 
 const state = {
   data: null,
+  candidateSize: defaultCandidateSize,
   view: "all",
   sourceId: SCOPE_ID,
   query: "",
@@ -288,6 +352,21 @@ const state = {
   actionProgress: null,
   actionRequest: false,
   scanCancelRequested: false,
+  folderDiscoveryOpen: false,
+  folderDiscoverySubmitting: false,
+  folderDiscoveryPage: 0,
+  folderDiscoveryCancelRequested: false,
+  folderDiscoveryLocalError: null,
+  folderDiscoveryRunKey: null,
+  folderDiscoveryNodes: new Map(),
+  folderDiscoveryExpanded: new Set(),
+  folderDiscoveryChildrenLoading: new Set(),
+  folderDiscoverySelectionRemote: null,
+  folderDiscoverySelectionPending: false,
+  folderDiscoverySelectionPromise: null,
+  folderDiscoveryReturnFocus: null,
+  folderDiscoveryRateRunKey: null,
+  folderDiscoveryRateSamples: [],
   page: 0,
   pageCursors: [""]
 }
@@ -318,9 +397,42 @@ const esc = (value) => String(value == null ? "" : value).replace(/[&<>"']/g, (c
 }[char]))
 const attr = esc
 const fmt = window.PinokioFormatStorageSize
+const formatInteger = (value) => Math.max(0, Number(value) || 0)
+  .toLocaleString()
+const formatDuration = (milliseconds) => {
+  const seconds = Math.max(0, Math.floor((Number(milliseconds) || 0) / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`
+  const hours = Math.floor(minutes / 60)
+  return `${hours}h ${minutes % 60}m`
+}
 const candidateSize = () => {
-  const value = Number(el("vault-candidate-size").value)
+  const value = Number(state.candidateSize)
   return candidateSizeOptions.includes(value) ? value : defaultCandidateSize
+}
+const candidateSizeLabel = (size = candidateSize()) => {
+  return size === 0 ? COPY.all : `${fmt(size)}+`
+}
+const renderCandidateSizeControl = () => {
+  const size = candidateSize()
+  const select = el("vault-candidate-size")
+  if (select) select.value = String(size)
+  const label = el("vault-scan-size-label")
+  if (label) label.textContent = candidateSizeLabel(size)
+  const menu = el("vault-scan-size-menu")
+  if (menu) {
+    const trigger = menu.querySelector("summary")
+    if (trigger) {
+      trigger.setAttribute("aria-label",
+        `${COPY.minimum_file_size}: ${candidateSizeLabel(size)}`)
+    }
+    for (const option of menu.querySelectorAll("[data-candidate-size]")) {
+      const selected = Number(option.dataset.candidateSize) === size
+      option.classList.toggle("selected", selected)
+      option.setAttribute("aria-pressed", String(selected))
+    }
+  }
 }
 const countLabel = (count, singular = COPY.file, plural = COPY.files) => `${count} ${count === 1 ? singular : plural}`
 const basename = (value) => String(value || "").split(/[\\/]/).filter(Boolean).pop() || ""
@@ -484,11 +596,20 @@ const renderLocations = () => {
 }
 
 const externalPromptDismissed = () => {
-  try { return localStorage.getItem(externalPromptKey) === "1" }
+  const scan = state.data && state.data.last_scan
+  if (!scan || !scan.ts) return false
+  try {
+    return localStorage.getItem(externalPromptKey) === String(scan.ts)
+  }
   catch (error) { return false }
 }
 const dismissExternalPrompt = () => {
-  try { localStorage.setItem(externalPromptKey, "1") } catch (error) {}
+  const scan = state.data && state.data.last_scan
+  try {
+    if (scan && scan.ts) {
+      localStorage.setItem(externalPromptKey, String(scan.ts))
+    }
+  } catch (error) {}
   const prompt = el("vault-external-prompt")
   if (prompt) prompt.hidden = true
 }
@@ -496,10 +617,603 @@ const renderExternalPrompt = () => {
   const prompt = el("vault-external-prompt")
   if (!prompt || IS_APP_MODE || !state.data) return
   const hasCompletedScan = !!(state.data.last_scan && state.data.last_scan.ts)
+  const scanning = scanActive(state.data.scan)
+  for (const findButton of document.querySelectorAll(
+    "#btn-find-folders, [data-find-folders]"
+  )) {
+    findButton.disabled = !hasCompletedScan || scanning
+    findButton.title = !hasCompletedScan
+      ? COPY.find_requires_scan
+      : scanning
+        ? COPY.find_wait_for_scan
+        : COPY.find_folders
+    findButton.setAttribute("aria-label", findButton.title)
+  }
   const hasExternalLocation = (state.data.sources || []).some((source) =>
     source.kind === "external")
   prompt.hidden = !hasCompletedScan || hasExternalLocation ||
     externalPromptDismissed()
+}
+
+const folderDiscoveryActive = (discovery) => !!(
+  discovery && (
+    discovery.pending ||
+    discovery.active ||
+    discovery.phase === "queued"
+  )
+)
+
+const folderDiscoveryComplete = (discovery) => !!(
+  discovery && ["complete", "completed_with_exclusions"]
+    .includes(discovery.phase)
+)
+
+const folderDiscoveryThreshold = () => {
+  const scan = state.data && state.data.last_scan
+  const threshold = scan && Number(scan.candidate_min_bytes)
+  if (!Number.isFinite(threshold)) return defaultCandidateSize
+  return Math.max(0, threshold)
+}
+
+const folderDiscoveryThresholdLabel = () => {
+  const threshold = folderDiscoveryThreshold()
+  return threshold === 0 ? COPY.all : fmt(threshold)
+}
+
+const folderDiscoveryStageMarkup = (phase) => {
+  const activeIndex = phase === "hashing"
+    ? 1
+    : phase === "preparing_results" ? 2 : 0
+  const labels = [
+    COPY.find_stage_searching,
+    COPY.find_stage_verifying,
+    COPY.find_stage_suggestions
+  ]
+  return `<ol class="vault-find-stages" aria-label="${attr(COPY.find_stages)}">${labels.map((label, index) => {
+    const complete = index < activeIndex
+    const active = index === activeIndex
+    const marker = complete
+      ? '<i class="fa-solid fa-check" aria-hidden="true"></i>'
+      : String(index + 1)
+    return `<li class="vault-find-stage${complete ? " complete" : ""}${active ? " active" : ""}"${active ? ' aria-current="step"' : ""}><span class="vault-find-stage-marker">${marker}</span><span>${esc(label)}</span></li>`
+  }).join("")}</ol>`
+}
+
+const folderDiscoveryRate = (discovery, now = Date.now()) => {
+  const runKey = [discovery.root || "", discovery.started || ""].join("\u0000")
+  if (state.folderDiscoveryRateRunKey !== runKey) {
+    state.folderDiscoveryRateRunKey = runKey
+    state.folderDiscoveryRateSamples = []
+  }
+  const files = Math.max(0, Number(discovery.files) || 0)
+  const samples = state.folderDiscoveryRateSamples
+  const previous = samples[samples.length - 1]
+  if (!previous || previous.files !== files) {
+    samples.push({ files, at: now })
+  }
+  while (samples.length > 2 && samples[1].at < now - 60000) {
+    samples.shift()
+  }
+  if (samples.length > 1) {
+    const first = samples[0]
+    const last = samples[samples.length - 1]
+    const seconds = (last.at - first.at) / 1000
+    if (seconds > 0 && last.files >= first.files) {
+      return (last.files - first.files) / seconds
+    }
+  }
+  return null
+}
+
+const resetFolderDiscoveryChoices = () => {
+  state.folderDiscoverySubmitting = false
+  state.folderDiscoveryRunKey = null
+  state.folderDiscoveryNodes.clear()
+  state.folderDiscoveryExpanded.clear()
+  state.folderDiscoveryChildrenLoading.clear()
+  state.folderDiscoverySelectionRemote = null
+  state.folderDiscoverySelectionPending = false
+  state.folderDiscoverySelectionPromise = null
+  state.folderDiscoveryRateRunKey = null
+  state.folderDiscoveryRateSamples = []
+}
+
+const folderDiscoveryPathKey = (value) => {
+  const normalized = String(value || "")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "") || "/"
+  return document.body.dataset.platform === "win32"
+    ? normalized.toLowerCase()
+    : normalized
+}
+
+const folderDiscoveryContains = (ancestor, candidate) => {
+  const parent = folderDiscoveryPathKey(ancestor)
+  const child = folderDiscoveryPathKey(candidate)
+  return parent === child || parent === "/" || child.startsWith(`${parent}/`)
+}
+
+const registerFolderDiscoveryNode = (node) => {
+  if (!node || typeof node.folder !== "string") return
+  const key = folderDiscoveryPathKey(node.folder)
+  const current = state.folderDiscoveryNodes.get(key)
+  const children = current && Array.isArray(current.children)
+    ? current.children
+    : []
+  const merged = Object.assign({}, current || {}, node, { children })
+  state.folderDiscoveryNodes.set(key, merged)
+  for (const child of Array.isArray(node.children) ? node.children : []) {
+    registerFolderDiscoveryNode(child)
+  }
+  return merged
+}
+
+const registerFolderDiscoveryResult = (result) => {
+  registerFolderDiscoveryNode(result)
+}
+
+const renderFolderDiscoveryNode = (
+  node,
+  depth = 0,
+  options = {}
+) => {
+  const children = options.root
+    ? []
+    : Array.isArray(node.children) ? node.children : []
+  const key = folderDiscoveryPathKey(node.folder)
+  const hasChildren = !options.root &&
+    Math.max(0, Number(node.child_count) || 0) > 0
+  const expanded = hasChildren && state.folderDiscoveryExpanded.has(key)
+  const loadingChildren = state.folderDiscoveryChildrenLoading.has(key)
+  const checked = !!node.selected
+  const nestedSelectionCount = Math.max(
+    0, Number(node.selected_inside) || 0)
+  const count = Math.max(0, Number(node.file_count) || 0)
+  const eligibleCount = Math.max(count,
+    Number(node.eligible_file_count) || 0)
+  const eligibleBytes = Math.max(Number(node.bytes) || 0,
+    Number(node.eligible_bytes) || 0)
+  const matchLabel = count === 1
+    ? COPY.matching_file
+    : COPY.matching_files.replace("{count}", count)
+  const scanLabel = COPY.scan_scope
+    .replace("{count}", eligibleCount)
+    .replace("{size}", fmt(eligibleBytes))
+  const isRecommended = !!node.recommended
+  const isBroader = !isRecommended && !!node.broader
+  const scopeBadge = isRecommended
+    ? `<span class="vault-find-tree-badge">${esc(COPY.recommended)}</span>`
+    : isBroader
+      ? `<span class="vault-find-tree-badge broader">${esc(COPY.broader_scan)}</span>`
+      : ""
+  const toggle = hasChildren
+    ? `<button class="vault-find-tree-toggle" type="button" data-toggle-found-folder="${attr(node.folder)}" aria-label="${attr(expanded ? COPY.collapse : COPY.expand)}" aria-expanded="${expanded ? "true" : "false"}"><i class="fa-solid fa-chevron-right" aria-hidden="true"></i></button>`
+    : `<span class="vault-find-tree-toggle-spacer" aria-hidden="true"></span>`
+  const nextChildPage = Math.max(0, Number(node.child_page) || 0) + 1
+  const childPages = Math.max(1, Number(node.child_pages) || 1)
+  const childRows = expanded
+    ? children.map((child) =>
+      renderFolderDiscoveryNode(child, depth + 1)).join("") +
+      (loadingChildren
+        ? `<div class="vault-find-tree-state" style="--vault-find-depth:${depth + 1}"><i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i>${esc(COPY.loading_folders)}</div>`
+        : node.children_loaded && nextChildPage < childPages
+          ? `<div class="vault-find-tree-state" style="--vault-find-depth:${depth + 1}"><button class="vault-text-button" type="button" data-load-found-folder="${attr(node.folder)}" data-found-folder-page="${nextChildPage}">${esc(COPY.show_more_folders)}</button></div>`
+          : "")
+    : ""
+  const nestedSelectionLabel = COPY.selected_inside.replace(
+    "{count}", nestedSelectionCount)
+  const detailLabel = [
+    nestedSelectionCount ? nestedSelectionLabel : null,
+    COPY.matching_bytes.replace("{size}", fmt(Number(node.bytes) || 0)),
+    scanLabel
+  ].filter(Boolean).join(" · ")
+  const showPath = options.root || depth <= 1 || checked
+  return `<div class="vault-find-tree-branch">
+    <div class="vault-find-tree-row${checked ? " selected" : ""}${options.root ? " root" : ""}${showPath ? "" : " compact"}" style="--vault-find-depth:${depth}">
+      ${toggle}
+      <label class="vault-find-tree-check-target"><input class="vault-find-tree-check" type="checkbox" data-select-found-folder="${attr(node.folder)}" aria-label="${attr(`Select ${node.folder}`)}"${checked ? " checked" : ""}${state.folderDiscoverySelectionPending ? " disabled" : ""}></label>
+      <i class="fa-regular fa-folder vault-find-tree-icon" aria-hidden="true"></i>
+      <div class="vault-find-tree-copy" title="${attr(node.folder)}"><div class="vault-find-tree-name"><strong>${esc(node.name || basename(node.folder) || node.folder)}</strong>${scopeBadge}</div>${showPath ? `<span>${esc(node.folder)}</span>` : ""}</div>
+      <div class="vault-find-tree-saving"><strong>${esc(matchLabel)}</strong><span>${esc(detailLabel)}</span></div>
+    </div>${childRows}
+  </div>`
+}
+
+const folderDiscoverySelectionSummary = () => {
+  const remote = state.folderDiscoverySelectionRemote || {}
+  const count = Math.max(0, Number(remote.selected_count) || 0)
+  const label = count === 1
+    ? COPY.selected_location
+    : COPY.selected_locations.replace("{count}", count)
+  return {
+    count,
+    bytes: Math.max(0, Number(remote.potential_savings) || 0),
+    files: Math.max(0, Number(remote.selected_files) || 0),
+    label,
+    pending: state.folderDiscoverySelectionPending
+  }
+}
+
+const folderDiscoveryRunKey = (discovery) => [
+  discovery.root || "",
+  discovery.started || "",
+  discovery.result_count || 0,
+  discovery.result_bytes || 0
+].join("\u0000")
+
+const addFolderDiscoverySelection = async (discovery) => {
+  if (state.folderDiscoverySelectionPromise) {
+    await state.folderDiscoverySelectionPromise.catch(() => {})
+  }
+  const result = await post({
+    action: "add_folder_discovery_sources",
+    root: discovery.root,
+    started: discovery.started
+  })
+  if (result.error) throw new Error(result.error)
+  return result
+}
+
+const applyFolderDiscoverySelection = (folder, selected, result) => {
+  const updateCachedNode = (changed) => {
+    const results = state.data && state.data.folder_discovery_results
+    if (!results) return
+    const candidates = [results.root]
+      .concat(Array.isArray(results.items) ? results.items : [])
+    const cached = candidates.find((candidate) => candidate &&
+      folderDiscoveryPathKey(candidate.folder) ===
+        folderDiscoveryPathKey(changed.folder))
+    if (cached) Object.assign(cached, changed)
+  }
+  if (selected) {
+    for (const node of state.folderDiscoveryNodes.values()) {
+      if (folderDiscoveryPathKey(node.folder) !==
+          folderDiscoveryPathKey(folder) &&
+          folderDiscoveryContains(folder, node.folder)) {
+        node.selected = false
+        node.selected_inside = 0
+        updateCachedNode(node)
+      }
+    }
+  }
+  for (const changed of Array.isArray(result.nodes) ? result.nodes : []) {
+    const node = state.folderDiscoveryNodes.get(
+      folderDiscoveryPathKey(changed.folder))
+    if (node) Object.assign(node, changed)
+    updateCachedNode(changed)
+  }
+  const results = state.data && state.data.folder_discovery_results
+  if (results) {
+    results.selection = {
+      selected_count: result.selected_count,
+      selected_files: result.selected_files,
+      potential_savings: result.potential_savings
+    }
+  }
+  state.folderDiscoverySelectionRemote = result
+}
+
+const updateFolderDiscoverySelection = async (node, selected, discovery) => {
+  if (!node || !folderDiscoveryComplete(discovery) ||
+      state.folderDiscoverySelectionPending) return
+  const runKey = state.folderDiscoveryRunKey
+  const focusToken = folderDiscoveryFocusToken()
+  state.folderDiscoverySelectionPending = true
+  renderFolderDiscovery()
+  try {
+    const result = await post({
+      action: "update_folder_discovery_selection",
+      root: discovery.root,
+      started: discovery.started,
+      path: node.folder,
+      selected
+    })
+    if (result.error) throw new Error(result.error)
+    if (state.folderDiscoveryRunKey !== runKey) return
+    applyFolderDiscoverySelection(node.folder, selected, result)
+    state.folderDiscoveryLocalError = null
+  } catch (error) {
+    if (state.folderDiscoveryRunKey !== runKey) return
+    state.folderDiscoveryLocalError = error && error.message
+      ? error.message
+      : String(error)
+  } finally {
+    if (state.folderDiscoveryRunKey === runKey) {
+      state.folderDiscoverySelectionPending = false
+      renderFolderDiscovery()
+      restoreFolderDiscoveryFocus(focusToken)
+    }
+  }
+}
+
+const prepareFolderDiscoveryResults = (discovery, results) => {
+  const runKey = folderDiscoveryRunKey(discovery)
+  if (state.folderDiscoveryRunKey !== runKey) {
+    resetFolderDiscoveryChoices()
+    state.folderDiscoveryRunKey = runKey
+  }
+  if (!state.folderDiscoverySelectionPending && results.selection) {
+    state.folderDiscoverySelectionRemote = results.selection
+  }
+  if (results.root) registerFolderDiscoveryNode(results.root)
+  for (const result of Array.isArray(results.items) ? results.items : []) {
+    registerFolderDiscoveryResult(result)
+  }
+}
+
+const loadFolderDiscoveryChildren = async (folder, page = 0) => {
+  const key = folderDiscoveryPathKey(folder)
+  const runKey = state.folderDiscoveryRunKey
+  if (state.folderDiscoveryChildrenLoading.has(key)) return
+  const node = state.folderDiscoveryNodes.get(key)
+  if (!node) return
+  state.folderDiscoveryChildrenLoading.add(key)
+  renderFolderDiscovery()
+  try {
+    const manifest = await fetchJson(
+      folderDiscoveryChildrenUrl(folder, page))
+    if (state.folderDiscoveryRunKey !== runKey) return
+    const current = state.folderDiscoveryNodes.get(key)
+    if (!current) return
+    const byKey = new Map((Array.isArray(current.children)
+      ? current.children
+      : []).map((child) => [folderDiscoveryPathKey(child.folder), child]))
+    for (const item of Array.isArray(manifest.items) ? manifest.items : []) {
+      const child = registerFolderDiscoveryNode(item)
+      if (child) byKey.set(folderDiscoveryPathKey(child.folder), child)
+    }
+    current.children = [...byKey.values()]
+    current.children_loaded = true
+    current.child_page = Math.max(0, Number(manifest.page) || 0)
+    current.child_pages = Math.max(1, Number(manifest.pages) || 1)
+    state.folderDiscoveryLocalError = null
+  } catch (error) {
+    state.folderDiscoveryLocalError = error && error.message
+      ? error.message
+      : String(error)
+  } finally {
+    state.folderDiscoveryChildrenLoading.delete(key)
+    renderFolderDiscovery()
+  }
+}
+
+const folderDiscoveryFocusToken = () => {
+  const active = document.activeElement
+  const overlay = el("vault-find-overlay")
+  if (!active || !overlay || !overlay.contains(active)) return null
+  const attributes = [
+    "data-select-found-folder",
+    "data-toggle-found-folder",
+    "data-load-found-folder",
+    "data-find-page",
+    "data-add-found-folders",
+    "data-search-somewhere-else",
+    "data-close-find-folders",
+    "data-cancel-find-folders",
+  ]
+  for (const attribute of attributes) {
+    if (active.hasAttribute && active.hasAttribute(attribute)) {
+      return { attribute, value: active.getAttribute(attribute) }
+    }
+  }
+  return null
+}
+
+const restoreFolderDiscoveryFocus = (token) => {
+  if (!token) return
+  const candidates = document.querySelectorAll(`[${token.attribute}]`)
+  const target = [...candidates].find((candidate) =>
+    candidate.getAttribute(token.attribute) === token.value)
+  if (target && !target.disabled) target.focus({ preventScroll: true })
+}
+
+const setFolderDiscoveryBody = (body, html, focusToken) => {
+  body.innerHTML = html
+  const dialog = body.closest(".vault-find-dialog")
+  if (dialog) {
+    dialog.setAttribute("aria-busy",
+      String(state.folderDiscoverySubmitting))
+    const close = dialog.querySelector(".vault-find-close")
+    if (close) close.disabled = state.folderDiscoverySubmitting
+  }
+  if (state.folderDiscoverySubmitting) {
+    for (const control of body.querySelectorAll(
+      "button, input, select, summary, textarea"
+    )) control.disabled = true
+  }
+  restoreFolderDiscoveryFocus(focusToken)
+}
+
+const focusFolderDiscoveryDialog = () => {
+  const dialog = document.querySelector(".vault-find-dialog")
+  if (dialog && state.folderDiscoveryOpen) {
+    dialog.focus({ preventScroll: true })
+  }
+}
+
+const closeFolderDiscoveryModal = (restoreFocus = true) => {
+  const returnFocus = state.folderDiscoveryReturnFocus
+  state.folderDiscoveryOpen = false
+  renderFolderDiscovery()
+  if (restoreFocus && returnFocus && returnFocus.isConnected) {
+    returnFocus.focus({ preventScroll: true })
+  }
+  if (restoreFocus) state.folderDiscoveryReturnFocus = null
+}
+
+const renderFolderDiscovery = () => {
+  const overlay = el("vault-find-overlay")
+  const body = el("vault-find-body")
+  if (!overlay || !body || IS_APP_MODE) return
+  overlay.hidden = !state.folderDiscoveryOpen
+  if (!state.folderDiscoveryOpen || !state.data) return
+  const focusToken = folderDiscoveryFocusToken()
+
+  const discovery = state.data.folder_discovery || { phase: "idle" }
+  const title = el("vault-find-title")
+  if (title) {
+    title.textContent = folderDiscoveryComplete(discovery)
+      ? COPY.suggested_locations
+      : COPY.find_folders_title
+  }
+  const active = folderDiscoveryActive(discovery)
+  const localErrorBanner = state.folderDiscoveryLocalError
+    ? `<div class="vault-find-partial" role="alert"><i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i><span>${esc(state.folderDiscoveryLocalError)}</span></div>`
+    : ""
+  if (active) {
+    const labels = {
+      queued: COPY.find_waiting,
+      discovering: COPY.find_searching,
+      hashing: COPY.find_verifying,
+      preparing_results: COPY.find_preparing
+    }
+    const label = labels[discovery.phase] || COPY.find_searching
+    const candidates = Math.max(0, Number(discovery.candidates) || 0)
+    const processed = Math.max(0,
+      Number(discovery.processed ?? discovery.hashed) || 0)
+    const verifiedFiles = Math.max(0,
+      Number(discovery.verified_files) || 0)
+    const verifiedBytes = Math.max(0,
+      Number(discovery.verified_bytes) || 0)
+    const ratio = discovery.phase === "hashing" && candidates
+      ? Math.min(1, processed / candidates)
+      : null
+    const now = Date.now()
+    const elapsedMs = Math.max(0,
+      now - (Number(discovery.started) || now))
+    const elapsed = COPY.find_elapsed.replace("{time}",
+      formatDuration(elapsedMs))
+    const lastActivity = Number(discovery.last_activity) || 0
+    const inactiveMs = lastActivity
+      ? Math.max(0, now - lastActivity)
+      : 0
+    const stalled = lastActivity > 0 && inactiveMs >= 10000
+    const thresholdDetail = `${COPY.minimum_file_size}: ${folderDiscoveryThresholdLabel()}`
+    const currentFolder = discovery.current_folder || discovery.root || ""
+    const currentDetail = discovery.phase === "hashing" && discovery.current_file
+      ? discovery.current_file
+      : currentFolder
+    const currentLabel = discovery.phase === "hashing"
+      ? COPY.find_current_file
+      : COPY.find_current_folder
+    const verifiedDetail = COPY.find_verified_so_far
+      .replace("{count}", formatInteger(verifiedFiles))
+      .replace("{size}", fmt(verifiedBytes))
+    let activity = ""
+    if (discovery.phase === "discovering") {
+      const rate = folderDiscoveryRate(discovery, now)
+      const activityState = stalled
+        ? COPY.find_stalled.replace("{time}", formatDuration(inactiveMs))
+        : rate && rate > 0
+          ? COPY.find_rate.replace("{count}",
+            formatInteger(Math.max(1, Math.round(rate))))
+          : COPY.find_active
+      const discoveryMeta = [
+        activityState,
+        COPY.find_folders_checked.replace(
+          "{count}", formatInteger(discovery.dirs)),
+        elapsed
+      ].filter(Boolean)
+      const candidateLabel = candidates === 1
+        ? COPY.find_candidate
+        : COPY.find_candidates.replace(
+          "{count}", formatInteger(candidates))
+      activity = `<div class="vault-find-live"><strong>${esc(formatInteger(discovery.files))}</strong><span>${esc(COPY.find_files_checked)}</span></div>
+        <div class="vault-find-progress-meta">${discoveryMeta.map((item) => `<span>${esc(item)}</span>`).join("")}</div>
+        ${discovery.candidates_known ? `<div class="vault-find-candidates"><i class="fa-solid fa-layer-group" aria-hidden="true"></i><strong>${esc(candidateLabel)}</strong></div>` : ""}
+        ${currentDetail ? `<div class="vault-find-current" title="${attr(currentDetail)}"><span>${esc(currentLabel)}</span><strong>${esc(currentDetail)}</strong></div>` : ""}`
+    } else if (discovery.phase === "hashing") {
+      const progressLabel = COPY.find_verified_progress
+        .replace("{done}", formatInteger(processed))
+        .replace("{total}", formatInteger(candidates))
+      activity = `<div class="vault-find-live compact"><strong>${esc(progressLabel)}</strong></div>
+        ${ratio === null ? "" : `<span class="vault-progress-track" role="progressbar" aria-label="${attr(progressLabel)}" aria-valuemin="0" aria-valuemax="${candidates}" aria-valuenow="${processed}"><span class="vault-progress-bar determinate" style="--vault-progress:${ratio}"></span></span>`}
+        ${currentDetail ? `<div class="vault-find-current" title="${attr(currentDetail)}"><span>${esc(currentLabel)}</span><strong>${esc(currentDetail)}</strong></div>` : ""}
+        <div class="vault-find-progress-meta"><span>${esc(verifiedDetail)}</span><span>${esc(elapsed)}</span>${stalled ? `<span>${esc(COPY.find_stalled.replace("{time}", formatDuration(inactiveMs)))}</span>` : ""}</div>`
+    } else if (discovery.phase === "preparing_results") {
+      activity = `<div class="vault-find-live compact"><strong>${esc(verifiedDetail)}</strong></div>
+        <div class="vault-find-progress-meta"><span>${esc(elapsed)}</span>${stalled ? `<span>${esc(COPY.find_stalled.replace("{time}", formatDuration(inactiveMs)))}</span>` : ""}</div>`
+    } else {
+      activity = `<div class="vault-find-current" title="${attr(discovery.root || "")}">${esc(discovery.root || "")}</div>`
+    }
+    const progressIcon = stalled
+      ? "fa-regular fa-clock"
+      : "fa-solid fa-circle-notch fa-spin"
+    setFolderDiscoveryBody(body, `${localErrorBanner}<div class="vault-find-progress">
+      ${folderDiscoveryStageMarkup(discovery.phase)}
+      <div class="vault-find-progress-heading"><i class="${progressIcon}" aria-hidden="true"></i><span>${esc(label)}</span></div>
+      <div class="vault-find-root" title="${attr(discovery.root || "")}">${esc(discovery.root || "")}</div>
+      ${activity}
+      <div class="vault-find-threshold">${esc(thresholdDetail)}</div>
+      <div class="vault-find-actions"><button class="vault-button" type="button" data-cancel-find-folders ${state.folderDiscoveryCancelRequested ? "disabled" : ""}>${esc(state.folderDiscoveryCancelRequested ? COPY.cancelling : COPY.cancel)}</button></div>
+    </div>`, focusToken)
+    return
+  }
+
+  if (discovery.phase === "failed" || discovery.error) {
+    setFolderDiscoveryBody(body, `<div class="vault-find-error">
+      <p>${esc(discovery.error || COPY.action_not_completed)}</p>
+      <div class="vault-find-actions"><button class="vault-button" type="button" data-search-somewhere-else>${esc(COPY.search_somewhere_else)}</button><button class="vault-button primary" type="button" data-close-find-folders>${esc(COPY.done)}</button></div>
+    </div>`, focusToken)
+    return
+  }
+
+  if (folderDiscoveryComplete(discovery)) {
+    const results = state.data.folder_discovery_results
+    if (!results) {
+      setFolderDiscoveryBody(body, `<div class="vault-find-progress"><div class="vault-find-progress-heading"><i class="fa-solid fa-circle-notch fa-spin" aria-hidden="true"></i><span>${esc(COPY.find_preparing)}</span></div></div>`, focusToken)
+      return
+    }
+    const partial = discovery.phase === "completed_with_exclusions" ||
+      !!discovery.partial
+    const items = Array.isArray(results.items) ? results.items : []
+    const partialBanner = partial
+      ? `<div class="vault-find-partial"><i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i><span>${esc(COPY.find_partial)}</span></div>`
+      : ""
+    prepareFolderDiscoveryResults(discovery, results)
+    const root = results.root
+    const hasMatches = !!(root && Number(root.file_count) > 0)
+    if (!hasMatches) {
+      const emptyTitle = partial
+        ? COPY.no_matching_folders_partial
+        : COPY.no_matching_folders
+      setFolderDiscoveryBody(body, `${partialBanner}<div class="vault-find-empty">
+        <p><strong>${esc(emptyTitle)}</strong><br>${esc(COPY.no_matching_folders_hint)}</p>
+        <div class="vault-find-actions"><button class="vault-button" type="button" data-search-somewhere-else>${esc(COPY.search_somewhere_else)}</button><button class="vault-button primary" type="button" data-close-find-folders>${esc(COPY.done)}</button></div>
+      </div>`, focusToken)
+      return
+    }
+    const rows = renderFolderDiscoveryNode(root, 0, { root: true }) +
+      items.map((result) =>
+        renderFolderDiscoveryNode(
+          state.folderDiscoveryNodes.get(
+            folderDiscoveryPathKey(result.folder)) || result,
+          1
+        )).join("")
+    const selection = folderDiscoverySelectionSummary()
+    const page = Math.max(0, Number(results.page) || 0)
+    const pages = Math.max(1, Number(results.pages) || 1)
+    const pageControls = pages > 1
+      ? `<div class="vault-pagination"><button class="vault-text-button" type="button" data-find-page="previous" ${page <= 0 ? "disabled" : ""}>${esc(COPY.previous)}</button><span class="vault-find-page">${page + 1} / ${pages}</span><button class="vault-text-button" type="button" data-find-page="next" ${page + 1 >= pages ? "disabled" : ""}>${esc(COPY.next)}</button></div>`
+      : ""
+    const addLabel = state.folderDiscoverySubmitting
+      ? COPY.adding_locations
+      : selection.count === 1
+        ? COPY.add_selected_location
+        : COPY.add_selected_locations.replace("{count}", selection.count)
+    const savingsLabel = selection.pending
+      ? COPY.calculating_savings
+      : COPY.can_save_selection.replace("{size}", fmt(selection.bytes))
+    const filesLabel = selection.files === 1
+      ? COPY.matching_file
+      : COPY.matching_files.replace("{count}", selection.files)
+    setFolderDiscoveryBody(body, `<div class="vault-find-results-head"><div class="vault-find-results-copy"><strong>${esc(COPY.choose_locations)}</strong><span>${esc(COPY.choose_locations_hint)}</span></div><span class="vault-find-verified"><i class="fa-solid fa-check" aria-hidden="true"></i>${esc(COPY.verified_identical_only)}</span></div>${localErrorBanner}${partialBanner}<div class="vault-find-result-list">${rows}</div><footer class="vault-find-results-footer"><div class="vault-find-results-footer-summary">${pageControls}<strong>${esc(selection.label)}</strong><span>${esc(filesLabel)} · ${esc(savingsLabel)}</span></div><div class="vault-find-actions"><button class="vault-text-button" type="button" data-search-somewhere-else>${esc(COPY.search_somewhere_else)}</button><button class="vault-button" type="button" data-close-find-folders>${esc(COPY.done)}</button><button class="vault-button primary" type="button" data-add-found-folders ${selection.count && !selection.pending ? "" : "disabled"}>${esc(addLabel)}</button></div></footer>`, focusToken)
+    return
+  }
+
+  state.folderDiscoveryOpen = false
+  overlay.hidden = true
+  body.innerHTML = ""
 }
 
 const selectedSource = () => state.sourceId ? sourceById(state.sourceId) : null
@@ -1279,13 +1993,32 @@ const renderOverview = () => {
       </div>
       <div class="vault-summary-side">${summarySide}</div>`
   }
-  el("btn-scan").innerHTML = scanning
-    ? `<i class="fa-solid fa-xmark"></i>${esc(state.scanCancelRequested ? COPY.cancelling : COPY.cancel)}`
+  const idleScanLabel = IS_APP_MODE
+    ? (last ? COPY.scan_again : COPY.scan_app)
+    : (last ? COPY.scan_again : COPY.scan)
+  const scanButton = el("btn-scan")
+  scanButton.innerHTML = scanning
+    ? `<i class="fa-solid fa-xmark"></i>${esc(state.scanCancelRequested ? COPY.cancelling : COPY.cancel_scan)}`
     : activeScan
       ? `<i class="fa-solid fa-circle-notch fa-spin"></i>${esc(COPY.scanning)}`
-    : `<i class="fa-solid fa-rotate"></i>${esc(last ? COPY.scan_again : (IS_APP_MODE ? COPY.scan_app : COPY.scan))}`
-  el("btn-scan").disabled = busyElsewhere || state.scanCancelRequested
-  el("vault-candidate-size").disabled = activeScan
+    : `<i class="fa-solid fa-rotate"></i>${esc(idleScanLabel)}`
+  const firstGlobalScan = !IS_APP_MODE && !last && !activeScan
+  scanButton.classList.toggle("primary", firstGlobalScan)
+  scanButton.disabled = busyElsewhere || state.scanCancelRequested
+  const candidateSizeSelect = el("vault-candidate-size")
+  if (candidateSizeSelect) candidateSizeSelect.disabled = activeScan
+  const scanControl = el("vault-scan-control")
+  if (scanControl) scanControl.classList.toggle("single", activeScan)
+  const scanSizeMenu = el("vault-scan-size-menu")
+  if (scanSizeMenu) {
+    const scanSizeTrigger = scanSizeMenu.querySelector("summary")
+    if (scanSizeTrigger) {
+      scanSizeTrigger.classList.toggle("primary", firstGlobalScan)
+    }
+    scanSizeMenu.hidden = activeScan
+    if (activeScan) scanSizeMenu.open = false
+  }
+  renderCandidateSizeControl()
   const scanState = el("vault-scan-state")
   if (busyElsewhere) {
     scanState.classList.add("show")
@@ -1575,6 +2308,7 @@ const render = () => {
   }
   renderViews()
   renderExternalPrompt()
+  renderFolderDiscovery()
   renderLocations()
   renderToolbar()
   const page = pagedItems(items)
@@ -1640,6 +2374,7 @@ const duplicateGroupSelectionPaths = async (hash) =>
   fetchJson(duplicateGroupUrl(hash, { select: true }))
 const applyFullData = (data) => {
   const scanning = scanActive(data.scan)
+  const findingFolders = folderDiscoveryActive(data.folder_discovery)
   const contextualScan = !IS_APP_MODE || !data.scan || data.scan.scope_id === SCOPE_ID
   const completed = state.scanRequested && !scanning && data.last_scan && data.last_scan.ts !== state.scanBaseline
   const partial = contextualScan && !scanning && (
@@ -1657,6 +2392,7 @@ const applyFullData = (data) => {
   if (fileAction) state.actionProgress = fileAction
   else if (!state.actionRequest) state.actionProgress = null
   if (!scanning) state.scanCancelRequested = false
+  if (!findingFolders) state.folderDiscoveryCancelRequested = false
   if (failed) {
     state.scanRequested = false
     state.feedback = { error: true, message: data.scan.error }
@@ -1683,7 +2419,7 @@ const applyFullData = (data) => {
     }
   }
   render()
-  return scanning || !!fileAction
+  return scanning || findingFolders || !!fileAction
 }
 let refreshSequence = 0
 const refresh = async (forceFull = false) => {
@@ -1691,21 +2427,30 @@ const refresh = async (forceFull = false) => {
   let delay = null
   try {
     const progressOnly = !forceFull &&
-      !!(state.data && (scanActive(state.data.scan) || state.actionProgress))
+      !!(state.data && (
+        scanActive(state.data.scan) ||
+        folderDiscoveryActive(state.data.folder_discovery) ||
+        state.actionProgress
+      ))
     if (progressOnly) {
       const progress = await fetchJson(statusUrl(true))
       if (sequence !== refreshSequence) return
       state.data.scan = progress.scan
       state.data.last_scan = progress.last_scan
+      state.data.folder_discovery = progress.folder_discovery
       const fileAction = serverFileAction(progress.file_action)
       if (fileAction) state.actionProgress = fileAction
       else if (!state.actionRequest) state.actionProgress = null
-      if (scanActive(progress.scan) || fileAction) {
+      if (scanActive(progress.scan) ||
+          folderDiscoveryActive(progress.folder_discovery) ||
+          fileAction) {
         delay = 1500
         renderOverview()
         renderResult()
         renderActionProgress()
         renderFeedback()
+        renderExternalPrompt()
+        renderFolderDiscovery()
       } else {
         const data = await fetchJson(statusUrl())
         if (sequence !== refreshSequence) return
@@ -1945,7 +2690,7 @@ const detachFeedback = (result) => {
   return { error: true, message: messages[result.status] || COPY.action_not_completed }
 }
 
-const chooseExternalFolder = () => new Promise((resolve, reject) => {
+const chooseExternalFolder = (title = COPY.add_external_folder) => new Promise((resolve, reject) => {
   const picker = new Socket()
   let settled = false
   const finish = (value) => {
@@ -1960,7 +2705,7 @@ const chooseExternalFolder = () => new Promise((resolve, reject) => {
   }
   picker.run({
     method: "kernel.bin.filepicker",
-    params: { title: COPY.add_external_folder, type: "folder" }
+    params: { title, type: "folder" }
   }, (packet) => {
     if (packet.type === "result") {
       const paths = packet.data && Array.isArray(packet.data.paths) ? packet.data.paths : []
@@ -1974,9 +2719,235 @@ const chooseExternalFolder = () => new Promise((resolve, reject) => {
   }).then(() => finish(null)).catch(fail)
 })
 
+const beginFolderDiscovery = async (opener = null) => {
+  if (opener && typeof opener.focus === "function") {
+    state.folderDiscoveryReturnFocus = opener
+  }
+  const returnToOpener = () => {
+    const target = opener || state.folderDiscoveryReturnFocus
+    if (target && target.isConnected) target.focus({ preventScroll: true })
+    state.folderDiscoveryReturnFocus = null
+  }
+  state.folderDiscoveryLocalError = null
+  state.feedback = null
+  renderFeedback()
+  if (!(state.data && state.data.last_scan && state.data.last_scan.ts)) {
+    state.feedback = { error: true, message: COPY.find_requires_scan }
+    renderFeedback()
+    returnToOpener()
+    return
+  }
+  if (scanActive(state.data.scan)) {
+    state.feedback = { error: true, message: COPY.find_wait_for_scan }
+    renderFeedback()
+    returnToOpener()
+    return
+  }
+  try {
+    const folderPath = await chooseExternalFolder(COPY.find_folders_picker)
+    if (!folderPath) {
+      returnToOpener()
+      return
+    }
+    resetFolderDiscoveryChoices()
+    const result = await post({ action: "find_folders", path: folderPath })
+    if (result.error) {
+      state.feedback = { error: true, message: result.error }
+      renderFeedback()
+      returnToOpener()
+      return
+    }
+    state.folderDiscoveryOpen = true
+    state.folderDiscoveryPage = 0
+    state.folderDiscoveryCancelRequested = false
+    await refresh(true)
+    focusFolderDiscoveryDialog()
+  } catch (error) {
+    state.feedback = {
+      error: true,
+      message: error && error.message ? error.message : String(error)
+    }
+    renderFeedback()
+    returnToOpener()
+  }
+}
+
+const closeAddMenu = () => {
+  const menu = el("vault-add-menu")
+  if (menu) menu.open = false
+}
+const closeScanSizeMenu = () => {
+  const menu = el("vault-scan-size-menu")
+  if (menu) menu.open = false
+}
+
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("button")
   if (!target) return
+  if (state.folderDiscoverySubmitting &&
+      target.closest("#vault-find-overlay")) return
+  if (target.hasAttribute("data-candidate-size")) {
+    const size = Number(target.dataset.candidateSize)
+    if (candidateSizeOptions.includes(size)) {
+      state.candidateSize = size
+      try { localStorage.setItem(candidateSizeKey, String(size)) } catch (error) {}
+      closeScanSizeMenu()
+      renderCandidateSizeControl()
+    }
+    return
+  }
+  if (target.id === "btn-find-folders" ||
+      target.hasAttribute("data-find-folders")) {
+    const addMenu = el("vault-add-menu")
+    const opener = target.id === "btn-find-folders" && addMenu
+      ? addMenu.querySelector("summary")
+      : target
+    closeAddMenu()
+    state.folderDiscoveryLocalError = null
+    state.folderDiscoveryPage = 0
+    await beginFolderDiscovery(opener)
+    return
+  }
+  if (target.hasAttribute("data-close-find-folders")) {
+    if (folderDiscoveryActive(
+      state.data && state.data.folder_discovery
+    )) {
+      state.folderDiscoveryCancelRequested = true
+      renderFolderDiscovery()
+      try {
+        await post({ action: "cancel_find_folders" })
+        closeFolderDiscoveryModal()
+        await refresh()
+      } catch (error) {
+        state.folderDiscoveryCancelRequested = false
+        state.folderDiscoveryLocalError = error && error.message
+          ? error.message
+          : String(error)
+        renderFolderDiscovery()
+      }
+    } else {
+      target.disabled = true
+      try {
+        const result = await post({ action: "clear_find_folders" })
+        if (result.error) throw new Error(result.error)
+        closeFolderDiscoveryModal()
+        resetFolderDiscoveryChoices()
+        await refresh(true)
+      } catch (error) {
+        target.disabled = false
+        state.folderDiscoveryLocalError = error && error.message
+          ? error.message
+          : String(error)
+        renderFolderDiscovery()
+      }
+    }
+    return
+  }
+  if (target.hasAttribute("data-cancel-find-folders")) {
+    target.disabled = true
+    state.folderDiscoveryCancelRequested = true
+    renderFolderDiscovery()
+    try {
+      const result = await post({ action: "cancel_find_folders" })
+      if (!result.cancel_requested) {
+        throw new Error(COPY.action_not_completed)
+      }
+      closeFolderDiscoveryModal()
+      await refresh()
+    } catch (error) {
+      state.folderDiscoveryCancelRequested = false
+      state.folderDiscoveryLocalError = error && error.message
+        ? error.message
+        : String(error)
+      renderFolderDiscovery()
+    }
+    return
+  }
+  if (target.hasAttribute("data-search-somewhere-else")) {
+    target.disabled = true
+    try {
+      const result = await post({ action: "clear_find_folders" })
+      if (result.error) throw new Error(result.error)
+      state.folderDiscoveryPage = 0
+      state.folderDiscoveryLocalError = null
+      closeFolderDiscoveryModal(false)
+      await refresh(true)
+      await beginFolderDiscovery()
+    } catch (error) {
+      state.folderDiscoveryLocalError = error && error.message
+        ? error.message
+        : String(error)
+      renderFolderDiscovery()
+    } finally {
+      target.disabled = false
+    }
+    return
+  }
+  if (target.dataset.findPage) {
+    const direction = target.dataset.findPage
+    state.folderDiscoveryPage = Math.max(
+      0,
+      state.folderDiscoveryPage + (direction === "next" ? 1 : -1)
+    )
+    await refresh(true)
+    return
+  }
+  if (target.dataset.toggleFoundFolder) {
+    const key = folderDiscoveryPathKey(target.dataset.toggleFoundFolder)
+    if (state.folderDiscoveryExpanded.has(key)) {
+      state.folderDiscoveryExpanded.delete(key)
+      renderFolderDiscovery()
+    } else {
+      state.folderDiscoveryExpanded.add(key)
+      const node = state.folderDiscoveryNodes.get(key)
+      if (node && !node.children_loaded) {
+        await loadFolderDiscoveryChildren(node.folder, 0)
+      } else {
+        renderFolderDiscovery()
+      }
+    }
+    return
+  }
+  if (target.dataset.loadFoundFolder) {
+    await loadFolderDiscoveryChildren(
+      target.dataset.loadFoundFolder,
+      target.dataset.foundFolderPage)
+    return
+  }
+  if (target.hasAttribute("data-add-found-folders")) {
+    if (state.folderDiscoverySubmitting) return
+    const selection = folderDiscoverySelectionSummary()
+    if (!selection.count) return
+    const discovery = state.data && state.data.folder_discovery
+    if (!folderDiscoveryComplete(discovery)) return
+    state.folderDiscoverySubmitting = true
+    renderFolderDiscovery()
+    focusFolderDiscoveryDialog()
+    try {
+      const result = await addFolderDiscoverySelection(discovery)
+      dismissExternalPrompt()
+      const created = Math.max(0, Number(result.created_count) || 0)
+      state.feedback = {
+        error: false,
+        message: created === 0
+          ? COPY.external_exists
+          : created === 1
+            ? COPY.external_added
+            : COPY.external_locations_added.replace("{count}", created)
+      }
+      closeFolderDiscoveryModal()
+      resetFolderDiscoveryChoices()
+      await refresh(true)
+    } catch (error) {
+      state.folderDiscoveryLocalError = error && error.message
+        ? error.message
+        : String(error)
+    } finally {
+      state.folderDiscoverySubmitting = false
+      if (state.folderDiscoveryOpen) renderFolderDiscovery()
+    }
+    return
+  }
   if (target.hasAttribute("data-reveal-file")) {
     target.disabled = true
     target.setAttribute("aria-busy", "true")
@@ -2137,6 +3108,7 @@ document.addEventListener("click", async (event) => {
   } else if (target.hasAttribute("data-dismiss-external-prompt")) {
     dismissExternalPrompt()
   } else if (target.id === "btn-add-source" || target.hasAttribute("data-add-source")) {
+    closeAddMenu()
     target.disabled = true
     try {
       const folderPath = await chooseExternalFolder()
@@ -2365,6 +3337,65 @@ document.addEventListener("click", async (event) => {
   }
 })
 
+document.addEventListener("change", async (event) => {
+  const target = event.target.closest("[data-select-found-folder]")
+  if (!target || state.folderDiscoverySubmitting ||
+      state.folderDiscoverySelectionPending) return
+  const node = state.folderDiscoveryNodes.get(
+    folderDiscoveryPathKey(target.dataset.selectFoundFolder))
+  if (!node) return
+  const promise = updateFolderDiscoverySelection(
+    node,
+    target.checked,
+    state.data && state.data.folder_discovery
+  )
+  state.folderDiscoverySelectionPromise = promise
+  try {
+    await promise
+  } finally {
+    if (state.folderDiscoverySelectionPromise === promise) {
+      state.folderDiscoverySelectionPromise = null
+    }
+  }
+})
+
+document.addEventListener("keydown", (event) => {
+  if (!state.folderDiscoveryOpen) return
+  const overlay = el("vault-find-overlay")
+  const dialog = overlay && overlay.querySelector(".vault-find-dialog")
+  if (!dialog) return
+  if (event.key === "Escape") {
+    event.preventDefault()
+    event.stopImmediatePropagation()
+    if (state.folderDiscoverySubmitting) return
+    const close = dialog.querySelector("[data-close-find-folders]")
+    if (close) close.click()
+    return
+  }
+  if (event.key !== "Tab") return
+  const focusable = [...dialog.querySelectorAll(
+    "button:not([disabled]), input:not([disabled]), summary, [href], [tabindex]:not([tabindex='-1'])"
+  )].filter((candidate) => !candidate.closest("[hidden]"))
+  if (!focusable.length) {
+    event.preventDefault()
+    dialog.focus({ preventScroll: true })
+    return
+  }
+  const first = focusable[0]
+  const last = focusable[focusable.length - 1]
+  if (document.activeElement === dialog ||
+      !dialog.contains(document.activeElement)) {
+    event.preventDefault()
+    ;(event.shiftKey ? last : first).focus({ preventScroll: true })
+  } else if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault()
+    last.focus({ preventScroll: true })
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault()
+    first.focus({ preventScroll: true })
+  }
+}, true)
+
 document.addEventListener("input", (event) => {
   if (event.target.id !== "vault-search") return
   clearFileSelections()
@@ -2539,8 +3570,12 @@ document.addEventListener("change", async (event) => {
     return
   }
   if (event.target.id === "vault-candidate-size") {
+    const size = Number(event.target.value)
+    state.candidateSize = candidateSizeOptions.includes(size)
+      ? size
+      : defaultCandidateSize
     try { localStorage.setItem(candidateSizeKey, String(candidateSize())) } catch (error) {}
-    render()
+    renderCandidateSizeControl()
     return
   }
   if (event.target.id !== "vault-status-filter") return
@@ -2550,26 +3585,58 @@ document.addEventListener("change", async (event) => {
   refresh(true)
 })
 
-el("btn-scan").textContent = COPY.scan
-const candidateSizeSelect = el("vault-candidate-size")
-candidateSizeSelect.setAttribute("aria-label", COPY.minimum_file_size)
-candidateSizeSelect.innerHTML = candidateSizeOptions
-  .map((size) => `<option value="${size}">${size === 0 ? COPY.all : `${fmt(size)}+`}</option>`)
-  .join("")
-candidateSizeSelect.value = String(defaultCandidateSize)
+let initialCandidateSize = defaultCandidateSize
 try {
   const storedValue = localStorage.getItem(candidateSizeKey)
   if (storedValue !== null) {
     const storedCandidateSize = Number(storedValue)
     if (candidateSizeOptions.includes(storedCandidateSize)) {
-      candidateSizeSelect.value = String(storedCandidateSize)
+      initialCandidateSize = storedCandidateSize
     }
   }
 } catch (error) {}
+state.candidateSize = initialCandidateSize
+const candidateSizeSelect = el("vault-candidate-size")
+if (candidateSizeSelect) {
+  candidateSizeSelect.setAttribute("aria-label", COPY.minimum_file_size)
+  candidateSizeSelect.innerHTML = candidateSizeOptions
+    .map((size) => `<option value="${size}">${candidateSizeLabel(size)}</option>`)
+    .join("")
+}
+const candidateSizeOptionsElement = el("vault-scan-size-options")
+if (candidateSizeOptionsElement) {
+  candidateSizeOptionsElement.innerHTML = `
+    <div class="vault-scan-size-heading">${esc(COPY.minimum_file_size)}</div>
+    ${candidateSizeOptions.map((size) => `
+      <button class="vault-scan-size-option" type="button" data-candidate-size="${size}" aria-pressed="false">
+        <span>${esc(candidateSizeLabel(size))}</span>
+        <i class="fa-solid fa-check" aria-hidden="true"></i>
+      </button>`).join("")}`
+}
+renderCandidateSizeControl()
+el("btn-scan").textContent = IS_APP_MODE ? COPY.scan_app : COPY.scan
 const addSourceButton = el("btn-add-source")
 if (addSourceButton) {
   addSourceButton.setAttribute("aria-label", COPY.add_external_folder)
   addSourceButton.setAttribute("title", COPY.add_external_folder)
+}
+const disclosureMenus = [el("vault-add-menu"), el("vault-scan-size-menu")]
+  .filter(Boolean)
+if (disclosureMenus.length) {
+  document.addEventListener("pointerdown", (event) => {
+    for (const menu of disclosureMenus) {
+      if (menu.open && !menu.contains(event.target)) menu.open = false
+    }
+  }, true)
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return
+    for (const menu of disclosureMenus) {
+      if (!menu.open) continue
+      menu.open = false
+      const trigger = menu.querySelector("summary")
+      if (trigger) trigger.focus()
+    }
+  }, true)
 }
 el("vault-pane").setAttribute("aria-label", COPY.files_region)
 refresh()
