@@ -149,6 +149,7 @@ for (const method of [
   "reclaimableBatch",
   "duplicateGroupChildren",
   "duplicateGroupSelection",
+  "duplicateGroupPageSelection",
   "statusSnapshot",
   "clearFiles"
 ]) {

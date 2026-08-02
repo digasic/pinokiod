@@ -540,6 +540,10 @@ describe("Save Space engine", () => {
     assert.ok(secondRow, JSON.stringify(await vault.registry.files()))
     assert.equal(firstRow.status, "reference")
     assert.equal(secondRow.status, "duplicate")
+    const status = await vault.status()
+    assert.equal(status.bytes_without_sharing, contents.length)
+    assert.equal(status.logical_bytes, contents.length * 3)
+    assert.equal(status.pending_bytes, contents.length)
     await close(vault)
   })
 
@@ -1093,6 +1097,17 @@ describe("Save Space engine", () => {
       firstGroupPage.items[0].hash,
       secondGroupPage.items[0].hash
     )
+    const firstPageSelection = await vault.duplicateGroupPageSelection(null, {
+      size_sort: "desc",
+      page_size: 1
+    })
+    assert.equal(firstPageSelection.exceeded, false)
+    assert.equal(
+      firstPageSelection.items.length,
+      firstGroupPage.items[0].eligible_count
+    )
+    assert.equal(firstPageSelection.items.every((entry) =>
+      entry.hash === firstGroupPage.items[0].hash), true)
     const searched = await vault.status(null, {
       view: "duplicates",
       display_mode: "files",
@@ -1148,6 +1163,13 @@ describe("Save Space engine", () => {
     })
     assert.deepEqual(selection.paths, [scopedDuplicate.path])
     assert.equal(selection.exceeded, false)
+    const scopedPageSelection = await vault.duplicateGroupPageSelection(null, {
+      location_id: scopedDuplicate.source_id
+    })
+    assert.deepEqual(
+      scopedPageSelection.items.map((entry) => entry.path),
+      [scopedDuplicate.path]
+    )
 
     const appGrouped = await vault.status(scopedDuplicate.source_id, {
       view: "duplicates",
@@ -1170,6 +1192,13 @@ describe("Save Space engine", () => {
       hash
     )
     assert.deepEqual(appSelection.paths, [scopedDuplicate.path])
+    const appPageSelection = await vault.duplicateGroupPageSelection(
+      scopedDuplicate.source_id
+    )
+    assert.deepEqual(
+      appPageSelection.items.map((entry) => entry.path),
+      [scopedDuplicate.path]
+    )
 
     await close(vault)
   })
@@ -1359,16 +1388,20 @@ describe("Save Space engine", () => {
     await close(vault)
   })
 
-  test("Before, After, Can save, and current savings change coherently", async () => {
+  test("compatibility and segmented summary measurements change coherently", async () => {
     const { home, vault } = await makeVault()
     const pair = await duplicatePair(home)
     await vault.sweeper.scan()
     let status = await vault.status()
 
     assert.equal(status.bytes_without_sharing, pair.contents.length * 2)
+    assert.equal(status.logical_bytes, pair.contents.length * 2)
     assert.equal(status.saved_by_sharing, 0)
     assert.equal(status.bytes_on_disk, pair.contents.length * 2)
     assert.equal(status.pending_bytes, pair.contents.length)
+    assert.equal(Object.hasOwn(status, "shared_logical_bytes"), false)
+    let appStatus = await vault.status("app:first")
+    assert.equal(appStatus.shared_logical_bytes, 0)
 
     const duplicate = [...await vault.registry.files({
       statuses: ["duplicate"]
@@ -1376,8 +1409,14 @@ describe("Save Space engine", () => {
     await vault.perform("deduplicate", { path: duplicate.path })
     status = await vault.status()
     assert.equal(status.saved_by_sharing, pair.contents.length)
+    assert.equal(status.logical_bytes, pair.contents.length * 2)
     assert.equal(status.bytes_on_disk, pair.contents.length)
     assert.equal(status.pending_bytes, 0)
+    appStatus = await vault.status("app:first", {
+      view: "duplicates",
+      query: "does-not-match"
+    })
+    assert.equal(appStatus.shared_logical_bytes, pair.contents.length)
 
     await vault.perform("separate_files", { paths: [duplicate.path] })
     status = await vault.status()

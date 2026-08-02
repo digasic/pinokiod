@@ -76,12 +76,13 @@ const COPY = {
   remove_external_confirm: "Remove “{name}” from Locations? This does not delete or modify any files.",
   external_removed: "Removed from Locations. No files were changed.",
   save_space: "Disk Saver",
-  disk_space_saved: "of disk space saved",
-  saved_for_app: "{size} saved for this app",
-  before: "Before",
-  before_help: "Combined logical size of every file in the scanned locations, counting each visible path once. File Explorer may count deduplicated files differently.",
-  after: "After",
-  effective_help: "For deduplicated files, disk usage is divided evenly among every location using them.",
+  storage_saved_headline: "{size} saved by deduplicating",
+  storage_unique_headline: "{size} unique to this app",
+  storage_still_used: "Still used",
+  storage_saved: "Saved",
+  storage_unique: "Unique",
+  storage_shared: "Shared",
+  storage_can_save: "Can save",
   nothing_more_to_save: "Nothing else to save",
   more_can_be_saved: "{size} more can be saved",
   review_files: "Review files",
@@ -313,6 +314,19 @@ const duplicateGroupUrl = (hash, options = {}) => {
     if (options.cursor) query.set("cursor", options.cursor)
     query.set("page_size", String(DUPLICATE_CHILD_PAGE_SIZE))
   }
+  return `/info/dedup?${query.toString()}`
+}
+const duplicateGroupPageSelectionUrl = () => {
+  const query = new URLSearchParams({
+    group_page_select: "1",
+    page_size: String(PAGE_SIZE)
+  })
+  if (SCOPE_ID) query.set("scope_id", SCOPE_ID)
+  if (state.sourceId) query.set("location_id", state.sourceId)
+  if (state.query) query.set("q", state.query)
+  if (state.sizeSort) query.set("size_sort", state.sizeSort)
+  const cursor = state.pageCursors[state.page]
+  if (cursor) query.set("cursor", cursor)
   return `/info/dedup?${query.toString()}`
 }
 const reviewedScanKey = `pinokio:vault:reviewed-scan:${SCOPE_ID || "global"}`
@@ -1744,6 +1758,19 @@ const syncDuplicateGroupCheckboxes = () => {
     checkbox.indeterminate = selected > 0 && selected < eligible
   }
 }
+const syncDuplicateGroupPageSelectionCheckbox = () => {
+  const selectPage = document.querySelector(
+    "[data-select-duplicate-group-page]")
+  if (!selectPage) return
+  const groupCheckboxes = [...document.querySelectorAll(
+    "[data-select-duplicate-group]")]
+  const eligible = groupCheckboxes.reduce((sum, checkbox) =>
+    sum + Math.max(0, Number(checkbox.dataset.eligibleCount) || 0), 0)
+  const selected = groupCheckboxes.reduce((sum, checkbox) =>
+    sum + Math.max(0, Number(checkbox.dataset.selectedCount) || 0), 0)
+  selectPage.checked = eligible > 0 && selected === eligible
+  selectPage.indeterminate = selected > 0 && selected < eligible
+}
 
 const renderSeparateSelectionBanner = (
   pagePaths = selectablePagePaths(buildItems())
@@ -1822,18 +1849,34 @@ const renderTable = (items) => {
   const duplicatePagePaths = state.view === "duplicates"
     ? selectableDuplicatePagePaths(items)
     : []
-  const pagePaths = duplicatePagePaths.length
-    ? duplicatePagePaths
-    : separatePagePaths
-  const selectedPaths = duplicatePagePaths.length
-    ? state.selectedDuplicateFiles
-    : state.selectedSeparateFiles
-  const allPageSelected = pagePaths.length > 0 && pagePaths.every((filePath) =>
-    selectedPaths.has(filePath))
-  const pageSelectionAttribute = duplicatePagePaths.length
-    ? "data-select-duplicate-page"
-    : "data-select-separate-page"
-  const headerMarkup = headers.map((header, index) => index === 0 && pagePaths.length
+  const groupedDuplicatePage = state.view === "duplicates" &&
+    state.displayMode === "files" &&
+    items.some((item) => item.kind === "duplicate_group")
+  const groupedEligible = groupedDuplicatePage
+    ? items.reduce((sum, item) =>
+        sum + Math.max(0, Number(item.eligible_count) || 0), 0)
+    : 0
+  const groupedSelected = groupedDuplicatePage
+    ? items.reduce((sum, item) => sum + Math.min(
+        Math.max(0, Number(item.eligible_count) || 0),
+        duplicateGroupSelectedCount(item.hash)
+      ), 0)
+    : 0
+  let pageSelectionAttribute = ""
+  let allPageSelected = false
+  if (groupedEligible) {
+    pageSelectionAttribute = "data-select-duplicate-group-page"
+    allPageSelected = groupedSelected === groupedEligible
+  } else if (duplicatePagePaths.length) {
+    pageSelectionAttribute = "data-select-duplicate-page"
+    allPageSelected = duplicatePagePaths.every((filePath) =>
+      state.selectedDuplicateFiles.has(filePath))
+  } else if (separatePagePaths.length) {
+    pageSelectionAttribute = "data-select-separate-page"
+    allPageSelected = separatePagePaths.every((filePath) =>
+      state.selectedSeparateFiles.has(filePath))
+  }
+  const headerMarkup = headers.map((header, index) => index === 0 && pageSelectionAttribute
     ? `<span class="vault-name-header"><input class="vault-row-checkbox" type="checkbox" ${pageSelectionAttribute} aria-label="${attr(COPY.select_all_on_page)}" title="${attr(COPY.select_all_on_page)}" ${allPageSelected ? "checked" : ""} /><span>${esc(header)}</span></span>`
     : (header === COPY.size || header === COPY.size_each) && sortableSize
       ? `<span class="vault-sort-column" role="columnheader" aria-sort="${state.sizeSort === "desc" ? "descending" : state.sizeSort === "asc" ? "ascending" : "none"}"><button class="vault-sort-button ${state.sizeSort ? "active" : ""}" type="button" data-sort-size aria-label="${attr(sizeSortLabel)}">${esc(header)}<i class="fa-solid ${sizeSortIcon}" aria-hidden="true"></i></button></span>`
@@ -1843,6 +1886,7 @@ const renderTable = (items) => {
   syncPageSelectionCheckbox()
   syncDuplicatePageSelectionCheckbox()
   syncDuplicateGroupCheckboxes()
+  syncDuplicateGroupPageSelectionCheckbox()
 }
 
 const orderedItems = (items) => {
@@ -1930,6 +1974,28 @@ const renderPaneFooter = (page) => {
     </span>`
 }
 
+const storageSummaryMarkup = (segments, logicalBytes) => {
+  const barBytes = Math.max(logicalBytes, 1)
+  const visible = segments
+    .filter((segment) => segment.value > 0)
+    .map((segment) => Object.assign({}, segment, {
+      percent: Math.min(100, (segment.value / barBytes) * 100)
+    }))
+  const ariaLabel = segments.map((segment) =>
+    `${segment.label}: ${fmt(segment.value)}`).join(". ")
+  const track = visible.map((segment) => `
+    <span class="vault-storage-segment ${segment.kind}" style="--vault-segment-share:${segment.percent.toFixed(4)}%"></span>`).join("")
+  const legend = visible.map((segment) => `
+    <span class="vault-storage-key ${segment.kind}">
+      <i aria-hidden="true"></i><span>${esc(segment.label)}</span><strong>${fmt(segment.value)}</strong>
+    </span>`).join("")
+  return `
+    <div class="vault-storage-chart" role="img" aria-label="${attr(ariaLabel)}">
+      <div class="vault-storage-track" aria-hidden="true">${track}</div>
+      <div class="vault-storage-legend" aria-hidden="true">${legend}</div>
+    </div>`
+}
+
 const renderOverview = () => {
   const data = state.data
   const last = data.last_scan
@@ -1939,41 +2005,51 @@ const renderOverview = () => {
   const metrics = el("vault-metrics")
   metrics.classList.add("summary")
   {
-    const beforeBytes = IS_APP_MODE
-      ? Math.max(0, Number(last && last.bytes_total) || 0)
-      : Math.max(0, Number(data.bytes_without_sharing) || 0)
-    const afterBytes = IS_APP_MODE
-      ? Math.max(0, Number(data.effective_bytes) || 0)
-      : Math.max(0, Number(data.bytes_on_disk) || 0)
-    const hasComparison = IS_APP_MODE
-      ? !!(last && Number.isFinite(last.bytes_total) && Number.isFinite(data.effective_bytes))
-      : Number.isFinite(data.bytes_without_sharing) &&
-        Number.isFinite(data.bytes_on_disk) &&
-        (!!last || beforeBytes > 0 || afterBytes > 0 || Number(data.pending_bytes) > 0)
-    const afterRatio = beforeBytes ? Math.min(100, (afterBytes / beforeBytes) * 100) : 0
+    const fallbackLogicalBytes = IS_APP_MODE
+      ? Number(last && last.bytes_total)
+      : Number(data.bytes_without_sharing)
+    const logicalBytes = Math.max(
+      0,
+      Number.isFinite(data.logical_bytes)
+        ? data.logical_bytes
+        : fallbackLogicalBytes || 0
+    )
     const pendingBytes = Math.max(0, Number(data.pending_bytes) || 0)
-    const sharedNow = Math.max(0, Number(data.saved_by_sharing) || 0)
-    const headline = hasComparison
+    const savedBytes = Math.max(0, Number(data.saved_by_sharing) || 0)
+    const sharedLogicalBytes = Math.max(
+      0, Number(data.shared_logical_bytes) || 0)
+    const uniqueBytes = Math.max(
+      0, logicalBytes - sharedLogicalBytes - pendingBytes)
+    const stillUsedBytes = Math.max(
+      0, logicalBytes - savedBytes - pendingBytes)
+    const hasSummary = IS_APP_MODE
+      ? !!(last && Number.isFinite(last.bytes_total) &&
+        Number.isFinite(data.logical_bytes) &&
+        Number.isFinite(data.shared_logical_bytes) &&
+        Number.isFinite(data.pending_bytes))
+      : Number.isFinite(data.logical_bytes) &&
+        Number.isFinite(data.saved_by_sharing) &&
+        Number.isFinite(data.pending_bytes) &&
+        (!!last || logicalBytes > 0 || savedBytes > 0 || pendingBytes > 0)
+    const headline = hasSummary
       ? (IS_APP_MODE
-          ? COPY.saved_for_app.replace("{size}", fmt(Math.max(0, beforeBytes - afterBytes)))
-          : `${fmt(sharedNow)} ${COPY.disk_space_saved}`)
+          ? COPY.storage_unique_headline.replace("{size}", fmt(uniqueBytes))
+          : COPY.storage_saved_headline.replace("{size}", fmt(savedBytes)))
       : (IS_APP_MODE ? COPY.find_app_savings : COPY.find_savings)
-    const help = IS_APP_MODE ? COPY.effective_help : COPY.before_help
-    const helpId = IS_APP_MODE ? "vault-after-help" : "vault-before-help"
-    const helpMarkup = `<span class="vault-compare-info" tabindex="0" aria-describedby="${helpId}"><i class="fa-regular fa-circle-question" aria-hidden="true"></i><span class="vault-compare-tooltip" id="${helpId}" role="tooltip">${esc(help)}</span></span>`
-    const comparison = hasComparison ? `
-      <div class="vault-comparison" aria-label="${attr(`${COPY.before}: ${fmt(beforeBytes)}. ${COPY.after}: ${fmt(afterBytes)}.`)}">
-        <div class="vault-compare-row">
-          <span class="vault-compare-label">${esc(COPY.before)}${IS_APP_MODE ? "" : helpMarkup}</span>
-          <span class="vault-compare-track"><span class="vault-compare-fill before"></span></span>
-          <span class="vault-compare-value">${fmt(beforeBytes)}</span>
-        </div>
-        <div class="vault-compare-row">
-          <span class="vault-compare-label">${esc(COPY.after)}${IS_APP_MODE ? helpMarkup : ""}</span>
-          <span class="vault-compare-track"><span class="vault-compare-fill after" style="--vault-after-ratio:${afterRatio.toFixed(2)}%"></span></span>
-          <span class="vault-compare-value">${fmt(afterBytes)}</span>
-        </div>
-      </div>` : ""
+    const segments = IS_APP_MODE
+      ? [
+          { label: COPY.storage_unique, value: uniqueBytes, kind: "occupied" },
+          { label: COPY.storage_shared, value: sharedLogicalBytes, kind: "optimized" },
+          { label: COPY.storage_can_save, value: pendingBytes, kind: "potential" }
+        ]
+      : [
+          { label: COPY.storage_still_used, value: stillUsedBytes, kind: "occupied" },
+          { label: COPY.storage_saved, value: savedBytes, kind: "optimized" },
+          { label: COPY.storage_can_save, value: pendingBytes, kind: "potential" }
+        ]
+    const summary = hasSummary
+      ? storageSummaryMarkup(segments, logicalBytes)
+      : ""
     const opportunity = activeScan
       ? ""
       : pendingBytes
@@ -1989,7 +2065,7 @@ const renderOverview = () => {
       <div class="vault-summary-main">
         <div class="vault-summary-label"><i class="fa-solid fa-hard-drive"></i>${esc(COPY.save_space)}</div>
         <div class="vault-summary-value">${esc(headline)}</div>
-        ${comparison}
+        ${summary}
       </div>
       <div class="vault-summary-side">${summarySide}</div>`
   }
@@ -2372,6 +2448,8 @@ const loadDuplicateGroupChildren = async (hash, append = false) => {
 }
 const duplicateGroupSelectionPaths = async (hash) =>
   fetchJson(duplicateGroupUrl(hash, { select: true }))
+const duplicateGroupPageSelectionItems = async () =>
+  fetchJson(duplicateGroupPageSelectionUrl())
 const applyFullData = (data) => {
   const scanning = scanActive(data.scan)
   const findingFolders = folderDiscoveryActive(data.folder_discovery)
@@ -3405,6 +3483,57 @@ document.addEventListener("input", (event) => {
   window.__vaultSearchRefresh = setTimeout(() => refresh(true), 250)
 })
 document.addEventListener("change", async (event) => {
+  if (event.target.hasAttribute("data-select-duplicate-group-page")) {
+    const checkbox = event.target
+    const pageHashes = new Set([...document.querySelectorAll(
+      "[data-select-duplicate-group]")].map((item) =>
+      item.dataset.selectDuplicateGroup))
+    if (!checkbox.checked) {
+      for (const [filePath, selection] of state.selectedDuplicateFiles) {
+        if (!selection || !pageHashes.has(selection.hash)) continue
+        state.selectedDuplicateFiles.delete(filePath)
+      }
+      render()
+      return
+    }
+    checkbox.disabled = true
+    const generation = state.duplicateGroupGeneration
+    try {
+      const result = await duplicateGroupPageSelectionItems()
+      if (generation !== state.duplicateGroupGeneration) return
+      const items = Array.isArray(result.items)
+        ? result.items.filter((item) => item && item.path)
+        : []
+      const combined = new Set(state.selectedDuplicateFiles.keys())
+      for (const item of items) combined.add(item.path)
+      if (result.exceeded ||
+          combined.size > MAX_BULK_DEDUPLICATE_FILES) {
+        state.feedback = {
+          error: true,
+          message: COPY.duplicate_selection_limit
+        }
+      } else {
+        for (const item of items) {
+          state.selectedDuplicateFiles.set(item.path, {
+            hash: item.hash || "",
+            size: Math.max(0, Number(item.size) || 0)
+          })
+        }
+      }
+    } catch (error) {
+      if (generation === state.duplicateGroupGeneration) {
+        state.feedback = {
+          error: true,
+          message: error && error.message
+            ? error.message
+            : String(error)
+        }
+      }
+    } finally {
+      if (generation === state.duplicateGroupGeneration) render()
+    }
+    return
+  }
   if (event.target.dataset.selectDuplicateGroup) {
     const checkbox = event.target
     const hash = checkbox.dataset.selectDuplicateGroup

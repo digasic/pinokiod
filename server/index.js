@@ -15772,6 +15772,16 @@ class Server {
         typeof req.query.group_hash === "string"
         ? req.query.group_hash
         : null
+      if (req.query && req.query.group_page_select === "1") {
+        res.json(await vault.duplicateGroupPageSelection(scopeId, {
+          location_id: req.query.location_id,
+          query: req.query.q,
+          cursor: req.query.cursor,
+          page_size: req.query.page_size,
+          size_sort: req.query.size_sort
+        }))
+        return
+      }
       if (groupHash) {
         const options = {
           location_id: req.query && req.query.location_id,

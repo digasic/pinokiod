@@ -4571,6 +4571,38 @@ class RegistryCore {
     }
   }
 
+  duplicateGroupPageSelection(options = {}) {
+    const page = this.duplicateGroupPage(options)
+    const hashes = page.rows
+      .filter((row) => Number(row.eligible_count) > 0)
+      .map((row) => row.hash)
+    if (!hashes.length) return { items: [], exceeded: false }
+    const sourceIds = [...new Set(
+      (options.sourceIds || []).filter(Boolean))]
+    const externalSourceIds = [...new Set(
+      (options.externalSourceIds || []).filter(Boolean))]
+    const active = this.duplicateGroupFilter(
+      sourceIds,
+      String(options.query || ""),
+      !!options.unrestricted,
+      "candidate",
+      ["duplicate"],
+      externalSourceIds
+    )
+    const rows = this.database.prepare(`
+      SELECT candidate.path, candidate.hash, candidate.size
+      FROM files candidate
+      WHERE candidate.hash IN (${placeholders(hashes)})
+        AND ${active.where.join(" AND ")}
+      ORDER BY candidate.path
+      LIMIT 501
+    `).all(...hashes, ...active.values)
+    return {
+      items: rows.slice(0, 500),
+      exceeded: rows.length > 500
+    }
+  }
+
   reclaimablePage(pageSize, cursor) {
     const decoded = this.decodeCursor(cursor)
     const where = ["nlink = 1"]

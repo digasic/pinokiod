@@ -2895,6 +2895,32 @@ class Vault {
     }
   }
 
+  async duplicateGroupPageSelection(scopeId, options = {}) {
+    const locationId = typeof options.location_id === "string" &&
+      options.location_id
+      ? options.location_id
+      : null
+    const cursor = typeof options.cursor === "string"
+      ? options.cursor.slice(0, 2048)
+      : ""
+    const result = await this.registry.duplicateGroupPageSelection({
+      sourceIds: this.scopeSourceIds(scopeId, locationId),
+      authorizedSourceIds: this.scopeSourceIds(scopeId),
+      externalSourceIds: this.configuredExternalSourceIds(),
+      query: String(options.query || "").slice(0, 500).trim(),
+      cursor,
+      pageSize: boundedInteger(
+        options.page_size, STATUS_PAGE_SIZE, 1, STATUS_PAGE_SIZE),
+      sizeSort: options.size_sort || "desc",
+      unrestricted: !scopeId && !locationId,
+      authorizedUnrestricted: !scopeId
+    })
+    return {
+      items: result.items || [],
+      exceeded: !!result.exceeded
+    }
+  }
+
   async status(scopeId = null, options = {}) {
     if (!this.enabled || !this.registry) return { enabled: false }
     const view = STATUS_VIEWS.has(options.view) ? options.view : "all"
@@ -2959,6 +2985,16 @@ class Vault {
       ? lastScan.bytes_total
       : 0
     const saved = Math.max(0, Number(snapshot.saved) || 0)
+    const publishedLogicalBytes = snapshot.scopeRows.reduce(
+      (sum, row) => sum + Math.max(0, Number(row.bytes) || 0),
+      0
+    )
+    const logicalBytes = Math.max(before, publishedLogicalBytes)
+    const sharedLogicalBytes = scopeId
+      ? snapshot.scopeRows
+        .filter((row) => row.status === "linked")
+        .reduce((sum, row) => sum + Math.max(0, Number(row.bytes) || 0), 0)
+      : 0
     const currentCount = Number(snapshot.total) || 0
     const pageTotal = Number(snapshot.pageTotal) || 0
     const pages = Math.max(1, Math.ceil(pageTotal / pageSize))
@@ -2984,6 +3020,7 @@ class Vault {
       mode: this.mode,
       scan: this.scanStatus(),
       last_scan: lastScan,
+      logical_bytes: logicalBytes,
       bytes_without_sharing: before,
       bytes_on_disk: Math.max(0, before - saved),
       saved_by_sharing: saved,
@@ -3031,6 +3068,7 @@ class Vault {
     }
     if (scopeId) {
       result.scope_id = scopeId
+      result.shared_logical_bytes = sharedLogicalBytes
     } else {
       result.folder_discovery = this.folderDiscoveryStatus()
       if (options.folder_discovery_page != null &&

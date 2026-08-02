@@ -64,9 +64,12 @@ const fixture = (items = [], overrides = {}) => {
       hash_failures: 0
     },
     bytes_without_sharing: 8192,
+    logical_bytes: 8192,
     bytes_on_disk: 4096,
     saved_by_sharing: 4096,
     effective_bytes: 4096,
+    shared_logical_bytes: shared.reduce(
+      (sum, entry) => sum + (Number(entry.size) || 0), 0),
     reclaimable: 0,
     pending_bytes: shareable.reduce(
       (sum, entry) => sum + (Number(entry.size) || 0), 0),
@@ -407,6 +410,10 @@ describe("Save Space interface", () => {
     assert.doesNotMatch(combined,
       /btn-empty-scan|vault-rail-footer|vault-visually-hidden/)
     assert.doesNotMatch(combined, /Scan files \{size\}\+|scan_files_over/)
+    assert.doesNotMatch(combined,
+      /vault-comparison|vault-compare-row|saved for this app|of disk space saved/)
+    assert.match(combined, /saved by deduplicating/)
+    assert.match(combined, /unique to this app/)
     assert.match(vaultCss,
       /body\.vault-page \.vault-view-tabs\s*\{[^}]*padding:\s*0;/s)
     assert.match(vaultCss,
@@ -417,6 +424,92 @@ describe("Save Space interface", () => {
       /\.vault-scan-size-menu\s*>\s*\.vault-scan-size-trigger\s*\{[^}]*border-radius:\s*0 7px 7px 0;/s)
     assert.match(vaultCss,
       /\.vault-scan-control\s*>\s*\.vault-scan-size-menu\s*>\s*\.vault-scan-size-trigger\.primary/)
+    assert.match(vaultCss,
+      /\.vault-metrics\.summary\s*\{[^}]*grid-template-columns:\s*minmax\(430px, 620px\) minmax\(230px, 1fr\);/s)
+    assert.match(vaultCss,
+      /\.vault-storage-track\s*\{[^}]*height:\s*10px;/s)
+    assert.match(vaultCss,
+      /\.vault-storage-legend\s*\{[^}]*display:\s*flex;/s)
+    assert.match(vaultCss,
+      /\.vault-storage-key\s*\{[^}]*display:\s*inline-flex;/s)
+    assert.doesNotMatch(vaultCss,
+      /\.vault-storage-legend\s*\{[^}]*grid-template-columns:/s)
+    assert.match(vaultCss,
+      /\.vault-storage-segment\.occupied,[^{]*\{[^}]*background:\s*var\(--task-accent\);/s)
+    assert.match(vaultCss,
+      /\.vault-storage-segment\.optimized,[^{]*\{[^}]*var\(--task-muted\)/s)
+    assert.match(vaultCss,
+      /\.vault-storage-segment\.potential,[^{]*\{[^}]*var\(--task-muted\)[^}]*repeating-linear-gradient/s)
+    assert.doesNotMatch(vaultCss,
+      /\.vault-storage-segment\.potential,[^{]*\{[^}]*var\(--task-accent\)/s)
+    assert.doesNotMatch(vaultCss,
+      /\.vault-overview\s*\{[^}]*flex:\s*0 0 auto;/s)
+    assert.match(vaultCss, /repeating-linear-gradient/)
+  })
+
+  test("global and app summaries use one correctly labeled segmented bar", async () => {
+    const globalStatus = fixture([item()], {
+      // The last scan total can lag behind locations published afterward.
+      bytes_without_sharing: 1000,
+      logical_bytes: 10000,
+      saved_by_sharing: 3000,
+      pending_bytes: 2000
+    })
+    const { dom: globalDom } = await makePage(globalStatus)
+    const globalDocument = globalDom.window.document
+    const globalHeadline = globalDocument.querySelector(".vault-summary-value")
+    const globalChart = globalDocument.querySelector(".vault-storage-chart")
+
+    assert.match(globalHeadline.textContent, /saved by deduplicating/)
+    assert.match(globalChart.getAttribute("aria-label"), /Still used:/)
+    assert.match(globalChart.getAttribute("aria-label"), /Saved:/)
+    assert.match(globalChart.getAttribute("aria-label"), /Can save:/)
+    assert.match(globalDocument.querySelector(
+      ".vault-storage-key.occupied").textContent, /Still used/)
+    assert.match(globalDocument.querySelector(
+      ".vault-storage-key.optimized").textContent, /Saved/)
+    assert.match(globalDocument.querySelector(
+      ".vault-storage-key.potential").textContent, /Can save/)
+    assert.equal(globalDocument.querySelectorAll(
+      ".vault-storage-key").length, 3)
+    assert.equal(globalDocument.querySelectorAll(
+      ".vault-storage-track").length, 1)
+    assert.equal(globalChart.parentElement.className, "vault-summary-main")
+    assert.equal(globalDocument.querySelector("#vault-metrics").children.length, 2)
+    assert.equal(globalDocument.querySelector(".vault-storage-inside"), null)
+    assert.equal(globalDocument.querySelector(".vault-comparison"), null)
+    globalDom.window.close()
+
+    const appStatus = fixture([item()], {
+      last_scan: {
+        ts: Date.now(),
+        files: 3,
+        bytes_total: 10000,
+        hash_failures: 0
+      },
+      logical_bytes: 10000,
+      shared_logical_bytes: 3000,
+      pending_bytes: 2000
+    })
+    const { dom: appDom } = await makePage(appStatus, { appMode: true })
+    const appDocument = appDom.window.document
+    const appHeadline = appDocument.querySelector(".vault-summary-value")
+    const appChart = appDocument.querySelector(".vault-storage-chart")
+
+    assert.match(appHeadline.textContent, /unique to this app/)
+    assert.match(appChart.getAttribute("aria-label"), /Unique:/)
+    assert.match(appChart.getAttribute("aria-label"), /Shared:/)
+    assert.match(appChart.getAttribute("aria-label"), /Can save:/)
+    assert.match(appDocument.querySelector(
+      ".vault-storage-key.occupied").textContent, /Unique/)
+    assert.match(appDocument.querySelector(
+      ".vault-storage-key.optimized").textContent, /Shared/)
+    assert.match(appDocument.querySelector(
+      ".vault-storage-key.potential").textContent, /Can save/)
+    assert.equal(appDocument.querySelectorAll(
+      ".vault-storage-track").length, 1)
+    assert.equal(appDocument.querySelector(".vault-comparison"), null)
+    appDom.window.close()
   })
 
   test("global mode makes the existing location hierarchy primary", async () => {
@@ -1460,6 +1553,16 @@ describe("Save Space interface", () => {
     ]
 
     const { dom, requests } = await makePage((url) => {
+      if (url.includes("group_page_select=1")) {
+        return {
+          items: [first, second].map((entry) => ({
+            path: entry.path,
+            hash: entry.hash,
+            size: entry.size
+          })),
+          exceeded: false
+        }
+      }
       if (url.includes("group_select=1")) {
         return {
           hash: first.hash,
@@ -1505,9 +1608,25 @@ describe("Save Space interface", () => {
     document.querySelector('[data-display-mode="files"]').click()
     await waitFor(() => document.querySelector(
       ".vault-table.duplicate-files"))
+    const groupPageCheckbox = document.querySelector(
+      "[data-select-duplicate-group-page]")
+    assert.ok(groupPageCheckbox)
+    assert.equal(groupPageCheckbox.checked, false)
+    groupPageCheckbox.click()
+    await waitFor(() => document.querySelector(
+      "[data-deduplicate-selected]") &&
+      document.querySelector("[data-deduplicate-selected]")
+        .textContent.includes("2 selected"))
     assert.equal(document.querySelector(
-      "[data-select-duplicate-page]"), null)
-    const groupCheckbox = document.querySelector(
+      "[data-select-duplicate-group-page]").checked, true)
+    assert.equal(document.querySelector(
+      "[data-select-duplicate-group]").checked, true)
+    document.querySelector(
+      "[data-select-duplicate-group-page]").click()
+    assert.equal(document.querySelector(
+      "[data-deduplicate-selected]"), null)
+
+    let groupCheckbox = document.querySelector(
       "[data-select-duplicate-group]")
     assert.ok(groupCheckbox)
     assert.equal(groupCheckbox.checked, false)
@@ -1525,7 +1644,9 @@ describe("Save Space interface", () => {
     assert.equal(document.querySelector(
       "[data-select-duplicate-group]").indeterminate, true)
 
-    document.querySelector("[data-select-duplicate-group]").click()
+    groupCheckbox = document.querySelector(
+      "[data-select-duplicate-group]")
+    groupCheckbox.click()
     await waitFor(() => document.querySelector(
       "[data-deduplicate-selected]") &&
       document.querySelector("[data-deduplicate-selected]")
