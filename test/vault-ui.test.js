@@ -38,6 +38,7 @@ const fixture = (items = [], overrides = {}) => {
   const counts = {
     all: items.filter((entry) => entry.status).length,
     duplicates: items.filter((entry) => entry.status === "duplicate").length,
+    unavailable: items.filter((entry) => entry.status === "unavailable").length,
     shared: items.filter((entry) => entry.status === "shared").length,
     tracked: items.filter((entry) => entry.status === "tracked").length,
     reclaimable: items.filter((entry) => entry.orphan).length,
@@ -97,6 +98,7 @@ const fixture = (items = [], overrides = {}) => {
       source_counts: {
         all: { pinokio: counts.all, apps: counts.all, "app:app": counts.all },
         duplicates: {},
+        unavailable: {},
         shareable: {}
       },
       shareable_by_source: {},
@@ -137,6 +139,7 @@ const makePage = async (status, options = {}) => {
   const deferFolderDiscoverySelection =
     !!options.deferFolderDiscoverySelection
   const deferFolderDiscoveryAdd = !!options.deferFolderDiscoveryAdd
+  const actionResults = options.actionResults || {}
   const folderDiscoveryChildren = options.folderDiscoveryChildren || {}
   const scopeId = appMode ? (options.scopeId || "app:app") : ""
   const workspace = ejs.render(await source(workspacePath), {
@@ -267,7 +270,7 @@ const makePage = async (status, options = {}) => {
           payload.action === "add_folder_discovery_sources") {
         await new Promise((resolve) => pendingFolderDiscoveryAdds.push(resolve))
       }
-      const result = payload.action === "reveal"
+      const result = actionResults[payload.action] || (payload.action === "reveal"
         ? { revealed: true }
         : payload.action === "deduplicate_files"
         ? {
@@ -310,7 +313,7 @@ const makePage = async (status, options = {}) => {
                 shareable: true
               }))
             }
-          : {}
+          : {})
       return { ok: true, status: 200, json: async () => result }
     }
     const parsed = new URL(url, "http://localhost")
@@ -624,6 +627,158 @@ describe("Save Space interface", () => {
     assert.equal(scan.scope_id, null)
     assert.equal(scan.candidate_size, 100 * candidateBase ** 2)
     await settle()
+    dom.window.close()
+  })
+
+  test("Cannot deduplicate is separate from actionable duplicates", async () => {
+    const duplicate = item({
+      path: "/pinokio/api/app/models/duplicate.bin",
+      relative_path: "models/duplicate.bin",
+      status: "duplicate",
+      shareable: true
+    })
+    const unavailable = item({
+      path: "/pinokio/api/app/models/blocked.bin",
+      relative_path: "models/blocked.bin",
+      status: "unavailable",
+      unavailable_reason: "permission_denied"
+    })
+    const base = fixture([duplicate, unavailable])
+    base.inventory.source_counts.duplicates["app:app"] = 1
+    base.inventory.source_counts.unavailable["app:app"] = 1
+    base.inventory.shareable_by_source["app:app"] = 1
+    const response = (url) => {
+      const view = new URL(url, "http://localhost")
+        .searchParams.get("view") || "all"
+      const result = JSON.parse(JSON.stringify(base))
+      result.inventory.view = view
+      result.items = view === "duplicates"
+        ? [duplicate]
+        : view === "unavailable"
+          ? [unavailable]
+          : [duplicate, unavailable]
+      result.inventory.current.count = result.items.length
+      result.inventory.total = result.items.length
+      result.inventory.end = result.items.length
+      return result
+    }
+    const { dom, requests } = await makePage(response, {
+      actionResults: {
+        deduplicate: {
+          status: "unavailable",
+          unavailable_reason: "permission_denied"
+        }
+      }
+    })
+    const document = dom.window.document
+
+    assert.match(document.querySelector("#vault-views").textContent,
+      /Cannot deduplicate\s*1/)
+    assert.match(document.querySelector("#vault-status-filter").textContent,
+      /Cannot deduplicate/)
+
+    document.querySelector('[data-view="duplicates"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+    assert.match(document.querySelector(".vault-table").textContent,
+      /duplicate\.bin/)
+    assert.doesNotMatch(document.querySelector(".vault-table").textContent,
+      /blocked\.bin/)
+    assert.ok(document.querySelector("[data-deduplicate-all]"))
+
+    document.querySelector('[data-view="unavailable"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="unavailable"].selected'))
+    const table = document.querySelector(".vault-table")
+    assert.match(table.textContent, /blocked\.bin/)
+    assert.match(table.textContent,
+      /Disk Saver cannot modify this file or its folder/)
+    assert.doesNotMatch(table.textContent, /duplicate\.bin/)
+    assert.equal(document.querySelector("[data-deduplicate-all]"), null)
+    assert.equal(document.querySelector("[data-select-duplicate]"), null)
+    document.querySelector("[data-deduplicate-file]").click()
+    await waitFor(() => requests.some((request) =>
+      request.action === "deduplicate" &&
+      request.path === unavailable.path))
+    await waitFor(() => document.getElementById("vault-feedback")
+      .textContent.includes("Disk Saver cannot modify this file or its folder"))
+
+    dom.window.close()
+  })
+
+  test("a runtime write denial is reported as cannot deduplicate", async () => {
+    const duplicate = item({
+      status: "duplicate",
+      shareable: true
+    })
+    const { dom } = await makePage(fixture([duplicate]), {
+      actionResults: {
+        deduplicate: {
+          unavailable: 1,
+          unavailable_by_reason: { permission_denied: 1 }
+        }
+      }
+    })
+    const document = dom.window.document
+
+    document.querySelector('[data-view="duplicates"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+    document.querySelector("[data-deduplicate-all]").click()
+    await waitFor(() => document.getElementById("vault-feedback")
+      .textContent.includes("1 file cannot be deduplicated"))
+    assert.match(document.getElementById("vault-feedback").textContent,
+      /Disk Saver cannot modify this file or its folder/)
+    assert.doesNotMatch(document.getElementById("vault-feedback").textContent,
+      /still waiting for review/)
+
+    dom.window.close()
+  })
+
+  test("Cannot deduplicate filters expose no hidden deduplication action", async () => {
+    const duplicate = item({
+      path: "/pinokio/api/app/models/duplicate.bin",
+      relative_path: "models/duplicate.bin",
+      status: "duplicate",
+      shareable: true
+    })
+    const unavailable = item({
+      path: "/pinokio/api/app/models/blocked.bin",
+      relative_path: "models/blocked.bin",
+      status: "unavailable",
+      unavailable_reason: "metadata"
+    })
+    const base = fixture([duplicate, unavailable])
+    base.inventory.source_counts.duplicates["app:app"] = 1
+    base.inventory.source_counts.unavailable["app:app"] = 1
+    base.inventory.shareable_by_source["app:app"] = 1
+    const response = (url) => {
+      const filter = new URL(url, "http://localhost")
+        .searchParams.get("status_filter") || "all"
+      const result = JSON.parse(JSON.stringify(base))
+      result.items = filter === "unavailable"
+        ? [unavailable]
+        : filter === "duplicate" ? [duplicate] : [duplicate, unavailable]
+      result.inventory.current.count = result.items.length
+      result.inventory.total = result.items.length
+      result.inventory.end = result.items.length
+      return result
+    }
+    const { dom } = await makePage(response, { appMode: true })
+    const document = dom.window.document
+
+    assert.ok(document.querySelector("[data-deduplicate-scope]"))
+    const filter = document.getElementById("vault-status-filter")
+    filter.value = "unavailable"
+    filter.dispatchEvent(new dom.window.Event("change", { bubbles: true }))
+    await waitFor(() => document.querySelector(
+      "[data-deduplicate-scope]") === null)
+    assert.match(document.querySelector(".vault-table").textContent,
+      /blocked\.bin/)
+    assert.doesNotMatch(document.querySelector(".vault-table").textContent,
+      /duplicate\.bin/)
+    assert.equal(document.querySelector("[data-deduplicate-file]"), null)
+
     dom.window.close()
   })
 
@@ -1499,15 +1654,8 @@ describe("Save Space interface", () => {
       status: "duplicate",
       shareable: true
     })
-    const unavailable = item({
-      path: "/pinokio/api/app/models/unavailable.bin",
-      relative_path: "models/unavailable.bin",
-      status: "duplicate",
-      shareable: false,
-      unavailable_reason: "metadata"
-    })
-    const status = fixture([first, second, unavailable])
-    status.inventory.source_counts.duplicates["app:app"] = 3
+    const status = fixture([first, second])
+    status.inventory.source_counts.duplicates["app:app"] = 2
     status.inventory.shareable_by_source["app:app"] = 2
     const grouped = JSON.parse(JSON.stringify(status))
     grouped.items = [{
@@ -1515,7 +1663,7 @@ describe("Save Space interface", () => {
       hash: first.hash,
       path: first.path,
       size: first.size,
-      total_count: 4,
+      total_count: 3,
       eligible_count: 2,
       can_save: first.size + second.size,
       source_id: first.source_id,
@@ -1535,11 +1683,6 @@ describe("Save Space interface", () => {
         kind: "duplicate_path",
         registry_status: "duplicate",
         selectable: true
-      }),
-      Object.assign({}, unavailable, {
-        kind: "duplicate_path",
-        registry_status: "unavailable",
-        selectable: false
       }),
       item({
         kind: "duplicate_path",
@@ -1773,7 +1916,9 @@ describe("Save Space interface", () => {
     assert.equal(document.getElementById("btn-add-source"), null)
     assert.ok(document.querySelector(".vault-view-tabs"))
     assert.equal(document.querySelectorAll(
-      ".vault-view-tabs [data-view]").length, 5)
+      ".vault-view-tabs [data-view]").length, 6)
+    assert.ok(document.querySelector(
+      '[data-view="unavailable"]'))
     assert.equal(document.querySelector(
       '[data-view="reclaimable"]'), null)
     assert.ok(document.querySelector(

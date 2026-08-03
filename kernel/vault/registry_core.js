@@ -3535,6 +3535,32 @@ class RegistryCore {
         )
       `).run(now, runId)
 
+      // A scan does not retry destination mutation, so retain a confirmed
+      // permission denial while the file itself remains unchanged.
+      this.database.prepare(`
+        UPDATE scan_files AS candidate
+        SET status = 'unavailable', unavailable_reason = 'permission_denied'
+        WHERE candidate.run_id = ?
+          AND candidate.status = 'duplicate'
+          AND EXISTS (
+            SELECT 1 FROM files previous
+            WHERE previous.path = candidate.path
+              AND previous.status = 'unavailable'
+              AND previous.unavailable_reason = 'permission_denied'
+              AND previous.hash IS candidate.hash
+              AND previous.size = candidate.size
+              AND previous.mtime = candidate.mtime
+              AND previous.ctime = candidate.ctime
+              AND previous.dev = candidate.dev
+              AND previous.ino = candidate.ino
+              AND previous.mode = candidate.mode
+              AND previous.uid = candidate.uid
+              AND previous.gid = candidate.gid
+              AND previous.source_id IS candidate.source_id
+              AND previous.app IS candidate.app
+          )
+      `).run(runId)
+
       this.database.prepare(`
         INSERT INTO files (
           path, hash, size, mtime, ctime, dev, ino, mode, uid, gid, source_id,
@@ -3963,14 +3989,17 @@ class RegistryCore {
     const where = ["unavailable_reason IS NOT 'stale'"]
     const values = []
     if (view === "duplicates") {
-      where.push("status IN ('duplicate', 'unavailable')")
+      where.push("status = 'duplicate'")
+    } else if (view === "unavailable") {
+      where.push("status = 'unavailable'")
     } else if (view === "shared") {
       where.push("status = 'linked'")
     } else if (view === "tracked") {
       where.push("status = 'reference'")
     } else if (view === "all" && statusFilter !== "all") {
       const statuses = {
-        duplicate: ["duplicate", "unavailable"],
+        duplicate: ["duplicate"],
+        unavailable: ["unavailable"],
         shared: ["linked"],
         tracked: ["reference"]
       }[statusFilter] || []
@@ -4002,7 +4031,7 @@ class RegistryCore {
     query,
     unrestricted,
     alias,
-    statuses = ["duplicate", "unavailable"],
+    statuses = ["duplicate"],
     externalSourceIds = []
   ) {
     const column = (name) => `${alias}.${name}`
@@ -4185,14 +4214,16 @@ class RegistryCore {
   }
 
   statusesForView(view, statusFilter) {
-    if (view === "duplicates") return ["duplicate", "unavailable"]
+    if (view === "duplicates") return ["duplicate"]
+    if (view === "unavailable") return ["unavailable"]
     if (view === "shared") return ["linked"]
     if (view === "tracked") return ["reference"]
     if (view !== "all" || statusFilter === "all") {
       return ["reference", "duplicate", "linked", "unavailable"]
     }
     return {
-      duplicate: ["duplicate", "unavailable"],
+      duplicate: ["duplicate"],
+      unavailable: ["unavailable"],
       shared: ["linked"],
       tracked: ["reference"]
     }[statusFilter] || []
@@ -4374,7 +4405,7 @@ class RegistryCore {
       String(options.query || ""),
       !!options.unrestricted,
       "candidate",
-      ["duplicate", "unavailable"],
+      ["duplicate"],
       externalSourceIds
     )
     active.where.push("candidate.hash IS NOT NULL")
@@ -4383,7 +4414,7 @@ class RegistryCore {
       "",
       !!options.authorizedUnrestricted,
       "visible",
-      null,
+      ["reference", "duplicate", "linked"],
       externalSourceIds
     )
     const decoded = this.decodeCursor(options.cursor)
@@ -4481,7 +4512,7 @@ class RegistryCore {
       "",
       !!options.unrestricted,
       "child",
-      null,
+      ["reference", "duplicate", "linked"],
       externalSourceIds
     )
     const active = this.duplicateGroupFilter(
@@ -4742,8 +4773,8 @@ class RegistryCore {
     const counts = {
       all: ["reference", "duplicate", "linked", "unavailable"].reduce(
         (sum, status) => sum + (countsByStatus[status] || 0), 0),
-      duplicates: (countsByStatus.duplicate || 0) +
-        (countsByStatus.unavailable || 0),
+      duplicates: countsByStatus.duplicate || 0,
+      unavailable: countsByStatus.unavailable || 0,
       shared: countsByStatus.linked || 0,
       tracked: countsByStatus.reference || 0,
       reclaimable: options.scoped

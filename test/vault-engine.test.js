@@ -1217,13 +1217,311 @@ describe("Save Space engine", () => {
       path: duplicate.path
     })
 
-    assert.equal(result.status, "unavailable")
+    assert.deepEqual(result, {
+      status: "unavailable",
+      unavailable_reason: "hardlinks"
+    })
     assert.equal((await fs.promises.stat(duplicate.path)).ino, before.ino)
     assert.deepEqual(await fs.promises.readFile(duplicate.path), pair.contents)
     const rows = await vault.registry.files({ hash: duplicate.hash })
     assert.equal(rows.every((row) =>
       row.status === "unavailable" &&
       row.unavailable_reason === "hardlinks"), true)
+    await close(vault)
+  })
+
+  test("a destination write denial becomes unavailable without changing the file", async () => {
+    const { home, vault } = await makeVault()
+    const pair = await duplicatePair(home)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    const before = await fs.promises.stat(duplicate.path)
+    const link = fs.promises.link
+    fs.promises.link = async (source, destination) => {
+      if (destination === `${duplicate.path}.pinokio-dedup-tmp`) {
+        const error = new Error("The destination cannot be modified.")
+        error.code = "EACCES"
+        throw error
+      }
+      return link.call(fs.promises, source, destination)
+    }
+
+    let result
+    try {
+      result = await vault.perform("deduplicate", {
+        path: duplicate.path
+      })
+    } finally {
+      fs.promises.link = link
+    }
+
+    assert.deepEqual(result, {
+      status: "unavailable",
+      unavailable_reason: "permission_denied"
+    })
+    const summary = vault.deduplicationSummary()
+    vault.addDeduplicationResult(summary, result)
+    assert.deepEqual(summary.unavailable_by_reason, {
+      permission_denied: 1
+    })
+    const row = await vault.registry.getFile(duplicate.path)
+    assert.equal(row.status, "unavailable")
+    assert.equal(row.unavailable_reason, "permission_denied")
+    assert.equal((await fs.promises.stat(duplicate.path)).ino, before.ino)
+    assert.deepEqual(await fs.promises.readFile(duplicate.path), pair.contents)
+    const status = await vault.status(null, { view: "duplicates" })
+    const unavailable = await vault.status(null, { view: "unavailable" })
+    assert.equal(status.inventory.counts.duplicates, 0)
+    assert.equal(status.inventory.counts.unavailable, 1)
+    assert.equal(unavailable.items[0].unavailable_reason,
+      "permission_denied")
+
+    await vault.sweeper.scan()
+    const rescanned = await vault.registry.getFile(duplicate.path)
+    assert.equal(rescanned.status, "unavailable")
+    assert.equal(rescanned.unavailable_reason, "permission_denied")
+
+    fs.promises.link = async (source, destination) => {
+      if (destination === `${duplicate.path}.pinokio-dedup-tmp`) {
+        const error = new Error("The destination still cannot be modified.")
+        error.code = "EACCES"
+        throw error
+      }
+      return link.call(fs.promises, source, destination)
+    }
+    let stillDenied
+    try {
+      stillDenied = await vault.perform("deduplicate", {
+        path: duplicate.path
+      })
+    } finally {
+      fs.promises.link = link
+    }
+    assert.deepEqual(stillDenied, {
+      status: "unavailable",
+      unavailable_reason: "permission_denied"
+    })
+
+    const retried = await vault.perform("deduplicate", {
+      path: duplicate.path
+    })
+    assert.equal(retried.status, "converted")
+    assert.equal(
+      (await vault.registry.getFile(duplicate.path)).status,
+      "linked"
+    )
+    await close(vault)
+  })
+
+  test("an unavailable store is recorded even when reclassification cannot read it", async () => {
+    const { home, vault } = await makeVault()
+    await duplicatePair(home)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    const targetStat = await fs.promises.stat(duplicate.path)
+    const store = vault.anchorStoreForDevice(targetStat.dev)
+    const storePath = vault.storePathFor(duplicate.hash, store.id)
+    const storeStatIfPresent = vault.storeStatIfPresent
+    vault.storeStatIfPresent = async (filePath, ...args) => {
+      if (filePath === storePath) {
+        const error = new Error("The anchor store cannot be read.")
+        error.code = "EACCES"
+        throw error
+      }
+      return storeStatIfPresent.call(vault, filePath, ...args)
+    }
+
+    let result
+    try {
+      result = await vault.perform("deduplicate", {
+        path: duplicate.path
+      })
+    } finally {
+      vault.storeStatIfPresent = storeStatIfPresent
+    }
+
+    assert.deepEqual(result, {
+      status: "unavailable",
+      unavailable_reason: "permission_denied"
+    })
+    const row = await vault.registry.getFile(duplicate.path)
+    assert.equal(row.status, "unavailable")
+    assert.equal(row.unavailable_reason, "permission_denied")
+    await close(vault)
+  })
+
+  test("a scan reclassifies an action-time hardlink failure", async () => {
+    const { home, vault } = await makeVault()
+    await duplicatePair(home)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    const link = fs.promises.link
+    fs.promises.link = async (source, destination) => {
+      if (destination === `${duplicate.path}.pinokio-dedup-tmp`) {
+        const error = new Error("Hardlinks are unavailable here.")
+        error.code = "ENOTSUP"
+        throw error
+      }
+      return link.call(fs.promises, source, destination)
+    }
+
+    let result
+    try {
+      result = await vault.perform("deduplicate", {
+        path: duplicate.path
+      })
+    } finally {
+      fs.promises.link = link
+    }
+
+    assert.deepEqual(result, {
+      status: "unavailable",
+      unavailable_reason: "hardlinks"
+    })
+    await vault.sweeper.scan()
+    const rescanned = await vault.registry.getFile(duplicate.path)
+    assert.equal(rescanned.status, "duplicate")
+    assert.equal(rescanned.unavailable_reason, null)
+    assert.equal((await vault.perform("deduplicate", {
+      path: duplicate.path
+    })).status, "converted")
+    await close(vault)
+  })
+
+  test("an action-time metadata mismatch becomes unavailable", async () => {
+    const { home, vault } = await makeVault()
+    const pair = await duplicatePair(home)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    const before = await fs.promises.stat(duplicate.path)
+    const ensureAnchorForHash = vault.ensureAnchorForHash
+    vault.ensureAnchorForHash = async (...args) => {
+      const prepared = await ensureAnchorForHash.apply(vault, args)
+      if (prepared.status === "ready") {
+        const anchorPath = vault.storePathFor(
+          duplicate.hash, prepared.store_id)
+        const anchor = await fs.promises.stat(anchorPath)
+        await fs.promises.chmod(
+          anchorPath,
+          (anchor.mode & 0o7777) ^ 0o100
+        )
+      }
+      return prepared
+    }
+
+    let result
+    try {
+      result = await vault.perform("deduplicate", {
+        path: duplicate.path
+      })
+    } finally {
+      vault.ensureAnchorForHash = ensureAnchorForHash
+    }
+
+    assert.deepEqual(result, {
+      status: "unavailable",
+      unavailable_reason: "metadata"
+    })
+    const row = await vault.registry.getFile(duplicate.path)
+    assert.equal(row.status, "unavailable")
+    assert.equal(row.unavailable_reason, "metadata")
+    assert.equal((await fs.promises.stat(duplicate.path)).ino, before.ino)
+    assert.deepEqual(await fs.promises.readFile(duplicate.path), pair.contents)
+    await close(vault)
+  })
+
+  test("an action-time store device mismatch becomes unavailable", async () => {
+    const { home, vault } = await makeVault()
+    const pair = await duplicatePair(home)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    const before = await fs.promises.stat(duplicate.path)
+    const ensureAnchorForHash = vault.ensureAnchorForHash
+    const storeStatIfPresent = vault.storeStatIfPresent
+    let preparedStoreId = null
+    vault.ensureAnchorForHash = async (...args) => {
+      const prepared = await ensureAnchorForHash.apply(vault, args)
+      if (prepared.status === "ready") preparedStoreId = prepared.store_id
+      return prepared
+    }
+    vault.storeStatIfPresent = async (...args) => {
+      const stat = await storeStatIfPresent.apply(vault, args)
+      const storePath = preparedStoreId && vault.storePathFor(
+        duplicate.hash, preparedStoreId)
+      return stat && storePath && args[0] === storePath
+        ? Object.assign({}, stat, { dev: stat.dev + 1 })
+        : stat
+    }
+
+    let result
+    try {
+      result = await vault.perform("deduplicate", {
+        path: duplicate.path
+      })
+    } finally {
+      vault.ensureAnchorForHash = ensureAnchorForHash
+      vault.storeStatIfPresent = storeStatIfPresent
+    }
+
+    assert.deepEqual(result, {
+      status: "unavailable",
+      unavailable_reason: "different_disk"
+    })
+    const row = await vault.registry.getFile(duplicate.path)
+    assert.equal(row.status, "unavailable")
+    assert.equal(row.unavailable_reason, "different_disk")
+    assert.equal((await fs.promises.stat(duplicate.path)).ino, before.ino)
+    assert.deepEqual(await fs.promises.readFile(duplicate.path), pair.contents)
+    await close(vault)
+  })
+
+  test("a destination replacement lock remains retryable", async () => {
+    const { home, vault } = await makeVault()
+    const pair = await duplicatePair(home)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    const before = await fs.promises.stat(duplicate.path)
+    const rename = fs.promises.rename
+    fs.promises.rename = async (source, destination) => {
+      if (source === `${duplicate.path}.pinokio-dedup-tmp` &&
+          destination === duplicate.path) {
+        const error = new Error("The destination is in use.")
+        error.code = "EACCES"
+        throw error
+      }
+      return rename.call(fs.promises, source, destination)
+    }
+
+    let result
+    try {
+      result = await vault.perform("deduplicate", {
+        path: duplicate.path
+      })
+    } finally {
+      fs.promises.rename = rename
+    }
+
+    assert.deepEqual(result, { status: "locked" })
+    assert.equal(
+      (await vault.registry.getFile(duplicate.path)).status,
+      "duplicate"
+    )
+    assert.equal(fs.existsSync(
+      `${duplicate.path}.pinokio-dedup-tmp`), false)
+    assert.equal((await fs.promises.stat(duplicate.path)).ino, before.ino)
+    assert.deepEqual(await fs.promises.readFile(duplicate.path), pair.contents)
     await close(vault)
   })
 

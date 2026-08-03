@@ -3,11 +3,13 @@ const COPY = {
   locations: "LOCATIONS",
   all: "All files",
   duplicates: "Duplicates",
+  cannot_deduplicate: "Cannot deduplicate",
   shared: "Deduplicated",
   reclaimable: "Unused files",
   activity: "Activity",
   all_description: "Every scanned file and its current deduplication status.",
   duplicates_description: "Identical files waiting to be deduplicated.",
+  unavailable_description: "Identical files that cannot share storage.",
   shared_description: "Files currently sharing disk storage through hardlinks.",
   tracked_description: "Files with no duplicate action required.",
   reclaimable_description: "Private links no longer used by any linked file.",
@@ -135,6 +137,7 @@ const COPY = {
   review: "Review",
   search_all: "Search files",
   search_duplicates: "Search duplicates",
+  search_unavailable: "Search files that cannot be deduplicated",
   search_shared: "Search deduplicated files",
   search_tracked: "Search files with no action needed",
   search_activity: "Search activity",
@@ -167,11 +170,15 @@ const COPY = {
   can_free: "Can free",
   duplicate: "Duplicate",
   tracked: "No action needed",
-  different_disk: "Different disk",
+  different_disk: "No Disk Saver storage is available on this disk",
   can_save_suffix: "available to save",
   unavailable: "Unavailable",
   sharing_unavailable: "Deduplication is unavailable on this disk",
   permissions_differ: "File permissions or ownership differ",
+  hardlinks_unavailable: "This disk does not support shared files",
+  anchor_conflict: "The stored matching copy could not be verified",
+  permission_denied: "Disk Saver cannot modify this file or its folder",
+  cannot_share_safely: "This file cannot safely share storage",
   changed_since_scan: "Some files changed since the scan. Scan again before deduplicating them.",
   deduplicate_locked: "Stop the app before deduplicating this file.",
   deduplicate_changed: "This file changed while it was being checked. Nothing was changed.",
@@ -184,6 +191,7 @@ const COPY = {
   action_not_completed: "The action could not be completed. No existing files were overwritten.",
   activity_write_failed: "The file action completed, but some activity history could not be recorded.",
   files_still_waiting: "{count} still waiting for review",
+  files_cannot_deduplicate: "{count} cannot be deduplicated",
   just_now: "Just now",
   minutes_ago: "m ago",
   hours_ago: "h ago",
@@ -215,6 +223,7 @@ const COPY = {
   show_more_copies: "Show {count} more copies",
   making_separate: "Making file separate",
   make_separate: "Make separate",
+  try_again: "Try again",
   reclaim: "Clean up",
   reclaim_all: "Clean up all",
   cleanup_ready: "{size} ready to clean up",
@@ -243,6 +252,8 @@ const COPY = {
   scan_waiting_hint: "Files will appear here when this scan finishes.",
   no_duplicates: "No duplicates to review",
   no_duplicates_hint: "There are no files waiting for your review.",
+  no_unavailable: "Every duplicate can be deduplicated",
+  no_unavailable_hint: "Files that cannot safely share storage will appear here.",
   no_shared: "Nothing deduplicated yet",
   no_shared_hint: "Deduplicated files will appear here after you review duplicates.",
   no_tracked: "No files with no action needed",
@@ -526,6 +537,7 @@ const buildItems = () => {
 const viewIcon = {
   all: "fa-regular fa-file-lines",
   duplicates: "fa-regular fa-copy",
+  unavailable: "fa-regular fa-circle-xmark",
   shared: "fa-solid fa-link",
   tracked: "fa-regular fa-circle-check",
   reclaimable: "fa-regular fa-trash-can",
@@ -534,6 +546,7 @@ const viewIcon = {
 const viewLabel = {
   all: COPY.all,
   duplicates: COPY.duplicates,
+  unavailable: COPY.cannot_deduplicate,
   shared: COPY.shared,
   tracked: COPY.tracked,
   reclaimable: COPY.reclaimable,
@@ -548,8 +561,8 @@ const renderViews = () => {
   const counts = state.data.inventory.counts
   el("views-label").textContent = COPY.views
   const views = IS_APP_MODE
-    ? ["all", "duplicates", "shared", "tracked", "activity"]
-    : ["all", "duplicates", "shared", "tracked", "reclaimable", "activity"]
+    ? ["all", "duplicates", "unavailable", "shared", "tracked", "activity"]
+    : ["all", "duplicates", "unavailable", "shared", "tracked", "reclaimable", "activity"]
   el("vault-views").innerHTML = views.map((view) => `
     <button class="vault-nav-row ${state.view === view ? "selected" : ""}" type="button" data-view="${view}" ${state.view === view ? 'aria-current="page"' : ""}>
       <i class="${viewIcon[view]}"></i>
@@ -561,10 +574,15 @@ const renderViews = () => {
 const renderSourceNode = (source, depth, counts) => {
   const children = sourceChildren(source.id)
   const duplicateCount = counts.duplicates.get(source.id) || 0
+  const unavailableCount = counts.unavailable.get(source.id) || 0
   const trackedCount = counts.tracked.get(source.id) || 0
   const collapsed = state.collapsedSources.has(source.id)
   const pathText = source.kind === "virtual" ? (source.id === "apps" ? "api" : "") : sourcePath(source)
-  const count = state.view === "duplicates" ? duplicateCount : trackedCount
+  const count = state.view === "duplicates"
+    ? duplicateCount
+    : state.view === "unavailable"
+      ? unavailableCount
+      : trackedCount
   const icon = source.kind === "app" ? "fa-regular fa-folder-open" : "fa-regular fa-folder"
   const label = source.id === "external" ? COPY.other_folders : source.label
   let html = `<div class="vault-source-line depth-${Math.min(depth, 2)} ${pathText ? "has-path" : ""} ${state.sourceId === source.id ? "selected" : ""}">`
@@ -576,7 +594,7 @@ const renderSourceNode = (source, depth, counts) => {
   html += `<button class="vault-nav-row ${state.sourceId === source.id ? "selected" : ""}" type="button" data-source="${attr(source.id)}" ${state.sourceId === source.id ? 'aria-current="page"' : ""}>
     <i class="${icon}"></i>
     <span class="vault-nav-copy"><span class="vault-nav-name">${esc(label)}</span>${pathText ? `<span class="vault-nav-path" title="${attr(pathText)}">${esc(pathText)}</span>` : ""}</span>
-    <span class="vault-nav-count ${duplicateCount ? "attention" : ""}">${count || ""}</span>
+    <span class="vault-nav-count ${state.view === "duplicates" && duplicateCount ? "attention" : ""}">${count || ""}</span>
   </button></div>`
   if (!collapsed) html += children.map((child) => renderSourceNode(child, depth + 1, counts)).join("")
   return html
@@ -592,11 +610,14 @@ const renderLocations = () => {
   const inventoryCounts = state.data.inventory.source_counts
   const counts = {
     duplicates: new Map(Object.entries(inventoryCounts.duplicates || {})),
+    unavailable: new Map(Object.entries(inventoryCounts.unavailable || {})),
     tracked: new Map(Object.entries(inventoryCounts.all || {}))
   }
   const allCount = state.view === "duplicates"
     ? Number(state.data.inventory.counts.duplicates) || 0
-    : Number(state.data.inventory.counts.all) || 0
+    : state.view === "unavailable"
+      ? Number(state.data.inventory.counts.unavailable) || 0
+      : Number(state.data.inventory.counts.all) || 0
   let html = `<button class="vault-nav-row vault-all-locations ${state.sourceId ? "" : "selected"}" type="button" data-source="" ${state.sourceId ? "" : 'aria-current="page"'}>
     <i class="fa-solid fa-hard-drive"></i>
     <span class="vault-nav-copy"><span class="vault-nav-name">${esc(COPY.all_locations)}</span></span>
@@ -1294,6 +1315,10 @@ const bulkSeparateAction = () => {
   return `<button class="vault-button" type="button" data-separate-selected aria-label="${attr(label)}">${esc(label)}</button>`
 }
 const batchAction = (source) => {
+  if (state.view === "unavailable" ||
+      (state.view === "all" && state.statusFilter === "unavailable")) {
+    return ""
+  }
   if (!source || source.kind === "virtual" || source.kind === "pinokio") return ""
   const duplicateCount = scopeDuplicateCount(source.id)
   if (!duplicateCount) return ""
@@ -1321,6 +1346,7 @@ const toolbarSummary = () => {
 
 const searchPlaceholder = () => {
   if (state.view === "duplicates") return COPY.search_duplicates
+  if (state.view === "unavailable") return COPY.search_unavailable
   if (state.view === "shared") return COPY.search_shared
   if (state.view === "tracked") return COPY.search_tracked
   if (state.view === "activity") return COPY.search_activity
@@ -1329,6 +1355,7 @@ const searchPlaceholder = () => {
 }
 const supportsDisplayMode = () => state.view === "all" ||
   state.view === "duplicates" ||
+  state.view === "unavailable" ||
   state.view === "shared" ||
   state.view === "tracked"
 const displayModeControl = () => supportsDisplayMode() ? `<div class="vault-display-mode" role="group" aria-label="${attr(COPY.display_mode)}">
@@ -1362,6 +1389,7 @@ const renderToolbar = () => {
     ${state.view === "all" ? `<select class="vault-select" id="vault-status-filter" aria-label="${attr(COPY.all_statuses)}">
       <option value="all" ${state.statusFilter === "all" ? "selected" : ""}>${esc(COPY.all_statuses)}</option>
       <option value="duplicate" ${state.statusFilter === "duplicate" ? "selected" : ""}>${esc(COPY.duplicates)}</option>
+      <option value="unavailable" ${state.statusFilter === "unavailable" ? "selected" : ""}>${esc(COPY.cannot_deduplicate)}</option>
       <option value="shared" ${state.statusFilter === "shared" ? "selected" : ""}>${esc(COPY.shared)}</option>
       <option value="tracked" ${state.statusFilter === "tracked" ? "selected" : ""}>${esc(COPY.tracked)}</option>
     </select>` : ""}
@@ -1384,17 +1412,19 @@ const renderToolbar = () => {
   }
 }
 
-const unavailableLabel = (item) =>
-  item.unavailable_reason === "metadata"
-    ? COPY.permissions_differ
-    : item.unavailable_reason === "different_disk"
-      ? COPY.different_disk
-      : COPY.sharing_unavailable
+const unavailableLabel = (item) => ({
+  metadata: COPY.permissions_differ,
+  hardlinks: COPY.hardlinks_unavailable,
+  different_disk: COPY.different_disk,
+  anchor_conflict: COPY.anchor_conflict,
+  permission_denied: COPY.permission_denied
+}[item.unavailable_reason] || COPY.cannot_share_safely)
 const statusMarkup = (item) => {
+  if (item.status === "unavailable") {
+    return `<span class="vault-status"><i class="fa-regular fa-circle-xmark"></i>${esc(unavailableLabel(item))}</span>`
+  }
   if (item.status === "duplicate") {
-    return item.shareable
-      ? `<span class="vault-status"><span class="vault-status-dot warning"></span>${esc(COPY.duplicate)}</span>`
-      : `<span class="vault-status"><i class="fa-regular fa-circle-xmark"></i>${esc(unavailableLabel(item))}</span>`
+    return `<span class="vault-status"><span class="vault-status-dot warning"></span>${esc(COPY.duplicate)}</span>`
   }
   if (item.status === "shared") {
     const locations = Array.isArray(item.locations)
@@ -1409,13 +1439,16 @@ const statusMarkup = (item) => {
   return `<span class="vault-status"><i class="fa-regular fa-circle-check"></i>${esc(COPY.tracked)}</span>`
 }
 const spaceMarkup = (item) => {
-  if (item.status === "duplicate") return item.shareable ? `${fmt(item.size)} ${COPY.can_save_suffix}` : COPY.unavailable
+  if (item.status === "duplicate") return `${fmt(item.size)} ${COPY.can_save_suffix}`
   return "—"
 }
 const sharingControl = (item) => {
   let control = ""
   if (item.status === "shared") {
     control = `<button class="vault-text-button" type="button" aria-label="${attr(`${COPY.make_separate}: ${basename(item.relative_path)}`)}" data-detach="${attr(item.path)}">${esc(COPY.make_separate)}</button>`
+  } else if (item.status === "unavailable" &&
+      item.unavailable_reason === "permission_denied") {
+    control = `<button class="vault-text-button" type="button" aria-label="${attr(`${COPY.try_again}: ${basename(item.relative_path)}`)}" data-deduplicate-file="${attr(item.path)}">${esc(COPY.try_again)}</button>`
   }
   return `<span class="vault-status-cell">${statusMarkup(item)}${control}</span>`
 }
@@ -1505,8 +1538,15 @@ const renderTreeNode = (node, prefix, depth) => {
   const collapsed = state.collapsedDirs.has(key)
   const items = nodeItems(current)
   const duplicateCount = items.filter((item) => item.status === "duplicate").length
+  const unavailableCount = items.filter((item) => item.status === "unavailable").length
   const shared = items.filter((item) => item.status === "shared").length
-  const summary = duplicateCount ? countLabel(duplicateCount, COPY.duplicate.toLowerCase(), COPY.duplicates.toLowerCase()) : shared ? COPY.shared : COPY.tracked
+  const summary = duplicateCount
+    ? countLabel(duplicateCount, COPY.duplicate.toLowerCase(), COPY.duplicates.toLowerCase())
+    : unavailableCount
+      ? COPY.cannot_deduplicate
+      : shared
+        ? COPY.shared
+        : COPY.tracked
   let html = `<div class="vault-file-row directory">
     <div class="vault-name-cell indent-${Math.min(depth, 2)}"><button class="vault-disclosure" type="button" data-toggle-dir="${attr(key)}" aria-label="${collapsed ? COPY.expand : COPY.collapse}" aria-expanded="${!collapsed}"><i class="fa-solid fa-chevron-${collapsed ? "right" : "down"}"></i></button><i class="fa-regular fa-folder vault-name-icon"></i><span class="vault-file-name">${esc(labels.join(" / "))}</span></div>
     <span class="vault-size">${fmt(current.size)}</span><span>${esc(summary)}</span>
@@ -1570,9 +1610,6 @@ const duplicateChildStatus = (item) => {
     return state.selectedDuplicateFiles.has(item.path)
       ? `${COPY.selected_copy} · ${fmt(item.size)}`
       : COPY.duplicate
-  }
-  if (item.registry_status === "unavailable") {
-    return unavailableLabel(item)
   }
   if (item.registry_status === "linked") return COPY.shared
   if (item.registry_status === "reference") return COPY.reference_copy
@@ -1660,10 +1697,12 @@ const renderInventoryGroups = (items) => {
   return [...groups.entries()].sort(sourceSort).map(([sourceId, group]) => {
     const source = sourceById(sourceId)
     const duplicates = group.filter((item) => item.status === "duplicate")
+    const unavailable = group.filter((item) => item.status === "unavailable").length
     const saveable = duplicates.filter((item) => item.shareable).reduce((sum, item) => sum + item.size, 0)
     const shared = group.filter((item) => item.status === "shared").length
     const meta = [countLabel(group.length)]
     if (duplicates.length) meta.push(countLabel(duplicates.length, COPY.duplicate.toLowerCase(), COPY.duplicates.toLowerCase()))
+    else if (unavailable) meta.push(`${unavailable} ${COPY.cannot_deduplicate.toLowerCase()}`)
     else if (shared) meta.push(`${shared} ${COPY.shared.toLowerCase()}`)
     if (saveable) meta.push(`${fmt(saveable)} ${COPY.can_save_suffix}`)
     const action = batchAction(source)
@@ -1678,6 +1717,7 @@ const emptyState = (view) => {
       ? [COPY.scan_waiting, COPY.scan_waiting_hint, "fa-solid fa-circle-notch fa-spin"]
       : [COPY.no_files, COPY.no_files_hint, "fa-regular fa-folder-open"],
     duplicates: [COPY.no_duplicates, COPY.no_duplicates_hint, "fa-regular fa-circle-check"],
+    unavailable: [COPY.no_unavailable, COPY.no_unavailable_hint, "fa-regular fa-circle-check"],
     shared: [COPY.no_shared, COPY.no_shared_hint, "fa-solid fa-link"],
     tracked: [COPY.no_tracked, COPY.no_tracked_hint, "fa-regular fa-circle-check"],
     reclaimable: [COPY.no_reclaimable, COPY.no_reclaimable_hint, "fa-regular fa-circle-check"],
@@ -2577,12 +2617,27 @@ const runAction = async (payload, success) => {
 }
 
 const deduplicateFeedback = (result) => {
-  const waiting = (result.locked || 0) + (result.incompatible || 0) + (result.unavailable || 0) + (result.failed || 0)
+  const unavailable = result.unavailable || 0
+  const waiting = (result.locked || 0) + (result.incompatible || 0) + (result.failed || 0)
   const messages = []
   if (result.converted || result.bytes_saved) messages.push(`${COPY.converted}: ${fmt(result.bytes_saved || 0)}.`)
   if (result.stale) messages.push(COPY.changed_since_scan)
+  if (unavailable) {
+    const label = COPY.files_cannot_deduplicate.replace(
+      "{count}", countLabel(unavailable))
+    const reasonEntries = Object.entries(result.unavailable_by_reason || {})
+      .filter((entry) => Number(entry[1]) > 0)
+    const reasons = reasonEntries.length === 1 &&
+      Number(reasonEntries[0][1]) === unavailable
+      ? unavailableLabel({ unavailable_reason: reasonEntries[0][0] })
+      : reasonEntries.map(([reason, count]) =>
+        `${countLabel(Number(count))} — ${unavailableLabel({
+          unavailable_reason: reason
+        })}`).join("; ")
+    messages.push(`${label}${reasons ? `: ${reasons}` : ""}.`)
+  }
   if (waiting) messages.push(`${COPY.files_still_waiting.replace("{count}", countLabel(waiting))}.`)
-  if (!result.stale && !waiting) return messages.join(" ") || `${COPY.converted}: ${fmt(0)}`
+  if (!result.stale && !unavailable && !waiting) return messages.join(" ") || `${COPY.converted}: ${fmt(0)}`
   return {
     error: true,
     message: messages.join(" ")
@@ -2601,7 +2656,7 @@ const deduplicateFileFeedback = (result) => {
     "stale-blob": COPY.deduplicate_no_match,
     "size-mismatch": COPY.deduplicate_no_match,
     "metadata-mismatch": COPY.permissions_differ,
-    unavailable: COPY.sharing_unavailable,
+    unavailable: unavailableLabel(result),
     conflict: COPY.separate_conflict,
     "not-found": COPY.separate_not_found
   }

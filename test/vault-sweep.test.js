@@ -1194,12 +1194,24 @@ describe("Save Space scans", () => {
       statuses: ["unavailable"]
     })]
     const status = await vault.status(null, { view: "duplicates" })
+    const blocked = await vault.status(null, { view: "unavailable" })
+    const filtered = await vault.status(null, {
+      view: "all",
+      status_filter: "unavailable"
+    })
 
     assert.equal(unavailable.length, 1)
     assert.equal(unavailable[0].unavailable_reason, "metadata")
-    assert.equal(status.inventory.counts.duplicates, 1)
+    assert.equal(status.inventory.counts.duplicates, 0)
+    assert.equal(status.inventory.counts.unavailable, 1)
     assert.equal(status.inventory.shareable_duplicates, 0)
     assert.equal(status.pending_bytes, 0)
+    assert.equal(status.items.length, 0)
+    assert.equal(blocked.items.length, 1)
+    assert.equal(blocked.items[0].status, "unavailable")
+    assert.equal(blocked.items[0].unavailable_reason, "metadata")
+    assert.equal(filtered.items.length, 1)
+    assert.equal(filtered.items[0].status, "unavailable")
 
     const before = await fs.promises.stat(unavailable[0].path)
     assert.equal((await vault.perform("detach", {
@@ -1234,6 +1246,7 @@ describe("Save Space scans", () => {
 
     await vault.sweeper.scan()
     const status = await vault.status(null, { view: "duplicates" })
+    const blocked = await vault.status(null, { view: "unavailable" })
 
     assert.equal((await vault.registry.getFile(incompatible)).status, "unavailable")
     assert.equal(
@@ -1242,6 +1255,10 @@ describe("Save Space scans", () => {
     )
     assert.equal(status.inventory.shareable_duplicates, 0)
     assert.equal(status.pending_bytes, 0)
+    assert.equal(status.inventory.counts.duplicates, 0)
+    assert.equal(status.inventory.counts.unavailable, 1)
+    assert.equal(status.items.length, 0)
+    assert.equal(blocked.items.length, 1)
   })
 
   test("the largest compatible metadata group remains actionable", async (t) => {
@@ -1266,6 +1283,18 @@ describe("Save Space scans", () => {
     assert.equal((await vault.registry.getFile(incompatible)).status, "unavailable")
     assert.equal((await vault.registry.getFile(compatibleOne)).status, "reference")
     assert.equal((await vault.registry.getFile(compatibleTwo)).status, "duplicate")
+    const grouped = await vault.status(null, {
+      view: "duplicates",
+      display_mode: "files"
+    })
+    const hash = (await vault.registry.getFile(compatibleTwo)).hash
+    const children = await vault.duplicateGroupChildren(null, hash)
+    assert.equal(grouped.items.length, 1)
+    assert.equal(grouped.items[0].total_count, 2)
+    assert.equal(grouped.items[0].eligible_count, 1)
+    assert.equal(children.total, 2)
+    assert.equal(children.items.some((item) =>
+      item.registry_status === "unavailable"), false)
     assert.equal((await vault.perform("deduplicate", {
       path: compatibleTwo
     })).status, "converted")
@@ -1280,12 +1309,16 @@ describe("Save Space scans", () => {
 
     await vault.sweeper.scan()
     const status = await vault.status(null, { view: "duplicates" })
+    const blocked = await vault.status(null, { view: "unavailable" })
 
     assert.equal(await vault.registry.countFiles(["unavailable"]), 2)
-    assert.equal(status.inventory.counts.duplicates, 2)
+    assert.equal(status.inventory.counts.duplicates, 0)
+    assert.equal(status.inventory.counts.unavailable, 2)
     assert.equal(status.inventory.shareable_duplicates, 0)
     assert.equal(status.pending_bytes, 0)
-    assert.equal(status.items.every((item) =>
+    assert.equal(status.items.length, 0)
+    assert.equal(blocked.items.length, 2)
+    assert.equal(blocked.items.every((item) =>
       item.shareable === false &&
       item.unavailable_reason === "hardlinks"), true)
   })

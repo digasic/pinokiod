@@ -18,17 +18,34 @@ const {
   HASH_INACTIVITY_MS
 } = require("./constants")
 
-const NO_LINK_CODES = new Set([
-  "EXDEV", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EPERM", "EACCES"
+const HARDLINK_UNSUPPORTED_CODES = new Set([
+  "EXDEV", "ENOTSUP", "EOPNOTSUPP", "ENOSYS"
 ])
-const LOCK_CODES = new Set(["EBUSY", "EPERM", "EACCES"])
+const PERMISSION_DENIED_CODES = new Set(["EACCES", "EPERM"])
+const BUSY_CODES = new Set(["EBUSY"])
+const hardlinkUnavailableCode = (code) =>
+  HARDLINK_UNSUPPORTED_CODES.has(code) || PERMISSION_DENIED_CODES.has(code)
+const replacementLockedCode = (code) =>
+  BUSY_CODES.has(code) || PERMISSION_DENIED_CODES.has(code)
+const storeUnavailableReason = (error) => {
+  const code = error && error.code
+  if (error && error.unavailable_reason) return error.unavailable_reason
+  if (HARDLINK_UNSUPPORTED_CODES.has(code)) return "hardlinks"
+  if (PERMISSION_DENIED_CODES.has(code) || code === "EROFS") {
+    return "permission_denied"
+  }
+  if (code === "EVAULTPATH") return "anchor_conflict"
+  if (code === "EVAULTUNAVAILABLE") return "different_disk"
+  return null
+}
 const STATUS_PAGE_SIZE = 500
 const MAX_BULK_FILE_ACTIONS = 500
 const STATUS_VIEWS = new Set([
-  "all", "duplicates", "shared", "tracked", "reclaimable", "activity"
+  "all", "duplicates", "unavailable", "shared", "tracked", "reclaimable",
+  "activity"
 ])
 const STATUS_FILTERS = new Set([
-  "all", "duplicate", "shared", "tracked"
+  "all", "duplicate", "unavailable", "shared", "tracked"
 ])
 const FOLDER_DISCOVERY_COMPLETE_PHASES = new Set([
   "complete", "completed_with_exclusions"
@@ -69,9 +86,10 @@ const unsafeStoragePath = (filePath) => {
   return error
 }
 
-const unavailableStorage = (message) => {
+const unavailableStorage = (message, reason = "different_disk") => {
   const error = new Error(message)
   error.code = "EVAULTUNAVAILABLE"
+  error.unavailable_reason = reason
   return error
 }
 
@@ -427,7 +445,7 @@ class Vault {
     this._anchorStoresByDevice.set(rootStat.dev, store)
     if (mode !== "link") {
       throw unavailableStorage(
-        "This filesystem does not support hardlinks.")
+        "This filesystem does not support hardlinks.", "hardlinks")
     }
     await this.ensureDirectory(path.resolve(store.root, "sha256"))
     return store
@@ -777,7 +795,7 @@ class Vault {
         mode = "link"
       }
     } catch (error) {
-      if (!NO_LINK_CODES.has(error && error.code)) failure = error
+      if (!hardlinkUnavailableCode(error && error.code)) failure = error
     } finally {
       try {
         await unlinkIfSame(second, secondStat)
@@ -1888,7 +1906,9 @@ class Vault {
       return { status: "stale" }
     }
     const store = selectedStore || this.anchorStoreForDevice(current.dev)
-    if (!store) return { status: "unavailable" }
+    if (!store) {
+      return { status: "unavailable", unavailable_reason: "different_disk" }
+    }
     const storePath = this.storePathFor(hash, store.id)
     let storeStat
     try {
@@ -1898,13 +1918,11 @@ class Vault {
         store_id: store.id
       })
     } catch (error) {
-      if (error && (
-        error.code === "EVAULTUNAVAILABLE" ||
-        NO_LINK_CODES.has(error.code) ||
-        LOCK_CODES.has(error.code)
-      )) {
-        return { status: "unavailable" }
+      const reason = storeUnavailableReason(error)
+      if (reason) {
+        return { status: "unavailable", unavailable_reason: reason }
       }
+      if (BUSY_CODES.has(error && error.code)) return { status: "locked" }
       throw error
     }
     if (storeStat) {
@@ -1914,9 +1932,11 @@ class Vault {
     try {
       await fs.promises.link(filePath, storePath)
     } catch (error) {
-      if (NO_LINK_CODES.has(error && error.code)) {
-        return { status: "unavailable" }
+      const reason = storeUnavailableReason(error)
+      if (reason) {
+        return { status: "unavailable", unavailable_reason: reason }
       }
+      if (BUSY_CODES.has(error && error.code)) return { status: "locked" }
       throw error
     }
     storeStat = await this.storeStatIfPresent(storePath, {
@@ -1971,7 +1991,9 @@ class Vault {
   async ensureAnchorForHash(hash, targetStat) {
     const dev = targetStat.dev
     const store = this.anchorStoreForDevice(dev)
-    if (!store) return { status: "unavailable" }
+    if (!store) {
+      return { status: "unavailable", unavailable_reason: "different_disk" }
+    }
     const storePath = this.storePathFor(hash, store.id)
     let existingStore
     try {
@@ -1980,18 +2002,20 @@ class Vault {
       })
       if (existingStore) await this.validateAnchorStore(store, dev)
     } catch (error) {
-      if (error && (
-        error.code === "EVAULTPATH" ||
-        error.code === "EVAULTUNAVAILABLE" ||
-        NO_LINK_CODES.has(error.code) ||
-        LOCK_CODES.has(error.code)
-      )) {
-        return { status: "unavailable" }
+      const reason = storeUnavailableReason(error)
+      if (reason) {
+        return { status: "unavailable", unavailable_reason: reason }
       }
+      if (BUSY_CODES.has(error && error.code)) return { status: "locked" }
       throw error
     }
     if (existingStore) {
-      if (existingStore.dev !== dev) return { status: "unavailable" }
+      if (existingStore.dev !== dev) {
+        return {
+          status: "unavailable",
+          unavailable_reason: "different_disk"
+        }
+      }
       const verified = await this.verifyStoreContent(
         hash, storePath, existingStore, store.id)
       return verified.valid
@@ -2038,11 +2062,14 @@ class Vault {
     }
   }
 
-  async convert(targetPath) {
+  async convert(targetPath, options = {}) {
     const target = await this.registry.getFile(targetPath)
     if (!target ||
         target.unavailable_reason === "stale" ||
-        target.status !== "duplicate" ||
+        (target.status !== "duplicate" &&
+          !(options.retryUnavailable &&
+            target.status === "unavailable" &&
+            target.unavailable_reason === "permission_denied")) ||
         !target.hash) {
       return { status: "not-found" }
     }
@@ -2059,10 +2086,35 @@ class Vault {
         !sameSnapshot(rowSnapshot(target), targetStat)) {
       return { status: "stale" }
     }
+    const markUnavailable = async (unavailableReason) => {
+      const currentTarget = await lstatIfPresent(target.path)
+      if (!currentTarget ||
+          !currentTarget.isFile() ||
+          !sameSnapshot(fileSnapshot(targetStat), currentTarget)) {
+        return { status: "stale" }
+      }
+      await this.registry.upsertFile(Object.assign({}, target, {
+        status: "unavailable",
+        unavailable_reason: unavailableReason
+      }))
+      return {
+        status: "unavailable",
+        unavailable_reason: unavailableReason
+      }
+    }
     const prepared = await this.ensureAnchorForHash(target.hash, targetStat)
     if (prepared.status !== "ready") {
       if (prepared.status === "unavailable") {
-        await this.reclassifyHashes([target.hash])
+        const reason = prepared.unavailable_reason || "cannot_share_safely"
+        const result = await markUnavailable(reason)
+        if (result.status !== "unavailable") return result
+        try {
+          await this.reclassifyHashes([target.hash])
+        } catch (error) {
+          if (!storeUnavailableReason(error) &&
+              !BUSY_CODES.has(error && error.code)) throw error
+        }
+        return markUnavailable(reason)
       }
       return prepared
     }
@@ -2071,11 +2123,12 @@ class Vault {
       storePath, { store_id: prepared.store_id })
     if (!storeStat) return { status: "stale" }
     if (storeStat.dev !== targetStat.dev) {
-      return { status: "unavailable" }
+      return markUnavailable("different_disk")
     }
     if (sameIdentity(storeStat, targetStat)) {
       await this.registry.upsertFile(Object.assign({}, target, {
-        status: "linked"
+        status: "linked",
+        unavailable_reason: null
       }))
       return { status: "already", bytes_saved: 0 }
     }
@@ -2083,7 +2136,7 @@ class Vault {
       return { status: "size-mismatch" }
     }
     if (!sameFileMetadata(storeStat, targetStat)) {
-      return { status: "metadata-mismatch" }
+      return markUnavailable("metadata")
     }
     const verified = await this.verifyStoreContent(
       target.hash, storePath, storeStat, prepared.store_id)
@@ -2094,6 +2147,19 @@ class Vault {
     let committedStat = null
     try {
       await fs.promises.link(storePath, temporary)
+    } catch (error) {
+      const code = error && error.code
+      if (PERMISSION_DENIED_CODES.has(code) || code === "EROFS") {
+        return markUnavailable("permission_denied")
+      }
+      if (HARDLINK_UNSUPPORTED_CODES.has(code)) {
+        return markUnavailable("hardlinks")
+      }
+      if (BUSY_CODES.has(code)) return { status: "locked" }
+      if (code === "EEXIST") return { status: "conflict" }
+      throw error
+    }
+    try {
       temporaryStat = await fs.promises.lstat(temporary)
       if (this.sourceAppIsRunning(source)) {
         await unlinkIfSame(temporary, temporaryStat)
@@ -2123,11 +2189,12 @@ class Vault {
       if (temporaryStat) {
         await unlinkIfSame(temporary, temporaryStat).catch(() => {})
       }
-      if (LOCK_CODES.has(error && error.code)) return { status: "locked" }
-      if (NO_LINK_CODES.has(error && error.code)) {
-        return { status: "unavailable" }
+      const code = error && error.code
+      if (replacementLockedCode(code)) return { status: "locked" }
+      if (code === "EROFS") {
+        return markUnavailable("permission_denied")
       }
-      if (error && error.code === "EEXIST") return { status: "conflict" }
+      if (code === "EEXIST") return { status: "conflict" }
       throw error
     }
 
@@ -2150,7 +2217,8 @@ class Vault {
       ctime: finalStat.ctimeMs,
       dev: finalStat.dev,
       ino: finalStat.ino,
-      status: "linked"
+      status: "linked",
+      unavailable_reason: null
     }))
     await this.refreshInodeSnapshots(
       target.hash, finalStat.dev, finalStat.ino, prepared.store_id)
@@ -2207,7 +2275,9 @@ class Vault {
   }
 
   async deduplicateFile(filePath) {
-    const result = await this.convert(path.resolve(filePath))
+    const result = await this.convert(path.resolve(filePath), {
+      retryUnavailable: true
+    })
     if (result.status === "converted") {
       if (!await this.recordEvent({
         kind: "convert",
@@ -2247,6 +2317,10 @@ class Vault {
       summary.incompatible += 1
     } else if (result.status === "unavailable") {
       summary.unavailable += 1
+      const reason = result.unavailable_reason || "cannot_share_safely"
+      if (!summary.unavailable_by_reason) summary.unavailable_by_reason = {}
+      summary.unavailable_by_reason[reason] =
+        (summary.unavailable_by_reason[reason] || 0) + 1
     } else {
       summary.stale += 1
     }
@@ -2395,7 +2469,9 @@ class Vault {
       }
       if (error && error.code === "EEXIST") return { status: "conflict" }
       if (isMissingError(error)) return { status: "stale" }
-      if (LOCK_CODES.has(error && error.code)) return { status: "locked" }
+      if (replacementLockedCode(error && error.code)) {
+        return { status: "locked" }
+      }
       throw error
     }
   }
@@ -2709,6 +2785,7 @@ class Vault {
     const counts = {
       all: {},
       duplicates: {},
+      unavailable: {},
       shareable: {}
     }
     const add = (target, sourceIdValue, amount) => {
@@ -2727,11 +2804,12 @@ class Vault {
       if (!["reference", "duplicate", "linked", "unavailable"]
         .includes(row.status)) continue
       add(counts.all, row.source_id, amount)
-      if (row.status === "duplicate" || row.status === "unavailable") {
-        add(counts.duplicates, row.source_id, amount)
-      }
       if (row.status === "duplicate") {
+        add(counts.duplicates, row.source_id, amount)
         add(counts.shareable, row.source_id, amount)
+      }
+      if (row.status === "unavailable") {
+        add(counts.unavailable, row.source_id, amount)
       }
     }
     return counts
@@ -2769,7 +2847,7 @@ class Vault {
       const publicStatus = {
         reference: "tracked",
         duplicate: "duplicate",
-        unavailable: "duplicate",
+        unavailable: "unavailable",
         linked: "shared"
       }[row.status]
       const result = Object.assign({
@@ -2821,7 +2899,6 @@ class Vault {
     const publicStatus = {
       reference: "tracked",
       duplicate: "duplicate",
-      unavailable: "duplicate",
       linked: "shared"
     }
     return (rows || []).map((row) => Object.assign({
@@ -2833,10 +2910,7 @@ class Vault {
       status: publicStatus[row.status],
       registry_status: row.status,
       shareable: row.status === "duplicate",
-      selectable: !!row.selectable,
-      unavailable_reason: row.status === "unavailable"
-        ? row.unavailable_reason || "different_disk"
-        : null
+      selectable: !!row.selectable
     }, this.locationForPath(row.path, row.source_id)))
   }
 
