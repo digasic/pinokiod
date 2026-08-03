@@ -71,6 +71,28 @@ class Scanner {
     return { result, current, stable }
   }
 
+  async validateSnapshots(entries) {
+    const stats = await statMany(
+      entries.map((entry) => entry.path),
+      this.statConcurrency,
+      null,
+      { followSymlinks: false }
+    )
+    return entries.map((entry, index) => {
+      const stat = stats[index]
+      const valid = !!(stat && stat.isFile() && !stat.isSymbolicLink() &&
+        sameSnapshot(entry, stat) &&
+        entry.mode === stat.mode &&
+        entry.uid === stat.uid &&
+        entry.gid === stat.gid)
+      return {
+        path: entry.path,
+        valid,
+        nlink: valid ? stat.nlink : 1
+      }
+    })
+  }
+
   async walkAnchors(stores, options = {}) {
     const checkpoint = typeof options.checkpoint === "function"
       ? options.checkpoint

@@ -148,6 +148,32 @@ class Kernel {
       this.launchRequirements.hasRuntimeForLaunchPath(launchPath)
     )
   }
+  notifyVaultAppLifecycle(method, launchPath) {
+    const automaticScans = this.vault && this.vault.automaticScans
+    if (!automaticScans || typeof automaticScans[method] !== "function") {
+      return
+    }
+    try {
+      const pending = automaticScans[method](launchPath)
+      if (pending && typeof pending.catch === "function") {
+        pending.catch((error) => {
+          console.warn("[Vault Automatic Scan] " + JSON.stringify({
+            time: new Date().toISOString(),
+            event: "lifecycle-error",
+            method,
+            message: error && error.message ? error.message : String(error)
+          }))
+        })
+      }
+    } catch (error) {
+      console.warn("[Vault Automatic Scan] " + JSON.stringify({
+        time: new Date().toISOString(),
+        event: "lifecycle-error",
+        method,
+        message: error && error.message ? error.message : String(error)
+      }))
+    }
+  }
   markAppLaunchStarted(launchPath) {
     const status = this.readyState.markStarted(launchPath)
     const appId = this.readyState.getAppIdForLaunchPath(launchPath)
@@ -157,6 +183,8 @@ class Kernel {
       }
       this.launchRequirements.markStarted(launchPath)
     }
+    Kernel.prototype.notifyVaultAppLifecycle.call(
+      this, "handleStarted", launchPath)
     return status
   }
   markAppLaunchProgress(launchPath, current, total) {
@@ -182,6 +210,8 @@ class Kernel {
   }
   markAppLaunchStopped(launchPath, options = {}) {
     const status = this.readyState.markStopped(launchPath)
+    Kernel.prototype.notifyVaultAppLifecycle.call(
+      this, "handleStopped", launchPath)
     if (options && options.internal_completion) {
       return status
     }

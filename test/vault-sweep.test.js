@@ -101,6 +101,157 @@ describe("Save Space scans", () => {
     assert.equal(fs.existsSync(vault.blobRoot), false)
   })
 
+  test("an app scan classifies against linked files in other apps", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const knownOnly = crypto.randomBytes(5000)
+    const first = await write(
+      path.join(home, "api", "old-one", "model.bin"), contents)
+    const second = path.join(home, "api", "old-two", "model.bin")
+    await fs.promises.mkdir(path.dirname(second), { recursive: true })
+    await fs.promises.link(first, second)
+    const knownFirst = await write(
+      path.join(home, "api", "old-one", "known-only.bin"), knownOnly)
+    const knownSecond = path.join(
+      home, "api", "old-two", "known-only.bin")
+    await fs.promises.link(knownFirst, knownSecond)
+    await vault.sweeper.scan()
+    assert.equal((await vault.registry.getFile(first)).status, "linked")
+    assert.equal((await vault.registry.getFile(second)).status, "linked")
+    assert.equal((await vault.registry.getFile(knownFirst)).status, "linked")
+    assert.equal((await vault.registry.getFile(knownSecond)).status, "linked")
+
+    const newRoot = path.join(home, "api", "new-app")
+    const duplicate = await write(
+      path.join(newRoot, "model.bin"), contents)
+    await write(
+      path.join(newRoot, "same-size.bin"),
+      crypto.randomBytes(contents.length))
+    const knownDuplicate = await write(
+      path.join(newRoot, "known-only.bin"), knownOnly)
+    await vault.refreshSources()
+    const source = vault.sources().find((entry) => entry.root === newRoot)
+    assert.ok(source)
+
+    await vault.sweeper.scan(source.id)
+
+    assert.equal((await vault.registry.getFile(duplicate)).status, "duplicate")
+    assert.equal((await vault.registry.getFile(knownDuplicate)).status,
+      "duplicate")
+    assert.equal((await vault.registry.getFile(first)).status, "linked")
+    assert.equal((await vault.registry.getFile(second)).status, "linked")
+    const status = await vault.status(source.id, {
+      view: "activity",
+      page_size: 1
+    })
+    assert.equal(status.pending_bytes, contents.length + knownOnly.length)
+    assert.equal(fs.existsSync(vault.blobRoot), false)
+  })
+
+  test("an app scan hashes an unhashed peer and preserves its reference", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const existing = await write(
+      path.join(home, "api", "zeta", "model.bin"), contents)
+    await vault.refreshSources()
+    const existingSource = vault.sources().find((entry) =>
+      entry.root === path.dirname(existing))
+    assert.ok(existingSource)
+
+    await vault.sweeper.scan(existingSource.id)
+    assert.equal((await vault.registry.getFile(existing)).hash, null)
+    assert.equal((await vault.registry.getFile(existing)).status, "reference")
+
+    const added = await write(
+      path.join(home, "api", "alpha", "model.bin"), contents)
+    await vault.refreshSources()
+    const addedSource = vault.sources().find((entry) =>
+      entry.root === path.dirname(added))
+    assert.ok(addedSource)
+
+    await vault.sweeper.scan(addedSource.id)
+
+    const existingRow = await vault.registry.getFile(existing)
+    const addedRow = await vault.registry.getFile(added)
+    assert.equal(existingRow.hash, sha256(contents))
+    assert.equal(existingRow.status, "reference")
+    assert.equal(addedRow.hash, existingRow.hash)
+    assert.equal(addedRow.status, "duplicate")
+    const status = await vault.status(addedSource.id, {
+      view: "activity",
+      page_size: 1
+    })
+    assert.equal(status.pending_bytes, contents.length)
+
+    await fs.promises.rm(existing)
+    await vault.sweeper.scan(existingSource.id)
+    assert.equal((await vault.registry.getFile(existing)), null)
+    assert.equal((await vault.registry.getFile(added)).status, "reference")
+  })
+
+  test("an app scan rejects a changed comparison snapshot", async () => {
+    const { home, vault } = await makeVault()
+    const original = crypto.randomBytes(4096)
+    const existing = await write(
+      path.join(home, "api", "zeta", "model.bin"), original)
+    await vault.refreshSources()
+    const existingSource = vault.sources().find((entry) =>
+      entry.root === path.dirname(existing))
+    await vault.sweeper.scan(existingSource.id)
+
+    const temporary = await write(
+      path.join(home, "api", "alpha", "model.bin"), original)
+    await vault.refreshSources()
+    const temporarySource = vault.sources().find((entry) =>
+      entry.root === path.dirname(temporary))
+    await vault.sweeper.scan(temporarySource.id)
+    await fs.promises.rm(temporary)
+    await vault.sweeper.scan(temporarySource.id)
+
+    const replacement = crypto.randomBytes(original.length)
+    await fs.promises.writeFile(existing, replacement)
+    const added = await write(
+      path.join(home, "api", "beta", "model.bin"), original)
+    await vault.refreshSources()
+    const addedSource = vault.sources().find((entry) =>
+      entry.root === path.dirname(added))
+
+    await vault.sweeper.scan(addedSource.id)
+
+    assert.notDeepEqual(await fs.promises.readFile(existing), original)
+    assert.equal((await vault.registry.getFile(added)).status, "reference")
+    const status = await vault.status(addedSource.id, {
+      view: "activity",
+      page_size: 1
+    })
+    assert.equal(status.pending_bytes, 0)
+  })
+
+  test("a scoped scan does not publish an unrelated comparison hash", async () => {
+    const { home, vault } = await makeVault()
+    const existing = await write(
+      path.join(home, "api", "zeta", "model.bin"),
+      crypto.randomBytes(4096))
+    await vault.refreshSources()
+    const existingSource = vault.sources().find((entry) =>
+      entry.root === path.dirname(existing))
+    await vault.sweeper.scan(existingSource.id)
+    assert.equal((await vault.registry.getFile(existing)).hash, null)
+
+    const added = await write(
+      path.join(home, "api", "beta", "model.bin"),
+      crypto.randomBytes(4096))
+    await vault.refreshSources()
+    const addedSource = vault.sources().find((entry) =>
+      entry.root === path.dirname(added))
+
+    await vault.sweeper.scan(addedSource.id)
+
+    assert.ok((await vault.registry.getFile(added)).hash)
+    assert.equal((await vault.registry.getFile(existing)).hash, null)
+    assert.equal((await vault.registry.getFile(existing)).status, "reference")
+  })
+
   test("hash-looking cache paths and metadata never replace byte hashing", async () => {
     const { home, vault } = await makeVault()
     const contents = crypto.randomBytes(4096)
@@ -438,6 +589,17 @@ describe("Save Space scans", () => {
         FROM sqlite_temp_master
         WHERE type = 'table' AND name GLOB 'scan_*'
       `).get().count, 6)
+      const comparisonPlan = registry.database.prepare(`
+        EXPLAIN QUERY PLAN
+        SELECT *
+        FROM scan_files INDEXED BY scan_files_comparison_pending_idx
+        WHERE run_id = ?
+          AND comparison_only = 1
+          AND comparison_verified = 0
+        ORDER BY path
+        LIMIT 128
+      `).all("plan").map((row) => row.detail).join(" ")
+      assert.match(comparisonPlan, /scan_files_comparison_pending_idx/)
 
       const runId = registry.beginScan()
       const entries = []
@@ -671,6 +833,48 @@ describe("Save Space scans", () => {
     assert.deepEqual(
       [...await vault.registry.files()].map((row) => row.path),
       partialPaths
+    )
+  })
+
+  test("cancellation immediately before publication discards the draft", async () => {
+    const { home, vault } = await makeVault()
+    const original = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "one", "model.bin"), original)
+    await write(path.join(home, "api", "two", "model.bin"), original)
+    await vault.sweeper.scan()
+    const previousScan = await vault.registry.scanFor()
+    const previousPaths = [...await vault.registry.files()]
+      .map((row) => row.path)
+
+    await write(
+      path.join(home, "api", "three", "new.bin"),
+      crypto.randomBytes(5000)
+    )
+    const stageExclusions = vault.registry.stageExclusions.bind(vault.registry)
+    const publishScan = vault.registry.publishScan.bind(vault.registry)
+    let exclusionStages = 0
+    let published = false
+    vault.registry.stageExclusions = async (...args) => {
+      const result = await stageExclusions(...args)
+      exclusionStages += 1
+      if (exclusionStages === 3) vault.sweeper.cancel()
+      return result
+    }
+    vault.registry.publishScan = async (...args) => {
+      published = true
+      return publishScan(...args)
+    }
+
+    const result = await vault.sweeper.scan()
+    vault.registry.stageExclusions = stageExclusions
+    vault.registry.publishScan = publishScan
+
+    assert.equal(result.cancelled, true)
+    assert.equal(published, false)
+    assert.equal((await vault.registry.scanFor()).ts, previousScan.ts)
+    assert.deepEqual(
+      [...await vault.registry.files()].map((row) => row.path),
+      previousPaths
     )
   })
 

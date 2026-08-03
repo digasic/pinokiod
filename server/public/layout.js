@@ -30,6 +30,7 @@
     root: null,
     defaultPath: null,
     initialPath: null,
+    activeLeafId: null,
   };
 
   const nodeById = new Map();
@@ -234,6 +235,11 @@
     };
 
     iframe.addEventListener('load', updateNodeLocation);
+    const markActive = () => {
+      state.activeLeafId = node.id;
+    };
+    iframe.addEventListener('focus', markActive);
+    iframe.addEventListener('pointerdown', markActive);
 
     entry = { container, iframe, updateNodeLocation };
     leafElements.set(node.id, entry);
@@ -661,6 +667,27 @@
     return true;
   }
 
+  function navigateActiveLeaf(targetUrl) {
+    const normalized = normalizeSrc(targetUrl);
+    let frameId = state.activeLeafId;
+    if (!frameId || !leafElements.has(frameId)) {
+      frameId = leafElements.keys().next().value || null;
+    }
+    if (!frameId) {
+      return false;
+    }
+    const node = nodeById.get(frameId);
+    const entry = leafElements.get(frameId);
+    if (!node || node.type !== 'leaf' || !entry) {
+      return false;
+    }
+    node.src = normalized;
+    entry.iframe.src = normalized;
+    state.activeLeafId = frameId;
+    saveStateToStorage();
+    return true;
+  }
+
   function onMessage(event) {
     if (!event || !event.data || typeof event.data !== 'object') {
       return;
@@ -801,6 +828,179 @@
   };
 
   window.PinokioLayout = api;
+  (function initAutomaticScanTray() {
+    if (parsedConfig.vaultEnabled === false) {
+      return;
+    }
+    const tray = document.getElementById('vault-auto-scan-tray');
+    if (!tray) {
+      return;
+    }
+
+    const DRIVE_ICON = `
+      <svg viewBox="0 0 20 20" aria-hidden="true">
+        <rect x="2.5" y="4" width="15" height="12" rx="2"></rect>
+        <path d="M3 12.5h14"></path>
+        <circle cx="14" cy="14.25" r=".75"></circle>
+      </svg>`;
+    const PAUSE_ICON = `
+      <svg viewBox="0 0 20 20" aria-hidden="true">
+        <circle cx="10" cy="10" r="7.5"></circle>
+        <path d="M8 7.25v5.5M12 7.25v5.5"></path>
+      </svg>`;
+
+    let eventSource = null;
+
+    function formatBytes(value) {
+      const bytes = Math.max(0, Number(value) || 0);
+      const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+      let amount = bytes;
+      let unit = 0;
+      while (amount >= 1024 && unit < units.length - 1) {
+        amount /= 1024;
+        unit += 1;
+      }
+      const digits = amount >= 10 || unit === 0 ? 0 : 1;
+      return `${amount.toFixed(digits)} ${units[unit]}`;
+    }
+
+    function rowText(row) {
+      if (row.state === 'paused') {
+        return `${row.app} check paused`;
+      }
+      if (row.state === 'result') {
+        return `${row.app} — ${formatBytes(row.savings)} can be saved`;
+      }
+      return `Checking ${row.app} for duplicate files…`;
+    }
+
+    function actionFor(row) {
+      if (row.state === 'paused') {
+        return { label: 'Resume', action: 'automatic_resume' };
+      }
+      if (row.state === 'result') {
+        return { label: 'Review', action: 'automatic_review' };
+      }
+      return { label: 'Pause', action: 'automatic_pause' };
+    }
+
+    async function requestAction(action, app) {
+      const response = await fetch('/vault/action', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, app }),
+      });
+      if (!response.ok) {
+        throw new Error(`Disk Saver action failed (${response.status}).`);
+      }
+      const result = await response.json();
+      if (result && result.error) {
+        throw new Error(result.error);
+      }
+      return result || {};
+    }
+
+    function render(snapshot) {
+      const rows = snapshot && Array.isArray(snapshot.rows)
+        ? snapshot.rows
+        : [];
+      const fragment = document.createDocumentFragment();
+      rows.forEach((row) => {
+        if (!row || typeof row.app !== 'string' || !row.app) {
+          return;
+        }
+        const item = document.createElement('div');
+        item.className = 'vault-auto-scan-row';
+        item.dataset.state = row.state || 'checking';
+
+        const icon = document.createElement('span');
+        icon.className = 'vault-auto-scan-icon';
+        if (row.state === 'paused') {
+          icon.innerHTML = PAUSE_ICON;
+        } else if (row.state === 'result') {
+          icon.innerHTML = DRIVE_ICON;
+        }
+
+        const copy = document.createElement('span');
+        copy.className = 'vault-auto-scan-copy';
+        copy.textContent = rowText(row);
+
+        const action = actionFor(row);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'vault-auto-scan-action';
+        button.textContent = action.label;
+        button.addEventListener('click', async () => {
+          button.disabled = true;
+          try {
+            const result = await requestAction(action.action, row.app);
+            if (action.action === 'automatic_review' && result.href) {
+              item.remove();
+              tray.hidden = tray.childElementCount === 0;
+              navigateActiveLeaf(result.href);
+            } else {
+              await loadState();
+            }
+          } catch (error) {
+            console.warn('[Disk Saver] Automatic scan action failed', error);
+            button.disabled = false;
+          }
+        });
+
+        item.append(icon, copy, button);
+        fragment.appendChild(item);
+      });
+      tray.replaceChildren(fragment);
+      tray.hidden = tray.childElementCount === 0;
+    }
+
+    async function loadState() {
+      try {
+        const response = await fetch('/info/vault/automatic-scans', {
+          credentials: 'same-origin',
+          cache: 'no-store',
+        });
+        if (response.status === 404) {
+          render({ rows: [] });
+          return;
+        }
+        if (!response.ok) {
+          throw new Error(`Disk Saver state failed (${response.status}).`);
+        }
+        render(await response.json());
+      } catch (error) {
+        console.debug('[Disk Saver] Automatic scan state unavailable', error);
+      }
+    }
+
+    function connect() {
+      if (typeof window.EventSource !== 'function') {
+        return;
+      }
+      eventSource = new window.EventSource(
+        '/info/vault/automatic-scans/events');
+      eventSource.onmessage = (event) => {
+        try {
+          render(JSON.parse(event.data));
+        } catch (error) {
+          console.debug('[Disk Saver] Invalid automatic scan state', error);
+        }
+      };
+      eventSource.onerror = () => {
+        loadState();
+      };
+    }
+
+    if (typeof window.EventSource === 'function') {
+      connect();
+    } else {
+      loadState();
+    }
+    window.addEventListener('beforeunload', () => {
+      if (eventSource) eventSource.close();
+    }, { once: true });
+  })();
   // Mobile notification audio priming is centralized in common.js to avoid duplicates
   
   // Top-level notification listener (indicator + optional chime) for mobile

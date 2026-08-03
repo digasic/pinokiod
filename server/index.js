@@ -15739,6 +15739,73 @@ class Server {
 //    }))
 
 
+    // Automatic app-scan notices are read separately so loading the shared
+    // layout never creates Disk Saver storage.
+    this.app.get("/info/vault/automatic-scans", ex(async (req, res) => {
+      if (!privacyFilterCache.isSameOriginRequest(req)) {
+        res.sendStatus(403)
+        return
+      }
+      const vault = this.kernel.vault
+      if (vault && vault.ready) await vault.ready
+      if (!vault || !vault.enabled) {
+        res.sendStatus(404)
+        return
+      }
+      res.set("Cache-Control", "no-store")
+      res.json(await vault.automaticScanStatus())
+    }))
+
+    this.app.get("/info/vault/automatic-scans/events", ex(async (req, res) => {
+      if (!privacyFilterCache.isSameOriginRequest(req)) {
+        res.sendStatus(403)
+        return
+      }
+      let closed = false
+      let heartbeat = null
+      let unsubscribe = () => {}
+      const disconnected = () => closed || req.destroyed || res.destroyed ||
+        res.writableEnded
+      const close = () => {
+        if (closed) return
+        closed = true
+        if (heartbeat) clearInterval(heartbeat)
+        unsubscribe()
+      }
+      req.once("close", close)
+      res.once("close", close)
+      const vault = this.kernel.vault
+      if (vault && vault.ready) await vault.ready
+      if (disconnected()) return
+      if (!vault || !vault.enabled) {
+        res.sendStatus(404)
+        return
+      }
+      await vault.automaticScanStatus()
+      if (disconnected()) return
+      res.status(200)
+      res.set({
+        "Cache-Control": "no-cache, no-store",
+        "Content-Type": "text/event-stream",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+      })
+      if (typeof res.flushHeaders === "function") res.flushHeaders()
+      const send = (snapshot) => {
+        if (disconnected()) return
+        res.write(`data: ${JSON.stringify(snapshot)}\n\n`)
+      }
+      unsubscribe = vault.automaticScans.subscribe(send)
+      if (disconnected()) {
+        unsubscribe()
+        return
+      }
+      heartbeat = setInterval(() => {
+        if (!disconnected()) res.write(": keepalive\n\n")
+      }, 25000)
+      if (typeof heartbeat.unref === "function") heartbeat.unref()
+    }))
+
     // Vault dashboard data: registry-backed with bounded per-blob stats,
     // never a discovery walk. Scans run ONLY via the explicit action below.
     this.app.get("/info/dedup", ex(async (req, res) => {

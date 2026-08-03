@@ -94,6 +94,7 @@ class Sweeper {
     const runId = await registry.beginScan(scopeId)
     let outcome = "failed"
     let fatalError = null
+    let affectedApps = []
     try {
       await this.vault.refreshSources()
       if (!scopeId) {
@@ -128,6 +129,12 @@ class Sweeper {
       }
       this.state.walk_duration_ms = Date.now() - walkStarted
       await registry.stageExclusions(runId, this.exclusionList())
+      if (scopeId) {
+        const comparisons = await registry.stageComparisonFiles(
+          runId, this.publicationSourceIds(scopeId))
+        this.applyHashWork(comparisons && comparisons.work)
+        await this.verifyComparisonFiles(runId)
+      }
 
       this.state.phase = "hashing"
       const hashStarted = Date.now()
@@ -136,6 +143,7 @@ class Sweeper {
       await this.verifyCandidateAnchors(runId)
       await registry.stageExclusions(runId, this.exclusionList())
       this.state.hash_wait_duration_ms = Date.now() - hashStarted
+      this.checkpoint()
 
       outcome = this.exclusions.size
         ? "completed_with_exclusions"
@@ -152,12 +160,15 @@ class Sweeper {
           can_link: store.mode !== "copy",
           root: store.root
         }))
-      await registry.publishScan(
+      const publication = await registry.publishScan(
         runId,
         this.publicationSourceIds(scopeId),
         metadata,
         stores
       )
+      affectedApps = publication && Array.isArray(publication.affected_apps)
+        ? publication.affected_apps
+        : []
     } catch (error) {
       await registry.abortScan(runId).catch(() => {})
       if (error && error.code === "EVAULTCANCELLED") {
@@ -182,7 +193,8 @@ class Sweeper {
       outcome,
       partial: outcome === "completed_with_exclusions",
       cancelled: outcome === "cancelled",
-      exclusions: this.exclusionList()
+      exclusions: this.exclusionList(),
+      affected_apps: affectedApps
     }
   }
 
@@ -329,6 +341,20 @@ class Sweeper {
     })
   }
 
+  async verifyComparisonFiles(runId) {
+    while (true) {
+      this.checkpoint()
+      const entries = await this.vault.registry.comparisonFileBatch(runId)
+      if (!entries.length) {
+        const work = await this.vault.registry.stagedHashWork(runId)
+        this.applyHashWork(work)
+        return
+      }
+      const observations = await this.vault.scanner.validateSnapshots(entries)
+      await this.vault.registry.resolveComparisonFiles(runId, observations)
+    }
+  }
+
   async walk(root, runId, preferredSourceId = null) {
     await this.vault.scanner.walk(root, {
       checkpoint: () => this.checkpoint(),
@@ -425,16 +451,18 @@ class Sweeper {
           }
         })
         if (!verified.stable) {
-          this.state.unstable_hashes += 1
+          if (!candidate.comparison_only) this.state.unstable_hashes += 1
           const retry = await this.vault.registry.markStageHashFailed(
             runId, candidate)
-          this.recordExclusion(
-            null,
-            candidate.path,
-            candidate.source_id,
-            "changed_during_scan",
-            candidate
-          )
+          if (!candidate.comparison_only) {
+            this.recordExclusion(
+              null,
+              candidate.path,
+              candidate.source_id,
+              "changed_during_scan",
+              candidate
+            )
+          }
           candidate = retry.next
           deferCompletion = !candidate && retry.anchor_fallback
           continue
@@ -454,13 +482,15 @@ class Sweeper {
         const retry = await this.vault.registry.markStageHashFailed(
           runId, candidate)
         if (error && error.code === "EVAULTCANCELLED") throw error
-        if (!this.recordExclusion(
+        if (!candidate.comparison_only && !this.recordExclusion(
           error, candidate.path, candidate.source_id, null, candidate
         )) throw error
-        this.state.hash_failures += 1
-        const sourceId = candidate.source_id || "pinokio"
-        this.state.source_hash_failures[sourceId] =
-          (this.state.source_hash_failures[sourceId] || 0) + 1
+        if (!candidate.comparison_only) {
+          this.state.hash_failures += 1
+          const sourceId = candidate.source_id || "pinokio"
+          this.state.source_hash_failures[sourceId] =
+            (this.state.source_hash_failures[sourceId] || 0) + 1
+        }
         candidate = retry.next
         deferCompletion = !candidate && retry.anchor_fallback
       } finally {

@@ -7,6 +7,7 @@ const Registry = require("./registry")
 const Scanner = require("./scanner")
 const Sweeper = require("./sweeper")
 const FolderFinder = require("./folder_finder")
+const AutomaticScans = require("./automatic_scans")
 const { fileSnapshot, sameSnapshot, sameContentState } = require("./snapshot")
 const {
   SIZE_THRESHOLD,
@@ -20,6 +21,20 @@ const {
 
 const HARDLINK_UNSUPPORTED_CODES = new Set([
   "EXDEV", "ENOTSUP", "EOPNOTSUPP", "ENOSYS"
+])
+const USER_WORK_ACTIONS = new Set([
+  "add_source",
+  "add_folder_discovery_sources",
+  "remove_source",
+  "scan",
+  "find_folders",
+  "deduplicate",
+  "deduplicate_files",
+  "detach",
+  "separate_files",
+  "separate_all",
+  "reclaim",
+  "reclaim_all"
 ])
 const PERMISSION_DENIED_CODES = new Set(["EACCES", "EPERM"])
 const BUSY_CODES = new Set(["EBUSY"])
@@ -133,6 +148,31 @@ const rowSnapshot = (row) => ({
   ino: row.ino
 })
 
+class FileActionChanges {
+  constructor(registry) {
+    this.registry = registry
+    this.hashes = new Set()
+    this.apps = new Set()
+    this.error = null
+  }
+
+  add(hash) {
+    if (typeof hash === "string" && hash) this.hashes.add(hash)
+  }
+
+  async flush() {
+    if (!this.hashes.size) return
+    const hashes = [...this.hashes]
+    this.hashes.clear()
+    try {
+      const apps = await this.registry.appsForHashes(hashes)
+      for (const app of apps) this.apps.add(app)
+    } catch (error) {
+      if (!this.error) this.error = error
+    }
+  }
+}
+
 const revealInFileManager = (filePath, platform = process.platform) =>
   new Promise((resolve, reject) => {
     const command = platform === "darwin"
@@ -184,9 +224,12 @@ class Vault {
     this.operationTail = Promise.resolve()
     this.initializationPromise = null
     this.scanPromise = null
+    this.scanCompletionPromise = null
     this.scanError = null
     this.scanScopeId = null
     this.scanCancelRequested = false
+    this.scanOwner = null
+    this.scanOwnerApp = null
     this.lastScanCache = new Map()
     this.fileActionProgress = null
     this.fileActionCancelRequested = false
@@ -194,6 +237,7 @@ class Vault {
     this.folderDiscoveryPromise = null
     this.folderDiscoveryCancelRequested = false
     this.folderDiscoveryCommitPromise = null
+    this.automaticScans = new AutomaticScans(this)
   }
 
   get root() {
@@ -485,7 +529,20 @@ class Vault {
     this.fileActionCancelRequested = false
     this.fileActionProgress = progress
     try {
-      return await operation(progress)
+      const changedHashes = new FileActionChanges(this.registry)
+      const result = await operation(progress, changedHashes)
+      try {
+        await changedHashes.flush()
+        if (changedHashes.apps.size) {
+          await this.automaticScans.clearAutomaticState(
+            [...changedHashes.apps], "file-action")
+        }
+        if (changedHashes.error) throw changedHashes.error
+      } catch (error) {
+        console.warn("Automatic Disk Saver result cleanup failed:",
+          error && error.message ? error.message : error)
+      }
+      return result
     } finally {
       if (this.fileActionProgress === progress) {
         this.fileActionProgress = null
@@ -571,6 +628,24 @@ class Vault {
     await this.refreshAnchorStores()
     await this.refreshSources()
     return { enabled: true, mode: this.mode }
+  }
+
+  async automaticScanStatus() {
+    if (this.ready) await this.ready
+    if (!this.enabled) return { enabled: false, rows: [] }
+    if (!this.initialized) {
+      const [rootStat, configStat, databaseStat] = await Promise.all([
+        lstatIfPresent(this.root),
+        lstatIfPresent(this.configPath),
+        lstatIfPresent(path.resolve(this.root, "registry.sqlite3"))
+      ])
+      if (!rootStat || !configStat || !databaseStat) {
+        return this.automaticScans.snapshot()
+      }
+      await this.ensureInitialized()
+    }
+    await this.automaticScans.hydrate()
+    return this.automaticScans.snapshot()
   }
 
   async refreshAnchorStores() {
@@ -1531,38 +1606,89 @@ class Vault {
       this.folderFinder.runId, folder, page, STATUS_PAGE_SIZE)
   }
 
-  startScan(scopeId = null, sizeThreshold = this.sizeThreshold) {
+  startScan(
+    scopeId = null,
+    sizeThreshold = this.sizeThreshold,
+    options = {}
+  ) {
     if (!this.enabled || !this.sweeper) {
       return { started: false, disabled: true }
     }
     if (this.scanPromise) return { started: false, already_running: true }
+    const previousSizeThreshold = this.sizeThreshold
     this.sizeThreshold = sizeThreshold
     this.scanError = null
     this.scanScopeId = scopeId
     this.scanCancelRequested = false
-    this.scanPromise = this.runExclusive(() => {
+    const owner = options.owner === "automatic" ? "automatic" : "manual"
+    const ownerApp = owner === "automatic" && typeof options.app === "string"
+      ? options.app
+      : null
+    this.scanOwner = owner
+    this.scanOwnerApp = ownerApp
+    let scanResult = null
+    let scanFailure = null
+    const execution = this.runExclusive(() => {
       if (this.scanCancelRequested) {
         this.sweeper.state = Object.assign(this.sweeper.idleState(), {
           phase: "cancelled",
           scope_id: scopeId
         })
-        return { cancelled: true }
+        return { cancelled: true, outcome: "cancelled" }
       }
       return this.sweeper.scan(scopeId)
+    }).then((result) => {
+      scanResult = result
+      return result
     }).catch((error) => {
+      scanFailure = error
       this.scanError = error && error.message
         ? error.message
         : String(error)
-    }).finally(() => {
+    })
+    const tracked = execution.finally(() => {
+      if (this.scanPromise !== tracked) return
+      if (owner === "automatic") {
+        this.sizeThreshold = previousSizeThreshold
+      }
       this.scanPromise = null
       this.scanScopeId = null
       this.scanCancelRequested = false
+      this.scanOwner = null
+      this.scanOwnerApp = null
     })
+    this.scanPromise = tracked
+    const completion = tracked.then(async () => {
+      try {
+        await this.automaticScans.scanFinished({
+          owner,
+          app: ownerApp,
+          scopeId,
+          result: scanResult,
+          error: scanFailure
+        })
+      } catch (error) {
+        console.warn("Automatic Disk Saver state update failed:",
+          error && error.message ? error.message : error)
+      }
+    })
+    const settled = completion.finally(() => {
+      if (this.scanCompletionPromise === settled) {
+        this.scanCompletionPromise = null
+      }
+    })
+    this.scanCompletionPromise = settled
     return { started: true }
   }
 
-  cancelScan() {
+  cancelScan(options = {}) {
     if (!this.scanPromise || !this.sweeper) {
+      return { cancel_requested: false }
+    }
+    if (options.owner && options.owner !== this.scanOwner) {
+      return { cancel_requested: false }
+    }
+    if (options.app && options.app !== this.scanOwnerApp) {
       return { cancel_requested: false }
     }
     this.scanCancelRequested = true
@@ -1582,7 +1708,28 @@ class Vault {
   async perform(action, payload = {}) {
     if (!this.enabled) return { error: "Disk Saver is disabled." }
     await this.ensureInitialized()
-    switch (action) {
+    if (action === "cancel_scan" && this.scanOwner === "automatic" &&
+        this.scanOwnerApp) {
+      return this.automaticScans.pause(this.scanOwnerApp)
+    }
+    const userWorkAction = USER_WORK_ACTIONS.has(action)
+    if (userWorkAction) await this.automaticScans.beforeUserWork()
+    try {
+      switch (action) {
+      case "automatic_pause":
+      case "automatic_resume":
+      case "automatic_review": {
+        if (typeof payload.app !== "string" || !payload.app) {
+          return { error: "Choose an app." }
+        }
+        if (action === "automatic_pause") {
+          return this.automaticScans.pause(payload.app)
+        }
+        if (action === "automatic_resume") {
+          return this.automaticScans.resume(payload.app)
+        }
+        return this.automaticScans.review(payload.app)
+      }
       case "add_source": {
         const result = await this.runExclusive(() =>
           this.addExternalSource(payload.path))
@@ -1670,7 +1817,8 @@ class Vault {
           return this.runMutation(() => this.runFileAction({
             kind: "deduplicate-file",
             path: path.resolve(payload.path)
-          }, () => this.deduplicateFile(payload.path)))
+          }, (_progress, changedHashes) =>
+            this.deduplicateFile(payload.path, changedHashes)))
         }
         const filesTotal = await this.countActionFiles("duplicate", scopeId)
         return this.runMutation(() => this.runFileAction({
@@ -1678,7 +1826,10 @@ class Vault {
           scope_id: scopeId,
           files_total: filesTotal,
           files_completed: 0
-        }, (progress) => this.deduplicateScope(scopeId, { progress })))
+        }, (progress, changedHashes) => this.deduplicateScope(scopeId, {
+          progress,
+          changedHashes
+        })))
       }
       case "deduplicate_files": {
         if (!Array.isArray(payload.paths) ||
@@ -1694,7 +1845,8 @@ class Vault {
           kind: "deduplicate-files",
           files_total: paths.length,
           files_completed: 0
-        }, (progress) => this.deduplicateFiles(paths, progress)))
+        }, (progress, changedHashes) =>
+          this.deduplicateFiles(paths, progress, changedHashes)))
       }
       case "detach":
         if (typeof payload.path !== "string" || !payload.path) {
@@ -1703,7 +1855,9 @@ class Vault {
         return this.runMutation(() => this.runFileAction({
           kind: "make-separate",
           path: path.resolve(payload.path)
-        }, () => this.separate(payload.path)))
+        }, (_progress, changedHashes) => this.separate(payload.path, {
+          changedHashes
+        })))
       case "separate_files": {
         if (!Array.isArray(payload.paths) ||
             payload.paths.length === 0 ||
@@ -1717,7 +1871,8 @@ class Vault {
           files_total: new Set(payload.paths.map((item) =>
             path.resolve(item))).size,
           files_completed: 0
-        }, (progress) => this.separateFiles(payload.paths, progress)))
+        }, (progress, changedHashes) =>
+          this.separateFiles(payload.paths, progress, changedHashes)))
       }
       case "separate_all": {
         const selection = this.separateSelection(payload)
@@ -1734,8 +1889,9 @@ class Vault {
           all_matching: true,
           cancelable: true,
           cancel_requested: false
-        }, (progress) =>
-          this.separateMatchingFiles(selection, progress)))
+        }, (progress, changedHashes) =>
+          this.separateMatchingFiles(
+            selection, progress, changedHashes)))
       }
       case "reclaim":
         return this.runMutation(() =>
@@ -1744,6 +1900,9 @@ class Vault {
         return this.runMutation(() => this.reclaimAll())
       default:
         return { error: "unknown action" }
+      }
+    } finally {
+      if (userWorkAction) this.automaticScans.afterUserWork()
     }
   }
 
@@ -2130,7 +2289,14 @@ class Vault {
         status: "linked",
         unavailable_reason: null
       }))
-      return { status: "already", bytes_saved: 0 }
+      return {
+        status: "already",
+        bytes_saved: 0,
+        hash: target.hash,
+        path: target.path,
+        app: target.app,
+        source_id: target.source_id
+      }
     }
     if (storeStat.size !== targetStat.size) {
       return { status: "size-mismatch" }
@@ -2274,10 +2440,14 @@ class Vault {
     }
   }
 
-  async deduplicateFile(filePath) {
+  async deduplicateFile(filePath, changedHashes = null) {
     const result = await this.convert(path.resolve(filePath), {
       retryUnavailable: true
     })
+    if (changedHashes && result.hash &&
+        (result.status === "converted" || result.status === "already")) {
+      changedHashes.add(result.hash)
+    }
     if (result.status === "converted") {
       if (!await this.recordEvent({
         kind: "convert",
@@ -2348,7 +2518,11 @@ class Vault {
     if (!await this.recordEvent(event)) summary.activity_warning = true
   }
 
-  async deduplicateFiles(filePaths, progress = null) {
+  async deduplicateFiles(
+    filePaths,
+    progress = null,
+    changedHashes = null
+  ) {
     const summary = Object.assign(this.deduplicationSummary(), {
       results: []
     })
@@ -2359,6 +2533,10 @@ class Vault {
       try {
         const result = await this.convert(filePath)
         this.addDeduplicationResult(summary, result)
+        if (changedHashes && result.hash &&
+            (result.status === "converted" || result.status === "already")) {
+          changedHashes.add(result.hash)
+        }
         if (result.status === "converted") {
           if (!representative) representative = result
           const sourceId = result.source_id || null
@@ -2396,10 +2574,18 @@ class Vault {
         try {
           const result = await this.convert(row.path)
           this.addDeduplicationResult(summary, result)
+          if (options.changedHashes && result.hash &&
+              (result.status === "converted" ||
+                result.status === "already")) {
+            options.changedHashes.add(result.hash)
+          }
         } catch (error) {
           summary.failed += 1
         }
         if (options.progress) options.progress.files_completed += 1
+      }
+      if (options.changedHashes instanceof FileActionChanges) {
+        await options.changedHashes.flush()
       }
     }
     if (summary.converted) {
@@ -2510,6 +2696,7 @@ class Vault {
     if (options.reclassify !== false) {
       await this.reclassifyHashes([entry.hash])
     }
+    if (options.changedHashes) options.changedHashes.add(entry.hash)
     const result = {
       status: "detached",
       bytes: entry.size,
@@ -2526,7 +2713,7 @@ class Vault {
     return result
   }
 
-  async separateFiles(filePaths, progress = null) {
+  async separateFiles(filePaths, progress = null, changedHashes = null) {
     const summary = {
       separated: 0,
       bytes: 0,
@@ -2543,7 +2730,8 @@ class Vault {
         const result = entry && entry.status === "linked"
           ? await this.separate(filePath, {
               recordActivity: false,
-              reclassify: false
+              reclassify: false,
+              changedHashes
             })
           : { status: "ineligible" }
         if (result.status === "detached") {
@@ -2588,7 +2776,11 @@ class Vault {
     return summary
   }
 
-  async separateMatchingFiles(selection, progress = null) {
+  async separateMatchingFiles(
+    selection,
+    progress = null,
+    changedHashes = null
+  ) {
     const summary = {
       separated: 0,
       bytes: 0,
@@ -2623,7 +2815,8 @@ class Vault {
           const result = entry && entry.status === "linked"
             ? await this.separate(row.path, {
                 recordActivity: false,
-                reclassify: false
+                reclassify: false,
+                changedHashes
               })
             : { status: "ineligible" }
           if (result.status === "detached") {
@@ -2646,6 +2839,9 @@ class Vault {
       }
       if (affectedHashes.size) {
         await this.reclassifyHashes(affectedHashes)
+      }
+      if (changedHashes instanceof FileActionChanges) {
+        await changedHashes.flush()
       }
       if (summary.cancelled) break
     }
