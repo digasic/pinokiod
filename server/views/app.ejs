@@ -12131,11 +12131,6 @@ const rerenderMenuSection = (container, html) => {
       let shell = target.closest("[data-shell]")
       if (shell) {
         let shell_id = shell.getAttribute("data-shell")
-        n.Noty({
-          text: `stopping shell`,
-          silent: true,
-          timeout: 2000
-        })
         let socket = new Socket()
         socket.run({
           method: "kernel.bin.shell_kill",
@@ -12146,11 +12141,6 @@ const rerenderMenuSection = (container, html) => {
           console.log("packet", packet)
           if (packet.type === "result") {
             socket.close()
-            n.Noty({
-              timeout: 2000,
-              text: `stopped`,
-              silent: true
-            })
             console.log("Refresh 4")
             refresh(true)
           }
@@ -12163,11 +12153,6 @@ const rerenderMenuSection = (container, html) => {
             target.querySelector("i").className = "fa-solid fa-check"
           } catch (e) {
           }
-          n.Noty({
-            text: `stopping script`,
-            silent: true,
-            timeout: 2000
-          })
 
           let socket = new Socket()
           socket.run({
@@ -12179,11 +12164,6 @@ const rerenderMenuSection = (container, html) => {
             if (packet.type === "result") {
               console.log("is result")
               socket.close()
-              n.Noty({
-                timeout: 2000,
-                text: `stopped`,
-                silent: true
-              })
               console.log("Refresh 4")
               refresh(true)
             }
@@ -12196,11 +12176,6 @@ const rerenderMenuSection = (container, html) => {
               target.querySelector("i").className = "fa-solid fa-check"
             } catch (e) {
             }
-            n.Noty({
-              text: `stopping ${src}`,
-              silent: true,
-              timeout: 2000
-            })
             console.log("src", src)
 
             let socket = new Socket()
@@ -12212,11 +12187,6 @@ const rerenderMenuSection = (container, html) => {
             }, (packet) => {
               if (packet.type === "result") {
                 socket.close()
-                n.Noty({
-                  timeout: 2000,
-                  text: `stopped`,
-                  silent: true
-                })
                 console.log("Refresh 4")
                 refresh(true)
               }
