@@ -20,6 +20,7 @@ class AutomaticScans {
   constructor(vault) {
     this.vault = vault
     this.entries = new Map()
+    this.settings = new Map()
     this.hydrated = false
     this.hydrationPromise = null
     this.active = null
@@ -32,6 +33,7 @@ class AutomaticScans {
     this.drainQueued = false
     this.waitingFor = null
     this.listeners = new Set()
+    this.appTransitions = new Map()
   }
 
   log(event, details = {}) {
@@ -60,7 +62,12 @@ class AutomaticScans {
   }
 
   async appRootIsAvailable(app) {
-    const root = path.resolve(this.vault.kernel.homedir, "api", app)
+    const apiRoot = path.resolve(this.vault.kernel.homedir, "api")
+    const root = path.resolve(apiRoot, app)
+    const relative = path.relative(apiRoot, root)
+    if (!relative || relative === ".." ||
+        relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative) ||
+        relative.split(path.sep).length !== 1) return false
     try {
       const stat = await fs.promises.lstat(root)
       return stat.isDirectory() && !stat.isSymbolicLink()
@@ -85,13 +92,42 @@ class AutomaticScans {
         typeof launchPath === "string" && inside(root, launchPath)))
   }
 
+  noticeId(entry) {
+    if (!entry) return null
+    const signature = entry.state === "result" &&
+      typeof entry.signature === "string"
+      ? entry.signature
+      : ""
+    return `${entry.state}:${Number(entry.updated_at) || 0}:${signature}`
+  }
+
+  noticeMatches(entry, noticeId) {
+    if (noticeId === undefined || noticeId === null) return true
+    return typeof noticeId === "string" &&
+      noticeId === this.noticeId(entry)
+  }
+
+  async withAppTransition(app, operation) {
+    const previous = this.appTransitions.get(app) || Promise.resolve()
+    const current = previous.catch(() => {}).then(operation)
+    this.appTransitions.set(app, current)
+    try {
+      return await current
+    } finally {
+      if (this.appTransitions.get(app) === current) {
+        this.appTransitions.delete(app)
+      }
+    }
+  }
+
   publicEntry(entry) {
     return {
       app: entry.app,
       state: entry.state,
       savings: entry.state === "result"
         ? Math.max(0, Number(entry.savings) || 0)
-        : 0
+        : 0,
+      notice_id: this.noticeId(entry)
     }
   }
 
@@ -99,12 +135,24 @@ class AutomaticScans {
     return {
       enabled: !!this.vault.enabled,
       rows: [...this.entries.values()]
+        .filter((entry) => !entry.hidden)
         .sort((left, right) =>
           (Number(left.updated_at) || 0) -
             (Number(right.updated_at) || 0) ||
           left.app.localeCompare(right.app))
-        .map((entry) => this.publicEntry(entry))
+        .map((entry) => this.publicEntry(entry)),
+      settings: [...this.settings.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([app, setting]) => ({
+          app,
+          mode: setting.mode
+        }))
     }
+  }
+
+  modeFor(app) {
+    const setting = this.settings.get(app)
+    return setting && setting.mode === "manual" ? "manual" : "automatic"
   }
 
   broadcast() {
@@ -126,28 +174,48 @@ class AutomaticScans {
   async hydrate() {
     if (this.hydrated || !this.vault.registry) return this.snapshot()
     if (!this.hydrationPromise) {
-      this.hydrationPromise = this.vault.registry.automaticAppScanStates()
-        .then(async (rows) => {
-          const stale = []
-          for (const row of rows || []) {
-            if (!row || !row.app || this.entries.has(row.app)) continue
-            if (!this.sourceForApp(row.app)) {
-              stale.push(row.app)
-              continue
-            }
-            this.entries.set(row.app, {
-              app: row.app,
-              state: row.state,
-              savings: Math.max(0, Number(row.savings) || 0),
-              updated_at: Number(row.updated_at) || 0,
-              previous: null
-            })
+      this.hydrationPromise = Promise.all([
+        this.vault.registry.automaticAppScanStates(),
+        this.vault.registry.automaticAppScanSettings()
+      ]).then(async ([rows, settings]) => {
+        const stale = []
+        for (const setting of settings || []) {
+          if (!setting || !setting.app) continue
+          if (!this.sourceForApp(setting.app)) {
+            stale.push(setting.app)
+            continue
           }
-          await Promise.all(stale.map((app) =>
-            this.vault.registry.setAutomaticAppScanState(app, null)))
-          this.hydrated = true
-          this.log("state-restored", { rows: this.entries.size })
+          this.settings.set(setting.app, {
+            mode: setting.mode === "manual" ? "manual" : "automatic",
+            acknowledged_signature:
+              setting.acknowledged_signature || null,
+            updated_at: Number(setting.updated_at) || 0
+          })
+        }
+        for (const row of rows || []) {
+          if (!row || !row.app || this.entries.has(row.app)) continue
+          if (!this.sourceForApp(row.app)) {
+            stale.push(row.app)
+            continue
+          }
+          this.entries.set(row.app, {
+            app: row.app,
+            state: row.state,
+            savings: Math.max(0, Number(row.savings) || 0),
+            updated_at: Number(row.updated_at) || 0,
+            previous: null,
+            hidden: row.state === "result" && !!(
+              this.settings.get(row.app) || {}).acknowledged_signature
+          })
+        }
+        await Promise.all([...new Set(stale)].map((app) =>
+          this.vault.registry.removeAutomaticAppScanApp(app)))
+        this.hydrated = true
+        this.log("state-restored", {
+          rows: this.entries.size,
+          settings: this.settings.size
         })
+      })
         .finally(() => {
           this.hydrationPromise = null
         })
@@ -168,6 +236,10 @@ class AutomaticScans {
   }
 
   queueApp(app) {
+    if (this.modeFor(app) === "manual") {
+      this.log("queue-skipped", { app, reason: "manual" })
+      return false
+    }
     const current = this.entries.get(app)
     if (current && current.state === "paused") {
       this.log("queue-skipped", { app, reason: "paused" })
@@ -183,7 +255,8 @@ class AutomaticScans {
       state: "checking",
       savings: 0,
       updated_at: Date.now(),
-      previous
+      previous,
+      hidden: false
     })
     this.log("queued", { app })
     this.broadcast()
@@ -255,20 +328,27 @@ class AutomaticScans {
     await this.vault.ensureInitialized()
     if (this.pendingStops.get(app) !== pending) return
     await this.hydrate()
-    if (this.pendingStops.get(app) !== pending) return
-    if (!this.pendingStopIsCurrent(app, pending)) {
-      this.cancelPendingStop(app, "app-restarted")
-      return
-    }
-    if (!await this.appRootIsAvailable(app)) {
+    await this.withAppTransition(app, async () => {
+      if (this.pendingStops.get(app) !== pending) return
+      if (this.modeFor(app) === "manual") {
+        this.pendingStops.delete(app)
+        this.log("scan-skipped", { app, reason: "manual" })
+        return
+      }
+      if (!this.pendingStopIsCurrent(app, pending)) {
+        this.cancelPendingStop(app, "app-restarted")
+        return
+      }
+      if (!await this.appRootIsAvailable(app)) {
+        this.pendingStops.delete(app)
+        this.log("scan-skipped", { app, reason: "app-source-unavailable" })
+        return
+      }
+      if (this.pendingStops.get(app) !== pending) return
       this.pendingStops.delete(app)
-      this.log("scan-skipped", { app, reason: "app-source-unavailable" })
-      return
-    }
-    if (this.pendingStops.get(app) !== pending) return
-    this.pendingStops.delete(app)
-    this.log("settled", { app })
-    this.queueApp(app)
+      this.log("settled", { app })
+      this.queueApp(app)
+    })
   }
 
   handleStarted(launchPath) {
@@ -329,8 +409,8 @@ class AutomaticScans {
       await this.vault.automaticScanStatus()
       entry = this.entries.get(app)
     }
-    if (entry && entry.state === "paused") {
-      this.log("scan-skipped", { app, reason: "paused" })
+    if (this.modeFor(app) === "manual") {
+      this.log("scan-skipped", { app, reason: "manual" })
       return
     }
     if (this.observedApps.has(app) || this.appIsRunning(app)) {
@@ -454,28 +534,134 @@ class AutomaticScans {
     this.schedule()
   }
 
-  async publishResult(app, scopeId) {
-    const status = await this.vault.status(scopeId, {
-      view: "activity",
-      page_size: 1
+  async setAcknowledgement(app, signature = null) {
+    const current = this.settings.get(app)
+    const acknowledged = current && current.acknowledged_signature
+    if ((acknowledged || null) === signature) return
+    if (!current && signature === null) return
+    const persisted = await this.vault.registry
+      .setAutomaticAppScanAcknowledgement(app, signature)
+    this.cacheAcknowledgement(app, signature, persisted.updated_at)
+  }
+
+  cacheAcknowledgement(app, signature, updatedAt = Date.now()) {
+    this.settings.set(app, {
+      mode: this.modeFor(app),
+      acknowledged_signature: signature,
+      updated_at: updatedAt || Date.now()
     })
-    const savings = Math.max(0, Number(status.pending_bytes) || 0)
-    if (savings > 0) {
-      const persisted = await this.vault.registry.setAutomaticAppScanState(
-        app, "result", savings)
+  }
+
+  async resultForScope(scopeId) {
+    return this.vault.registry.automaticAppResultSignature(
+      this.vault.scopeSourceIds(scopeId))
+  }
+
+  async publishResult(app, scopeId) {
+    return this.withAppTransition(app, () =>
+      this.publishResultNow(app, scopeId))
+  }
+
+  async publishResultNow(app, scopeId) {
+    const result = await this.resultForScope(scopeId)
+    const savings = Math.max(0, Number(result.savings) || 0)
+    if (savings > 0 && result.signature) {
+      const acknowledged = (this.settings.get(app) || {})
+        .acknowledged_signature
+      let persisted
+      if (acknowledged && acknowledged !== result.signature) {
+        persisted = await this.vault.registry.setAutomaticAppScanState(
+          app, "result", savings, { acknowledged_signature: null })
+        this.cacheAcknowledgement(app, null, persisted.updated_at)
+      } else {
+        persisted = await this.vault.registry.setAutomaticAppScanState(
+          app, "result", savings)
+      }
       this.entries.set(app, {
         app,
         state: "result",
         savings,
+        signature: result.signature,
         updated_at: persisted.updated_at || Date.now(),
-        previous: null
+        previous: null,
+        hidden: acknowledged === result.signature
       })
-      this.log("result", { app, savings_bytes: savings })
+      this.log("result", {
+        app,
+        savings_bytes: savings,
+        acknowledged: acknowledged === result.signature
+      })
     } else {
-      await this.vault.registry.setAutomaticAppScanState(app, null)
+      const acknowledged = (this.settings.get(app) || {})
+        .acknowledged_signature
+      if (acknowledged) {
+        const persisted = await this.vault.registry.setAutomaticAppScanState(
+          app, null, 0, { acknowledged_signature: null })
+        this.cacheAcknowledgement(app, null, persisted.updated_at)
+      } else {
+        await this.vault.registry.setAutomaticAppScanState(app, null)
+      }
       this.entries.delete(app)
       this.log("no-savings", { app })
     }
+  }
+
+  async reconcileResult(app) {
+    const entry = this.entries.get(app)
+    const current = entry && entry.state === "result"
+    const previous = entry && entry.state === "checking" &&
+      entry.previous && entry.previous.state === "result"
+    if (!current && !previous) return false
+    const source = this.sourceForApp(app)
+    let result = { signature: null, savings: 0 }
+    if (source) {
+      result = await this.resultForScope(source.id)
+    }
+    const savings = Math.max(0, Number(result.savings) || 0)
+    const target = current ? entry : entry.previous
+    if (savings > 0 && result.signature) {
+      const acknowledged = (this.settings.get(app) || {})
+        .acknowledged_signature
+      const hidden = acknowledged === result.signature
+      if (target.savings === savings &&
+          target.signature === result.signature &&
+          !!target.hidden === hidden) {
+        if (acknowledged && acknowledged !== result.signature) {
+          await this.setAcknowledgement(app, null)
+        }
+        return false
+      }
+      let persisted
+      if (acknowledged && acknowledged !== result.signature) {
+        persisted = await this.vault.registry.setAutomaticAppScanState(
+          app, "result", savings, { acknowledged_signature: null })
+        this.cacheAcknowledgement(app, null, persisted.updated_at)
+      } else {
+        persisted = await this.vault.registry.setAutomaticAppScanState(
+          app, "result", savings)
+      }
+      target.savings = savings
+      target.signature = result.signature
+      target.hidden = hidden
+      target.updated_at = persisted.updated_at || Date.now()
+    } else {
+      const acknowledged = (this.settings.get(app) || {})
+        .acknowledged_signature
+      if (acknowledged) {
+        const persisted = await this.vault.registry.setAutomaticAppScanState(
+          app, null, 0, { acknowledged_signature: null })
+        this.cacheAcknowledgement(app, null, persisted.updated_at)
+      } else {
+        await this.vault.registry.setAutomaticAppScanState(app, null)
+      }
+      if (current) {
+        this.entries.delete(app)
+      } else {
+        entry.previous = null
+      }
+    }
+    this.log("result-reconciled", { app, savings_bytes: savings })
+    return true
   }
 
   async reconcileResults(apps, excludedApps = []) {
@@ -484,37 +670,8 @@ class AutomaticScans {
     let changed = false
     for (const app of new Set((apps || []).filter(Boolean))) {
       if (excluded.has(app)) continue
-      const entry = this.entries.get(app)
-      const current = entry && entry.state === "result"
-      const previous = entry && entry.state === "checking" &&
-        entry.previous && entry.previous.state === "result"
-      if (!current && !previous) continue
-      const source = this.sourceForApp(app)
-      let savings = 0
-      if (source) {
-        const status = await this.vault.status(source.id, {
-          view: "activity",
-          page_size: 1
-        })
-        savings = Math.max(0, Number(status.pending_bytes) || 0)
-      }
-      const target = current ? entry : entry.previous
-      if (savings > 0) {
-        if (target.savings === savings) continue
-        const persisted = await this.vault.registry.setAutomaticAppScanState(
-          app, "result", savings)
-        target.savings = savings
-        target.updated_at = persisted.updated_at || Date.now()
-      } else {
-        await this.vault.registry.setAutomaticAppScanState(app, null)
-        if (current) {
-          this.entries.delete(app)
-        } else {
-          entry.previous = null
-        }
-      }
-      this.log("result-reconciled", { app, savings_bytes: savings })
-      changed = true
+      if (await this.withAppTransition(app, () =>
+        this.reconcileResult(app))) changed = true
     }
     if (changed) this.broadcast()
     return changed
@@ -525,24 +682,39 @@ class AutomaticScans {
     const states = new Set(options.states || ["result"])
     let changed = false
     for (const app of new Set((apps || []).filter(Boolean))) {
-      if (options.cancelPending) this.cancelPendingStop(app, reason)
-      const entry = this.entries.get(app)
-      if (!entry || entry.state === "paused") {
-        continue
-      }
-      const clearCurrent = states.has(entry.state)
-      const clearPrevious = states.has("result") &&
-        entry.state === "checking" &&
-        entry.previous && entry.previous.state === "result"
-      if (!clearCurrent && !clearPrevious) continue
-      await this.vault.registry.setAutomaticAppScanState(app, null)
-      if (clearCurrent) {
-        this.entries.delete(app)
-      } else {
-        entry.previous = null
-      }
-      this.log("state-cleared", { app, reason })
-      changed = true
+      const cleared = await this.withAppTransition(app, async () => {
+        if (options.cancelPending) this.cancelPendingStop(app, reason)
+        const clearAcknowledgement = options.clearAcknowledgement && !!(
+          this.settings.get(app) || {}).acknowledged_signature
+        const entry = this.entries.get(app)
+        if (!entry || entry.state === "paused") {
+          if (clearAcknowledgement) await this.setAcknowledgement(app, null)
+          return false
+        }
+        const clearCurrent = states.has(entry.state)
+        const clearPrevious = states.has("result") &&
+          entry.state === "checking" &&
+          entry.previous && entry.previous.state === "result"
+        if (!clearCurrent && !clearPrevious) {
+          if (clearAcknowledgement) await this.setAcknowledgement(app, null)
+          return false
+        }
+        if (clearAcknowledgement) {
+          const persisted = await this.vault.registry.setAutomaticAppScanState(
+            app, null, 0, { acknowledged_signature: null })
+          this.cacheAcknowledgement(app, null, persisted.updated_at)
+        } else {
+          await this.vault.registry.setAutomaticAppScanState(app, null)
+        }
+        if (clearCurrent) {
+          this.entries.delete(app)
+        } else {
+          entry.previous = null
+        }
+        this.log("state-cleared", { app, reason })
+        return true
+      })
+      if (cleared) changed = true
     }
     if (changed) this.broadcast()
     return changed
@@ -565,40 +737,51 @@ class AutomaticScans {
     const complete = !error && result &&
       COMPLETE_PHASES.has(result.outcome)
     if (owner === "automatic") {
-      if (this.active && this.active.app === app) this.active = null
-      const reason = this.cancelReasons.get(app)
-      this.cancelReasons.delete(app)
-      this.log("scan-finished", {
-        app,
-        scope_id: scopeId,
-        outcome: result && result.outcome,
-        cancel_reason: reason,
-        error: error && error.message ? error.message : error
-      })
+      let affectedApps = []
       try {
-        const entry = this.entries.get(app)
-        if (reason === "paused" || (entry && entry.state === "paused")) {
-          // Pause has already persisted and published its state.
-        } else if (reason === "manual") {
-          if (entry && entry.state === "checking") {
-            entry.updated_at = Date.now()
+        await this.withAppTransition(app, async () => {
+          if (this.active && this.active.app === app) this.active = null
+          const reason = this.cancelReasons.get(app)
+          this.cancelReasons.delete(app)
+          this.log("scan-finished", {
+            app,
+            scope_id: scopeId,
+            outcome: result && result.outcome,
+            cancel_reason: reason,
+            error: error && error.message ? error.message : error
+          })
+          try {
+            const entry = this.entries.get(app)
+            if (reason === "paused" || reason === "manual-mode" ||
+                (entry && entry.state === "paused")) {
+              // Pause has already persisted and published its state.
+            } else if (reason === "manual") {
+              if (entry && entry.state === "checking") {
+                entry.updated_at = Date.now()
+              }
+            } else if (reason === "app-source-unavailable") {
+              // removeUnavailableApp already removed this scan's state.
+            } else if (reason === "app-started") {
+              this.restorePrevious(app)
+            } else if (complete) {
+              await this.publishResultNow(app, scopeId)
+              affectedApps = result.affected_apps || []
+            } else {
+              this.restorePrevious(app)
+            }
+          } catch (error) {
+            this.restorePrevious(app)
+            throw error
           }
-        } else if (reason === "app-started") {
-          this.restorePrevious(app)
-        } else if (complete) {
-          await this.publishResult(app, scopeId)
+        })
+        if (affectedApps.length) {
           await this.reconcileResults(
-            result.affected_apps, [app]
+            affectedApps, [app]
           ).catch((error) => {
             console.warn("Automatic Disk Saver result reconciliation failed:",
               error && error.message ? error.message : error)
           })
-        } else {
-          this.restorePrevious(app)
         }
-      } catch (error) {
-        this.restorePrevious(app)
-        throw error
       } finally {
         this.broadcast()
         this.schedule()
@@ -626,84 +809,217 @@ class AutomaticScans {
     }
   }
 
-  async pause(app) {
-    await this.hydrate()
-    const entry = this.entries.get(app)
-    if (!entry || entry.state !== "checking") {
-      return { error: "That app is not being checked." }
-    }
-    this.cancelReasons.set(app, "paused")
-    let persisted
-    try {
-      persisted = await this.vault.registry.setAutomaticAppScanState(
-        app, "paused", 0)
-    } catch (error) {
-      if (this.cancelReasons.get(app) === "paused") {
-        this.cancelReasons.delete(app)
-      }
-      throw error
-    }
-    this.entries.set(app, {
-      app,
-      state: "paused",
-      savings: 0,
-      updated_at: persisted.updated_at || Date.now(),
-      previous: null
+  async persistMode(app, mode, showPausedNotice = false) {
+    const current = this.settings.get(app) || {}
+    const persisted = await this.vault.registry.setAutomaticAppScanMode(
+      app, mode, showPausedNotice)
+    this.settings.set(app, {
+      mode,
+      acknowledged_signature: current.acknowledged_signature || null,
+      updated_at: persisted.updated_at || Date.now()
     })
+    return persisted
+  }
+
+  async removeUnavailableApp(app) {
+    this.cancelPendingStop(app, "app-source-unavailable")
     if (this.active && this.active.app === app) {
-      this.log("scan-cancel-requested", { app, reason: "paused" })
-      this.vault.cancelScan({ owner: "automatic", app })
-    } else if (this.cancelReasons.get(app) === "paused") {
-      this.cancelReasons.delete(app)
-    }
-    this.log("paused", { app })
-    this.broadcast()
-    return { paused: true, app }
-  }
-
-  async resume(app) {
-    await this.hydrate()
-    const entry = this.entries.get(app)
-    if (!entry || entry.state !== "paused") {
-      return { error: "Automatic checking is not paused for that app." }
-    }
-    await this.vault.refreshSources()
-    await this.vault.registry.setAutomaticAppScanState(app, null)
-    this.entries.delete(app)
-    if (this.sourceForApp(app) && !this.appIsRunning(app)) {
-      this.log("resumed", { app })
-      this.queueApp(app)
-    } else {
-      this.log("resume-skipped", {
+      this.cancelReasons.set(app, "app-source-unavailable")
+      this.log("scan-cancel-requested", {
         app,
-        reason: this.appIsRunning(app)
-          ? "app-running"
-          : "app-source-unavailable"
+        reason: "app-source-unavailable"
       })
-      this.broadcast()
+      this.vault.cancelScan({ owner: "automatic", app })
     }
-    return { resumed: true, app }
+    await this.vault.registry.removeAutomaticAppScanApp(app)
+    this.settings.delete(app)
+    this.entries.delete(app)
+    this.broadcast()
   }
 
-  async review(app) {
+  async setMode(app, mode) {
+    return this.withAppTransition(app, () => this.setModeNow(app, mode))
+  }
+
+  async setModeNow(app, mode) {
     await this.hydrate()
-    const entry = this.entries.get(app)
-    if (!entry || entry.state !== "result") {
-      return { error: "That Disk Saver result is no longer available." }
+    if (mode !== "automatic" && mode !== "manual") {
+      return { error: "Choose Automatic or Manual." }
     }
-    if (!await this.appRootIsAvailable(app)) {
-      await this.clearAutomaticState([app], "app-source-unavailable")
+    if (!this.sourceForApp(app) || !await this.appRootIsAvailable(app)) {
+      await this.removeUnavailableApp(app)
       return { error: "That app is no longer available." }
     }
-    await this.clearAutomaticState([app], "reviewed")
-    this.log("reviewed", { app })
-    return {
-      reviewed: true,
-      app,
-      href: `/v/${encodeURIComponent(app)}?pinokio_home_select=${
-        encodeURIComponent(JSON.stringify({ selector: "#save-space-tab" }))
-      }`
+    if (mode === "automatic") {
+      await this.vault.refreshSources()
+      await this.persistMode(app, mode)
+      const entry = this.entries.get(app)
+      if (entry && entry.state === "paused") this.entries.delete(app)
+      if (this.sourceForApp(app) && !this.appIsRunning(app)) {
+        this.log("mode-changed", { app, mode })
+        this.queueApp(app)
+      } else {
+        this.log("mode-changed", { app, mode, scan: "waiting-for-stop" })
+        this.broadcast()
+      }
+      return { app, mode }
     }
+
+    await this.persistMode(app, mode)
+    this.cancelPendingStop(app, "manual-mode")
+    const entry = this.entries.get(app)
+    if (entry && entry.state === "checking") {
+      if (this.active && this.active.app === app) {
+        this.cancelReasons.set(app, "manual-mode")
+        this.log("scan-cancel-requested", { app, reason: "manual-mode" })
+        this.vault.cancelScan({ owner: "automatic", app })
+      }
+      this.restorePrevious(app)
+    } else if (entry && entry.state === "paused") {
+      this.entries.delete(app)
+    }
+    this.log("mode-changed", { app, mode })
+    this.broadcast()
+    return { app, mode }
+  }
+
+  async pause(app, noticeId = null) {
+    return this.withAppTransition(app, async () => {
+      await this.hydrate()
+      const entry = this.entries.get(app)
+      if (!this.noticeMatches(entry, noticeId)) {
+        return { stale: true, app }
+      }
+      if (!entry || entry.state !== "checking") {
+        return { error: "That app is not being checked." }
+      }
+      const persisted = await this.persistMode(app, "manual", true)
+      this.entries.set(app, {
+        app,
+        state: "paused",
+        savings: 0,
+        updated_at: persisted.updated_at || Date.now(),
+        previous: null,
+        hidden: false
+      })
+      this.cancelReasons.set(app, "paused")
+      if (this.active && this.active.app === app) {
+        this.log("scan-cancel-requested", { app, reason: "paused" })
+        this.vault.cancelScan({ owner: "automatic", app })
+      } else {
+        this.cancelReasons.delete(app)
+      }
+      this.log("paused", { app })
+      this.broadcast()
+      return { paused: true, app, mode: "manual" }
+    })
+  }
+
+  async resume(app, noticeId = null) {
+    return this.withAppTransition(app, async () => {
+      await this.hydrate()
+      const entry = this.entries.get(app)
+      if (!this.noticeMatches(entry, noticeId)) {
+        return { stale: true, app }
+      }
+      if (this.modeFor(app) !== "manual") {
+        return { error: "Automatic checking is not paused for that app." }
+      }
+      const result = await this.setModeNow(app, "automatic")
+      if (result.error) return result
+      this.log("resumed", { app })
+      return { resumed: true, app, mode: "automatic" }
+    })
+  }
+
+  appHref(app) {
+    return `/v/${encodeURIComponent(app)}?pinokio_home_select=${
+      encodeURIComponent(JSON.stringify({ selector: "#save-space-tab" }))
+    }`
+  }
+
+  async settingsLink(app) {
+    if (this.sourceForApp(app) && await this.appRootIsAvailable(app)) {
+      return { app, href: this.appHref(app) }
+    }
+    return this.withAppTransition(app, async () => {
+      if (this.sourceForApp(app) && await this.appRootIsAvailable(app)) {
+        return { app, href: this.appHref(app) }
+      }
+      await this.removeUnavailableApp(app)
+      return { error: "That app is no longer available." }
+    })
+  }
+
+  async acknowledgeResult(app, entry, options = {}) {
+    let signature = entry && entry.signature
+    if (!signature) {
+      const source = this.sourceForApp(app)
+      if (source) {
+        signature = (await this.resultForScope(source.id)).signature
+      }
+    }
+    if (options.clearState) {
+      if (signature) {
+        const persisted = await this.vault.registry.setAutomaticAppScanState(
+          app, null, 0, { acknowledged_signature: signature })
+        this.cacheAcknowledgement(app, signature, persisted.updated_at)
+      } else {
+        await this.vault.registry.setAutomaticAppScanState(app, null)
+      }
+    } else if (signature) {
+      await this.setAcknowledgement(app, signature)
+    }
+    return signature || null
+  }
+
+  async dismiss(app, noticeId = null) {
+    return this.withAppTransition(app, async () => {
+      await this.hydrate()
+      const entry = this.entries.get(app)
+      if (!this.noticeMatches(entry, noticeId)) {
+        return { stale: true, app }
+      }
+      if (!entry) return { dismissed: true, app }
+      if (entry.state === "checking") {
+        entry.hidden = true
+      } else if (entry.state === "paused") {
+        await this.vault.registry.setAutomaticAppScanState(app, null)
+        this.entries.delete(app)
+      } else if (entry.state === "result") {
+        await this.acknowledgeResult(app, entry)
+        entry.hidden = true
+      }
+      this.log("dismissed", { app, state: entry.state })
+      this.broadcast()
+      return { dismissed: true, app }
+    })
+  }
+
+  async review(app, noticeId = null) {
+    return this.withAppTransition(app, async () => {
+      await this.hydrate()
+      const entry = this.entries.get(app)
+      if (!this.noticeMatches(entry, noticeId)) {
+        return { stale: true, app }
+      }
+      if (!entry || entry.state !== "result") {
+        return { error: "That Disk Saver result is no longer available." }
+      }
+      if (!await this.appRootIsAvailable(app)) {
+        await this.removeUnavailableApp(app)
+        return { error: "That app is no longer available." }
+      }
+      await this.acknowledgeResult(app, entry, { clearState: true })
+      this.entries.delete(app)
+      this.broadcast()
+      this.log("reviewed", { app })
+      return {
+        reviewed: true,
+        app,
+        href: this.appHref(app)
+      }
+    })
   }
 }
 

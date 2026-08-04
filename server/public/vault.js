@@ -78,6 +78,10 @@ const COPY = {
   remove_external_confirm: "Remove “{name}” from Locations? This does not delete or modify any files.",
   external_removed: "Removed from Locations. No files were changed.",
   save_space: "Disk Saver",
+  automatic: "Automatic",
+  manual: "Manual",
+  automatic_description: "Scan after this app stops",
+  manual_description: "Scan only when requested",
   storage_saved_headline: "{size} saved by deduplicating",
   storage_unique_headline: "{size} unique to this app",
   storage_still_used: "Still used",
@@ -279,6 +283,7 @@ const COPY = {
 
 const SCOPE_ID = document.body.dataset.vaultScope || null
 const IS_APP_MODE = document.body.dataset.vaultMode === "app" && !!SCOPE_ID
+const APP_NAME = IS_APP_MODE ? document.body.dataset.vaultApp || "" : ""
 const MAX_BULK_DEDUPLICATE_FILES = 500
 const MAX_BULK_SEPARATE_FILES = 500
 const DUPLICATE_CHILD_PAGE_SIZE = 100
@@ -343,6 +348,19 @@ const duplicateGroupPageSelectionUrl = () => {
 const reviewedScanKey = `pinokio:vault:reviewed-scan:${SCOPE_ID || "global"}`
 const candidateSizeKey = "pinokio:vault:candidate-size"
 const externalPromptKey = "pinokio:vault:external-prompt-dismissed"
+const automaticSettingsKey = APP_NAME
+  ? `pinokio:vault:auto-settings:${encodeURIComponent(APP_NAME)}`
+  : null
+const consumeAutomaticSettingsRequest = () => {
+  if (!automaticSettingsKey) return false
+  try {
+    const requested = sessionStorage.getItem(automaticSettingsKey) === "1"
+    if (requested) sessionStorage.removeItem(automaticSettingsKey)
+    return requested
+  } catch (error) {
+    return false
+  }
+}
 const candidateSizeBase = document.body.dataset.platform === "win32" ? 1024 : 1000
 const defaultCandidateSize = 100 * candidateSizeBase ** 2
 const candidateSizeOptions = [0]
@@ -376,6 +394,9 @@ const state = {
   feedback: null,
   actionProgress: null,
   actionRequest: false,
+  automaticMode: null,
+  automaticModeUpdating: false,
+  automaticModeMenuRequested: consumeAutomaticSettingsRequest(),
   scanCancelRequested: false,
   folderDiscoveryOpen: false,
   folderDiscoverySubmitting: false,
@@ -489,6 +510,49 @@ const post = async (payload) => {
   }
   if (!result) throw new Error(COPY.action_request_failed.replace("{status}", response.status))
   return result
+}
+let automaticModeEventSource = null
+const applyAutomaticScanSnapshot = (snapshot) => {
+  if (!IS_APP_MODE) return
+  const settings = snapshot && Array.isArray(snapshot.settings)
+    ? snapshot.settings
+    : []
+  const setting = settings.find((item) => item && item.app === APP_NAME)
+  const mode = setting && setting.mode === "manual"
+    ? "manual"
+    : "automatic"
+  if (state.automaticMode === mode) return
+  state.automaticMode = mode
+  if (state.data) renderOverview()
+}
+const loadAutomaticMode = async () => {
+  if (!IS_APP_MODE) return
+  try {
+    const response = await fetch("/info/vault/automatic-scans", {
+      credentials: "same-origin",
+      cache: "no-store"
+    })
+    if (!response.ok) return
+    applyAutomaticScanSnapshot(await response.json())
+  } catch (error) {}
+}
+const connectAutomaticMode = () => {
+  if (!IS_APP_MODE || typeof window.EventSource !== "function") return
+  automaticModeEventSource = new window.EventSource(
+    "/info/vault/automatic-scans/events")
+  automaticModeEventSource.onmessage = (event) => {
+    try {
+      applyAutomaticScanSnapshot(JSON.parse(event.data))
+    } catch (error) {}
+  }
+}
+const requestAutomaticModeMenu = () => {
+  if (!IS_APP_MODE) return
+  if (automaticSettingsKey) {
+    try { sessionStorage.removeItem(automaticSettingsKey) } catch (error) {}
+  }
+  state.automaticModeMenuRequested = true
+  if (state.data) renderOverview()
 }
 const sourceById = (id) => (state.data.sources || []).find((source) => source.id === id)
 const sourceChildren = (id) => (state.data.sources || []).filter((source) => source.parent_id === id)
@@ -2036,6 +2100,29 @@ const storageSummaryMarkup = (segments, logicalBytes) => {
     </div>`
 }
 
+const automaticModeMarkup = () => {
+  if (!IS_APP_MODE || !state.automaticMode) return ""
+  const automatic = state.automaticMode === "automatic"
+  const label = automatic ? COPY.automatic : COPY.manual
+  return `<details class="vault-auto-mode ${automatic ? "automatic" : "manual"}" id="vault-auto-mode">
+    <summary aria-label="Automatic scanning: ${attr(label)}">
+      <span class="vault-auto-mode-dot" aria-hidden="true"></span>
+      <span>${esc(label)}</span>
+      <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
+    </summary>
+    <div class="vault-auto-mode-popover" role="menu">
+      <button type="button" role="menuitemradio" aria-checked="${automatic}" data-automatic-mode="automatic" ${state.automaticModeUpdating ? "disabled" : ""}>
+        <span><strong>${esc(COPY.automatic)}</strong><small>${esc(COPY.automatic_description)}</small></span>
+        <i class="fa-solid fa-check" aria-hidden="true"></i>
+      </button>
+      <button type="button" role="menuitemradio" aria-checked="${!automatic}" data-automatic-mode="manual" ${state.automaticModeUpdating ? "disabled" : ""}>
+        <span><strong>${esc(COPY.manual)}</strong><small>${esc(COPY.manual_description)}</small></span>
+        <i class="fa-solid fa-check" aria-hidden="true"></i>
+      </button>
+    </div>
+  </details>`
+}
+
 const renderOverview = () => {
   const data = state.data
   const last = data.last_scan
@@ -2043,6 +2130,9 @@ const renderOverview = () => {
   const scanning = scanMatchesContext(data.scan)
   const busyElsewhere = activeScan && !scanning
   const metrics = el("vault-metrics")
+  const existingModeMenu = el("vault-auto-mode")
+  const modeMenuOpen = !!(existingModeMenu && existingModeMenu.open) ||
+    state.automaticModeMenuRequested
   metrics.classList.add("summary")
   {
     const fallbackLogicalBytes = IS_APP_MODE
@@ -2103,11 +2193,24 @@ const renderOverview = () => {
       : `<span class="vault-summary-freshness">${esc(freshness)}</span>`
     metrics.innerHTML = `
       <div class="vault-summary-main">
-        <div class="vault-summary-label"><i class="fa-solid fa-hard-drive"></i>${esc(COPY.save_space)}</div>
+        <div class="vault-summary-label"><i class="fa-solid fa-hard-drive"></i><span>${esc(COPY.save_space)}</span>${automaticModeMarkup()}</div>
         <div class="vault-summary-value">${esc(headline)}</div>
         ${summary}
       </div>
       <div class="vault-summary-side">${summarySide}</div>`
+    const modeMenu = el("vault-auto-mode")
+    if (modeMenu && modeMenuOpen) modeMenu.open = true
+    if (modeMenu && state.automaticModeMenuRequested) {
+      state.automaticModeMenuRequested = false
+      modeMenu.classList.add("targeted")
+      const trigger = modeMenu.querySelector("summary")
+      requestAnimationFrame(() => {
+        if (trigger && trigger.isConnected) trigger.focus()
+      })
+      setTimeout(() => {
+        if (modeMenu.isConnected) modeMenu.classList.remove("targeted")
+      }, 1600)
+    }
   }
   const idleScanLabel = IS_APP_MODE
     ? (last ? COPY.scan_again : COPY.scan_app)
@@ -2917,6 +3020,37 @@ const closeScanSizeMenu = () => {
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("button")
   if (!target) return
+  if (target.hasAttribute("data-automatic-mode")) {
+    const mode = target.dataset.automaticMode
+    const menu = el("vault-auto-mode")
+    if (mode === state.automaticMode) {
+      if (menu) menu.open = false
+      return
+    }
+    state.automaticModeUpdating = true
+    renderOverview()
+    try {
+      const result = await post({
+        action: "automatic_set_mode",
+        app: APP_NAME,
+        mode
+      })
+      if (result.error) throw new Error(result.error)
+      state.automaticMode = result.mode
+    } catch (error) {
+      state.feedback = {
+        error: true,
+        message: error && error.message ? error.message : String(error)
+      }
+      renderFeedback()
+    } finally {
+      state.automaticModeUpdating = false
+      renderOverview()
+      const currentMenu = el("vault-auto-mode")
+      if (currentMenu) currentMenu.open = false
+    }
+    return
+  }
   if (state.folderDiscoverySubmitting &&
       target.closest("#vault-find-overlay")) return
   if (target.hasAttribute("data-candidate-size")) {
@@ -3821,6 +3955,30 @@ if (disclosureMenus.length) {
       if (trigger) trigger.focus()
     }
   }, true)
+}
+if (IS_APP_MODE) {
+  document.addEventListener("pointerdown", (event) => {
+    const menu = el("vault-auto-mode")
+    if (menu && menu.open && !menu.contains(event.target)) menu.open = false
+  }, true)
+  document.addEventListener("keydown", (event) => {
+    if (event.key !== "Escape") return
+    const menu = el("vault-auto-mode")
+    if (!menu || !menu.open) return
+    menu.open = false
+    const trigger = menu.querySelector("summary")
+    if (trigger) trigger.focus()
+  }, true)
+  window.addEventListener("message", (event) => {
+    if (event.source !== window.parent ||
+        event.origin !== window.location.origin ||
+        !event.data || event.data.e !== "vault-auto-settings") return
+    requestAutomaticModeMenu()
+  })
+  loadAutomaticMode().finally(connectAutomaticMode)
+  window.addEventListener("beforeunload", () => {
+    if (automaticModeEventSource) automaticModeEventSource.close()
+  }, { once: true })
 }
 el("vault-pane").setAttribute("aria-label", COPY.files_region)
 refresh()

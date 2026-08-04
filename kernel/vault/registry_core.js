@@ -259,6 +259,20 @@ class RegistryCore {
         updated_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS automatic_app_scan_settings (
+        app TEXT PRIMARY KEY,
+        mode TEXT NOT NULL CHECK (mode IN ('automatic', 'manual')),
+        acknowledged_signature TEXT,
+        updated_at INTEGER NOT NULL
+      );
+
+      INSERT OR IGNORE INTO automatic_app_scan_settings(
+        app, mode, acknowledged_signature, updated_at
+      )
+      SELECT app, 'manual', NULL, updated_at
+      FROM automatic_app_scans
+      WHERE state = 'paused';
+
     `)
     this.database.exec(`
       DROP TRIGGER IF EXISTS content_summary_insert;
@@ -2595,30 +2609,173 @@ class RegistryCore {
     }))
   }
 
-  setAutomaticAppScanState(app, state = null, savings = 0) {
+  automaticAppScanSettings() {
+    return this.database.prepare(`
+      SELECT app, mode, acknowledged_signature, updated_at
+      FROM automatic_app_scan_settings
+      ORDER BY app
+    `).all().map((row) => ({
+      app: row.app,
+      mode: row.mode,
+      acknowledged_signature: row.acknowledged_signature || null,
+      updated_at: Number(row.updated_at) || 0
+    }))
+  }
+
+  setAutomaticAppScanMode(app, mode, showPausedNotice = false) {
+    if (typeof app !== "string" || !app) {
+      throw new Error("An app is required for automatic scan settings.")
+    }
+    if (mode !== "automatic" && mode !== "manual") {
+      throw new Error("Invalid automatic scan mode.")
+    }
+    const updatedAt = Date.now()
+    this.transaction(() => {
+      this.database.prepare(`
+        INSERT INTO automatic_app_scan_settings(
+          app, mode, acknowledged_signature, updated_at
+        ) VALUES (?, ?, NULL, ?)
+        ON CONFLICT(app) DO UPDATE SET
+          mode = excluded.mode,
+          updated_at = excluded.updated_at
+      `).run(app, mode, updatedAt)
+      if (mode === "manual" && showPausedNotice) {
+        this.database.prepare(`
+          INSERT INTO automatic_app_scans(app, state, savings, updated_at)
+          VALUES (?, 'paused', 0, ?)
+          ON CONFLICT(app) DO UPDATE SET
+            state = 'paused',
+            savings = 0,
+            updated_at = excluded.updated_at
+        `).run(app, updatedAt)
+      } else {
+        this.database.prepare(`
+          DELETE FROM automatic_app_scans
+          WHERE app = ? AND state = 'paused'
+        `).run(app)
+      }
+    })
+    return { mode, updated_at: updatedAt }
+  }
+
+  setAutomaticAppScanAcknowledgement(app, signature = null) {
+    if (typeof app !== "string" || !app) {
+      throw new Error("An app is required for automatic scan settings.")
+    }
+    if (signature !== null &&
+        (typeof signature !== "string" || !/^[a-f0-9]{64}$/.test(signature))) {
+      throw new Error("Invalid automatic scan result signature.")
+    }
+    const updatedAt = Date.now()
+    this.database.prepare(`
+      INSERT INTO automatic_app_scan_settings(
+        app, mode, acknowledged_signature, updated_at
+      ) VALUES (?, 'automatic', ?, ?)
+      ON CONFLICT(app) DO UPDATE SET
+        acknowledged_signature = excluded.acknowledged_signature,
+        updated_at = excluded.updated_at
+    `).run(app, signature, updatedAt)
+    return { acknowledged_signature: signature, updated_at: updatedAt }
+  }
+
+  automaticAppResultSignature(sourceIds = []) {
+    const ids = [...new Set((sourceIds || []).filter((id) =>
+      typeof id === "string" && id))]
+    if (!ids.length) return { signature: null, savings: 0, files: 0 }
+    const digest = crypto.createHash("sha256")
+    let savings = 0
+    let files = 0
+    const rows = this.database.prepare(`
+      SELECT path, hash, size
+      FROM files
+      WHERE source_id IN (${placeholders(ids)})
+        AND status = 'duplicate'
+        AND hash IS NOT NULL
+        AND unavailable_reason IS NOT 'stale'
+      ORDER BY path
+    `).iterate(...ids)
+    for (const row of rows) {
+      digest.update(row.path)
+      digest.update("\0")
+      digest.update(row.hash)
+      digest.update("\0")
+      digest.update(String(row.size))
+      digest.update("\n")
+      savings += Math.max(0, Number(row.size) || 0)
+      files += 1
+    }
+    return {
+      signature: files ? digest.digest("hex") : null,
+      savings,
+      files
+    }
+  }
+
+  removeAutomaticAppScanApp(app) {
+    if (typeof app !== "string" || !app) return { changes: 0 }
+    let changes = 0
+    this.transaction(() => {
+      changes += this.database.prepare(
+        "DELETE FROM automatic_app_scans WHERE app = ?"
+      ).run(app).changes
+      changes += this.database.prepare(
+        "DELETE FROM automatic_app_scan_settings WHERE app = ?"
+      ).run(app).changes
+    })
+    return { changes }
+  }
+
+  setAutomaticAppScanState(app, state = null, savings = 0, options = {}) {
     if (typeof app !== "string" || !app) {
       throw new Error("An app is required for automatic scan state.")
     }
-    if (state === null) {
-      return {
-        changes: this.database.prepare(
-          "DELETE FROM automatic_app_scans WHERE app = ?"
-        ).run(app).changes
-      }
-    }
-    if (state !== "paused" && state !== "result") {
+    if (state !== null && state !== "paused" && state !== "result") {
       throw new Error("Invalid automatic scan state.")
     }
+    const updateAcknowledgement = !!options &&
+      Object.prototype.hasOwnProperty.call(options, "acknowledged_signature")
+    const acknowledgedSignature = updateAcknowledgement
+      ? options.acknowledged_signature
+      : null
+    if (updateAcknowledgement && acknowledgedSignature !== null &&
+        (typeof acknowledgedSignature !== "string" ||
+          !/^[a-f0-9]{64}$/.test(acknowledgedSignature))) {
+      throw new Error("Invalid automatic scan result signature.")
+    }
     const updatedAt = Date.now()
-    const result = this.database.prepare(`
-      INSERT INTO automatic_app_scans(app, state, savings, updated_at)
-      VALUES (?, ?, ?, ?)
-      ON CONFLICT(app) DO UPDATE SET
-        state = excluded.state,
-        savings = excluded.savings,
-        updated_at = excluded.updated_at
-    `).run(app, state, Math.max(0, Number(savings) || 0), updatedAt)
-    return { changes: result.changes, updated_at: updatedAt }
+    let changes = 0
+    const write = () => {
+      if (state === null) {
+        changes += this.database.prepare(
+          "DELETE FROM automatic_app_scans WHERE app = ?"
+        ).run(app).changes
+      } else {
+        changes += this.database.prepare(`
+          INSERT INTO automatic_app_scans(app, state, savings, updated_at)
+          VALUES (?, ?, ?, ?)
+          ON CONFLICT(app) DO UPDATE SET
+            state = excluded.state,
+            savings = excluded.savings,
+            updated_at = excluded.updated_at
+        `).run(app, state, Math.max(0, Number(savings) || 0), updatedAt).changes
+      }
+      if (updateAcknowledgement) {
+        this.database.prepare(`
+          INSERT INTO automatic_app_scan_settings(
+            app, mode, acknowledged_signature, updated_at
+          ) VALUES (?, 'automatic', ?, ?)
+          ON CONFLICT(app) DO UPDATE SET
+            acknowledged_signature = excluded.acknowledged_signature,
+            updated_at = excluded.updated_at
+        `).run(app, acknowledgedSignature, updatedAt)
+      }
+    }
+    if (updateAcknowledgement) {
+      this.transaction(write)
+    } else {
+      write()
+    }
+    return { changes, updated_at: updatedAt }
   }
 
   removeScan(scopeId) {

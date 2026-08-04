@@ -535,7 +535,9 @@ class Vault {
         await changedHashes.flush()
         if (changedHashes.apps.size) {
           await this.automaticScans.clearAutomaticState(
-            [...changedHashes.apps], "file-action")
+            [...changedHashes.apps], "file-action", {
+              clearAcknowledgement: true
+            })
         }
         if (changedHashes.error) throw changedHashes.error
       } catch (error) {
@@ -1718,17 +1720,29 @@ class Vault {
       switch (action) {
       case "automatic_pause":
       case "automatic_resume":
-      case "automatic_review": {
+      case "automatic_review":
+      case "automatic_dismiss":
+      case "automatic_settings":
+      case "automatic_set_mode": {
         if (typeof payload.app !== "string" || !payload.app) {
           return { error: "Choose an app." }
         }
         if (action === "automatic_pause") {
-          return this.automaticScans.pause(payload.app)
+          return this.automaticScans.pause(payload.app, payload.notice_id)
         }
         if (action === "automatic_resume") {
-          return this.automaticScans.resume(payload.app)
+          return this.automaticScans.resume(payload.app, payload.notice_id)
         }
-        return this.automaticScans.review(payload.app)
+        if (action === "automatic_review") {
+          return this.automaticScans.review(payload.app, payload.notice_id)
+        }
+        if (action === "automatic_dismiss") {
+          return this.automaticScans.dismiss(payload.app, payload.notice_id)
+        }
+        if (action === "automatic_settings") {
+          return this.automaticScans.settingsLink(payload.app)
+        }
+        return this.automaticScans.setMode(payload.app, payload.mode)
       }
       case "add_source": {
         const result = await this.runExclusive(() =>

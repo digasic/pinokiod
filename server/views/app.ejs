@@ -12868,6 +12868,28 @@ const rerenderMenuSection = (container, html) => {
 
 
   });
+  const openVaultAutomaticSettings = () => {
+    const frame = document.querySelector("iframe[name='app-vault']")
+    if (!frame || !frame.contentWindow) return false
+    frame.contentWindow.postMessage(
+      { e: "vault-auto-settings" }, window.location.origin)
+    return true
+  }
+  window.addEventListener("message", async (event) => {
+    if (event.source !== window.parent ||
+        event.origin !== window.location.origin ||
+        !event.data || event.data.e !== "vault-auto-settings") return
+    const diskSaverTab = document.querySelector("#save-space-tab")
+    if (!diskSaverTab) return
+    if (diskSaverTab.classList.contains("selected") &&
+        openVaultAutomaticSettings()) return
+    await renderSelection({ target: diskSaverTab, force: true })
+    openVaultAutomaticSettings()
+  })
+  if (window.parent !== window) {
+    window.parent.postMessage(
+      { e: "vault-auto-settings-ready" }, window.location.origin)
+  }
   renderSelection({ force: true })
   <% if (type === "browse" || type === "files") { %>
     const repoStatusCache = new Map()

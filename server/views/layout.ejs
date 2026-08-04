@@ -20,6 +20,7 @@
       --vault-notice-button: #f2f3f4;
       --vault-notice-button-hover: #e8e9eb;
       --vault-notice-focus: #3f6fc4;
+      --vault-notice-accent: #a96508;
       --layout-viewport-height: 100vh;
       --layout-dragger-height: 0px;
       color-scheme: light dark;
@@ -74,6 +75,7 @@
       --vault-notice-button: #343638;
       --vault-notice-button-hover: #404245;
       --vault-notice-focus: #8bb4ff;
+      --vault-notice-accent: #e8b75b;
       color: #f3f3f3;
     }
 
@@ -144,7 +146,7 @@
       bottom: max(16px, env(safe-area-inset-bottom));
       z-index: 1000;
       display: grid;
-      width: min(360px, calc(100vw - 32px));
+      width: min(390px, calc(100vw - 32px));
       max-height: min(50vh, 420px);
       gap: 8px;
       overflow: auto;
@@ -158,12 +160,14 @@
     }
 
     .vault-auto-scan-row {
+      position: relative;
       display: grid;
-      grid-template-columns: 20px minmax(0, 1fr) auto;
+      grid-template-columns: 20px minmax(0, 1fr) 76px;
+      grid-template-rows: 16px 34px 18px;
       align-items: center;
-      gap: 10px;
-      min-height: 52px;
-      padding: 8px 8px 8px 12px;
+      column-gap: 10px;
+      min-height: 86px;
+      padding: 9px 34px 9px 12px;
       box-sizing: border-box;
       overflow: hidden;
       color: var(--vault-notice-text);
@@ -177,6 +181,8 @@
 
     .vault-auto-scan-icon {
       display: grid;
+      grid-column: 1;
+      grid-row: 1 / 4;
       place-items: center;
       width: 20px;
       height: 20px;
@@ -202,17 +208,102 @@
     }
 
     .vault-auto-scan-copy {
+      display: grid;
+      grid-column: 2;
+      grid-row: 1 / 4;
+      grid-template-rows: 16px 34px 18px;
+      align-items: center;
       min-width: 0;
-      font-size: 13px;
+    }
+
+    .vault-auto-scan-app {
+      overflow: hidden;
+      color: var(--vault-notice-muted);
+      font-size: 11px;
       font-weight: 500;
-      line-height: 1.35;
-      overflow-wrap: anywhere;
+      line-height: 16px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .vault-auto-scan-status {
+      display: flex;
+      min-width: 0;
+      align-items: baseline;
+      overflow: hidden;
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 18px;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .vault-auto-scan-value {
+      flex: 0 0 auto;
+      color: var(--vault-notice-accent);
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    .vault-auto-scan-detail {
+      margin-left: 5px;
+      overflow: hidden;
+      color: var(--vault-notice-muted);
+      font-weight: 400;
+      text-overflow: ellipsis;
+    }
+
+    .vault-auto-scan-controls {
+      display: grid;
+      grid-column: 3;
+      grid-row: 2;
+      align-items: center;
+    }
+
+    .vault-auto-scan-settings,
+    .vault-auto-scan-close {
+      color: var(--vault-notice-muted);
+      background: transparent;
+      border: 0;
+      cursor: pointer;
+    }
+
+    .vault-auto-scan-settings {
+      justify-self: start;
+      min-height: 18px;
+      padding: 0;
+      font: 500 10.5px/18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      text-decoration: underline;
+      text-decoration-color: color-mix(in srgb, currentColor 55%, transparent);
+      text-underline-offset: 2px;
+    }
+
+    .vault-auto-scan-settings:hover,
+    .vault-auto-scan-close:hover {
+      color: var(--vault-notice-text);
+    }
+
+    .vault-auto-scan-close {
+      position: absolute;
+      top: 5px;
+      right: 6px;
+      display: grid;
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      place-items: center;
+      border-radius: 6px;
+      font: 400 17px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .vault-auto-scan-close:hover {
+      background: var(--vault-notice-button);
     }
 
     .vault-auto-scan-action {
       position: relative;
-      min-width: 58px;
-      min-height: 34px;
+      width: 76px;
+      min-height: 32px;
       padding: 6px 10px;
       color: var(--vault-notice-text);
       background: var(--vault-notice-button);
@@ -237,9 +328,34 @@
       outline-offset: 2px;
     }
 
-    .vault-auto-scan-action:disabled {
+    .vault-auto-scan-settings:focus-visible,
+    .vault-auto-scan-close:focus-visible {
+      outline: 2px solid var(--vault-notice-focus);
+      outline-offset: 1px;
+    }
+
+    .vault-auto-scan-action:disabled,
+    .vault-auto-scan-settings:disabled,
+    .vault-auto-scan-close:disabled {
       cursor: wait;
       opacity: 0.55;
+    }
+
+    .vault-auto-scan-row[data-state="result"] {
+      grid-template-rows: 16px 30px;
+      min-height: 66px;
+      padding-top: 10px;
+      padding-bottom: 10px;
+    }
+
+    .vault-auto-scan-row[data-state="result"] .vault-auto-scan-icon,
+    .vault-auto-scan-row[data-state="result"] .vault-auto-scan-copy,
+    .vault-auto-scan-row[data-state="result"] .vault-auto-scan-controls {
+      grid-row: 1 / 3;
+    }
+
+    .vault-auto-scan-row[data-state="result"] .vault-auto-scan-copy {
+      grid-template-rows: 16px 30px;
     }
 
     @keyframes vault-notice-enter {
@@ -252,9 +368,17 @@
     }
 
     @media (pointer: coarse) {
+      .vault-auto-scan-row,
+      .vault-auto-scan-copy {
+        grid-template-rows: 16px 44px 28px;
+      }
+      .vault-auto-scan-row {
+        min-height: 106px;
+      }
       .vault-auto-scan-action {
         min-height: 44px;
       }
+      .vault-auto-scan-settings { min-height: 28px; }
     }
 
     @media (prefers-reduced-motion: reduce) {

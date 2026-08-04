@@ -7,6 +7,8 @@
   --vault-row-height: 44px;
   --vault-tree-row: 26px;
   --vault-tree-path-row: 34px;
+  --vault-auto-accent: #a96508;
+  --vault-auto-accent-soft: color-mix(in srgb, var(--vault-auto-accent) 14%, transparent);
 }
 body.dark.vault-page {
   --task-bg: var(--pinokio-sidebar-tabbar-bg);
@@ -14,6 +16,8 @@ body.dark.vault-page {
   --vault-warning: #dca451;
   --vault-warning-soft: color-mix(in srgb, var(--vault-warning) 8%, var(--task-panel));
   --vault-selected: color-mix(in srgb, var(--task-accent) 9%, var(--task-panel));
+  --vault-auto-accent: #e8b75b;
+  --vault-auto-accent-soft: color-mix(in srgb, var(--vault-auto-accent) 16%, transparent);
 }
 .vault-shell,
 .vault-shell * { box-sizing: border-box; }
@@ -88,6 +92,7 @@ body[data-vault-mode="app"] .vault-overview {
 }
 .vault-summary-main { min-width: 0; }
 .vault-summary-label {
+  position: relative;
   display: flex;
   align-items: center;
   gap: 7px;
@@ -97,6 +102,114 @@ body[data-vault-mode="app"] .vault-overview {
   line-height: 1.2;
 }
 .vault-summary-label i { width: 13px; color: var(--task-text); text-align: center; }
+.vault-auto-mode {
+  position: relative;
+  display: inline-block;
+  color: var(--task-muted);
+  font: inherit;
+}
+.vault-auto-mode > summary {
+  display: inline-flex;
+  min-height: 22px;
+  margin: -5px 0;
+  padding: 4px 2px;
+  align-items: center;
+  gap: 5px;
+  list-style: none;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: background 120ms ease, box-shadow 120ms ease;
+}
+.vault-auto-mode > summary::before {
+  margin-right: 1px;
+  color: var(--task-muted);
+  content: "·";
+}
+.vault-auto-mode > summary::marker { content: ""; }
+.vault-auto-mode > summary::-webkit-details-marker { display: none; }
+.vault-auto-mode > summary > i {
+  width: auto;
+  margin-left: 1px;
+  color: currentColor;
+  font-size: 8px;
+  transition: transform 120ms ease;
+}
+.vault-auto-mode[open] > summary > i { transform: rotate(180deg); }
+.vault-auto-mode > summary:hover { background: var(--task-soft); }
+.vault-auto-mode > summary:focus-visible {
+  outline: 2px solid var(--task-accent);
+  outline-offset: 2px;
+}
+.vault-auto-mode.automatic > summary { color: var(--vault-auto-accent); }
+.vault-auto-mode.manual > summary { color: var(--task-muted); }
+.vault-auto-mode-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border: 1.5px solid currentColor;
+  border-radius: 50%;
+}
+.vault-auto-mode.automatic .vault-auto-mode-dot {
+  border-color: var(--vault-auto-accent);
+  background: var(--vault-auto-accent);
+}
+.vault-auto-mode.targeted > summary {
+  background: var(--vault-auto-accent-soft);
+  box-shadow: 0 0 0 3px var(--vault-auto-accent-soft);
+}
+.vault-auto-mode-popover {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 7px);
+  left: 10px;
+  width: 230px;
+  padding: 5px;
+  color: var(--task-text);
+  background: var(--task-panel);
+  border: 1px solid var(--task-border-strong);
+  border-radius: 9px;
+  box-shadow: 0 12px 30px rgba(0, 0, 0, .2);
+}
+.vault-auto-mode-popover button {
+  display: grid;
+  width: 100%;
+  min-height: 48px;
+  padding: 7px 9px;
+  grid-template-columns: minmax(0, 1fr) 14px;
+  align-items: center;
+  gap: 10px;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.vault-auto-mode-popover button:hover { background: var(--task-soft); }
+.vault-auto-mode-popover button:focus-visible {
+  outline: 2px solid var(--task-accent);
+  outline-offset: -2px;
+}
+.vault-auto-mode-popover button:disabled { cursor: wait; opacity: .55; }
+.vault-auto-mode-popover button > span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+.vault-auto-mode-popover strong { font-size: 11px; font-weight: 650; }
+.vault-auto-mode-popover small {
+  color: var(--task-muted);
+  font-size: 9.5px;
+  font-weight: 450;
+}
+.vault-auto-mode-popover button > i {
+  visibility: hidden;
+  width: 14px;
+  color: var(--vault-auto-accent);
+}
+.vault-auto-mode-popover button[aria-checked="true"] > i {
+  visibility: visible;
+}
 .vault-summary-value {
   margin-top: 2px;
   color: var(--task-text);

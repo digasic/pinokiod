@@ -146,7 +146,7 @@ const makePage = async (status, options = {}) => {
     appMode
   })
   const dom = new JSDOM(
-    `<body data-platform="${process.platform}" data-agent="electron" data-vault-mode="${appMode ? "app" : "global"}" data-vault-scope="${scopeId}">${workspace}</body>`,
+    `<body data-platform="${process.platform}" data-agent="electron" data-vault-mode="${appMode ? "app" : "global"}" data-vault-scope="${scopeId}" data-vault-app="${appMode ? "app" : ""}">${workspace}</body>`,
     {
       runScripts: "outside-only",
       url: appMode
@@ -238,6 +238,12 @@ const makePage = async (status, options = {}) => {
   dom.window.confirm = (message) => {
     confirmations.push(message)
     return true
+  }
+  dom.window.requestAnimationFrame = (callback) =>
+    dom.window.setTimeout(callback, 0)
+  if (appMode && options.automaticSettingsRequested) {
+    dom.window.sessionStorage.setItem(
+      "pinokio:vault:auto-settings:app", "1")
   }
   dom.window.Socket = class {
     run(payload, callback) {
@@ -1933,6 +1939,42 @@ describe("Save Space interface", () => {
     assert.equal(scan.scope_id, "app:app")
 
     await settle()
+    dom.window.close()
+  })
+
+  test("app mode shows and updates its automatic-scan setting", async () => {
+    const { dom, requests } = await makePage(fixture([item()]), {
+      appMode: true,
+      scopeId: "app:app",
+      automaticSettingsRequested: true,
+      actionResults: {
+        automatic_set_mode: { app: "app", mode: "manual" }
+      }
+    })
+    const document = dom.window.document
+    await waitFor(() => document.getElementById("vault-auto-mode"))
+
+    let selector = document.getElementById("vault-auto-mode")
+    assert.equal(selector.classList.contains("automatic"), true)
+    assert.equal(selector.open, true)
+    assert.match(selector.querySelector("summary").textContent, /Automatic/)
+    assert.equal(dom.window.sessionStorage.getItem(
+      "pinokio:vault:auto-settings:app"), null)
+
+    selector.querySelector('[data-automatic-mode="manual"]').click()
+    await waitFor(() => requests.some((request) =>
+      request.action === "automatic_set_mode"))
+    await waitFor(() => document.getElementById(
+      "vault-auto-mode").classList.contains("manual"))
+    selector = document.getElementById("vault-auto-mode")
+    assert.match(selector.querySelector("summary").textContent, /Manual/)
+    assert.deepEqual(requests.find((request) =>
+      request.action === "automatic_set_mode"), {
+      action: "automatic_set_mode",
+      app: "app",
+      mode: "manual"
+    })
+
     dom.window.close()
   })
 

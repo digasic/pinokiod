@@ -195,6 +195,143 @@ describe("automatic app scans", () => {
     await close(restored)
   })
 
+  test("Manual mode persists and prevents automatic scans after restart", async () => {
+    const home = await makeHome()
+    const appRoot = path.join(home, "api", "manual-mode-app")
+    const scriptPath = path.join(appRoot, "start.js")
+    await fs.promises.mkdir(appRoot, { recursive: true })
+    const firstKernel = {
+      homedir: home,
+      platform: process.platform,
+      api: { running: {}, running_paths: {}, ondata() {} }
+    }
+    const first = new Vault(firstKernel)
+    firstKernel.vault = first
+    await first.init()
+
+    assert.deepEqual(await first.perform("automatic_set_mode", {
+      app: "manual-mode-app",
+      mode: "manual"
+    }), { app: "manual-mode-app", mode: "manual" })
+    assert.equal((await first.automaticScanStatus()).settings[0].mode,
+      "manual")
+    await close(first)
+
+    const restoredKernel = {
+      homedir: home,
+      platform: process.platform,
+      api: { running: {}, running_paths: {}, ondata() {} }
+    }
+    const restored = new Vault(restoredKernel)
+    restoredKernel.vault = restored
+    restored.ready = restored.init({ deferStorage: true })
+    await restored.ready
+    assert.equal((await restored.automaticScanStatus()).settings[0].mode,
+      "manual")
+
+    restored.automaticScans.handleStarted(scriptPath)
+    await restored.automaticScans.handleStopped(scriptPath)
+    assert.equal(restored.automaticScans.pendingStops.size, 0)
+    assert.deepEqual(restored.automaticScans.snapshot().rows, [])
+    await close(restored)
+  })
+
+  test("dismissed results stay acknowledged until the duplicate set changes", async () => {
+    const home = await makeHome()
+    const appRoot = path.join(home, "api", "dismissed-app")
+    const contents = crypto.randomBytes(4096)
+    await fs.promises.mkdir(appRoot, { recursive: true })
+    await fs.promises.writeFile(path.join(appRoot, "first.bin"), contents)
+    await fs.promises.writeFile(path.join(appRoot, "second.bin"), contents)
+    const firstKernel = {
+      homedir: home,
+      platform: process.platform,
+      api: { running: {}, running_paths: {}, ondata() {} }
+    }
+    const first = new Vault(firstKernel)
+    firstKernel.vault = first
+    await first.init()
+    first.automaticScans.sizeThreshold = 1
+    first.automaticScans.queueApp("dismissed-app")
+    await waitFor(() => {
+      const row = first.automaticScans.entries.get("dismissed-app")
+      return !first.scanPromise && row && row.state === "result"
+    })
+
+    await first.perform("automatic_dismiss", { app: "dismissed-app" })
+    assert.deepEqual((await first.automaticScanStatus()).rows, [])
+    const firstSettings = await first.registry.automaticAppScanSettings()
+    assert.match(firstSettings[0].acknowledged_signature, /^[a-f0-9]{64}$/)
+    await close(first)
+
+    const restoredKernel = {
+      homedir: home,
+      platform: process.platform,
+      api: { running: {}, running_paths: {}, ondata() {} }
+    }
+    const restored = new Vault(restoredKernel)
+    restoredKernel.vault = restored
+    await restored.init()
+    restored.automaticScans.sizeThreshold = 1
+    assert.deepEqual((await restored.automaticScanStatus()).rows, [])
+
+    restored.automaticScans.queueApp("dismissed-app")
+    assert.equal(restored.automaticScans.entries.get(
+      "dismissed-app").state, "checking")
+    await waitFor(() => {
+      const row = restored.automaticScans.entries.get("dismissed-app")
+      return !restored.scanPromise && row && row.state === "result"
+    })
+    assert.deepEqual(restored.automaticScans.snapshot().rows, [])
+
+    await fs.promises.writeFile(path.join(appRoot, "third.bin"), contents)
+    restored.automaticScans.queueApp("dismissed-app")
+    await waitFor(() => {
+      const rows = restored.automaticScans.snapshot().rows
+      return !restored.scanPromise && rows.length === 1 &&
+        rows[0].state === "result"
+    })
+    assert.equal(restored.automaticScans.snapshot().rows[0].savings, 8192)
+    await close(restored)
+  })
+
+  test("automatic result signatures exclude stale duplicate rows", async () => {
+    const home = await makeHome()
+    const appRoot = path.join(home, "api", "stale-result-app")
+    const contents = crypto.randomBytes(4096)
+    await fs.promises.mkdir(appRoot, { recursive: true })
+    await fs.promises.writeFile(path.join(appRoot, "first.bin"), contents)
+    await fs.promises.writeFile(path.join(appRoot, "second.bin"), contents)
+    const kernel = {
+      homedir: home,
+      platform: process.platform,
+      api: { running: {}, running_paths: {}, ondata() {} }
+    }
+    const vault = new Vault(kernel)
+    kernel.vault = vault
+    await vault.init()
+    const scopeId = "app:stale-result-app"
+
+    assert.equal((await vault.perform("scan", {
+      scope_id: scopeId,
+      candidate_size: 0
+    })).started, true)
+    await waitFor(() => !vault.scanPromise && !vault.scanCompletionPromise)
+    assert.equal((await vault.registry.automaticAppResultSignature(
+      [scopeId])).savings, contents.length)
+
+    const duplicate = (await vault.registry.files({
+      sourceIds: [scopeId],
+      statuses: ["duplicate"]
+    }))[0]
+    await vault.registry.upsertFile(Object.assign({}, duplicate, {
+      unavailable_reason: "stale"
+    }))
+    assert.deepEqual(await vault.registry.automaticAppResultSignature(
+      [scopeId]), { signature: null, savings: 0, files: 0 })
+    await close(vault)
+  })
+
   test("a manual app rescan clears an existing automatic result", async () => {
     const home = await makeHome()
     const appRoot = path.join(home, "api", "manual-app")
@@ -561,7 +698,7 @@ describe("automatic app scans", () => {
     let schedules = 0
     automatic.broadcast = () => { broadcasts += 1 }
     automatic.schedule = () => { schedules += 1 }
-    automatic.publishResult = async () => {
+    automatic.publishResultNow = async () => {
       throw new Error("publication failed")
     }
 
@@ -610,7 +747,8 @@ describe("automatic app scans", () => {
     assert.deepEqual(automatic.snapshot().rows, [{
       app: "demo",
       state: "result",
-      savings: 4096
+      savings: 4096,
+      notice_id: "result:1:"
     }])
   })
 
@@ -620,7 +758,7 @@ describe("automatic app scans", () => {
       enabled: true,
       kernel: { homedir: "/pinokio", api: { running_paths: {} } },
       registry: {
-        setAutomaticAppScanState: async () => {
+        setAutomaticAppScanMode: async () => {
           throw new Error("database failed")
         }
       },
@@ -649,12 +787,24 @@ describe("automatic app scans", () => {
     const automatic = new AutomaticScans({
       enabled: true,
       kernel: { homedir: "/pinokio", api: { running_paths: {} } },
+      sources: () => [{
+        id: "app:demo",
+        kind: "app",
+        app: "demo",
+        available: true
+      }],
       refreshSources: async () => { throw new Error("refresh failed") },
       registry: {
-        setAutomaticAppScanState: async () => { persistenceCalls += 1 }
+        setAutomaticAppScanMode: async () => { persistenceCalls += 1 }
       }
     })
+    automatic.appRootIsAvailable = async () => true
     automatic.hydrated = true
+    automatic.settings.set("demo", {
+      mode: "manual",
+      acknowledged_signature: null,
+      updated_at: 1
+    })
     automatic.entries.set("demo", {
       app: "demo",
       state: "paused",
@@ -678,7 +828,7 @@ describe("automatic app scans", () => {
       initialized: true,
       kernel: { homedir: "/pinokio", api: { running_paths: {} } },
       registry: {
-        setAutomaticAppScanState: async () => ({ updated_at: 2 })
+        setAutomaticAppScanMode: async () => ({ updated_at: 2 })
       },
       cancelScan: () => {},
       startScan: () => {
@@ -709,6 +859,471 @@ describe("automatic app scans", () => {
 
     assert.equal(scans, 0)
     assert.equal(automatic.entries.get("demo").state, "paused")
+  })
+
+  test("Manual mode cancels automatic work and suppresses later stops", async () => {
+    let cancellations = 0
+    let settled = 0
+    const source = {
+      id: "app:demo",
+      kind: "app",
+      app: "demo",
+      available: true
+    }
+    const automatic = new AutomaticScans({
+      enabled: true,
+      kernel: { homedir: "/pinokio", api: { running_paths: {} } },
+      sources: () => [source],
+      sourceAppIsRunning: () => false,
+      registry: {
+        setAutomaticAppScanMode: async (_app, mode) => ({
+          mode,
+          updated_at: 2
+        })
+      },
+      cancelScan: () => { cancellations += 1 }
+    })
+    automatic.hydrated = true
+    automatic.appRootIsAvailable = async () => true
+    automatic.log = () => {}
+    automatic.active = { app: "demo" }
+    automatic.entries.set("demo", {
+      app: "demo",
+      state: "checking",
+      savings: 0,
+      updated_at: 1,
+      previous: null
+    })
+
+    assert.deepEqual(await automatic.setMode("demo", "manual"), {
+      app: "demo",
+      mode: "manual"
+    })
+    assert.equal(cancellations, 1)
+    assert.equal(automatic.modeFor("demo"), "manual")
+    assert.equal(automatic.entries.has("demo"), false)
+
+    automatic.scheduleStoppedApp = () => { settled += 1 }
+    automatic.handleStarted("/pinokio/api/demo/start.js")
+    await automatic.handleStopped("/pinokio/api/demo/start.js")
+    assert.equal(settled, 0)
+  })
+
+  test("automatic-scan settings reject paths that are not registered apps", async () => {
+    let modeWrites = 0
+    const automatic = new AutomaticScans({
+      enabled: true,
+      kernel: { homedir: "/pinokio", api: { running_paths: {} } },
+      sources: () => [],
+      registry: {
+        setAutomaticAppScanMode: async () => { modeWrites += 1 },
+        removeAutomaticAppScanApp: async () => ({ changes: 0 })
+      }
+    })
+    automatic.hydrated = true
+    automatic.log = () => {}
+
+    assert.deepEqual(await automatic.setMode("../outside", "manual"), {
+      error: "That app is no longer available."
+    })
+    assert.deepEqual(await automatic.settingsLink("../outside"), {
+      error: "That app is no longer available."
+    })
+    assert.equal(modeWrites, 0)
+  })
+
+  test("unavailable-app cleanup waits for result publication", async () => {
+    let releaseResult
+    let resultStarted
+    const resultWait = new Promise((resolve) => { releaseResult = resolve })
+    const resultStart = new Promise((resolve) => { resultStarted = resolve })
+    const writes = []
+    const automatic = new AutomaticScans({
+      enabled: true,
+      kernel: { homedir: "/pinokio", api: { running_paths: {} } },
+      sources: () => [{ kind: "app", app: "demo", available: true }],
+      scopeSourceIds: () => ["app:demo"],
+      registry: {
+        automaticAppResultSignature: async () => {
+          resultStarted()
+          await resultWait
+          return {
+            signature: "a".repeat(64),
+            savings: 4096,
+            files: 1
+          }
+        },
+        setAutomaticAppScanState: async () => {
+          writes.push("result")
+          return { updated_at: 2 }
+        },
+        removeAutomaticAppScanApp: async () => {
+          writes.push("removed")
+          return { changes: 1 }
+        }
+      }
+    })
+    automatic.hydrated = true
+    automatic.log = () => {}
+    automatic.appRootIsAvailable = async () => false
+
+    const publication = automatic.publishResult("demo", "app:demo")
+    await resultStart
+    const settings = automatic.settingsLink("demo")
+    await Promise.resolve()
+    assert.deepEqual(writes, [])
+
+    releaseResult()
+    await publication
+    assert.deepEqual(await settings, {
+      error: "That app is no longer available."
+    })
+    assert.deepEqual(writes, ["result", "removed"])
+    assert.equal(automatic.entries.has("demo"), false)
+  })
+
+  test("unavailable-app cleanup cancels an active scan without republishing", async () => {
+    const cancellations = []
+    const automatic = new AutomaticScans({
+      enabled: true,
+      kernel: { homedir: "/pinokio", api: { running_paths: {} } },
+      sources: () => [{ kind: "app", app: "demo", available: true }],
+      registry: {
+        removeAutomaticAppScanApp: async () => ({ changes: 1 })
+      },
+      cancelScan: (options) => {
+        cancellations.push(options)
+        return { cancel_requested: true }
+      }
+    })
+    automatic.hydrated = true
+    automatic.log = () => {}
+    automatic.broadcast = () => {}
+    automatic.schedule = () => {}
+    automatic.appRootIsAvailable = async () => false
+    automatic.active = { app: "demo" }
+    automatic.entries.set("demo", {
+      app: "demo",
+      state: "checking",
+      savings: 0,
+      updated_at: 1,
+      previous: null,
+      hidden: false
+    })
+    let publications = 0
+    automatic.publishResultNow = async () => { publications += 1 }
+
+    assert.deepEqual(await automatic.settingsLink("demo"), {
+      error: "That app is no longer available."
+    })
+    assert.deepEqual(cancellations, [{ owner: "automatic", app: "demo" }])
+
+    const replacement = {
+      app: "demo",
+      state: "checking",
+      savings: 0,
+      updated_at: 2,
+      previous: null,
+      hidden: false
+    }
+    automatic.entries.set("demo", replacement)
+
+    await automatic.scanFinished({
+      owner: "automatic",
+      app: "demo",
+      scopeId: "app:demo",
+      result: { outcome: "complete", affected_apps: [] }
+    })
+
+    assert.equal(publications, 0)
+    assert.equal(automatic.entries.get("demo"), replacement)
+    assert.equal(automatic.cancelReasons.has("demo"), false)
+  })
+
+  test("unchanged result reconciliation performs no state write", async () => {
+    let stateWrites = 0
+    const signature = "a".repeat(64)
+    const automatic = new AutomaticScans({
+      enabled: true,
+      kernel: { homedir: "/pinokio", api: { running_paths: {} } },
+      sources: () => [{
+        id: "app:demo",
+        kind: "app",
+        app: "demo",
+        available: true
+      }],
+      scopeSourceIds: () => ["app:demo"],
+      registry: {
+        automaticAppResultSignature: async () => ({
+          signature,
+          savings: 4096,
+          files: 1
+        }),
+        setAutomaticAppScanState: async () => {
+          stateWrites += 1
+          return { updated_at: 3 }
+        }
+      }
+    })
+    automatic.hydrated = true
+    automatic.log = () => {}
+    automatic.entries.set("demo", {
+      app: "demo",
+      state: "result",
+      savings: 4096,
+      signature,
+      updated_at: 2,
+      previous: null,
+      hidden: false
+    })
+
+    assert.equal(await automatic.reconcileResults(["demo"]), false)
+    assert.equal(stateWrites, 0)
+    assert.equal(automatic.entries.get("demo").updated_at, 2)
+  })
+
+  test("file-action cleanup clears an acknowledgement during checking", async () => {
+    const acknowledgements = []
+    const automatic = new AutomaticScans({
+      enabled: true,
+      kernel: { homedir: "/pinokio", api: { running_paths: {} } },
+      registry: {
+        setAutomaticAppScanAcknowledgement: async (_app, signature) => {
+          acknowledgements.push(signature)
+          return { acknowledged_signature: signature, updated_at: 3 }
+        }
+      }
+    })
+    automatic.hydrated = true
+    automatic.log = () => {}
+    automatic.settings.set("demo", {
+      mode: "automatic",
+      acknowledged_signature: "a".repeat(64),
+      updated_at: 1
+    })
+    automatic.entries.set("demo", {
+      app: "demo",
+      state: "checking",
+      savings: 0,
+      updated_at: 2,
+      previous: null,
+      hidden: false
+    })
+
+    await automatic.clearAutomaticState(["demo"], "file-action", {
+      clearAcknowledgement: true
+    })
+
+    assert.deepEqual(acknowledgements, [null])
+    assert.equal(automatic.settings.get("demo").acknowledged_signature, null)
+    assert.equal(automatic.entries.get("demo").state, "checking")
+  })
+
+  test("dismissal hides only the current notice and acknowledges exact results", async () => {
+    let currentResult = {
+      signature: "a".repeat(64),
+      savings: 4096,
+      files: 1
+    }
+    const acknowledgements = []
+    const automatic = new AutomaticScans({
+      enabled: true,
+      kernel: { homedir: "/pinokio", api: { running_paths: {} } },
+      scopeSourceIds: () => ["app:demo"],
+      registry: {
+        automaticAppResultSignature: async () => currentResult,
+        setAutomaticAppScanState: async (...args) => {
+          if (args[3] && Object.prototype.hasOwnProperty.call(
+            args[3], "acknowledged_signature")) {
+            acknowledgements.push(args[3].acknowledged_signature)
+          }
+          return { updated_at: 2 }
+        },
+        setAutomaticAppScanAcknowledgement: async (_app, signature) => {
+          acknowledgements.push(signature)
+          return { acknowledged_signature: signature, updated_at: 3 }
+        }
+      }
+    })
+    automatic.hydrated = true
+    automatic.log = () => {}
+    automatic.entries.set("demo", {
+      app: "demo",
+      state: "checking",
+      savings: 0,
+      updated_at: 1,
+      previous: null,
+      hidden: false
+    })
+
+    await automatic.dismiss(
+      "demo", automatic.snapshot().rows[0].notice_id)
+    assert.deepEqual(automatic.snapshot().rows, [])
+
+    await automatic.publishResult("demo", "app:demo")
+    assert.equal(automatic.snapshot().rows[0].state, "result")
+    await automatic.dismiss(
+      "demo", automatic.snapshot().rows[0].notice_id)
+    assert.deepEqual(automatic.snapshot().rows, [])
+    assert.deepEqual(acknowledgements, ["a".repeat(64)])
+
+    await automatic.publishResult("demo", "app:demo")
+    assert.deepEqual(automatic.snapshot().rows, [])
+    currentResult = {
+      signature: "b".repeat(64),
+      savings: 8192,
+      files: 2
+    }
+    await automatic.publishResult("demo", "app:demo")
+    assert.equal(automatic.snapshot().rows[0].savings, 8192)
+    assert.deepEqual(acknowledgements, ["a".repeat(64), null])
+  })
+
+  test("a stale checking dismissal cannot acknowledge its replacement result", async () => {
+    const acknowledgements = []
+    const automatic = new AutomaticScans({
+      enabled: true,
+      kernel: { homedir: "/pinokio", api: { running_paths: {} } },
+      scopeSourceIds: () => ["app:demo"],
+      registry: {
+        automaticAppResultSignature: async () => ({
+          signature: "b".repeat(64),
+          savings: 4096,
+          files: 1
+        }),
+        setAutomaticAppScanState: async () => ({ updated_at: 2 }),
+        setAutomaticAppScanAcknowledgement: async (_app, signature) => {
+          acknowledgements.push(signature)
+          return { acknowledged_signature: signature, updated_at: 3 }
+        }
+      }
+    })
+    automatic.hydrated = true
+    automatic.log = () => {}
+    automatic.entries.set("demo", {
+      app: "demo",
+      state: "checking",
+      savings: 0,
+      updated_at: 1,
+      previous: null,
+      hidden: false
+    })
+    const checkingNotice = automatic.snapshot().rows[0].notice_id
+
+    await automatic.publishResult("demo", "app:demo")
+    assert.deepEqual(await automatic.dismiss("demo", checkingNotice), {
+      stale: true,
+      app: "demo"
+    })
+    assert.equal(automatic.snapshot().rows[0].state, "result")
+    assert.deepEqual(acknowledgements, [])
+  })
+
+  test("review cannot clear a result published while acknowledgement is pending", async () => {
+    let releaseAcknowledgement
+    let acknowledgementStarted
+    const acknowledgementWait = new Promise((resolve) => {
+      releaseAcknowledgement = resolve
+    })
+    const acknowledgementStart = new Promise((resolve) => {
+      acknowledgementStarted = resolve
+    })
+    let currentResult = {
+      signature: "b".repeat(64),
+      savings: 8192,
+      files: 2
+    }
+    const acknowledgements = []
+    let updatedAt = 1
+    const automatic = new AutomaticScans({
+      enabled: true,
+      kernel: { homedir: "/pinokio", api: { running_paths: {} } },
+      sources: () => [{
+        kind: "app",
+        app: "demo",
+        available: true
+      }],
+      scopeSourceIds: () => ["app:demo"],
+      registry: {
+        automaticAppResultSignature: async () => currentResult,
+        setAutomaticAppScanState: async (...args) => {
+          if (args[3] && Object.prototype.hasOwnProperty.call(
+            args[3], "acknowledged_signature")) {
+            const signature = args[3].acknowledged_signature
+            acknowledgements.push(signature)
+            if (signature === "a".repeat(64)) {
+              acknowledgementStarted()
+              await acknowledgementWait
+            }
+          }
+          return { updated_at: ++updatedAt }
+        },
+        setAutomaticAppScanAcknowledgement: async (_app, signature) => {
+          acknowledgements.push(signature)
+          return {
+            acknowledged_signature: signature,
+            updated_at: ++updatedAt
+          }
+        }
+      }
+    })
+    automatic.hydrated = true
+    automatic.log = () => {}
+    automatic.appRootIsAvailable = async () => true
+    automatic.entries.set("demo", {
+      app: "demo",
+      state: "result",
+      savings: 4096,
+      signature: "a".repeat(64),
+      updated_at: 1,
+      previous: null,
+      hidden: false
+    })
+    const reviewedNotice = automatic.snapshot().rows[0].notice_id
+
+    const review = automatic.review("demo", reviewedNotice)
+    await acknowledgementStart
+    const replacement = automatic.publishResult("demo", "app:demo")
+    assert.equal(automatic.entries.get("demo").signature, "a".repeat(64))
+
+    releaseAcknowledgement()
+    assert.equal((await review).reviewed, true)
+    await replacement
+
+    assert.equal(automatic.entries.get("demo").signature, "b".repeat(64))
+    assert.equal(automatic.entries.get("demo").hidden, false)
+    assert.deepEqual(acknowledgements, ["a".repeat(64), null])
+  })
+
+  test("dismissing a paused notice keeps the app in Manual mode", async () => {
+    let cleared = 0
+    const automatic = new AutomaticScans({
+      enabled: true,
+      kernel: { homedir: "/pinokio", api: { running_paths: {} } },
+      registry: {
+        setAutomaticAppScanState: async () => { cleared += 1 }
+      }
+    })
+    automatic.hydrated = true
+    automatic.log = () => {}
+    automatic.settings.set("demo", {
+      mode: "manual",
+      acknowledged_signature: null,
+      updated_at: 1
+    })
+    automatic.entries.set("demo", {
+      app: "demo",
+      state: "paused",
+      savings: 0,
+      updated_at: 1,
+      previous: null,
+      hidden: false
+    })
+
+    await automatic.dismiss("demo")
+    assert.equal(cleared, 1)
+    assert.deepEqual(automatic.snapshot().rows, [])
+    assert.equal(automatic.modeFor("demo"), "manual")
   })
 
   test("the sweeper performs the only source refresh for an automatic scan", async () => {

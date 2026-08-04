@@ -15916,6 +15916,7 @@ class Server {
         theme: this.theme,
         platform: this.kernel.platform,
         agent: req.agent,
+        app: source.app,
         scope_id: source.id
       })
     }))

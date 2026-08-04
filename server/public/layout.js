@@ -241,7 +241,12 @@
     iframe.addEventListener('focus', markActive);
     iframe.addEventListener('pointerdown', markActive);
 
-    entry = { container, iframe, updateNodeLocation };
+    entry = {
+      container,
+      iframe,
+      updateNodeLocation,
+      vaultAutoSettingsReady: false,
+    };
     leafElements.set(node.id, entry);
     return entry;
   }
@@ -636,6 +641,7 @@
       leaf.src = state.defaultPath;
       const entry = leafElements.get(leaf.id);
       if (entry) {
+        entry.vaultAutoSettingsReady = false;
         entry.iframe.src = leaf.src;
       }
       cleanupSessionIfSingleLeaf();
@@ -682,6 +688,7 @@
       return false;
     }
     node.src = normalized;
+    entry.vaultAutoSettingsReady = false;
     entry.iframe.src = normalized;
     state.activeLeafId = frameId;
     saveStateToStorage();
@@ -690,6 +697,16 @@
 
   function onMessage(event) {
     if (!event || !event.data || typeof event.data !== 'object') {
+      return;
+    }
+    if (event.data.e === 'vault-auto-settings-ready' &&
+        event.origin === window.location.origin) {
+      for (const entry of leafElements.values()) {
+        if (entry.iframe && entry.iframe.contentWindow === event.source) {
+          entry.vaultAutoSettingsReady = true;
+          break;
+        }
+      }
       return;
     }
     if (event.data.e === 'layout-state-request') {
@@ -771,6 +788,7 @@
       if (node.type === 'leaf') {
         const entry = ensureLeafElement(node);
         if (entry && entry.iframe.src !== node.src) {
+          entry.vaultAutoSettingsReady = false;
           entry.iframe.src = node.src;
         }
       }
@@ -864,14 +882,11 @@
       return `${amount.toFixed(digits)} ${units[unit]}`;
     }
 
-    function rowText(row) {
+    function statusText(row) {
       if (row.state === 'paused') {
-        return `${row.app} check paused`;
+        return 'Automatic scans are off';
       }
-      if (row.state === 'result') {
-        return `${row.app} — ${formatBytes(row.savings)} can be saved`;
-      }
-      return `Checking ${row.app} for duplicate files…`;
+      return 'Checking for duplicate files…';
     }
 
     function actionFor(row) {
@@ -884,12 +899,16 @@
       return { label: 'Pause', action: 'automatic_pause' };
     }
 
-    async function requestAction(action, app) {
+    async function requestAction(action, app, noticeId = null) {
+      const payload = { action, app };
+      if (noticeId) {
+        payload.notice_id = noticeId;
+      }
       const response = await fetch('/vault/action', {
         method: 'POST',
         credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action, app }),
+        body: JSON.stringify(payload),
       });
       if (!response.ok) {
         throw new Error(`Disk Saver action failed (${response.status}).`);
@@ -899,6 +918,45 @@
         throw new Error(result.error);
       }
       return result || {};
+    }
+
+    function removeRow(item) {
+      item.remove();
+      tray.hidden = tray.childElementCount === 0;
+    }
+
+    function automaticSettingsKey(app) {
+      return `pinokio:vault:auto-settings:${encodeURIComponent(app)}`;
+    }
+
+    function openAutomaticSettings(app, href) {
+      const storageKey = automaticSettingsKey(app);
+      try {
+        sessionStorage.setItem(storageKey, '1');
+      } catch (_) {}
+      let frameId = state.activeLeafId;
+      if (!frameId || !leafElements.has(frameId)) {
+        frameId = leafElements.keys().next().value || null;
+      }
+      const node = frameId ? nodeById.get(frameId) : null;
+      const entry = frameId ? leafElements.get(frameId) : null;
+      let currentPath = '';
+      let targetPath = '';
+      try {
+        currentPath = new URL(node?.src || '', window.location.href).pathname;
+        targetPath = new URL(href, window.location.href).pathname;
+      } catch (_) {}
+      if (entry && entry.vaultAutoSettingsReady &&
+          currentPath && currentPath === targetPath) {
+        entry.iframe?.contentWindow?.postMessage(
+          { e: 'vault-auto-settings' }, window.location.origin);
+        return true;
+      }
+      const opened = navigateActiveLeaf(href);
+      if (!opened) {
+        try { sessionStorage.removeItem(storageKey); } catch (_) {}
+      }
+      return opened;
     }
 
     function render(snapshot) {
@@ -914,6 +972,29 @@
         item.className = 'vault-auto-scan-row';
         item.dataset.state = row.state || 'checking';
 
+        const close = document.createElement('button');
+        close.type = 'button';
+        close.className = 'vault-auto-scan-close';
+        close.setAttribute('aria-label', `Dismiss Disk Saver notification for ${row.app}`);
+        close.title = 'Dismiss';
+        close.textContent = '×';
+        close.addEventListener('click', async () => {
+          close.disabled = true;
+          try {
+            const result = await requestAction(
+              'automatic_dismiss', row.app, row.notice_id);
+            if (result.stale) {
+              await loadState();
+              if (close.isConnected) close.disabled = false;
+              return;
+            }
+            removeRow(item);
+          } catch (error) {
+            console.warn('[Disk Saver] Automatic scan dismissal failed', error);
+            close.disabled = false;
+          }
+        });
+
         const icon = document.createElement('span');
         icon.className = 'vault-auto-scan-icon';
         if (row.state === 'paused') {
@@ -924,7 +1005,48 @@
 
         const copy = document.createElement('span');
         copy.className = 'vault-auto-scan-copy';
-        copy.textContent = rowText(row);
+        const appName = document.createElement('span');
+        appName.className = 'vault-auto-scan-app';
+        appName.textContent = row.app;
+        appName.title = row.app;
+        const status = document.createElement('span');
+        status.className = 'vault-auto-scan-status';
+        if (row.state === 'result') {
+          const value = document.createElement('strong');
+          value.className = 'vault-auto-scan-value';
+          value.textContent = formatBytes(row.savings);
+          const detail = document.createElement('span');
+          detail.className = 'vault-auto-scan-detail';
+          detail.textContent = 'can be saved';
+          status.append(value, detail);
+        } else {
+          status.textContent = statusText(row);
+        }
+        copy.append(appName, status);
+
+        const controls = document.createElement('span');
+        controls.className = 'vault-auto-scan-controls';
+        if (row.state !== 'result') {
+          const settings = document.createElement('button');
+          settings.type = 'button';
+          settings.className = 'vault-auto-scan-settings';
+          settings.textContent = 'Auto-scan settings';
+          settings.addEventListener('click', async () => {
+            settings.disabled = true;
+            try {
+              const result = await requestAction(
+                'automatic_settings', row.app);
+              if (!result.href || !openAutomaticSettings(row.app, result.href)) {
+                throw new Error('The app page is unavailable.');
+              }
+            } catch (error) {
+              console.warn('[Disk Saver] Automatic scan settings failed', error);
+            } finally {
+              if (settings.isConnected) settings.disabled = false;
+            }
+          });
+          copy.appendChild(settings);
+        }
 
         const action = actionFor(row);
         const button = document.createElement('button');
@@ -934,10 +1056,15 @@
         button.addEventListener('click', async () => {
           button.disabled = true;
           try {
-            const result = await requestAction(action.action, row.app);
+            const result = await requestAction(
+              action.action, row.app, row.notice_id);
+            if (result.stale) {
+              await loadState();
+              if (button.isConnected) button.disabled = false;
+              return;
+            }
             if (action.action === 'automatic_review' && result.href) {
-              item.remove();
-              tray.hidden = tray.childElementCount === 0;
+              removeRow(item);
               navigateActiveLeaf(result.href);
             } else {
               await loadState();
@@ -948,7 +1075,9 @@
           }
         });
 
-        item.append(icon, copy, button);
+        controls.appendChild(button);
+
+        item.append(close, icon, copy, controls);
         fragment.appendChild(item);
       });
       tray.replaceChildren(fragment);
