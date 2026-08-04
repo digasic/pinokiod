@@ -135,6 +135,7 @@ for (const method of [
   "abortScan",
   "stageExclusions",
   "stageFiles",
+  "scopedAnchorBatch",
   "stageComparisonFiles",
   "comparisonFileBatch",
   "resolveComparisonFiles",

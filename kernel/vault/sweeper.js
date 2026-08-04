@@ -113,8 +113,10 @@ class Sweeper {
       }
 
       const anchorStores = this.anchorStoresForScope(scopeId)
-      await this.stageAnchors(runId, anchorStores)
-      this.checkpoint()
+      if (!scopeId) {
+        await this.stageAnchors(runId, anchorStores)
+        this.checkpoint()
+      }
 
       const walkStarted = Date.now()
       for (const source of scanRoots) {
@@ -130,6 +132,8 @@ class Sweeper {
       this.state.walk_duration_ms = Date.now() - walkStarted
       await registry.stageExclusions(runId, this.exclusionList())
       if (scopeId) {
+        await this.stageScopedAnchors(runId, anchorStores)
+        this.checkpoint()
         const comparisons = await registry.stageComparisonFiles(
           runId, this.publicationSourceIds(scopeId))
         this.applyHashWork(comparisons && comparisons.work)
@@ -339,6 +343,29 @@ class Sweeper {
         this.applyHashWork(staged && staged.work)
       }
     })
+  }
+
+  async stageScopedAnchors(runId, stores = []) {
+    const storeIds = stores.map((store) => store.id).filter(Boolean)
+    let cursor = null
+    while (true) {
+      this.checkpoint()
+      const anchors = await this.vault.registry.scopedAnchorBatch(
+        runId, storeIds, cursor)
+      if (!anchors.length) return
+      const observations = await this.vault.scanner.validateSnapshots(anchors)
+      const checked = anchors.flatMap((anchor, index) =>
+        observations[index] && observations[index].valid
+          ? [Object.assign({}, anchor, {
+              hash_name: anchor.hash,
+              nlink: observations[index].nlink
+            })]
+          : [])
+      const staged = await this.vault.registry.stageAnchors(runId, checked)
+      this.applyHashWork(staged && staged.work)
+      const last = anchors[anchors.length - 1]
+      cursor = { store_id: last.store_id, hash: last.hash }
+    }
   }
 
   async verifyComparisonFiles(runId) {

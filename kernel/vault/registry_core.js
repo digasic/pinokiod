@@ -134,7 +134,6 @@ class RegistryCore {
         ON anchors(nlink, size DESC, store_id, hash);
       CREATE INDEX IF NOT EXISTS anchors_inode_idx
         ON anchors(dev, ino);
-
       CREATE TABLE IF NOT EXISTS files (
         path TEXT PRIMARY KEY,
         hash TEXT,
@@ -3295,6 +3294,47 @@ class RegistryCore {
     }
   }
 
+  scopedAnchorBatch(runId, storeIds = [], cursor = null, limit = 128) {
+    const stores = [...new Set((storeIds || []).filter((storeId) =>
+      typeof storeId === "string" && storeId))]
+    if (!stores.length) return []
+    const afterStore = cursor && typeof cursor.store_id === "string"
+      ? cursor.store_id
+      : ""
+    const afterHash = cursor && typeof cursor.hash === "string"
+      ? cursor.hash
+      : ""
+    return this.database.prepare(`
+      SELECT anchor.*
+      FROM anchors anchor
+      WHERE anchor.verified_at IS NOT NULL
+        AND anchor.store_id IN (${placeholders(stores)})
+        AND (anchor.store_id, anchor.hash) > (?, ?)
+        AND EXISTS (
+          SELECT 1
+          FROM scan_files selected
+          WHERE selected.run_id = ?
+            AND selected.comparison_only = 0
+            AND selected.dev = anchor.dev
+            AND (
+              selected.size = anchor.size OR
+              (
+                selected.ino != 0 AND
+                selected.ino = anchor.ino
+              )
+            )
+      )
+      ORDER BY anchor.store_id, anchor.hash
+      LIMIT ?
+    `).all(
+      ...stores,
+      afterStore,
+      afterHash,
+      runId,
+      Math.max(1, Math.min(1024, Number(limit) || 128))
+    )
+  }
+
   comparisonFileBatch(runId, limit = 128) {
     return this.database.prepare(`
       SELECT *
@@ -3354,6 +3394,18 @@ class RegistryCore {
         gid = excluded.gid,
         verified_hash = excluded.verified_hash
     `)
+    const markManaged = this.database.prepare(`
+      UPDATE scan_files SET
+        managed = 1,
+        status = 'linked',
+        hash = COALESCE(hash, ?),
+        hash_needed = 0
+      WHERE run_id = ?
+        AND comparison_only = 0
+        AND dev = ?
+        AND ino = ?
+        AND ino != 0
+    `)
     this.transaction(() => {
       for (const entry of entries) {
         const previous = previousAnchor.get(
@@ -3383,6 +3435,12 @@ class RegistryCore {
         this.scanAnchorInodes.add(`${entry.dev}:${entry.ino}`)
         if (unchanged) {
           this.rememberScanHash(entry, entry.hash_name)
+          markManaged.run(
+            entry.hash_name,
+            runId,
+            entry.dev,
+            entry.ino
+          )
         } else {
           this.addScanHashWork({
             entry,
@@ -3397,6 +3455,26 @@ class RegistryCore {
         sizeState.hashNeeded = true
         this.scanSizes.set(entry.size, sizeState)
       }
+      this.database.prepare(`
+        UPDATE scan_files AS candidate
+        SET hash_needed = 1
+        WHERE candidate.run_id = ?
+          AND candidate.comparison_only = 0
+          AND candidate.hash IS NULL
+          AND EXISTS (
+            SELECT 1
+            FROM scan_anchors anchor
+            WHERE anchor.run_id = candidate.run_id
+              AND anchor.verified_hash IS NOT NULL
+              AND anchor.size = candidate.size
+              AND anchor.dev = candidate.dev
+              AND (
+                anchor.ino = 0 OR
+                candidate.ino = 0 OR
+                anchor.ino != candidate.ino
+              )
+          )
+      `).run(runId)
     })
     return { work: this.scanHashWork() }
   }
@@ -3893,10 +3971,11 @@ class RegistryCore {
 
       this.database.prepare(`
         DELETE FROM anchors
-        WHERE store_id IN (
+        WHERE ? IS NULL
+          AND store_id IN (
           SELECT store_id FROM scan_stores WHERE run_id = ?
         )
-      `).run(runId)
+      `).run(metadata.scope_id || null, runId)
       this.database.prepare(`
         INSERT INTO anchors (
           store_id, hash, path, verified_at, dev, ino, size, mtime, ctime,
@@ -3906,8 +3985,10 @@ class RegistryCore {
           store_id, hash_name, path, ?, dev, ino, size, mtime, ctime,
           nlink, mode, uid, gid
         FROM scan_anchors
-        WHERE run_id = ? AND verified_hash = hash_name
-      `).run(now, runId)
+        WHERE ? IS NULL
+          AND run_id = ?
+          AND verified_hash = hash_name
+      `).run(now, metadata.scope_id || null, runId)
 
       this.dropFileTriggers()
       this.database.prepare(`

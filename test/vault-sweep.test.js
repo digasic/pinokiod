@@ -42,6 +42,40 @@ const makeVault = async (threshold = 1) => {
   return { home, vault, store }
 }
 
+const seedVerifiedAnchor = async (vault, contents) => {
+  const hash = sha256(contents)
+  const store = vault.defaultAnchorStore()
+  await vault.ensureAnchorStore(
+    store,
+    (await fs.promises.stat(vault.kernel.homedir)).dev
+  )
+  const anchor = await write(vault.storePathFor(hash), contents)
+  const stat = await fs.promises.stat(anchor)
+  const now = Date.now()
+  await vault.registry.upsertContent({
+    hash,
+    size: stat.size,
+    first_seen: now,
+    verified_at: now
+  })
+  await vault.registry.upsertAnchor({
+    store_id: store.id,
+    hash,
+    path: anchor,
+    verified_at: now,
+    dev: stat.dev,
+    ino: stat.ino,
+    size: stat.size,
+    mtime: stat.mtimeMs,
+    ctime: stat.ctimeMs,
+    nlink: stat.nlink,
+    mode: stat.mode,
+    uid: stat.uid,
+    gid: stat.gid
+  })
+  return { anchor, hash, stat, store }
+}
+
 const close = async (vault) => {
   if (vault.worker) await vault.worker.terminate().catch(() => {})
   if (vault.registry) await vault.registry.close()
@@ -250,6 +284,108 @@ describe("Save Space scans", () => {
     assert.ok((await vault.registry.getFile(added)).hash)
     assert.equal((await vault.registry.getFile(existing)).hash, null)
     assert.equal((await vault.registry.getFile(existing)).status, "reference")
+  })
+
+  test("an app scan does not walk or invalidate unrelated store files", async () => {
+    const { home, vault } = await makeVault()
+    const unrelated = await seedVerifiedAnchor(
+      vault, crypto.randomBytes(5000))
+    await fs.promises.utimes(
+      unrelated.anchor,
+      new Date(unrelated.stat.atimeMs),
+      new Date(unrelated.stat.mtimeMs + 2000)
+    )
+    const appRoot = path.join(home, "api", "new-app")
+    await write(
+      path.join(appRoot, "model.bin"),
+      crypto.randomBytes(4096)
+    )
+    await vault.refreshSources()
+    const source = vault.sources().find((entry) => entry.root === appRoot)
+    assert.ok(source)
+
+    let anchorWalks = 0
+    const walkAnchors = vault.scanner.walkAnchors.bind(vault.scanner)
+    vault.scanner.walkAnchors = async (...args) => {
+      anchorWalks += 1
+      return walkAnchors(...args)
+    }
+    const hashedPaths = []
+    const hashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath, options) => {
+      hashedPaths.push(filePath)
+      return hashFile(filePath, options)
+    }
+
+    await vault.sweeper.scan(source.id)
+
+    vault.scanner.walkAnchors = walkAnchors
+    vault.hashFile = hashFile
+    assert.equal(anchorWalks, 0)
+    assert.equal(hashedPaths.includes(unrelated.anchor), false)
+    assert.ok(await vault.registry.getAnchor(
+      unrelated.store.id, unrelated.hash))
+  })
+
+  test("an app scan compares with a relevant unchanged store file", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const stored = await seedVerifiedAnchor(vault, contents)
+    const appRoot = path.join(home, "api", "new-app")
+    const candidate = await write(
+      path.join(appRoot, "model.bin"), contents)
+    await vault.refreshSources()
+    const source = vault.sources().find((entry) => entry.root === appRoot)
+    assert.ok(source)
+
+    const hashedPaths = []
+    const hashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath, options) => {
+      hashedPaths.push(filePath)
+      return hashFile(filePath, options)
+    }
+
+    await vault.sweeper.scan(source.id)
+
+    vault.hashFile = hashFile
+    assert.deepEqual(hashedPaths, [candidate])
+    assert.equal((await vault.registry.getFile(candidate)).status, "duplicate")
+    assert.ok(await vault.registry.getAnchor(stored.store.id, stored.hash))
+  })
+
+  test("an app scan ignores a relevant store record that changed", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const stored = await seedVerifiedAnchor(vault, contents)
+    await fs.promises.writeFile(
+      stored.anchor,
+      crypto.randomBytes(contents.length)
+    )
+    await fs.promises.utimes(
+      stored.anchor,
+      new Date(stored.stat.atimeMs),
+      new Date(stored.stat.mtimeMs + 2000)
+    )
+    const appRoot = path.join(home, "api", "new-app")
+    const first = await write(path.join(appRoot, "one.bin"), contents)
+    const second = await write(path.join(appRoot, "two.bin"), contents)
+    await vault.refreshSources()
+    const source = vault.sources().find((entry) => entry.root === appRoot)
+    assert.ok(source)
+
+    await vault.sweeper.scan(source.id)
+
+    const rows = await Promise.all([
+      vault.registry.getFile(first),
+      vault.registry.getFile(second)
+    ])
+    assert.deepEqual(
+      rows.map((row) => row.status).sort(),
+      ["duplicate", "reference"]
+    )
+    assert.ok(await vault.registry.getAnchor(
+      stored.store.id, stored.hash))
+    assert.equal(fs.existsSync(stored.anchor), true)
   })
 
   test("hash-looking cache paths and metadata never replace byte hashing", async () => {
