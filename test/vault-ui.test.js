@@ -245,6 +245,10 @@ const makePage = async (status, options = {}) => {
     dom.window.sessionStorage.setItem(
       "pinokio:vault:auto-settings:app", "1")
   }
+  if (appMode && options.automaticReviewRequested) {
+    dom.window.sessionStorage.setItem(
+      "pinokio:vault:auto-review:app", "1")
+  }
   dom.window.Socket = class {
     run(payload, callback) {
       pickerRequests.push(payload)
@@ -1975,6 +1979,41 @@ describe("Save Space interface", () => {
       mode: "manual"
     })
 
+    dom.window.close()
+  })
+
+  test("Review waits to focus Scan this app until it is available", async () => {
+    let current = fixture([item()], {
+      scan: {
+        active: true,
+        pending: false,
+        phase: "walking",
+        scope_id: "app:app"
+      }
+    })
+    const { dom, requests } = await makePage(() => current, {
+      appMode: true,
+      scopeId: "app:app",
+      automaticReviewRequested: true
+    })
+    const document = dom.window.document
+    const scanButton = document.getElementById("btn-scan")
+
+    assert.equal(scanButton.disabled, false)
+    assert.match(scanButton.textContent, /Cancel scan/)
+    assert.notEqual(document.activeElement, scanButton)
+    assert.equal(dom.window.sessionStorage.getItem(
+      "pinokio:vault:auto-review:app"), null)
+
+    current = fixture([item()])
+    for (let attempt = 0; attempt < 400 &&
+        document.activeElement !== scanButton; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+
+    assert.equal(document.activeElement, scanButton)
+    assert.equal(scanButton.disabled, false)
+    assert.equal(requests.some((request) => request.action === "scan"), false)
     dom.window.close()
   })
 

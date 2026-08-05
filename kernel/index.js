@@ -157,7 +157,7 @@ class Kernel {
       const pending = automaticScans[method](launchPath)
       if (pending && typeof pending.catch === "function") {
         pending.catch((error) => {
-          console.warn("[Vault Automatic Scan] " + JSON.stringify({
+          console.warn("[Vault Automatic Check] " + JSON.stringify({
             time: new Date().toISOString(),
             event: "lifecycle-error",
             method,
@@ -166,7 +166,7 @@ class Kernel {
         })
       }
     } catch (error) {
-      console.warn("[Vault Automatic Scan] " + JSON.stringify({
+      console.warn("[Vault Automatic Check] " + JSON.stringify({
         time: new Date().toISOString(),
         event: "lifecycle-error",
         method,

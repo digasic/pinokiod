@@ -36,6 +36,14 @@ const USER_WORK_ACTIONS = new Set([
   "reclaim",
   "reclaim_all"
 ])
+const AUTOMATIC_ACTIONS = new Set([
+  "automatic_pause",
+  "automatic_resume",
+  "automatic_review",
+  "automatic_dismiss",
+  "automatic_settings",
+  "automatic_set_mode"
+])
 const PERMISSION_DENIED_CODES = new Set(["EACCES", "EPERM"])
 const BUSY_CODES = new Set(["EBUSY"])
 const hardlinkUnavailableCode = (code) =>
@@ -222,14 +230,13 @@ class Vault {
     this._anchorStoresById = new Map()
     this._anchorStoresByDevice = new Map()
     this.operationTail = Promise.resolve()
+    this.registryInitializationPromise = null
     this.initializationPromise = null
     this.scanPromise = null
     this.scanCompletionPromise = null
     this.scanError = null
     this.scanScopeId = null
     this.scanCancelRequested = false
-    this.scanOwner = null
-    this.scanOwnerApp = null
     this.lastScanCache = new Map()
     this.fileActionProgress = null
     this.fileActionCancelRequested = false
@@ -587,8 +594,8 @@ class Vault {
     return this.initializeStorage()
   }
 
-  async initializeStorage() {
-    if (this.initialized) return { enabled: true, mode: this.mode }
+  async initializeRegistryStorage() {
+    if (this.registry) return { enabled: true }
     await this.ensureDirectory(this.root)
     const configStat = await lstatIfPresent(this.configPath)
     if (configStat &&
@@ -601,8 +608,26 @@ class Vault {
     } else {
       this.readConfig()
     }
-    this.registry = new Registry(this.root)
-    await this.registry.load()
+    const registry = new Registry(this.root)
+    await registry.load()
+    this.registry = registry
+    return { enabled: true }
+  }
+
+  ensureRegistryInitialized() {
+    if (this.registry) return Promise.resolve({ enabled: true })
+    if (!this.registryInitializationPromise) {
+      this.registryInitializationPromise = this.initializeRegistryStorage()
+        .finally(() => {
+          this.registryInitializationPromise = null
+        })
+    }
+    return this.registryInitializationPromise
+  }
+
+  async initializeStorage() {
+    if (this.initialized) return { enabled: true, mode: this.mode }
+    await this.ensureRegistryInitialized()
     await this.refreshAnchorStores()
     this.mode = this.defaultAnchorStore() &&
       this.defaultAnchorStore().mode === "copy"
@@ -635,7 +660,7 @@ class Vault {
   async automaticScanStatus() {
     if (this.ready) await this.ready
     if (!this.enabled) return { enabled: false, rows: [] }
-    if (!this.initialized) {
+    if (!this.registry) {
       const [rootStat, configStat, databaseStat] = await Promise.all([
         lstatIfPresent(this.root),
         lstatIfPresent(this.configPath),
@@ -644,7 +669,7 @@ class Vault {
       if (!rootStat || !configStat || !databaseStat) {
         return this.automaticScans.snapshot()
       }
-      await this.ensureInitialized()
+      await this.ensureRegistryInitialized()
     }
     await this.automaticScans.hydrate()
     return this.automaticScans.snapshot()
@@ -1608,26 +1633,15 @@ class Vault {
       this.folderFinder.runId, folder, page, STATUS_PAGE_SIZE)
   }
 
-  startScan(
-    scopeId = null,
-    sizeThreshold = this.sizeThreshold,
-    options = {}
-  ) {
+  startScan(scopeId = null, sizeThreshold = this.sizeThreshold) {
     if (!this.enabled || !this.sweeper) {
       return { started: false, disabled: true }
     }
     if (this.scanPromise) return { started: false, already_running: true }
-    const previousSizeThreshold = this.sizeThreshold
     this.sizeThreshold = sizeThreshold
     this.scanError = null
     this.scanScopeId = scopeId
     this.scanCancelRequested = false
-    const owner = options.owner === "automatic" ? "automatic" : "manual"
-    const ownerApp = owner === "automatic" && typeof options.app === "string"
-      ? options.app
-      : null
-    this.scanOwner = owner
-    this.scanOwnerApp = ownerApp
     let scanResult = null
     let scanFailure = null
     const execution = this.runExclusive(() => {
@@ -1650,21 +1664,14 @@ class Vault {
     })
     const tracked = execution.finally(() => {
       if (this.scanPromise !== tracked) return
-      if (owner === "automatic") {
-        this.sizeThreshold = previousSizeThreshold
-      }
       this.scanPromise = null
       this.scanScopeId = null
       this.scanCancelRequested = false
-      this.scanOwner = null
-      this.scanOwnerApp = null
     })
     this.scanPromise = tracked
     const completion = tracked.then(async () => {
       try {
         await this.automaticScans.scanFinished({
-          owner,
-          app: ownerApp,
           scopeId,
           result: scanResult,
           error: scanFailure
@@ -1683,14 +1690,8 @@ class Vault {
     return { started: true }
   }
 
-  cancelScan(options = {}) {
+  cancelScan() {
     if (!this.scanPromise || !this.sweeper) {
-      return { cancel_requested: false }
-    }
-    if (options.owner && options.owner !== this.scanOwner) {
-      return { cancel_requested: false }
-    }
-    if (options.app && options.app !== this.scanOwnerApp) {
       return { cancel_requested: false }
     }
     this.scanCancelRequested = true
@@ -1709,14 +1710,14 @@ class Vault {
 
   async perform(action, payload = {}) {
     if (!this.enabled) return { error: "Disk Saver is disabled." }
-    await this.ensureInitialized()
-    if (action === "cancel_scan" && this.scanOwner === "automatic" &&
-        this.scanOwnerApp) {
-      return this.automaticScans.pause(this.scanOwnerApp)
-    }
     const userWorkAction = USER_WORK_ACTIONS.has(action)
     if (userWorkAction) await this.automaticScans.beforeUserWork()
     try {
+      if (AUTOMATIC_ACTIONS.has(action)) {
+        await this.ensureRegistryInitialized()
+      } else {
+        await this.ensureInitialized()
+      }
       switch (action) {
       case "automatic_pause":
       case "automatic_resume":

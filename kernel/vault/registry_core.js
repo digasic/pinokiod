@@ -9,6 +9,12 @@ const DATABASE_VERSION = 3
 const isMissing = (error) => !!(error &&
   (error.code === "ENOENT" || error.code === "ENOTDIR"))
 
+const canonicalPathKey = (value) => {
+  const filePath = String(value || "")
+  if (process.platform !== "win32") return path.resolve(filePath)
+  return path.win32.resolve(filePath).toLowerCase()
+}
+
 const unsafePath = (filePath) => {
   const error = new Error(`Storage index path is not safe: ${filePath}`)
   error.code = "EVAULTPATH"
@@ -54,6 +60,11 @@ class RegistryCore {
 
     this.database = new Database(this.databasePath)
     try {
+      this.database.function(
+        "pinokio_path_key",
+        { deterministic: true },
+        canonicalPathKey
+      )
       this.database.pragma("journal_mode = DELETE")
       this.database.pragma("synchronous = NORMAL")
       this.database.pragma("foreign_keys = ON")
@@ -64,6 +75,7 @@ class RegistryCore {
       this.createSchema()
       this.dropLegacyScanSchema()
       this.createScanSchema()
+      this.createAutomaticPrecheckSchema()
       this.createFolderDiscoverySchema()
       this.database.pragma(`application_id = ${DATABASE_APPLICATION_ID}`)
       this.database.pragma(`user_version = ${DATABASE_VERSION}`)
@@ -134,6 +146,8 @@ class RegistryCore {
         ON anchors(nlink, size DESC, store_id, hash);
       CREATE INDEX IF NOT EXISTS anchors_inode_idx
         ON anchors(dev, ino);
+      CREATE INDEX IF NOT EXISTS anchors_size_device_path_idx
+        ON anchors(size, dev, path);
       CREATE TABLE IF NOT EXISTS files (
         path TEXT PRIMARY KEY,
         hash TEXT,
@@ -255,6 +269,7 @@ class RegistryCore {
         app TEXT PRIMARY KEY,
         state TEXT NOT NULL CHECK (state IN ('paused', 'result')),
         savings INTEGER NOT NULL DEFAULT 0,
+        signature TEXT,
         updated_at INTEGER NOT NULL
       );
 
@@ -273,6 +288,17 @@ class RegistryCore {
       WHERE state = 'paused';
 
     `)
+    const automaticScanColumns = new Set(this.database.prepare(
+      "PRAGMA table_info(automatic_app_scans)"
+    ).all().map((column) => column.name))
+    if (!automaticScanColumns.has("signature")) {
+      this.database.exec(
+        "ALTER TABLE automatic_app_scans ADD COLUMN signature TEXT")
+    }
+    this.database.prepare(`
+      DELETE FROM automatic_app_scans
+      WHERE state = 'result' AND signature IS NULL
+    `).run()
     this.database.exec(`
       DROP TRIGGER IF EXISTS content_summary_insert;
       DROP TRIGGER IF EXISTS content_summary_delete;
@@ -445,6 +471,22 @@ class RegistryCore {
         UNIQUE (run_id, dev),
         FOREIGN KEY (run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
       ) WITHOUT ROWID;
+
+    `)
+  }
+
+  createAutomaticPrecheckSchema() {
+    this.database.exec(`
+      CREATE TEMP TABLE IF NOT EXISTS automatic_precheck_files (
+        app TEXT NOT NULL,
+        path TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        dev INTEGER NOT NULL,
+        ino INTEGER NOT NULL,
+        PRIMARY KEY (app, path)
+      ) WITHOUT ROWID;
+      CREATE INDEX IF NOT EXISTS temp.automatic_precheck_match_idx
+        ON automatic_precheck_files(app, dev, size, ino, path);
     `)
   }
 
@@ -2597,13 +2639,13 @@ class RegistryCore {
 
   automaticAppScanStates() {
     return this.database.prepare(`
-      SELECT app, state, savings, updated_at
+      SELECT app, state, signature, updated_at
       FROM automatic_app_scans
       ORDER BY updated_at, app
     `).all().map((row) => ({
       app: row.app,
       state: row.state,
-      savings: Math.max(0, Number(row.savings) || 0),
+      signature: row.signature || null,
       updated_at: Number(row.updated_at) || 0
     }))
   }
@@ -2640,11 +2682,13 @@ class RegistryCore {
       `).run(app, mode, updatedAt)
       if (mode === "manual" && showPausedNotice) {
         this.database.prepare(`
-          INSERT INTO automatic_app_scans(app, state, savings, updated_at)
-          VALUES (?, 'paused', 0, ?)
+          INSERT INTO automatic_app_scans(
+            app, state, savings, signature, updated_at
+          ) VALUES (?, 'paused', 0, NULL, ?)
           ON CONFLICT(app) DO UPDATE SET
             state = 'paused',
             savings = 0,
+            signature = NULL,
             updated_at = excluded.updated_at
         `).run(app, updatedAt)
       } else {
@@ -2677,37 +2721,108 @@ class RegistryCore {
     return { acknowledged_signature: signature, updated_at: updatedAt }
   }
 
-  automaticAppResultSignature(sourceIds = []) {
-    const ids = [...new Set((sourceIds || []).filter((id) =>
-      typeof id === "string" && id))]
-    if (!ids.length) return { signature: null, savings: 0, files: 0 }
-    const digest = crypto.createHash("sha256")
-    let savings = 0
-    let files = 0
+  beginAutomaticPrecheck(app) {
+    if (typeof app !== "string" || !app) {
+      throw new Error("An app is required for an automatic check.")
+    }
+    this.database.prepare(
+      "DELETE FROM automatic_precheck_files WHERE app = ?"
+    ).run(app)
+    return { app }
+  }
+
+  stageAutomaticPrecheckFiles(app, entries = []) {
+    if (typeof app !== "string" || !app) {
+      throw new Error("An app is required for an automatic check.")
+    }
+    const insert = this.database.prepare(`
+      INSERT INTO automatic_precheck_files(app, path, size, dev, ino)
+      VALUES (@app, @path, @size, @dev, @ino)
+      ON CONFLICT(app, path) DO UPDATE SET
+        size = excluded.size,
+        dev = excluded.dev,
+        ino = excluded.ino
+    `)
+    let changes = 0
+    this.transaction(() => {
+      for (const entry of entries || []) {
+        if (!entry || typeof entry.path !== "string" || !entry.path) continue
+        changes += insert.run({
+          app,
+          path: path.resolve(entry.path),
+          size: Math.max(0, Number(entry.size) || 0),
+          dev: Number(entry.dev) || 0,
+          ino: Number(entry.ino) || 0
+        }).changes
+      }
+    })
+    return { changes }
+  }
+
+  automaticPrecheckResult(app) {
+    if (typeof app !== "string" || !app) {
+      throw new Error("An app is required for an automatic check.")
+    }
+    const differentPath = `
+      pinokio_path_key(peer.path) != pinokio_path_key(candidate.path)
+    `
+    const sameFile = `NOT (
+      candidate.ino != 0 AND peer.ino != 0 AND candidate.ino = peer.ino
+    )`
     const rows = this.database.prepare(`
-      SELECT path, hash, size
-      FROM files
-      WHERE source_id IN (${placeholders(ids)})
-        AND status = 'duplicate'
-        AND hash IS NOT NULL
-        AND unavailable_reason IS NOT 'stale'
-      ORDER BY path
-    `).iterate(...ids)
+      SELECT candidate.path, candidate.dev, candidate.size
+      FROM automatic_precheck_files candidate
+      WHERE candidate.app = ?
+        AND (
+          EXISTS (
+            SELECT 1 FROM automatic_precheck_files peer
+            WHERE peer.app = candidate.app
+              AND peer.dev = candidate.dev
+              AND peer.size = candidate.size
+              AND ${differentPath}
+              AND ${sameFile}
+          )
+          OR EXISTS (
+            SELECT 1 FROM files peer
+            WHERE peer.dev = candidate.dev
+              AND peer.size = candidate.size
+              AND peer.unavailable_reason IS NOT 'stale'
+              AND ${differentPath}
+              AND ${sameFile}
+          )
+          OR EXISTS (
+            SELECT 1 FROM anchors peer
+            WHERE peer.verified_at IS NOT NULL
+              AND peer.dev = candidate.dev
+              AND peer.size = candidate.size
+              AND ${differentPath}
+              AND ${sameFile}
+          )
+        )
+      ORDER BY pinokio_path_key(candidate.path), candidate.dev, candidate.size
+    `).iterate(app)
+    const digest = crypto.createHash("sha256")
+    let files = 0
     for (const row of rows) {
-      digest.update(row.path)
+      digest.update(canonicalPathKey(row.path))
       digest.update("\0")
-      digest.update(row.hash)
+      digest.update(String(row.dev))
       digest.update("\0")
       digest.update(String(row.size))
       digest.update("\n")
-      savings += Math.max(0, Number(row.size) || 0)
       files += 1
     }
     return {
       signature: files ? digest.digest("hex") : null,
-      savings,
       files
     }
+  }
+
+  abortAutomaticPrecheck(app) {
+    if (typeof app !== "string" || !app) return { changes: 0 }
+    return this.database.prepare(
+      "DELETE FROM automatic_precheck_files WHERE app = ?"
+    ).run(app)
   }
 
   removeAutomaticAppScanApp(app) {
@@ -2720,11 +2835,14 @@ class RegistryCore {
       changes += this.database.prepare(
         "DELETE FROM automatic_app_scan_settings WHERE app = ?"
       ).run(app).changes
+      changes += this.database.prepare(
+        "DELETE FROM automatic_precheck_files WHERE app = ?"
+      ).run(app).changes
     })
     return { changes }
   }
 
-  setAutomaticAppScanState(app, state = null, savings = 0, options = {}) {
+  setAutomaticAppScanState(app, state = null, options = {}) {
     if (typeof app !== "string" || !app) {
       throw new Error("An app is required for automatic scan state.")
     }
@@ -2736,6 +2854,14 @@ class RegistryCore {
     const acknowledgedSignature = updateAcknowledgement
       ? options.acknowledged_signature
       : null
+    const signature = state === "result" && options &&
+      typeof options.signature === "string"
+      ? options.signature
+      : null
+    if (state === "result" &&
+        (!signature || !/^[a-f0-9]{64}$/.test(signature))) {
+      throw new Error("Invalid automatic check result signature.")
+    }
     if (updateAcknowledgement && acknowledgedSignature !== null &&
         (typeof acknowledgedSignature !== "string" ||
           !/^[a-f0-9]{64}$/.test(acknowledgedSignature))) {
@@ -2750,13 +2876,20 @@ class RegistryCore {
         ).run(app).changes
       } else {
         changes += this.database.prepare(`
-          INSERT INTO automatic_app_scans(app, state, savings, updated_at)
-          VALUES (?, ?, ?, ?)
+          INSERT INTO automatic_app_scans(
+            app, state, savings, signature, updated_at
+          ) VALUES (?, ?, 0, ?, ?)
           ON CONFLICT(app) DO UPDATE SET
             state = excluded.state,
             savings = excluded.savings,
+            signature = excluded.signature,
             updated_at = excluded.updated_at
-        `).run(app, state, Math.max(0, Number(savings) || 0), updatedAt).changes
+        `).run(
+          app,
+          state,
+          signature,
+          updatedAt
+        ).changes
       }
       if (updateAcknowledgement) {
         this.database.prepare(`

@@ -12,10 +12,10 @@ const waitFor = async (condition) => {
     if (condition()) return
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
-  throw new Error("Timed out waiting for the automatic scan tray.")
+  throw new Error("Timed out waiting for the automatic check tray.")
 }
 
-test("the shared layout renders and reviews automatic app-scan notices", async () => {
+test("the shared layout renders and reviews automatic possible-match notices", async () => {
   const template = await fs.promises.readFile(
     path.join(root, "server", "views", "layout.ejs"), "utf8")
   const script = await fs.promises.readFile(
@@ -75,7 +75,6 @@ test("the shared layout renders and reviews automatic app-scan notices", async (
       rows: [{
         app: "ComfyUI",
         state: "result",
-        savings: 12 * 1024 * 1024 * 1024,
         notice_id: "result:1:result-a"
       }]
     })
@@ -88,9 +87,8 @@ test("the shared layout renders and reviews automatic app-scan notices", async (
   assert.equal(tray.querySelector(
     ".vault-auto-scan-app").textContent, "ComfyUI")
   assert.equal(tray.querySelector(
-    ".vault-auto-scan-value").textContent, "12 GB")
-  assert.equal(tray.querySelector(
-    ".vault-auto-scan-detail").textContent, "can be saved")
+    ".vault-auto-scan-detail").textContent, "may have duplicate files")
+  assert.equal(tray.querySelector(".vault-auto-scan-value"), null)
   assert.equal(tray.querySelector(
     ".vault-auto-scan-action").textContent, "Review")
   assert.ok(tray.querySelector(".vault-auto-scan-close"))
@@ -104,6 +102,8 @@ test("the shared layout renders and reviews automatic app-scan notices", async (
       "/v/ComfyUI?pinokio_home_select=%7B%22selector%22%3A%22%23save-space-tab%22%7D"
   })
   assert.equal(tray.hidden, true)
+  assert.equal(dom.window.sessionStorage.getItem(
+    "pinokio:vault:auto-review:ComfyUI"), "1")
   const actionRequest = requests.find((request) =>
     request && request.url === "/vault/action")
   assert.deepEqual(JSON.parse(actionRequest.options.body), {
@@ -113,6 +113,10 @@ test("the shared layout renders and reviews automatic app-scan notices", async (
   })
   assert.equal(requests.some((request) =>
     request && request.url === "/info/vault/automatic-scans"), false)
+  assert.match(script, /window\.location\.assign\(/)
+  assert.ok(script.indexOf("if (!openAutomaticReview(row.app, result.href))") <
+    script.indexOf("removeRow(item);", script.indexOf(
+      "if (!openAutomaticReview(row.app, result.href))")))
 
   dom.window.close()
 })
@@ -182,9 +186,11 @@ test("checking notices expose settings, Pause, and dismissal", async () => {
   assert.equal(tray.querySelector(
     ".vault-auto-scan-app").textContent, "ComfyUI")
   assert.equal(tray.querySelector(
-    ".vault-auto-scan-status").textContent, "Checking for duplicate files…")
+    ".vault-auto-scan-status").textContent,
+  "Checking for possible duplicate files…")
   assert.equal(tray.querySelector(
-    ".vault-auto-scan-settings").textContent, "Auto-scan settings")
+    ".vault-auto-scan-settings").textContent,
+  "Automatic check settings")
   assert.equal(tray.querySelector(
     ".vault-auto-scan-action").textContent, "Pause")
 
@@ -253,7 +259,7 @@ test("the shared layout does not initialize automatic notices when Vault is disa
   dom.window.close()
 })
 
-test("the automatic scan event stream handles disconnects before initialization", async () => {
+test("the automatic check event stream handles disconnects before initialization", async () => {
   const source = await fs.promises.readFile(
     path.join(root, "server", "index.js"), "utf8")
   const routeStart = source.indexOf(
@@ -267,4 +273,20 @@ test("the automatic scan event stream handles disconnects before initialization"
     route.indexOf("await vault.automaticScanStatus()"))
   assert.ok(route.indexOf("if (disconnected()) return") <
     route.indexOf("vault.automaticScans.subscribe(send)"))
+})
+
+test("the app workspace focuses Scan this app without starting it after Review", async () => {
+  const source = await fs.promises.readFile(
+    path.join(root, "server", "public", "vault.js"), "utf8")
+
+  assert.match(source,
+    /pinokio:vault:auto-review:\$\{encodeURIComponent\(APP_NAME\)\}/)
+  assert.match(source,
+    /state\.automaticReviewRequested && !activeScan &&\s*!scanButton\.disabled/)
+  assert.match(source,
+    /scanActive\(state\.data && state\.data\.scan\)/)
+  assert.match(source, /state\.automaticReviewRequested = false/)
+  assert.match(source, /scanButton\.focus\(\)/)
+  assert.doesNotMatch(source,
+    /automaticReviewRequested[\s\S]{0,200}(post\(|btn-scan\.click)/)
 })

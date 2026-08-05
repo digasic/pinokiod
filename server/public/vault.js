@@ -80,7 +80,7 @@ const COPY = {
   save_space: "Disk Saver",
   automatic: "Automatic",
   manual: "Manual",
-  automatic_description: "Scan after this app stops",
+  automatic_description: "Check after this app stops",
   manual_description: "Scan only when requested",
   storage_saved_headline: "{size} saved by deduplicating",
   storage_unique_headline: "{size} unique to this app",
@@ -351,11 +351,24 @@ const externalPromptKey = "pinokio:vault:external-prompt-dismissed"
 const automaticSettingsKey = APP_NAME
   ? `pinokio:vault:auto-settings:${encodeURIComponent(APP_NAME)}`
   : null
+const automaticReviewKey = APP_NAME
+  ? `pinokio:vault:auto-review:${encodeURIComponent(APP_NAME)}`
+  : null
 const consumeAutomaticSettingsRequest = () => {
   if (!automaticSettingsKey) return false
   try {
     const requested = sessionStorage.getItem(automaticSettingsKey) === "1"
     if (requested) sessionStorage.removeItem(automaticSettingsKey)
+    return requested
+  } catch (error) {
+    return false
+  }
+}
+const consumeAutomaticReviewRequest = () => {
+  if (!automaticReviewKey) return false
+  try {
+    const requested = sessionStorage.getItem(automaticReviewKey) === "1"
+    if (requested) sessionStorage.removeItem(automaticReviewKey)
     return requested
   } catch (error) {
     return false
@@ -397,6 +410,7 @@ const state = {
   automaticMode: null,
   automaticModeUpdating: false,
   automaticModeMenuRequested: consumeAutomaticSettingsRequest(),
+  automaticReviewRequested: consumeAutomaticReviewRequest(),
   scanCancelRequested: false,
   folderDiscoveryOpen: false,
   folderDiscoverySubmitting: false,
@@ -2105,7 +2119,7 @@ const automaticModeMarkup = () => {
   const automatic = state.automaticMode === "automatic"
   const label = automatic ? COPY.automatic : COPY.manual
   return `<details class="vault-auto-mode ${automatic ? "automatic" : "manual"}" id="vault-auto-mode">
-    <summary aria-label="Automatic scanning: ${attr(label)}">
+    <summary aria-label="Automatic checking: ${attr(label)}">
       <span class="vault-auto-mode-dot" aria-hidden="true"></span>
       <span>${esc(label)}</span>
       <i class="fa-solid fa-chevron-down" aria-hidden="true"></i>
@@ -2224,6 +2238,17 @@ const renderOverview = () => {
   const firstGlobalScan = !IS_APP_MODE && !last && !activeScan
   scanButton.classList.toggle("primary", firstGlobalScan)
   scanButton.disabled = busyElsewhere || state.scanCancelRequested
+  if (state.automaticReviewRequested && !activeScan &&
+      !scanButton.disabled) {
+    requestAnimationFrame(() => {
+      if (!state.automaticReviewRequested || !scanButton.isConnected ||
+          scanButton.disabled || scanActive(state.data && state.data.scan)) {
+        return
+      }
+      state.automaticReviewRequested = false
+      scanButton.focus()
+    })
+  }
   const candidateSizeSelect = el("vault-candidate-size")
   if (candidateSizeSelect) candidateSizeSelect.disabled = activeScan
   const scanControl = el("vault-scan-control")

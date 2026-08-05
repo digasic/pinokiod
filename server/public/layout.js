@@ -869,24 +869,11 @@
 
     let eventSource = null;
 
-    function formatBytes(value) {
-      const bytes = Math.max(0, Number(value) || 0);
-      const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-      let amount = bytes;
-      let unit = 0;
-      while (amount >= 1024 && unit < units.length - 1) {
-        amount /= 1024;
-        unit += 1;
-      }
-      const digits = amount >= 10 || unit === 0 ? 0 : 1;
-      return `${amount.toFixed(digits)} ${units[unit]}`;
-    }
-
     function statusText(row) {
       if (row.state === 'paused') {
-        return 'Automatic scans are off';
+        return 'Automatic checks are off';
       }
-      return 'Checking for duplicate files…';
+      return 'Checking for possible duplicate files…';
     }
 
     function actionFor(row) {
@@ -929,6 +916,10 @@
       return `pinokio:vault:auto-settings:${encodeURIComponent(app)}`;
     }
 
+    function automaticReviewKey(app) {
+      return `pinokio:vault:auto-review:${encodeURIComponent(app)}`;
+    }
+
     function openAutomaticSettings(app, href) {
       const storageKey = automaticSettingsKey(app);
       try {
@@ -953,6 +944,24 @@
         return true;
       }
       const opened = navigateActiveLeaf(href);
+      if (!opened) {
+        try { sessionStorage.removeItem(storageKey); } catch (_) {}
+      }
+      return opened;
+    }
+
+    function openAutomaticReview(app, href) {
+      const storageKey = automaticReviewKey(app);
+      try {
+        sessionStorage.setItem(storageKey, '1');
+      } catch (_) {}
+      let opened = navigateActiveLeaf(href);
+      if (!opened) {
+        try {
+          window.location.assign(new URL(href, window.location.href).href);
+          opened = true;
+        } catch (_) {}
+      }
       if (!opened) {
         try { sessionStorage.removeItem(storageKey); } catch (_) {}
       }
@@ -990,7 +999,7 @@
             }
             removeRow(item);
           } catch (error) {
-            console.warn('[Disk Saver] Automatic scan dismissal failed', error);
+            console.warn('[Disk Saver] Automatic check dismissal failed', error);
             close.disabled = false;
           }
         });
@@ -1012,13 +1021,10 @@
         const status = document.createElement('span');
         status.className = 'vault-auto-scan-status';
         if (row.state === 'result') {
-          const value = document.createElement('strong');
-          value.className = 'vault-auto-scan-value';
-          value.textContent = formatBytes(row.savings);
           const detail = document.createElement('span');
           detail.className = 'vault-auto-scan-detail';
-          detail.textContent = 'can be saved';
-          status.append(value, detail);
+          detail.textContent = 'may have duplicate files';
+          status.append(detail);
         } else {
           status.textContent = statusText(row);
         }
@@ -1030,7 +1036,7 @@
           const settings = document.createElement('button');
           settings.type = 'button';
           settings.className = 'vault-auto-scan-settings';
-          settings.textContent = 'Auto-scan settings';
+          settings.textContent = 'Automatic check settings';
           settings.addEventListener('click', async () => {
             settings.disabled = true;
             try {
@@ -1040,7 +1046,7 @@
                 throw new Error('The app page is unavailable.');
               }
             } catch (error) {
-              console.warn('[Disk Saver] Automatic scan settings failed', error);
+              console.warn('[Disk Saver] Automatic check settings failed', error);
             } finally {
               if (settings.isConnected) settings.disabled = false;
             }
@@ -1064,13 +1070,15 @@
               return;
             }
             if (action.action === 'automatic_review' && result.href) {
+              if (!openAutomaticReview(row.app, result.href)) {
+                throw new Error('The app page could not be opened.');
+              }
               removeRow(item);
-              navigateActiveLeaf(result.href);
             } else {
               await loadState();
             }
           } catch (error) {
-            console.warn('[Disk Saver] Automatic scan action failed', error);
+            console.warn('[Disk Saver] Automatic check action failed', error);
             button.disabled = false;
           }
         });
@@ -1099,7 +1107,7 @@
         }
         render(await response.json());
       } catch (error) {
-        console.debug('[Disk Saver] Automatic scan state unavailable', error);
+        console.debug('[Disk Saver] Automatic check state unavailable', error);
       }
     }
 
@@ -1113,7 +1121,7 @@
         try {
           render(JSON.parse(event.data));
         } catch (error) {
-          console.debug('[Disk Saver] Invalid automatic scan state', error);
+          console.debug('[Disk Saver] Invalid automatic check state', error);
         }
       };
       eventSource.onerror = () => {
