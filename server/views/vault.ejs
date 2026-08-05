@@ -14,7 +14,7 @@
 <% } %>
 <link href="/vault.css" rel="stylesheet"/>
 </head>
-<body class='<%=theme%> main-sidebar-page task-launcher-page task-page vault-page' data-platform="<%=platform%>" data-agent="<%=agent%>" data-vault-mode="global">
+<body class='<%=theme%> main-sidebar-page task-launcher-page task-page vault-page' data-platform="<%=platform%>" data-agent="<%=agent%>" data-vault-mode="global" data-vault-home="<%= typeof systemHome === 'string' ? systemHome : '' %>">
 <%- include('partials/app_navheader', { agent }) %>
 <main>
   <div class='task-container'>

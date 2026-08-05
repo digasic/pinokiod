@@ -857,6 +857,7 @@ body[data-vault-mode="global"] .vault-explorer {
   background: var(--task-panel);
   box-shadow: 0 22px 70px color-mix(in srgb, var(--task-text) 24%, transparent);
 }
+.vault-find-dialog.choosing-root { width: min(460px, 100%); }
 .vault-find-dialog:focus { outline: none; }
 .vault-find-header {
   display: flex;
@@ -879,6 +880,74 @@ body[data-vault-mode="global"] .vault-explorer {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
+}
+.vault-find-chooser {
+  display: grid;
+  gap: 0;
+}
+.vault-find-choice {
+  display: grid;
+  width: 100%;
+  min-height: 68px;
+  grid-template-columns: 18px minmax(0, 1fr) 10px;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 18px;
+  border: 0;
+  border-radius: 0;
+  background: var(--task-panel);
+  color: var(--task-text);
+  font-weight: inherit;
+  text-align: left;
+  white-space: normal;
+}
+.vault-find-choice + .vault-find-choice {
+  border-top: 1px solid var(--task-border);
+}
+.vault-find-choice.recommended {
+  background: color-mix(in srgb, var(--vault-auto-accent) 6%, var(--task-panel));
+}
+.vault-find-choice:hover {
+  background: var(--task-soft);
+}
+.vault-find-choice.recommended:hover {
+  background: color-mix(in srgb, var(--vault-auto-accent) 10%, var(--task-panel));
+}
+.vault-find-choice:focus-visible {
+  outline: 0;
+  box-shadow: inset 3px 0 var(--task-accent);
+}
+.vault-find-choice.recommended:disabled { background: var(--task-panel); }
+.vault-find-choice > i {
+  color: var(--task-muted);
+  font-size: 12px;
+  text-align: center;
+}
+.vault-find-choice.recommended > i {
+  color: color-mix(in srgb, var(--vault-auto-accent) 72%, var(--task-text));
+}
+.vault-find-choice > .vault-find-choice-chevron {
+  justify-self: end;
+  font-size: 9px;
+}
+.vault-find-choice-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+.vault-find-choice-copy strong {
+  font-size: 12.5px;
+  font-weight: 650;
+  line-height: 1.2;
+}
+.vault-find-choice-path {
+  overflow: hidden;
+  color: var(--task-muted);
+  font-size: 10.5px;
+  font-weight: 450;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .vault-find-progress,
 .vault-find-empty,

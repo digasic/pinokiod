@@ -4102,6 +4102,48 @@ body.dark .disk-usage {
   flex: 0 0 auto;
   min-width: 0;
 }
+.appcanvas.vertical > aside .menu-actions #save-space-tab {
+  width: 100%;
+  max-width: none;
+  box-sizing: border-box;
+}
+.app-vault-mode {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: rgba(71, 85, 105, 0.82);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0;
+  line-height: 1.2;
+  text-align: right;
+  white-space: nowrap;
+}
+.app-vault-mode[data-mode="automatic"] {
+  color: #b45309;
+}
+body.dark .app-vault-mode {
+  color: rgba(203, 213, 225, 0.74);
+}
+body.dark .app-vault-mode[data-mode="automatic"] {
+  color: #e0a54b;
+}
+.app-vault-mode-chevron,
+.app-autolaunch-chevron {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 10px;
+  flex: 0 0 10px;
+  margin-right: 0;
+  padding: 0;
+  color: var(--pinokio-sidebar-action-muted);
+  font-size: 10px;
+  line-height: 1;
+  box-sizing: border-box;
+}
+.appcanvas > aside .menu-actions .header-item .tab .app-vault-mode-chevron {
+  margin-right: 0;
+}
 .app-autolaunch-row {
   appearance: none;
   display: flex;
@@ -4171,18 +4213,13 @@ body.dark .disk-usage {
 .app-autolaunch-status {
   flex: 0 0 auto;
   color: var(--pinokio-sidebar-action-muted);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: 0;
   white-space: nowrap;
 }
 .app-autolaunch-row[data-enabled="true"] .app-autolaunch-status {
   color: rgba(22, 101, 52, 0.95);
-}
-.app-autolaunch-chevron {
-  flex: 0 0 auto;
-  color: var(--pinokio-sidebar-action-muted);
-  font-size: 10px;
 }
 body.dark .app-autolaunch-row {
   background: transparent;
@@ -4193,6 +4230,7 @@ body.dark .app-autolaunch.open .app-autolaunch-row {
   background: var(--pinokio-sidebar-tab-hover);
   color: var(--pinokio-sidebar-tab-active-color);
 }
+body.dark .app-vault-mode-chevron,
 body.dark .app-autolaunch-status,
 body.dark .app-autolaunch-chevron {
   color: var(--pinokio-sidebar-action-muted);
@@ -8163,6 +8201,7 @@ body.dark .pinokio-custom-terminal-header {
 <script src="/tippy-bundle.umd.min.js"></script>
 <script src="/tab-link-popover.js"></script>
 <script src="/browser-popout-surface.js"></script>
+<script src="/app-vault-mode.js" defer></script>
 <script>
 (function() {
   try {
@@ -8461,11 +8500,16 @@ body.dark .pinokio-custom-terminal-header {
           </div>
         </button>
         <% if (typeof vault_enabled !== 'undefined' && vault_enabled) { %>
-        <a id='save-space-tab' data-mode="refresh" target="app-vault" href="/vault/app/<%=encodeURIComponent(name)%>" class="btn header-item frame-link" data-index="vault" data-static="retain" data-tab-link-popover="false">
+        <% const vaultAutomaticMode = typeof vault_automatic_mode === 'string' && vault_automatic_mode === 'manual' ? 'manual' : 'automatic' %>
+        <a id='save-space-tab' data-mode="refresh" target="app-vault" href="/vault/app/<%=encodeURIComponent(name)%>" class="btn header-item frame-link" data-index="vault" data-static="retain" data-tab-link-popover="false" aria-label="Disk Saver — <%=vaultAutomaticMode === 'automatic' ? 'Automatic' : 'Manual'%> checking">
           <div class='tab'>
             <i class="fa-solid fa-hard-drive menu-action-leading-icon"></i>
             <div class='display'>Disk Saver</div>
             <div class='flexible'></div>
+            <span class="app-vault-mode" data-app-vault-mode data-app="<%=name%>" data-mode="<%=vaultAutomaticMode%>" aria-hidden="true">
+              <span data-app-vault-mode-label><%=vaultAutomaticMode === 'automatic' ? 'Auto' : 'Manual'%></span>
+            </span>
+            <i class="fa-solid fa-angle-down app-vault-mode-chevron" aria-hidden="true"></i>
           </div>
         </a>
         <% } %>
@@ -8474,7 +8518,7 @@ body.dark .pinokio-custom-terminal-header {
             <button type="button" class="app-autolaunch-row" data-app-autolaunch-button data-enabled="<%= autolaunch_app.autolaunch_enabled ? 'true' : 'false' %>" aria-haspopup="dialog" aria-expanded="false">
               <span class="app-autolaunch-label"><i class="fa-solid fa-power-off"></i><span>Autolaunch</span></span>
               <span class="app-autolaunch-spacer" aria-hidden="true"></span>
-              <span class="app-autolaunch-status" data-app-autolaunch-status><%= autolaunch_app.autolaunch_enabled ? 'ON' : 'OFF' %></span>
+              <span class="app-autolaunch-status" data-app-autolaunch-status><%= autolaunch_app.autolaunch_enabled ? 'On' : 'Off' %></span>
               <i class="fa-solid fa-angle-down app-autolaunch-chevron" aria-hidden="true"></i>
             </button>
             <div class="app-autolaunch-modal hidden" data-app-autolaunch-modal role="dialog" aria-modal="true" aria-label="Autolaunch">

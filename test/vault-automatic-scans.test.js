@@ -409,12 +409,29 @@ describe("automatic app checks", () => {
       await handle.close()
     }
     const vault = await makeVault(home)
+    const broadcasts = []
+    const unsubscribe = vault.automaticScans.subscribe((snapshot) => {
+      broadcasts.push(snapshot)
+    })
 
     vault.automaticScans.queueApp("threshold-app")
     await waitFor(() => !vault.automaticScans.active &&
       !vault.automaticScans.entries.has("threshold-app"))
 
     assert.deepEqual(vault.automaticScans.snapshot().rows, [])
+    assert.deepEqual(broadcasts.find((snapshot) => snapshot.completion)
+      ?.completion, {
+      app: "threshold-app",
+      outcome: "no_possible_duplicates"
+    })
+    assert.equal("completion" in vault.automaticScans.snapshot(), false)
+    let restoredSnapshot = null
+    const unsubscribeRestored = vault.automaticScans.subscribe((snapshot) => {
+      restoredSnapshot = snapshot
+    })
+    assert.equal("completion" in restoredSnapshot, false)
+    unsubscribeRestored()
+    unsubscribe()
     assert.equal(await vault.registry.scanFor("app:threshold-app"), null)
     await close(vault)
   })

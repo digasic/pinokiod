@@ -18,7 +18,12 @@ const COPY = {
   find_folders: "Find more savings",
   find_folders_title: "Find more savings",
   suggested_locations: "Suggested locations",
+  search_home_folder: "Home folder",
+  choose_another_folder: "Another folder…",
+  choose_another_folder_hint: "Choose a folder or drive",
   find_folders_picker: "Choose where to search",
+  home_folder_unavailable: "The home folder is unavailable.",
+  find_already_running: "Another folder search is already running.",
   find_requires_scan: "Run a global scan before searching for more savings.",
   find_wait_for_scan: "Wait for the current scan to finish.",
   find_waiting: "Waiting to search",
@@ -284,6 +289,7 @@ const COPY = {
 const SCOPE_ID = document.body.dataset.vaultScope || null
 const IS_APP_MODE = document.body.dataset.vaultMode === "app" && !!SCOPE_ID
 const APP_NAME = IS_APP_MODE ? document.body.dataset.vaultApp || "" : ""
+const HOME_PATH = document.body.dataset.vaultHome || ""
 const MAX_BULK_DEDUPLICATE_FILES = 500
 const MAX_BULK_SEPARATE_FILES = 500
 const DUPLICATE_CHILD_PAGE_SIZE = 100
@@ -413,6 +419,8 @@ const state = {
   automaticReviewRequested: consumeAutomaticReviewRequest(),
   scanCancelRequested: false,
   folderDiscoveryOpen: false,
+  folderDiscoveryChoosingRoot: false,
+  folderDiscoveryStarting: false,
   folderDiscoverySubmitting: false,
   folderDiscoveryPage: 0,
   folderDiscoveryCancelRequested: false,
@@ -1103,6 +1111,8 @@ const folderDiscoveryFocusToken = () => {
     "data-search-somewhere-else",
     "data-close-find-folders",
     "data-cancel-find-folders",
+    "data-find-home-folder",
+    "data-find-other-folder",
   ]
   for (const attribute of attributes) {
     if (active.hasAttribute && active.hasAttribute(attribute)) {
@@ -1123,13 +1133,14 @@ const restoreFolderDiscoveryFocus = (token) => {
 const setFolderDiscoveryBody = (body, html, focusToken) => {
   body.innerHTML = html
   const dialog = body.closest(".vault-find-dialog")
+  const busy = state.folderDiscoverySubmitting ||
+    state.folderDiscoveryStarting
   if (dialog) {
-    dialog.setAttribute("aria-busy",
-      String(state.folderDiscoverySubmitting))
+    dialog.setAttribute("aria-busy", String(busy))
     const close = dialog.querySelector(".vault-find-close")
     if (close) close.disabled = state.folderDiscoverySubmitting
   }
-  if (state.folderDiscoverySubmitting) {
+  if (busy) {
     for (const control of body.querySelectorAll(
       "button, input, select, summary, textarea"
     )) control.disabled = true
@@ -1140,7 +1151,13 @@ const setFolderDiscoveryBody = (body, html, focusToken) => {
 const focusFolderDiscoveryDialog = () => {
   const dialog = document.querySelector(".vault-find-dialog")
   if (dialog && state.folderDiscoveryOpen) {
-    dialog.focus({ preventScroll: true })
+    const target = state.folderDiscoveryChoosingRoot
+      ? dialog.querySelector(
+        "[data-find-home-folder]:not([disabled]), " +
+        "[data-find-other-folder]:not([disabled])"
+      )
+      : dialog
+    ;(target || dialog).focus({ preventScroll: true })
   }
 }
 
@@ -1158,6 +1175,10 @@ const renderFolderDiscovery = () => {
   const overlay = el("vault-find-overlay")
   const body = el("vault-find-body")
   if (!overlay || !body || IS_APP_MODE) return
+  const choosingRoot = state.folderDiscoveryChoosingRoot ||
+    state.folderDiscoveryStarting
+  const dialog = body.closest(".vault-find-dialog")
+  if (dialog) dialog.classList.toggle("choosing-root", choosingRoot)
   overlay.hidden = !state.folderDiscoveryOpen
   if (!state.folderDiscoveryOpen || !state.data) return
   const focusToken = folderDiscoveryFocusToken()
@@ -1165,7 +1186,9 @@ const renderFolderDiscovery = () => {
   const discovery = state.data.folder_discovery || { phase: "idle" }
   const title = el("vault-find-title")
   if (title) {
-    title.textContent = folderDiscoveryComplete(discovery)
+    title.textContent = choosingRoot
+      ? COPY.find_folders_picker
+      : folderDiscoveryComplete(discovery)
       ? COPY.suggested_locations
       : COPY.find_folders_title
   }
@@ -1173,6 +1196,22 @@ const renderFolderDiscovery = () => {
   const localErrorBanner = state.folderDiscoveryLocalError
     ? `<div class="vault-find-partial" role="alert"><i class="fa-solid fa-triangle-exclamation" aria-hidden="true"></i><span>${esc(state.folderDiscoveryLocalError)}</span></div>`
     : ""
+  if (choosingRoot) {
+    const homeLabel = HOME_PATH || COPY.home_folder_unavailable
+    setFolderDiscoveryBody(body, `${localErrorBanner}<div class="vault-find-chooser">
+      <button class="vault-button vault-find-choice recommended" type="button" data-find-home-folder title="${attr(homeLabel)}" ${HOME_PATH ? "" : "disabled"}>
+        <i class="fa-solid fa-house" aria-hidden="true"></i>
+        <span class="vault-find-choice-copy"><strong>${esc(COPY.search_home_folder)}</strong><span class="vault-find-choice-path">${esc(homeLabel)}</span></span>
+        <i class="fa-solid fa-chevron-right vault-find-choice-chevron" aria-hidden="true"></i>
+      </button>
+      <button class="vault-button vault-find-choice" type="button" data-find-other-folder>
+        <i class="fa-solid fa-folder-open" aria-hidden="true"></i>
+        <span class="vault-find-choice-copy"><strong>${esc(COPY.choose_another_folder)}</strong><span class="vault-find-choice-path">${esc(COPY.choose_another_folder_hint)}</span></span>
+        <i class="fa-solid fa-chevron-right vault-find-choice-chevron" aria-hidden="true"></i>
+      </button>
+    </div>`, focusToken)
+    return
+  }
   if (active) {
     const labels = {
       queued: COPY.find_waiting,
@@ -2235,8 +2274,8 @@ const renderOverview = () => {
     : activeScan
       ? `<i class="fa-solid fa-circle-notch fa-spin"></i>${esc(COPY.scanning)}`
     : `<i class="fa-solid fa-rotate"></i>${esc(idleScanLabel)}`
-  const firstGlobalScan = !IS_APP_MODE && !last && !activeScan
-  scanButton.classList.toggle("primary", firstGlobalScan)
+  const firstScan = !last && !activeScan
+  scanButton.classList.toggle("primary", firstScan)
   scanButton.disabled = busyElsewhere || state.scanCancelRequested
   if (state.automaticReviewRequested && !activeScan &&
       !scanButton.disabled) {
@@ -2257,7 +2296,7 @@ const renderOverview = () => {
   if (scanSizeMenu) {
     const scanSizeTrigger = scanSizeMenu.querySelector("summary")
     if (scanSizeTrigger) {
-      scanSizeTrigger.classList.toggle("primary", firstGlobalScan)
+      scanSizeTrigger.classList.toggle("primary", firstScan)
     }
     scanSizeMenu.hidden = activeScan
     if (activeScan) scanSizeMenu.open = false
@@ -2618,6 +2657,12 @@ const duplicateGroupSelectionPaths = async (hash) =>
   fetchJson(duplicateGroupUrl(hash, { select: true }))
 const duplicateGroupPageSelectionItems = async () =>
   fetchJson(duplicateGroupPageSelectionUrl())
+const settleFolderDiscoveryStart = () => {
+  if (!state.folderDiscoveryStarting ||
+      state.folderDiscoveryChoosingRoot) return
+  state.folderDiscoveryStarting = false
+  state.folderDiscoveryLocalError = null
+}
 const applyFullData = (data) => {
   const scanning = scanActive(data.scan)
   const findingFolders = folderDiscoveryActive(data.folder_discovery)
@@ -2633,6 +2678,7 @@ const applyFullData = (data) => {
   const unreviewed = !scanning && data.last_scan &&
     reviewedScan() !== String(data.last_scan.ts) &&
     (shareableDuplicateCount > 0 || data.last_scan.partial)
+  settleFolderDiscoveryStart()
   state.data = data
   const fileAction = serverFileAction(data.file_action)
   if (fileAction) state.actionProgress = fileAction
@@ -2684,6 +2730,7 @@ const refresh = async (forceFull = false) => {
       state.data.scan = progress.scan
       state.data.last_scan = progress.last_scan
       state.data.folder_discovery = progress.folder_discovery
+      settleFolderDiscoveryStart()
       const fileAction = serverFileAction(progress.file_action)
       if (fileAction) state.actionProgress = fileAction
       else if (!state.actionRequest) state.actionProgress = null
@@ -2707,11 +2754,13 @@ const refresh = async (forceFull = false) => {
       if (sequence !== refreshSequence) return
       if (applyFullData(data) || state.scanRequested) delay = 1500
     }
+    return true
   } catch (error) {
     if (sequence !== refreshSequence) return
     state.feedback = { error: true, message: error && error.message ? error.message : String(error) }
     renderFeedback()
     delay = 5000
+    return false
   } finally {
     if (sequence !== refreshSequence) return
     clearTimeout(window.__vaultRefresh)
@@ -2980,7 +3029,47 @@ const chooseExternalFolder = (title = COPY.add_external_folder) => new Promise((
   }).then(() => finish(null)).catch(fail)
 })
 
-const beginFolderDiscovery = async (opener = null) => {
+const startFolderDiscovery = async (folderPath) => {
+  if (!folderPath || state.folderDiscoveryStarting) return
+  state.folderDiscoveryStarting = true
+  state.folderDiscoveryLocalError = null
+  renderFolderDiscovery()
+  try {
+    resetFolderDiscoveryChoices()
+    const result = await post({ action: "find_folders", path: folderPath })
+    if (result.error) throw new Error(result.error)
+    if (!result.started && !result.already_running) {
+      throw new Error(COPY.action_not_completed)
+    }
+    state.folderDiscoveryChoosingRoot = false
+    state.folderDiscoveryLocalError = null
+    state.folderDiscoveryPage = 0
+    state.folderDiscoveryCancelRequested = false
+    const refreshed = await refresh(true)
+    if (result.already_running && !state.folderDiscoveryStarting) {
+      state.folderDiscoveryLocalError = COPY.find_already_running
+      renderFolderDiscovery()
+    } else if (!refreshed && state.folderDiscoveryStarting &&
+        state.folderDiscoveryOpen) {
+      state.folderDiscoveryLocalError = state.feedback &&
+        state.feedback.error
+        ? state.feedback.message
+        : COPY.action_not_completed
+      renderFolderDiscovery()
+    }
+    focusFolderDiscoveryDialog()
+  } catch (error) {
+    state.folderDiscoveryStarting = false
+    state.folderDiscoveryChoosingRoot = true
+    state.folderDiscoveryLocalError = error && error.message
+      ? error.message
+      : String(error)
+    renderFolderDiscovery()
+    focusFolderDiscoveryDialog()
+  }
+}
+
+const beginFolderDiscovery = (opener = null) => {
   if (opener && typeof opener.focus === "function") {
     state.folderDiscoveryReturnFocus = opener
   }
@@ -2989,9 +3078,11 @@ const beginFolderDiscovery = async (opener = null) => {
     if (target && target.isConnected) target.focus({ preventScroll: true })
     state.folderDiscoveryReturnFocus = null
   }
-  state.folderDiscoveryLocalError = null
-  state.feedback = null
-  renderFeedback()
+  if (!state.folderDiscoveryStarting) {
+    state.folderDiscoveryLocalError = null
+    state.feedback = null
+    renderFeedback()
+  }
   if (!(state.data && state.data.last_scan && state.data.last_scan.ts)) {
     state.feedback = { error: true, message: COPY.find_requires_scan }
     renderFeedback()
@@ -3004,33 +3095,14 @@ const beginFolderDiscovery = async (opener = null) => {
     returnToOpener()
     return
   }
-  try {
-    const folderPath = await chooseExternalFolder(COPY.find_folders_picker)
-    if (!folderPath) {
-      returnToOpener()
-      return
-    }
-    resetFolderDiscoveryChoices()
-    const result = await post({ action: "find_folders", path: folderPath })
-    if (result.error) {
-      state.feedback = { error: true, message: result.error }
-      renderFeedback()
-      returnToOpener()
-      return
-    }
-    state.folderDiscoveryOpen = true
-    state.folderDiscoveryPage = 0
-    state.folderDiscoveryCancelRequested = false
-    await refresh(true)
-    focusFolderDiscoveryDialog()
-  } catch (error) {
-    state.feedback = {
-      error: true,
-      message: error && error.message ? error.message : String(error)
-    }
-    renderFeedback()
-    returnToOpener()
+  state.folderDiscoveryOpen = true
+  if (!state.folderDiscoveryStarting) {
+    state.folderDiscoveryChoosingRoot = true
   }
+  state.folderDiscoveryPage = 0
+  state.folderDiscoveryCancelRequested = false
+  renderFolderDiscovery()
+  focusFolderDiscoveryDialog()
 }
 
 const closeAddMenu = () => {
@@ -3097,10 +3169,42 @@ document.addEventListener("click", async (event) => {
     closeAddMenu()
     state.folderDiscoveryLocalError = null
     state.folderDiscoveryPage = 0
-    await beginFolderDiscovery(opener)
+    beginFolderDiscovery(opener)
+    return
+  }
+  if (target.hasAttribute("data-find-home-folder")) {
+    await startFolderDiscovery(HOME_PATH)
+    return
+  }
+  if (target.hasAttribute("data-find-other-folder")) {
+    target.disabled = true
+    try {
+      const folderPath = await chooseExternalFolder(
+        COPY.find_folders_picker)
+      if (folderPath) {
+        await startFolderDiscovery(folderPath)
+      } else if (state.folderDiscoveryOpen &&
+          state.folderDiscoveryChoosingRoot) {
+        target.disabled = false
+        target.focus({ preventScroll: true })
+      }
+    } catch (error) {
+      state.folderDiscoveryLocalError = error && error.message
+        ? error.message
+        : String(error)
+      renderFolderDiscovery()
+      focusFolderDiscoveryDialog()
+    } finally {
+      if (target.isConnected) target.disabled = false
+    }
     return
   }
   if (target.hasAttribute("data-close-find-folders")) {
+    if (state.folderDiscoveryChoosingRoot ||
+        state.folderDiscoveryStarting) {
+      closeFolderDiscoveryModal()
+      return
+    }
     if (folderDiscoveryActive(
       state.data && state.data.folder_discovery
     )) {
@@ -3164,7 +3268,7 @@ document.addEventListener("click", async (event) => {
       state.folderDiscoveryLocalError = null
       closeFolderDiscoveryModal(false)
       await refresh(true)
-      await beginFolderDiscovery()
+      beginFolderDiscovery()
     } catch (error) {
       state.folderDiscoveryLocalError = error && error.message
         ? error.message

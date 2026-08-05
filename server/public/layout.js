@@ -866,8 +866,16 @@
         <circle cx="10" cy="10" r="7.5"></circle>
         <path d="M8 7.25v5.5M12 7.25v5.5"></path>
       </svg>`;
+    const COMPLETE_ICON = `
+      <svg viewBox="0 0 20 20" aria-hidden="true">
+        <circle cx="10" cy="10" r="7.5"></circle>
+        <path d="m6.75 10.1 2.1 2.1 4.6-4.65"></path>
+      </svg>`;
+    const COMPLETION_VISIBLE_MS = 4000;
 
     let eventSource = null;
+    let visibleCheckingApps = new Set();
+    const completions = new Map();
 
     function statusText(row) {
       if (row.state === 'paused') {
@@ -910,6 +918,97 @@
     function removeRow(item) {
       item.remove();
       tray.hidden = tray.childElementCount === 0;
+    }
+
+    function removeCompletion(app) {
+      const completion = completions.get(app);
+      if (!completion) return;
+      if (completion.timer) window.clearTimeout(completion.timer);
+      completions.delete(app);
+      removeRow(completion.item);
+    }
+
+    function clearCompletions() {
+      [...completions.keys()].forEach(removeCompletion);
+    }
+
+    function scheduleCompletion(completion) {
+      if (completion.paused.size || completion.timer) return;
+      completion.startedAt = Date.now();
+      completion.timer = window.setTimeout(() => {
+        completion.timer = null;
+        removeCompletion(completion.app);
+      }, completion.remaining);
+    }
+
+    function setCompletionPaused(completion, reason, paused) {
+      if (paused) {
+        if (completion.paused.has(reason)) return;
+        if (!completion.paused.size && completion.timer) {
+          completion.remaining = Math.max(0,
+            completion.remaining - (Date.now() - completion.startedAt));
+          window.clearTimeout(completion.timer);
+          completion.timer = null;
+        }
+        completion.paused.add(reason);
+        return;
+      }
+      completion.paused.delete(reason);
+      if (!completion.paused.size) scheduleCompletion(completion);
+    }
+
+    function startCompletion(app) {
+      if (completions.has(app)) return;
+      const item = document.createElement('div');
+      item.className = 'vault-auto-scan-row';
+      item.dataset.state = 'complete';
+
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.className = 'vault-auto-scan-close';
+      close.setAttribute('aria-label',
+        `Dismiss Disk Saver completion for ${app}`);
+      close.title = 'Dismiss';
+      close.textContent = '×';
+
+      const icon = document.createElement('span');
+      icon.className = 'vault-auto-scan-icon';
+      icon.innerHTML = COMPLETE_ICON;
+
+      const copy = document.createElement('span');
+      copy.className = 'vault-auto-scan-copy';
+      const appName = document.createElement('span');
+      appName.className = 'vault-auto-scan-app';
+      appName.textContent = app;
+      appName.title = app;
+      const status = document.createElement('span');
+      status.className = 'vault-auto-scan-status';
+      status.textContent = 'No possible duplicate files found';
+      copy.append(appName, status);
+      item.append(close, icon, copy);
+
+      const completion = {
+        app,
+        item,
+        timer: null,
+        remaining: COMPLETION_VISIBLE_MS,
+        startedAt: 0,
+        paused: new Set()
+      };
+      close.addEventListener('click', () => removeCompletion(app));
+      item.addEventListener('mouseenter', () =>
+        setCompletionPaused(completion, 'pointer', true));
+      item.addEventListener('mouseleave', () =>
+        setCompletionPaused(completion, 'pointer', false));
+      item.addEventListener('focusin', () =>
+        setCompletionPaused(completion, 'focus', true));
+      item.addEventListener('focusout', (event) => {
+        if (!item.contains(event.relatedTarget)) {
+          setCompletionPaused(completion, 'focus', false);
+        }
+      });
+      completions.set(app, completion);
+      scheduleCompletion(completion);
     }
 
     function automaticSettingsKey(app) {
@@ -968,15 +1067,34 @@
       return opened;
     }
 
-    function render(snapshot) {
+    function render(snapshot, options = {}) {
       const rows = snapshot && Array.isArray(snapshot.rows)
         ? snapshot.rows
         : [];
+      const validRows = rows.filter((row) =>
+        row && typeof row.app === 'string' && row.app);
+      const liveApps = new Set(validRows.map((row) => row.app));
+      [...completions.keys()].forEach((app) => {
+        if (liveApps.has(app)) removeCompletion(app);
+      });
+      const manualApps = new Set(snapshot && Array.isArray(snapshot.settings)
+        ? snapshot.settings.filter((setting) =>
+          setting && setting.mode === 'manual').map((setting) => setting.app)
+        : []);
+      manualApps.forEach(removeCompletion);
+
+      const completion = snapshot && snapshot.completion;
+      if (options.acceptCompletion && completion &&
+          completion.outcome === 'no_possible_duplicates' &&
+          typeof completion.app === 'string' && completion.app &&
+          visibleCheckingApps.has(completion.app) &&
+          !liveApps.has(completion.app) &&
+          !manualApps.has(completion.app)) {
+        startCompletion(completion.app);
+      }
+
       const fragment = document.createDocumentFragment();
-      rows.forEach((row) => {
-        if (!row || typeof row.app !== 'string' || !row.app) {
-          return;
-        }
+      validRows.forEach((row) => {
         const item = document.createElement('div');
         item.className = 'vault-auto-scan-row';
         item.dataset.state = row.state || 'checking';
@@ -988,6 +1106,7 @@
         close.title = 'Dismiss';
         close.textContent = '×';
         close.addEventListener('click', async () => {
+          if (row.state === 'checking') visibleCheckingApps.delete(row.app);
           close.disabled = true;
           try {
             const result = await requestAction(
@@ -1000,6 +1119,9 @@
             removeRow(item);
           } catch (error) {
             console.warn('[Disk Saver] Automatic check dismissal failed', error);
+            if (row.state === 'checking' && item.isConnected) {
+              visibleCheckingApps.add(row.app);
+            }
             close.disabled = false;
           }
         });
@@ -1088,8 +1210,16 @@
         item.append(close, icon, copy, controls);
         fragment.appendChild(item);
       });
+      completions.forEach((completionRow) => {
+        if (!liveApps.has(completionRow.app)) {
+          fragment.appendChild(completionRow.item);
+        }
+      });
       tray.replaceChildren(fragment);
       tray.hidden = tray.childElementCount === 0;
+      visibleCheckingApps = new Set(validRows
+        .filter((row) => row.state === 'checking')
+        .map((row) => row.app));
     }
 
     async function loadState() {
@@ -1119,12 +1249,13 @@
         '/info/vault/automatic-scans/events');
       eventSource.onmessage = (event) => {
         try {
-          render(JSON.parse(event.data));
+          render(JSON.parse(event.data), { acceptCompletion: true });
         } catch (error) {
           console.debug('[Disk Saver] Invalid automatic check state', error);
         }
       };
       eventSource.onerror = () => {
+        clearCompletions();
         loadState();
       };
     }

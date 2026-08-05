@@ -1993,6 +1993,19 @@ class Server {
     const vault = this.kernel.vault
     if (vault && vault.ready) await vault.ready
     result.vault_enabled = !!(vault && vault.enabled)
+    result.vault_automatic_mode = "automatic"
+    if (result.vault_enabled) {
+      try {
+        const snapshot = await vault.automaticScanStatus()
+        const setting = Array.isArray(snapshot && snapshot.settings)
+          ? snapshot.settings.find((item) =>
+            item && item.app === name)
+          : null
+        result.vault_automatic_mode = setting && setting.mode === "manual"
+          ? "manual"
+          : "automatic"
+      } catch (_) {}
+    }
     if (!registryEnabled) {
       result.pendingSnapshotId = null
     }
@@ -15878,6 +15891,10 @@ class Server {
       }))
     }))
     this.app.get("/vault", ex(async (req, res) => {
+      if (!privacyFilterCache.isSameOriginRequest(req)) {
+        res.sendStatus(403)
+        return
+      }
       const vault = this.kernel.vault
       if (vault && vault.ready) await vault.ready
       if (!vault || !vault.enabled) {
@@ -15892,7 +15909,12 @@ class Server {
         return
       }
       await vault.openWorkspace()
-      res.render("vault", { theme: this.theme, platform: this.kernel.platform, agent: req.agent })
+      res.render("vault", {
+        theme: this.theme,
+        platform: this.kernel.platform,
+        agent: req.agent,
+        systemHome: path.resolve(os.homedir())
+      })
     }))
     this.app.get("/vault/app/:name", ex(async (req, res) => {
       if (!privacyFilterCache.isSameOriginRequest(req)) {

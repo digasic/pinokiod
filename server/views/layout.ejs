@@ -333,7 +333,8 @@
       opacity: 0.55;
     }
 
-    .vault-auto-scan-row[data-state="result"] {
+    .vault-auto-scan-row[data-state="result"],
+    .vault-auto-scan-row[data-state="complete"] {
       grid-template-rows: 16px 30px;
       min-height: 66px;
       padding-top: 10px;
@@ -342,12 +343,23 @@
 
     .vault-auto-scan-row[data-state="result"] .vault-auto-scan-icon,
     .vault-auto-scan-row[data-state="result"] .vault-auto-scan-copy,
-    .vault-auto-scan-row[data-state="result"] .vault-auto-scan-controls {
+    .vault-auto-scan-row[data-state="result"] .vault-auto-scan-controls,
+    .vault-auto-scan-row[data-state="complete"] .vault-auto-scan-icon,
+    .vault-auto-scan-row[data-state="complete"] .vault-auto-scan-copy {
       grid-row: 1 / 3;
     }
 
-    .vault-auto-scan-row[data-state="result"] .vault-auto-scan-copy {
+    .vault-auto-scan-row[data-state="result"] .vault-auto-scan-copy,
+    .vault-auto-scan-row[data-state="complete"] .vault-auto-scan-copy {
       grid-template-rows: 16px 30px;
+    }
+
+    .vault-auto-scan-row[data-state="complete"] .vault-auto-scan-copy {
+      grid-column: 2 / 4;
+    }
+
+    .vault-auto-scan-row[data-state="complete"] .vault-auto-scan-icon {
+      color: var(--vault-notice-accent);
     }
 
     @keyframes vault-notice-enter {

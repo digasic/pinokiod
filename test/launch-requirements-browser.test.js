@@ -122,7 +122,7 @@ function appAutolaunchMarkup(initialApp) {
     <div class="app-autolaunch" data-app-autolaunch data-app-id="target">
       <button type="button" class="app-autolaunch-row" data-app-autolaunch-button data-enabled="${initialApp.autolaunch_enabled ? "true" : "false"}" aria-haspopup="dialog" aria-expanded="false">
         <span class="app-autolaunch-label">Autolaunch</span>
-        <span class="app-autolaunch-status" data-app-autolaunch-status>${initialApp.autolaunch_enabled ? "ON" : "OFF"}</span>
+        <span class="app-autolaunch-status" data-app-autolaunch-status>${initialApp.autolaunch_enabled ? "On" : "Off"}</span>
       </button>
       <div class="app-autolaunch-modal hidden" data-app-autolaunch-modal role="dialog" aria-modal="true" aria-label="Autolaunch">
         <button type="button" class="app-autolaunch-switch" role="switch" aria-checked="${initialApp.autolaunch_enabled ? "true" : "false"}" data-app-autolaunch-switch aria-label="Start with Pinokio">
@@ -478,7 +478,7 @@ browserTest("browser: selecting a launch script from empty state persists and st
       enabled: false
     })
     assert.equal(await page.isChecked('input[name="app-autolaunch-script"][value="start.js"]'), true)
-    assert.equal((await textContent(page, "[data-app-autolaunch-status]")).trim(), "OFF")
+    assert.equal((await textContent(page, "[data-app-autolaunch-status]")).trim(), "Off")
   })
 })
 
@@ -532,7 +532,7 @@ browserTest("browser: startup toggle from empty selection saves the single eligi
     })
     assert.equal(state.launchRequirementsGets, 0)
     assert.equal(await page.isChecked('input[name="app-autolaunch-script"][value="start.js"]'), true)
-    assert.equal((await textContent(page, "[data-app-autolaunch-status]")).trim(), "ON")
+    assert.equal((await textContent(page, "[data-app-autolaunch-status]")).trim(), "On")
   })
 })
 
@@ -570,7 +570,7 @@ browserTest("browser: startup toggle from empty selection warns when no eligible
       })
 
       assert.equal(state.autolaunchPosts.length, 0, scenario.name)
-      assert.equal((await textContent(page, "[data-app-autolaunch-status]")).trim(), "OFF")
+      assert.equal((await textContent(page, "[data-app-autolaunch-status]")).trim(), "Off")
     })
   }
 })

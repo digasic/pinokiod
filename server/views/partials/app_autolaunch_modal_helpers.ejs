@@ -169,7 +169,7 @@
   }
   const renderStatus = () => {
     const enabled = !!(state && state.autolaunch_enabled)
-    status.textContent = enabled ? "ON" : "OFF"
+    status.textContent = enabled ? "On" : "Off"
     button.dataset.enabled = enabled ? "true" : "false"
     button.setAttribute("aria-label", `Autolaunch. Start with Pinokio ${enabled ? "On" : "Off"}`)
     switchButton.setAttribute("aria-checked", enabled ? "true" : "false")

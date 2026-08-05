@@ -152,8 +152,9 @@ class AutomaticScans {
     return setting && setting.mode === "manual" ? "manual" : "automatic"
   }
 
-  broadcast() {
+  broadcast(completion = null) {
     const snapshot = this.snapshot()
+    if (completion) snapshot.completion = completion
     for (const listener of this.listeners) {
       try {
         listener(snapshot)
@@ -617,6 +618,7 @@ class AutomaticScans {
 
   async precheckFinished(active, result, error) {
     const app = active.app
+    let completion = null
     try {
       await this.withAppTransition(app, async () => {
         let reason = active.reason
@@ -661,13 +663,20 @@ class AutomaticScans {
           ? Object.assign({}, this.settings.get(app))
           : null
         try {
-          await this.publishResultNow(app, result)
+          const outcome = await this.publishResultNow(app, result)
+          if (outcome === "empty") {
+            completion = {
+              app,
+              outcome: "no_possible_duplicates"
+            }
+          }
         } catch (publicationError) {
           this.restorePrevious(app)
           throw publicationError
         }
         reason = active.reason
         if (reason) {
+          completion = null
           await this.restorePublishedState(app, entry, previousSetting)
           this.entries.set(app, entry)
           this.log("publication-reverted", { app, reason })
@@ -682,7 +691,7 @@ class AutomaticScans {
       })
     } finally {
       if (this.active === active) this.active = null
-      this.broadcast()
+      this.broadcast(completion)
       this.schedule()
     }
   }
@@ -764,7 +773,7 @@ class AutomaticScans {
         possible_files: possibleFiles,
         acknowledged: acknowledged === result.signature
       })
-      return
+      return "result"
     }
     const acknowledged = (this.settings.get(app) || {})
       .acknowledged_signature
@@ -777,6 +786,7 @@ class AutomaticScans {
     }
     this.entries.delete(app)
     this.log("no-possible-matches", { app })
+    return "empty"
   }
 
   async clearAutomaticState(apps, reason, options = {}) {
