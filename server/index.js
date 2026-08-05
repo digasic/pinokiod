@@ -1994,9 +1994,12 @@ class Server {
     if (vault && vault.ready) await vault.ready
     result.vault_enabled = !!(vault && vault.enabled)
     result.vault_automatic_mode = "automatic"
+    result.vault_global_scan_ready = false
     if (result.vault_enabled) {
       try {
         const snapshot = await vault.automaticScanStatus()
+        result.vault_global_scan_ready =
+          snapshot && snapshot.global_scan_ready === true
         const setting = Array.isArray(snapshot && snapshot.settings)
           ? snapshot.settings.find((item) =>
             item && item.app === name)

@@ -134,6 +134,77 @@ describe("Save Space engine", () => {
     await close(vault)
   })
 
+  test("global readiness accepts only successful publication outcomes", async () => {
+    const { vault } = await makeVault()
+    const scan = (outcome) => ({ ts: 1, outcome })
+
+    assert.equal(vault.globalScanIsReady(scan("complete")), true)
+    assert.equal(vault.globalScanIsReady(
+      scan("completed_with_exclusions")), true)
+    assert.equal(vault.globalScanIsReady(scan("cancelled")), false)
+    assert.equal(vault.globalScanIsReady(scan("failed")), false)
+    assert.equal(vault.globalScanIsReady(null), false)
+
+    await close(vault)
+  })
+
+  test("app scans stay locked until the first global scan is published", async () => {
+    const { home, vault } = await makeVault()
+    await write(path.join(home, "api", "demo", "model.bin"), "demo")
+    await vault.openWorkspace()
+    const source = vault.sources().find((item) =>
+      item.kind === "app" && item.app === "demo")
+
+    assert.equal(await vault.globalScanReady(), false)
+    assert.equal((await vault.status(source.id)).global_scan_ready, false)
+    assert.deepEqual(await vault.perform("scan", {
+      scope_id: source.id,
+      candidate_size: 0
+    }), {
+      error: "Run an initial scan before scanning individual apps.",
+      code: "global_scan_required"
+    })
+
+    assert.deepEqual(await vault.perform("automatic_set_mode", {
+      app: "demo",
+      mode: "automatic"
+    }), { app: "demo", mode: "automatic" })
+    const launchPath = path.join(home, "api", "demo", "start.js")
+    vault.automaticScans.handleStarted(launchPath)
+    await vault.automaticScans.handleStopped(launchPath)
+    assert.equal(vault.automaticScans.pendingStops.size, 0)
+    assert.deepEqual(vault.automaticScans.snapshot().rows, [])
+
+    assert.equal((await vault.perform("scan", {
+      candidate_size: 0
+    })).started, true)
+    await waitForEngine(() =>
+      !vault.scanPromise && !vault.scanCompletionPromise)
+
+    assert.equal(await vault.globalScanReady(), true)
+    await vault.automaticScans.scanFinished({
+      scopeId: null,
+      result: { outcome: "cancelled" },
+      error: null
+    })
+    assert.equal(await vault.globalScanReady(), true)
+    await vault.automaticScans.scanFinished({
+      scopeId: null,
+      result: null,
+      error: new Error("scan failed")
+    })
+    assert.equal(await vault.globalScanReady(), true)
+    assert.equal(vault.automaticScans.active, null)
+    assert.deepEqual(vault.automaticScans.snapshot().rows, [])
+    assert.equal((await vault.perform("scan", {
+      scope_id: source.id,
+      candidate_size: 0
+    })).started, true)
+    await waitForEngine(() =>
+      !vault.scanPromise && !vault.scanCompletionPromise)
+    await close(vault)
+  })
+
   test("locations and anchor stores persist in the Disk Saver config", async () => {
     const base = await makeHome()
     const home = path.join(base, "pinokio")
@@ -903,6 +974,7 @@ describe("Save Space engine", () => {
     const outside = await makeOutside()
     const pair = await duplicatePair(home)
     await vault.sweeper.scan()
+    assert.equal(await vault.globalScanReady(), true)
     const duplicate = [...await vault.registry.files({
       statuses: ["duplicate"]
     })][0]
@@ -922,6 +994,7 @@ describe("Save Space engine", () => {
     replacement.sizeThreshold = pair.contents.length * 2
 
     assert.deepEqual(replacement.configuredLocations(), [])
+    assert.equal(await replacement.globalScanReady(), false)
     assert.equal(await replacement.registry.countFiles(), 0)
     assert.equal(fs.existsSync(anchorPath), true)
     await replacement.sweeper.scan()

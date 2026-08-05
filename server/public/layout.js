@@ -1068,6 +1068,13 @@
     }
 
     function render(snapshot, options = {}) {
+      if (!snapshot || snapshot.global_scan_ready !== true) {
+        [...completions.keys()].forEach(removeCompletion);
+        visibleCheckingApps = new Set();
+        tray.replaceChildren();
+        tray.hidden = true;
+        return;
+      }
       const rows = snapshot && Array.isArray(snapshot.rows)
         ? snapshot.rows
         : [];

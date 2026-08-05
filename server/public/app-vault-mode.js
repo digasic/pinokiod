@@ -5,14 +5,22 @@
   const app = status.dataset.app || ""
   const tab = status.closest("#save-space-tab")
   const label = status.querySelector("[data-app-vault-mode-label]")
-  const setMode = (value) => {
+  const setState = (value, ready) => {
     const mode = value === "manual" ? "manual" : "automatic"
+    const globalScanReady = ready === true
     status.dataset.mode = mode
+    status.dataset.ready = String(globalScanReady)
     status.hidden = false
-    if (label) label.textContent = mode === "automatic" ? "Auto" : "Manual"
+    if (label) {
+      label.textContent = globalScanReady
+        ? (mode === "automatic" ? "Auto" : "Manual")
+        : "Set up"
+    }
     if (tab) {
       tab.setAttribute("aria-label",
-        `Disk Saver — ${mode === "automatic" ? "Automatic" : "Manual"} checking`)
+        globalScanReady
+          ? `Disk Saver — ${mode === "automatic" ? "Automatic" : "Manual"} checking`
+          : "Disk Saver — Set up required")
     }
   }
   const applySnapshot = (snapshot) => {
@@ -20,10 +28,11 @@
       ? snapshot.settings
       : []
     const setting = settings.find((item) => item && item.app === app)
-    setMode(setting && setting.mode)
+    setState(setting && setting.mode,
+      snapshot && snapshot.global_scan_ready === true)
   }
 
-  setMode(status.dataset.mode)
+  setState(status.dataset.mode, status.dataset.ready === "true")
   if (!app || typeof window.EventSource !== "function") return
 
   const source = new window.EventSource(

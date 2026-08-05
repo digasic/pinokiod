@@ -105,6 +105,9 @@ const COPY = {
   never: "Never",
   scan: "Scan",
   scan_app: "Scan this app",
+  setup_disk_saver: "Set up Disk Saver",
+  setup_title: "Run an initial scan to enable app scans",
+  setup_description: "This creates the file index used to compare apps and enables automatic checks.",
   scan_again: "Scan again",
   cancel_scan: "Cancel scan",
   scanning: "Scanning…",
@@ -533,6 +536,9 @@ const post = async (payload) => {
   if (!result) throw new Error(COPY.action_request_failed.replace("{status}", response.status))
   return result
 }
+const openGlobalWorkspace = () => {
+  window.parent.location.assign("/vault")
+}
 let automaticModeEventSource = null
 const applyAutomaticScanSnapshot = (snapshot) => {
   if (!IS_APP_MODE) return
@@ -543,9 +549,17 @@ const applyAutomaticScanSnapshot = (snapshot) => {
   const mode = setting && setting.mode === "manual"
     ? "manual"
     : "automatic"
-  if (state.automaticMode === mode) return
+  const globalScanReady = !!(snapshot &&
+    snapshot.global_scan_ready === true)
+  const readinessChanged = state.data &&
+    state.data.global_scan_ready !== globalScanReady
+  if (state.data) state.data.global_scan_ready = globalScanReady
+  if (state.automaticMode === mode && !readinessChanged) return
   state.automaticMode = mode
-  if (state.data) renderOverview()
+  if (state.data) {
+    if (readinessChanged) refresh(true)
+    else renderOverview()
+  }
 }
 const loadAutomaticMode = async () => {
   if (!IS_APP_MODE) return
@@ -2176,7 +2190,51 @@ const automaticModeMarkup = () => {
   </details>`
 }
 
-const renderOverview = () => {
+const appSetupRequired = () => IS_APP_MODE && state.data &&
+  state.data.global_scan_ready !== true
+
+const restoreAutomaticModeMenu = (open) => {
+  const modeMenu = el("vault-auto-mode")
+  if (modeMenu && open) modeMenu.open = true
+  if (!modeMenu || !state.automaticModeMenuRequested) return
+  state.automaticModeMenuRequested = false
+  modeMenu.classList.add("targeted")
+  const trigger = modeMenu.querySelector("summary")
+  requestAnimationFrame(() => {
+    if (trigger && trigger.isConnected) trigger.focus()
+  })
+  setTimeout(() => {
+    if (modeMenu.isConnected) modeMenu.classList.remove("targeted")
+  }, 1600)
+}
+
+const renderSetupOverview = () => {
+  const metrics = el("vault-metrics")
+  const existingModeMenu = el("vault-auto-mode")
+  const modeMenuOpen = !!(existingModeMenu && existingModeMenu.open) ||
+    state.automaticModeMenuRequested
+  metrics.classList.add("summary")
+  metrics.innerHTML = `
+    <div class="vault-summary-main">
+      <div class="vault-summary-label"><i class="fa-solid fa-hard-drive"></i><span>${esc(COPY.save_space)}</span>${automaticModeMarkup()}</div>
+      <div class="vault-summary-value">${esc(COPY.setup_title)}</div>
+      <p class="vault-setup-copy">${esc(COPY.setup_description)}</p>
+    </div>
+    <div class="vault-summary-side"></div>`
+  restoreAutomaticModeMenu(modeMenuOpen)
+
+  const scanButton = el("btn-scan")
+  scanButton.innerHTML = `<i class="fa-solid fa-arrow-right" aria-hidden="true"></i>${esc(COPY.setup_disk_saver)}`
+  scanButton.classList.add("primary")
+  scanButton.disabled = false
+  const candidateSizeSelect = el("vault-candidate-size")
+  if (candidateSizeSelect) candidateSizeSelect.hidden = true
+  const scanState = el("vault-scan-state")
+  scanState.classList.remove("show")
+  scanState.innerHTML = ""
+}
+
+const renderNormalOverview = () => {
   const data = state.data
   const last = data.last_scan
   const activeScan = scanActive(data.scan)
@@ -2251,19 +2309,7 @@ const renderOverview = () => {
         ${summary}
       </div>
       <div class="vault-summary-side">${summarySide}</div>`
-    const modeMenu = el("vault-auto-mode")
-    if (modeMenu && modeMenuOpen) modeMenu.open = true
-    if (modeMenu && state.automaticModeMenuRequested) {
-      state.automaticModeMenuRequested = false
-      modeMenu.classList.add("targeted")
-      const trigger = modeMenu.querySelector("summary")
-      requestAnimationFrame(() => {
-        if (trigger && trigger.isConnected) trigger.focus()
-      })
-      setTimeout(() => {
-        if (modeMenu.isConnected) modeMenu.classList.remove("targeted")
-      }, 1600)
-    }
+    restoreAutomaticModeMenu(modeMenuOpen)
   }
   const idleScanLabel = IS_APP_MODE
     ? (last ? COPY.scan_again : COPY.scan_app)
@@ -2289,7 +2335,10 @@ const renderOverview = () => {
     })
   }
   const candidateSizeSelect = el("vault-candidate-size")
-  if (candidateSizeSelect) candidateSizeSelect.disabled = activeScan
+  if (candidateSizeSelect) {
+    candidateSizeSelect.hidden = false
+    candidateSizeSelect.disabled = activeScan
+  }
   const scanControl = el("vault-scan-control")
   if (scanControl) scanControl.classList.toggle("single", activeScan)
   const scanSizeMenu = el("vault-scan-size-menu")
@@ -2367,6 +2416,14 @@ const renderOverview = () => {
     scanState.classList.remove("show")
     scanState.innerHTML = ""
   }
+}
+
+const renderOverview = () => {
+  if (appSetupRequired()) {
+    renderSetupOverview()
+    return
+  }
+  renderNormalOverview()
 }
 
 const renderResult = () => {
@@ -2555,11 +2612,34 @@ const renderCleanupNotice = () => {
   notice.innerHTML = `<i class="fa-solid fa-broom" aria-hidden="true"></i><strong>${esc(title)}</strong><span class="vault-cleanup-notice-detail">${esc(detail)}</span><button class="vault-button" id="btn-review-cleanup" type="button">${esc(COPY.review_cleanup)}<i class="fa-solid fa-chevron-right" aria-hidden="true"></i></button>`
 }
 
+const clearPanel = (id, className) => {
+  const panel = el(id)
+  panel.className = className
+  panel.innerHTML = ""
+}
+
+const renderSetupWorkspace = () => {
+  renderSetupOverview()
+  renderFeedback()
+  el("vault-explorer").style.display = "none"
+  clearPanel("vault-action-state", "vault-action-state")
+  clearPanel("vault-result", "vault-result")
+  clearPanel("vault-cleanup-notice", "vault-cleanup-notice")
+  renderedActionProgress = null
+}
+
 const render = () => {
   if (!state.data) return
+  const setupRequired = appSetupRequired()
+  const body = document.querySelector(".vault-body")
+  if (body) body.classList.toggle("setup-required", setupRequired)
+  if (setupRequired) {
+    renderSetupWorkspace()
+    return
+  }
   renderOverview()
-  renderResult()
   renderFeedback()
+  renderResult()
   renderCleanupNotice()
   if (!state.data.enabled) {
     el("vault-explorer").style.display = "none"
@@ -2738,12 +2818,16 @@ const refresh = async (forceFull = false) => {
           folderDiscoveryActive(progress.folder_discovery) ||
           fileAction) {
         delay = 1500
-        renderOverview()
-        renderResult()
-        renderActionProgress()
-        renderFeedback()
-        renderExternalPrompt()
-        renderFolderDiscovery()
+        if (appSetupRequired()) {
+          renderSetupWorkspace()
+        } else {
+          renderOverview()
+          renderResult()
+          renderActionProgress()
+          renderFeedback()
+          renderExternalPrompt()
+          renderFolderDiscovery()
+        }
       } else {
         const data = await fetchJson(statusUrl())
         if (sequence !== refreshSequence) return
@@ -3551,6 +3635,10 @@ document.addEventListener("click", async (event) => {
         }
         render()
       }
+      return
+    }
+    if (appSetupRequired()) {
+      openGlobalWorkspace()
       return
     }
     state.scanRequested = true

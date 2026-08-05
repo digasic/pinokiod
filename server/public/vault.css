@@ -218,6 +218,31 @@ body[data-vault-mode="app"] .vault-overview {
   letter-spacing: -.025em;
   line-height: 1.15;
 }
+.vault-setup-copy {
+  max-width: 560px;
+  margin: 8px 0 0;
+  color: var(--task-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.vault-body.setup-required .vault-overview {
+  min-height: 260px;
+  flex: 1 1 auto;
+  justify-content: center;
+  gap: 32px;
+  padding: 48px;
+  border-bottom: 0;
+}
+.vault-body.setup-required .vault-metrics.summary {
+  max-width: 620px;
+  flex: 0 1 620px;
+  grid-template-columns: minmax(0, 1fr);
+}
+.vault-body.setup-required .vault-summary-value {
+  margin-top: 8px;
+  font-size: 24px;
+}
+.vault-body.setup-required .vault-summary-side { display: none; }
 .vault-storage-chart {
   width: min(100%, 540px);
   min-width: 0;

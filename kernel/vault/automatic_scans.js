@@ -10,7 +10,7 @@ const {
 } = require("./operation_errors")
 
 const COMPLETE_PHASES = new Set(["complete", "completed_with_exclusions"])
-const STOP_SETTLE_MS = 3000
+const STOP_SETTLE_MS = 1000
 const PROGRESS_INTERVAL_MS = 5000
 const isMissing = (error) => !!(error &&
   (error.code === "ENOENT" || error.code === "ENOTDIR"))
@@ -41,6 +41,7 @@ class AutomaticScans {
     this.waitingFor = null
     this.listeners = new Set()
     this.appTransitions = new Map()
+    this.globalScanReady = false
   }
 
   log(event, details = {}) {
@@ -134,7 +135,8 @@ class AutomaticScans {
   snapshot() {
     return {
       enabled: !!this.vault.enabled,
-      rows: [...this.entries.values()]
+      global_scan_ready: this.globalScanReady,
+      rows: (this.globalScanReady ? [...this.entries.values()] : [])
         .filter((entry) => !entry.hidden)
         .sort((left, right) =>
           (Number(left.updated_at) || 0) -
@@ -145,6 +147,14 @@ class AutomaticScans {
         .sort(([left], [right]) => left.localeCompare(right))
         .map(([app, setting]) => ({ app, mode: setting.mode }))
     }
+  }
+
+  async refreshGlobalScanReady() {
+    const ready = typeof this.vault.globalScanReady === "function" &&
+      !!await this.vault.globalScanReady()
+    const changed = ready !== this.globalScanReady
+    this.globalScanReady = ready
+    return changed
   }
 
   modeFor(app) {
@@ -236,6 +246,10 @@ class AutomaticScans {
   }
 
   queueApp(app) {
+    if (!this.globalScanReady) {
+      this.log("queue-skipped", { app, reason: "global-scan-required" })
+      return false
+    }
     if (this.modeFor(app) === "manual") {
       this.log("queue-skipped", { app, reason: "manual" })
       return false
@@ -324,6 +338,12 @@ class AutomaticScans {
     this.log("preparing", { app })
     await this.vault.ensureRegistryInitialized()
     if (this.pendingStops.get(app) !== pending) return
+    await this.refreshGlobalScanReady()
+    if (!this.globalScanReady) {
+      this.pendingStops.delete(app)
+      this.log("check-skipped", { app, reason: "global-scan-required" })
+      return
+    }
     await this.hydrate()
     await this.withAppTransition(app, async () => {
       if (this.pendingStops.get(app) !== pending) return
@@ -394,6 +414,11 @@ class AutomaticScans {
     }
     if (!this.hydrated && typeof this.vault.automaticScanStatus === "function") {
       await this.vault.automaticScanStatus()
+    }
+    await this.refreshGlobalScanReady()
+    if (!this.globalScanReady) {
+      this.log("check-skipped", { app, reason: "global-scan-required" })
+      return
     }
     if (this.modeFor(app) === "manual") {
       this.log("check-skipped", { app, reason: "manual" })
@@ -547,14 +572,16 @@ class AutomaticScans {
 
   async drain() {
     if (!this.vault.enabled || !this.vault.registry || this.active) return
+    const entry = [...this.entries.values()].find((item) =>
+      item.state === "checking")
+    if (!entry) return
+    await this.refreshGlobalScanReady()
+    if (!this.globalScanReady) return
     if (this.manualDepth > 0 || this.currentBusyPromise() ||
         this.vault.fileActionProgress) {
       this.waitForBusyWork()
       return
     }
-    const entry = [...this.entries.values()].find((item) =>
-      item.state === "checking")
-    if (!entry) return
     let appAvailable
     try {
       appAvailable = await this.appRootIsAvailable(entry.app)
@@ -842,6 +869,7 @@ class AutomaticScans {
 
   async scanFinished({ scopeId, result, error }) {
     const complete = !error && result && COMPLETE_PHASES.has(result.outcome)
+    let readinessChanged = false
     try {
       if (complete) {
         await this.hydrate()
@@ -852,7 +880,9 @@ class AutomaticScans {
           { cancelPending: true, states: ["checking", "result"] }
         )
       }
+      if (!scopeId) readinessChanged = await this.refreshGlobalScanReady()
     } finally {
+      if (readinessChanged) this.broadcast()
       this.schedule()
     }
   }
@@ -897,6 +927,16 @@ class AutomaticScans {
       await this.persistMode(app, mode)
       const entry = this.entries.get(app)
       if (entry && entry.state === "paused") this.entries.delete(app)
+      await this.refreshGlobalScanReady()
+      if (!this.globalScanReady) {
+        this.log("mode-changed", {
+          app,
+          mode,
+          check: "global-scan-required"
+        })
+        this.broadcast()
+        return { app, mode }
+      }
       if (!this.appIsRunning(app)) {
         this.log("mode-changed", { app, mode })
         this.queueApp(app)

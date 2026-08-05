@@ -49,6 +49,7 @@ const fixture = (items = [], overrides = {}) => {
   const shared = items.filter((entry) => entry.status === "shared")
   return Object.assign({
     enabled: true,
+    global_scan_ready: true,
     mode: "link",
     scan: {
       active: false,
@@ -162,6 +163,7 @@ const makePage = async (status, options = {}) => {
     }
   )
   const requests = []
+  const parentNavigations = []
   const selectedSources = new Set(options.folderDiscoverySelected || [])
   const recommendedSources = new Set()
   const confirmations = []
@@ -249,6 +251,18 @@ const makePage = async (status, options = {}) => {
   }
   dom.window.requestAnimationFrame = (callback) =>
     dom.window.setTimeout(callback, 0)
+  if (options.embeddedApp) {
+    Object.defineProperty(dom.window, "parent", {
+      configurable: true,
+      value: {
+        location: {
+          assign(target) {
+            parentNavigations.push(target)
+          }
+        }
+      }
+    })
+  }
   if (options.fastStatusRetry) {
     const setTimeout = dom.window.setTimeout.bind(dom.window)
     dom.window.setTimeout = (callback, delay, ...args) =>
@@ -370,7 +384,8 @@ const makePage = async (status, options = {}) => {
   }
   dom.window.eval(await source(path.join(publicRoot, "storage-size.js")))
   dom.window.eval(await source(path.join(publicRoot, "vault.js")))
-  await waitFor(() => dom.window.document.querySelector(".vault-table"))
+  await waitFor(() => dom.window.document.querySelector(
+    ".vault-summary-value"))
   const choosePickedPath = (folderPath) => {
     const pending = pendingPickers.shift()
     if (!pending) throw new Error("No folder picker is waiting for a selection.")
@@ -398,6 +413,7 @@ const makePage = async (status, options = {}) => {
   return {
     dom,
     requests,
+    parentNavigations,
     confirmations,
     pickerRequests,
     choosePickedPath,
@@ -444,6 +460,7 @@ describe("Save Space interface", () => {
     assert.doesNotMatch(combined, /Previous completed results were kept\./)
     assert.match(combined, /Scan completed with exclusions/)
     assert.match(combined, /Provisional until the scan completes/)
+    assert.match(combined, /Set up Disk Saver/)
     assert.doesNotMatch(combined, /Scan all locations/)
     assert.match(combined, /data-find-home-folder/)
     assert.match(combined, /data-find-other-folder/)
@@ -2200,6 +2217,95 @@ describe("Save Space interface", () => {
 
     assert.match(scanButton.textContent, /Scan this app/)
     assert.equal(scanButton.classList.contains("primary"), true)
+
+    dom.window.close()
+  })
+
+  test("an app without a global baseline shows setup and opens global Disk Saver", async () => {
+    const status = fixture([], {
+      global_scan_ready: false,
+      last_scan: null,
+      logical_bytes: 0,
+      saved_by_sharing: 0,
+      pending_bytes: 0
+    })
+    const { dom, requests, parentNavigations } = await makePage(status, {
+      appMode: true,
+      embeddedApp: true,
+      scopeId: "app:app",
+      actionResults: {
+        automatic_set_mode: { app: "app", mode: "manual" }
+      }
+    })
+    const document = dom.window.document
+    const scanButton = document.getElementById("btn-scan")
+
+    assert.match(document.querySelector(".vault-summary-value").textContent,
+      /Run an initial scan to enable app scans/)
+    assert.match(document.querySelector(".vault-setup-copy").textContent,
+      /creates the file index used to compare apps/)
+    assert.match(scanButton.textContent, /Set up Disk Saver/)
+    assert.equal(scanButton.classList.contains("primary"), true)
+    assert.equal(document.getElementById("vault-candidate-size").hidden, true)
+    assert.equal(document.getElementById("vault-explorer").style.display,
+      "none")
+    assert.doesNotMatch(document.getElementById("vault-metrics").textContent,
+      /Nothing else to save/)
+
+    await waitFor(() => document.querySelector(
+      '[data-automatic-mode="manual"]'))
+    document.querySelector('[data-automatic-mode="manual"]').click()
+    await waitFor(() => requests.some((request) =>
+      request.action === "automatic_set_mode"))
+    await waitFor(() => document.getElementById(
+      "vault-auto-mode").classList.contains("manual"))
+    assert.match(document.querySelector(".vault-summary-value").textContent,
+      /Run an initial scan to enable app scans/)
+    assert.equal(document.getElementById("vault-explorer").style.display,
+      "none")
+
+    scanButton.click()
+    assert.deepEqual(parentNavigations, ["/vault"])
+    assert.equal(requests.some((request) => request.action === "scan"), false)
+
+    dom.window.close()
+  })
+
+  test("app setup remains visible during global scan progress", async () => {
+    let progressRequests = 0
+    const status = fixture([], {
+      global_scan_ready: false,
+      scan: {
+        active: true,
+        pending: false,
+        phase: "walking",
+        queued: 0,
+        scope_id: null
+      },
+      last_scan: null,
+      logical_bytes: 0,
+      saved_by_sharing: 0,
+      pending_bytes: 0
+    })
+    const { dom } = await makePage((url) => {
+      if (url.includes("progress=1")) progressRequests += 1
+      return status
+    }, {
+      appMode: true,
+      scopeId: "app:app"
+    })
+    const document = dom.window.document
+
+    for (let attempt = 0; attempt < 400 && !progressRequests; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    assert.ok(progressRequests)
+    assert.match(document.querySelector(".vault-summary-value").textContent,
+      /Run an initial scan to enable app scans/)
+    assert.equal(document.getElementById("vault-explorer").style.display,
+      "none")
+    assert.equal(document.getElementById("vault-result").textContent, "")
+    assert.equal(document.getElementById("vault-action-state").textContent, "")
 
     dom.window.close()
   })

@@ -4121,10 +4121,16 @@ body.dark .disk-usage {
 .app-vault-mode[data-mode="automatic"] {
   color: #b45309;
 }
+.app-vault-mode[data-ready="false"] {
+  color: #b45309;
+}
 body.dark .app-vault-mode {
   color: rgba(203, 213, 225, 0.74);
 }
 body.dark .app-vault-mode[data-mode="automatic"] {
+  color: #e0a54b;
+}
+body.dark .app-vault-mode[data-ready="false"] {
   color: #e0a54b;
 }
 .app-vault-mode-chevron,
@@ -8501,13 +8507,14 @@ body.dark .pinokio-custom-terminal-header {
         </button>
         <% if (typeof vault_enabled !== 'undefined' && vault_enabled) { %>
         <% const vaultAutomaticMode = typeof vault_automatic_mode === 'string' && vault_automatic_mode === 'manual' ? 'manual' : 'automatic' %>
-        <a id='save-space-tab' data-mode="refresh" target="app-vault" href="/vault/app/<%=encodeURIComponent(name)%>" class="btn header-item frame-link" data-index="vault" data-static="retain" data-tab-link-popover="false" aria-label="Disk Saver — <%=vaultAutomaticMode === 'automatic' ? 'Automatic' : 'Manual'%> checking">
+        <% const vaultGlobalScanReady = typeof vault_global_scan_ready !== 'undefined' && vault_global_scan_ready === true %>
+        <a id='save-space-tab' data-mode="refresh" target="app-vault" href="/vault/app/<%=encodeURIComponent(name)%>" class="btn header-item frame-link" data-index="vault" data-static="retain" data-tab-link-popover="false" aria-label="<%=vaultGlobalScanReady ? `Disk Saver — ${vaultAutomaticMode === 'automatic' ? 'Automatic' : 'Manual'} checking` : 'Disk Saver — Set up required'%>">
           <div class='tab'>
             <i class="fa-solid fa-hard-drive menu-action-leading-icon"></i>
             <div class='display'>Disk Saver</div>
             <div class='flexible'></div>
-            <span class="app-vault-mode" data-app-vault-mode data-app="<%=name%>" data-mode="<%=vaultAutomaticMode%>" aria-hidden="true">
-              <span data-app-vault-mode-label><%=vaultAutomaticMode === 'automatic' ? 'Auto' : 'Manual'%></span>
+            <span class="app-vault-mode" data-app-vault-mode data-app="<%=name%>" data-mode="<%=vaultAutomaticMode%>" data-ready="<%=vaultGlobalScanReady ? 'true' : 'false'%>" aria-hidden="true">
+              <span data-app-vault-mode-label><%=vaultGlobalScanReady ? (vaultAutomaticMode === 'automatic' ? 'Auto' : 'Manual') : 'Set up'%></span>
             </span>
             <i class="fa-solid fa-angle-down app-vault-mode-chevron" aria-hidden="true"></i>
           </div>

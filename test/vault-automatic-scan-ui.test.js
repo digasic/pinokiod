@@ -50,6 +50,7 @@ test("the shared layout renders and reviews automatic possible-match notices", a
         status: 200,
         json: async () => ({
           enabled: true,
+          global_scan_ready: true,
           rows: []
         })
       }
@@ -72,6 +73,22 @@ test("the shared layout renders and reviews automatic possible-match notices", a
   eventSources[0].onmessage({
     data: JSON.stringify({
       enabled: true,
+      global_scan_ready: false,
+      rows: [{
+        app: "ComfyUI",
+        state: "checking",
+        notice_id: "checking:0:"
+      }]
+    })
+  })
+  assert.equal(dom.window.document.getElementById(
+    "vault-auto-scan-tray").hidden, true)
+  assert.equal(dom.window.document.querySelector(
+    ".vault-auto-scan-row"), null)
+  eventSources[0].onmessage({
+    data: JSON.stringify({
+      enabled: true,
+      global_scan_ready: true,
       rows: [{
         app: "ComfyUI",
         state: "result",
@@ -171,6 +188,7 @@ test("checking notices expose settings, Pause, and dismissal", async () => {
   eventSources[0].onmessage({
     data: JSON.stringify({
       enabled: true,
+      global_scan_ready: true,
       rows: [{
         app: "ComfyUI",
         state: "checking",
@@ -286,6 +304,7 @@ test("an empty automatic check briefly confirms completion", async () => {
         status: 200,
         json: async () => ({
           enabled: true,
+          global_scan_ready: true,
           rows: [],
           settings: [{ app: "ComfyUI", mode: "automatic" }]
         })
@@ -304,7 +323,7 @@ test("an empty automatic check briefly confirms completion", async () => {
   dom.window.eval(script)
   await waitFor(() => eventSources.length === 1)
   const send = (payload) => eventSources[0].onmessage({
-    data: JSON.stringify(payload)
+    data: JSON.stringify(Object.assign({ global_scan_ready: true }, payload))
   })
 
   send({
@@ -527,7 +546,7 @@ test("the app sidebar mirrors Automatic and Manual Disk Saver modes", async () =
   const script = await fs.promises.readFile(
     path.join(root, "server", "public", "app-vault-mode.js"), "utf8")
   const dom = new JSDOM(`<a id="save-space-tab">
-    <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic">
+    <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic" data-ready="true">
       <span data-app-vault-mode-label>Auto</span>
     </span>
   </a>`, {
@@ -557,6 +576,7 @@ test("the app sidebar mirrors Automatic and Manual Disk Saver modes", async () =
 
   eventSources[0].onmessage({
     data: JSON.stringify({
+      global_scan_ready: true,
       settings: [{ app: "ComfyUI", mode: "manual" }]
     })
   })
@@ -566,9 +586,31 @@ test("the app sidebar mirrors Automatic and Manual Disk Saver modes", async () =
   assert.equal(dom.window.document.getElementById("save-space-tab")
     .getAttribute("aria-label"), "Disk Saver — Manual checking")
 
-  eventSources[0].onmessage({ data: JSON.stringify({ settings: [] }) })
+  eventSources[0].onmessage({
+    data: JSON.stringify({ global_scan_ready: true, settings: [] })
+  })
   assert.equal(status.dataset.mode, "automatic")
   assert.equal(status.hidden, false)
+  assert.equal(label.textContent, "Auto")
+
+  eventSources[0].onmessage({
+    data: JSON.stringify({
+      global_scan_ready: false,
+      settings: [{ app: "ComfyUI", mode: "automatic" }]
+    })
+  })
+  assert.equal(status.dataset.ready, "false")
+  assert.equal(label.textContent, "Set up")
+  assert.equal(dom.window.document.getElementById("save-space-tab")
+    .getAttribute("aria-label"), "Disk Saver — Set up required")
+
+  eventSources[0].onmessage({
+    data: JSON.stringify({
+      global_scan_ready: true,
+      settings: [{ app: "ComfyUI", mode: "automatic" }]
+    })
+  })
+  assert.equal(status.dataset.ready, "true")
   assert.equal(label.textContent, "Auto")
   assert.match(template, /data-app-vault-mode/)
   assert.match(template, /app-vault-mode\.js/)
@@ -592,6 +634,7 @@ test("the app sidebar mirrors Automatic and Manual Disk Saver modes", async () =
   assert.doesNotMatch(template, /app-vault-mode-dot/)
   assert.match(server,
     /result\.vault_automatic_mode = setting && setting\.mode === "manual"/)
+  assert.match(server, /result\.vault_global_scan_ready/)
 
   dom.window.close()
 })

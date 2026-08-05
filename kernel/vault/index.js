@@ -73,6 +73,9 @@ const STATUS_FILTERS = new Set([
 const FOLDER_DISCOVERY_COMPLETE_PHASES = new Set([
   "complete", "completed_with_exclusions"
 ])
+const GLOBAL_SCAN_READY_OUTCOMES = new Set([
+  "complete", "completed_with_exclusions"
+])
 
 const isMissingError = (error) => !!(error &&
   (error.code === "ENOENT" || error.code === "ENOTDIR"))
@@ -672,7 +675,21 @@ class Vault {
       await this.ensureRegistryInitialized()
     }
     await this.automaticScans.hydrate()
+    await this.automaticScans.refreshGlobalScanReady()
     return this.automaticScans.snapshot()
+  }
+
+  async globalScanReady() {
+    if (!this.registry) return false
+    const scan = await this.registry.scanFor()
+    if (scan) this.lastScanCache.set("", scan)
+    else this.lastScanCache.delete("")
+    return this.globalScanIsReady(scan)
+  }
+
+  globalScanIsReady(scan = this.lastScanCache.get("")) {
+    return !!(scan && scan.ts &&
+      GLOBAL_SCAN_READY_OUTCOMES.has(scan.outcome))
   }
 
   async refreshAnchorStores() {
@@ -1790,8 +1807,18 @@ class Vault {
         return this.runMutation(() =>
           this.removeExternalSource(payload.source_id))
       case "scan": {
-        if (payload.scope_id && !this.scanSource(payload.scope_id)) {
+        const scanSource = payload.scope_id
+          ? this.scanSource(payload.scope_id)
+          : null
+        if (payload.scope_id && !scanSource) {
           return { error: "That scan location is no longer available." }
+        }
+        if (scanSource && scanSource.kind === "app" &&
+            !await this.globalScanReady()) {
+          return {
+            error: "Run an initial scan before scanning individual apps.",
+            code: "global_scan_required"
+          }
         }
         let threshold = this.sizeThreshold
         if (payload.candidate_size != null) {
@@ -3266,6 +3293,9 @@ class Vault {
     }
 
     const lastScan = await this.scanForScope(scopeId)
+    const globalScanReady = scopeId
+      ? await this.globalScanReady()
+      : this.globalScanIsReady(lastScan)
     const before = lastScan && Number.isFinite(lastScan.bytes_total)
       ? lastScan.bytes_total
       : 0
@@ -3302,6 +3332,7 @@ class Vault {
     const sourceCounts = this.sourceCountMaps(snapshot.scopeRows)
     const result = {
       enabled: true,
+      global_scan_ready: globalScanReady,
       mode: this.mode,
       scan: this.scanStatus(),
       last_scan: lastScan,
@@ -3402,6 +3433,7 @@ class Vault {
   async progressStatus(scopeId = null) {
     const result = {
       enabled: !!this.enabled,
+      global_scan_ready: this.globalScanIsReady(),
       scan: this.scanStatus(),
       file_action: this.fileActionStatus(scopeId),
       last_scan: this.lastScanCache.get(scopeId || "") || null

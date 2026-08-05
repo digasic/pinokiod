@@ -39,6 +39,11 @@ const makeVault = async (home, options = {}) => {
   } else {
     await vault.init()
   }
+  const globalScanReady = options.globalScanReady !== undefined
+    ? !!options.globalScanReady
+    : true
+  vault.globalScanReady = async () => globalScanReady
+  vault.automaticScans.globalScanReady = globalScanReady
   return vault
 }
 
@@ -75,12 +80,30 @@ describe("automatic app checks", () => {
 
   test("reading notice state does not create Vault storage", async () => {
     const home = await makeHome()
-    const vault = await makeVault(home, { deferStorage: true })
+    const vault = await makeVault(home, {
+      deferStorage: true,
+      globalScanReady: false
+    })
 
-    assert.deepEqual((await vault.automaticScanStatus()).rows, [])
+    const status = await vault.automaticScanStatus()
+    assert.equal(status.global_scan_ready, false)
+    assert.deepEqual(status.rows, [])
     assert.equal(vault.initialized, false)
     assert.equal(fs.existsSync(path.join(home, "vault")), false)
     await close(vault)
+  })
+
+  test("missing readiness state keeps automatic checks locked", async () => {
+    const automatic = new AutomaticScans({ enabled: true })
+
+    await automatic.refreshGlobalScanReady()
+
+    assert.equal(automatic.globalScanReady, false)
+    assert.deepEqual(automatic.snapshot().rows, [])
+  })
+
+  test("automatic checks wait one second after an app stops", () => {
+    assert.equal(AutomaticScans.STOP_SETTLE_MS, 1000)
   })
 
   test("disabled Vault ignores app-stop events", async () => {
@@ -111,6 +134,7 @@ describe("automatic app checks", () => {
         api: { running_paths: {} }
       },
       sources: () => [],
+      globalScanReady: async () => true,
       automaticScanStatus: async () => ({ rows: [] })
     }
     const automatic = new AutomaticScans(vault)
@@ -840,6 +864,7 @@ describe("automatic app checks", () => {
         }
       }
     })
+    automatic.globalScanReady = true
     automatic.hydrated = true
     automatic.log = () => {}
     automatic.active = {
@@ -904,6 +929,7 @@ describe("automatic app checks", () => {
         }
       }
     })
+    automatic.globalScanReady = true
     automatic.hydrated = true
     automatic.log = () => {}
     automatic.entries.set("demo", {
