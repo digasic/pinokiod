@@ -654,7 +654,7 @@ describe("Save Space interface", () => {
     assert.match(document.getElementById("btn-scan").textContent,
       /Scan again/)
     assert.equal(document.getElementById("btn-scan").classList
-      .contains("primary"), false)
+      .contains("primary"), true)
     assert.equal(document.querySelector("#vault-scan-size-menu > summary")
       .classList.contains("primary"), false)
     assert.match(document.getElementById("vault-scan-size-label").textContent,
@@ -751,6 +751,10 @@ describe("Save Space interface", () => {
       /Cannot deduplicate\s*1/)
     assert.match(document.querySelector("#vault-status-filter").textContent,
       /Cannot deduplicate/)
+    assert.equal(document.getElementById("btn-review-metric").classList
+      .contains("primary"), true)
+    assert.equal(document.getElementById("btn-scan").classList
+      .contains("primary"), false)
 
     document.querySelector('[data-view="duplicates"]').click()
     await waitFor(() => document.querySelector(
@@ -759,7 +763,10 @@ describe("Save Space interface", () => {
       /duplicate\.bin/)
     assert.doesNotMatch(document.querySelector(".vault-table").textContent,
       /blocked\.bin/)
-    assert.ok(document.querySelector("[data-deduplicate-all]"))
+    assert.equal(document.querySelector("[data-deduplicate-all]")
+      .classList.contains("primary"), true)
+    assert.equal(document.getElementById("btn-scan").classList
+      .contains("primary"), false)
 
     document.querySelector('[data-view="unavailable"]').click()
     await waitFor(() => document.querySelector(
@@ -2217,6 +2224,37 @@ describe("Save Space interface", () => {
 
     assert.match(scanButton.textContent, /Scan this app/)
     assert.equal(scanButton.classList.contains("primary"), true)
+
+    dom.window.close()
+  })
+
+  test("a completed app workspace keeps Scan again primary", async () => {
+    const { dom } = await makePage(fixture([]), {
+      appMode: true,
+      scopeId: "app:app"
+    })
+    const document = dom.window.document
+
+    assert.match(document.getElementById("btn-scan").textContent,
+      /Scan again/)
+    assert.equal(document.getElementById("btn-scan").classList
+      .contains("primary"), true)
+
+    dom.window.close()
+  })
+
+  test("an app with duplicates keeps Scan again secondary", async () => {
+    const duplicate = item({ status: "duplicate", shareable: true })
+    const { dom } = await makePage(fixture([duplicate]), {
+      appMode: true,
+      scopeId: "app:app"
+    })
+    const document = dom.window.document
+
+    assert.equal(document.getElementById("btn-review-metric").classList
+      .contains("primary"), true)
+    assert.equal(document.getElementById("btn-scan").classList
+      .contains("primary"), false)
 
     dom.window.close()
   })

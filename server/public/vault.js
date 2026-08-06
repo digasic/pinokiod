@@ -2232,6 +2232,8 @@ const renderNormalOverview = () => {
   const activeScan = scanActive(data.scan)
   const scanning = scanMatchesContext(data.scan)
   const busyElsewhere = activeScan && !scanning
+  const actionableDuplicates = Math.max(0, Number(
+    data.inventory && data.inventory.shareable_duplicates) || 0)
   const metrics = el("vault-metrics")
   const existingModeMenu = el("vault-auto-mode")
   const modeMenuOpen = !!(existingModeMenu && existingModeMenu.open) ||
@@ -2313,7 +2315,8 @@ const renderNormalOverview = () => {
       ? `<i class="fa-solid fa-circle-notch fa-spin"></i>${esc(COPY.scanning)}`
     : `<i class="fa-solid fa-rotate"></i>${esc(idleScanLabel)}`
   const firstScan = !last && !activeScan
-  scanButton.classList.toggle("primary", firstScan)
+  const scanIsPrimary = firstScan || (!activeScan && !actionableDuplicates)
+  scanButton.classList.toggle("primary", scanIsPrimary)
   scanButton.disabled = busyElsewhere || state.scanCancelRequested
   if (state.automaticReviewRequested && !activeScan &&
       !scanButton.disabled) {
