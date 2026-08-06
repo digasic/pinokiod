@@ -370,10 +370,21 @@ test("an empty automatic check briefly confirms completion", async () => {
   })
   const eventSources = []
   const requests = []
+  const revealTimers = []
   const completionTimers = []
   const nativeSetTimeout = dom.window.setTimeout.bind(dom.window)
   const nativeClearTimeout = dom.window.clearTimeout.bind(dom.window)
   dom.window.setTimeout = (callback, delay, ...args) => {
+    if (delay <= 500 && delay > 400) {
+      const timer = {
+        callback,
+        delay,
+        cleared: false,
+        id: 9000 + revealTimers.length
+      }
+      revealTimers.push(timer)
+      return timer.id
+    }
     if (delay <= 4000 && delay > 3500) {
       const timer = {
         callback,
@@ -387,7 +398,8 @@ test("an empty automatic check briefly confirms completion", async () => {
     return nativeSetTimeout(callback, delay, ...args)
   }
   dom.window.clearTimeout = (id) => {
-    const timer = completionTimers.find((candidate) => candidate.id === id)
+    const timer = [...revealTimers, ...completionTimers]
+      .find((candidate) => candidate.id === id)
     if (timer) {
       timer.cleared = true
       return
@@ -480,6 +492,20 @@ test("an empty automatic check briefly confirms completion", async () => {
     }
   })
 
+  const checking = [...tray.querySelectorAll(".vault-auto-scan-row")]
+    .find((card) => card.querySelector(
+      ".vault-auto-scan-app").textContent === "ComfyUI")
+  assert.ok(checking)
+  assert.equal(checking.dataset.state, "checking")
+  assert.equal(checking.querySelectorAll(
+    ".vault-auto-scan-message").length, 1)
+  assert.equal(tray.querySelector(
+    '.vault-auto-scan-row[data-state="complete"]'), null,
+  "the checking phase remains visible before an immediate result")
+  assert.equal(revealTimers.length, 1)
+  assert.ok(revealTimers[0].delay <= 500)
+
+  revealTimers[0].callback()
   const completed = tray.querySelector(
     '.vault-auto-scan-row[data-state="complete"]')
   assert.ok(completed)
@@ -541,6 +567,7 @@ test("an empty automatic check briefly confirms completion", async () => {
   })
   const focusedClose = tray.querySelector(".vault-auto-scan-close")
   focusedClose.focus()
+  const revealsBeforeFocusedCompletion = revealTimers.length
   const timersBeforeFocusedCompletion = completionTimers.length
   send({
     enabled: true,
@@ -552,6 +579,10 @@ test("an empty automatic check briefly confirms completion", async () => {
     }
   })
   assert.equal(tray.hidden, false)
+  assert.equal(revealTimers.length, revealsBeforeFocusedCompletion + 1)
+  assert.equal(completionTimers.length, timersBeforeFocusedCompletion,
+    "completion dismissal cannot start before its result is revealed")
+  revealTimers.at(-1).callback()
   assert.equal(completionTimers.length, timersBeforeFocusedCompletion,
     "completion does not start its timer while focus is already in the card")
   focusedClose.dispatchEvent(new dom.window.FocusEvent("focusout", {

@@ -853,6 +853,7 @@
         <circle cx="10" cy="10" r="7.5"></circle>
         <path d="m6.75 10.1 2.1 2.1 4.6-4.65"></path>
       </svg>`;
+    const MIN_CHECKING_VISIBLE_MS = 500;
     const COMPLETION_VISIBLE_MS = 4000;
 
     let eventSource = null;
@@ -923,7 +924,9 @@
     }
 
     function scheduleCompletion(completion) {
-      if (completion.paused.size || completion.timer) return;
+      if (!completion.revealed || completion.paused.size || completion.timer) {
+        return;
+      }
       completion.startedAt = Date.now();
       completion.timer = window.setTimeout(() => {
         completion.timer = null;
@@ -932,7 +935,7 @@
     }
 
     function setCompletionPaused(completion, reason, paused) {
-      if (!completion) return;
+      if (!completion || !completion.revealed) return;
       if (paused) {
         if (completion.paused.has(reason)) return;
         if (!completion.paused.size && completion.timer) {
@@ -1026,13 +1029,14 @@
         controls,
         currentState: null,
         currentNoticeId: null,
+        checkingShownAt: 0,
         dismissPending: false,
         pointerInside: false,
         focusInside: false,
         completion: null
       };
       close.addEventListener('click', async () => {
-        if (card.currentState === 'complete') {
+        if (card.completion) {
           removeCard(app);
           return;
         }
@@ -1177,32 +1181,50 @@
       appendMessage(card, displayState);
       card.currentState = row.state;
       card.currentNoticeId = row.notice_id || null;
+      card.checkingShownAt = row.state === 'checking' ? Date.now() : 0;
       card.dismissPending = false;
       card.item.dataset.state = row.state;
       renderControls(card, row);
       return card;
     }
 
-    function startCompletion(app) {
-      const card = cards.get(app);
-      if (!card || card.currentState !== 'checking' ||
-          card.dismissPending || card.completion) return false;
+    function revealCompletion(completion) {
+      const card = cards.get(completion.app);
+      if (!card || card.completion !== completion ||
+          card.currentState !== 'checking' || card.dismissPending) return;
+      completion.timer = null;
+      completion.revealed = true;
       appendMessage(card, 'complete');
       card.currentState = 'complete';
       card.currentNoticeId = null;
       card.item.dataset.state = 'complete';
       renderControls(card, { state: 'complete' });
+      if (card.pointerInside) completion.paused.add('pointer');
+      if (card.focusInside) completion.paused.add('focus');
+      scheduleCompletion(completion);
+    }
+
+    function startCompletion(app) {
+      const card = cards.get(app);
+      if (!card || card.currentState !== 'checking' ||
+          card.dismissPending || card.completion) return false;
       const completion = {
         app,
+        revealed: false,
         timer: null,
         remaining: COMPLETION_VISIBLE_MS,
         startedAt: 0,
         paused: new Set()
       };
-      if (card.pointerInside) completion.paused.add('pointer');
-      if (card.focusInside) completion.paused.add('focus');
       card.completion = completion;
-      scheduleCompletion(completion);
+      const elapsed = Math.max(0, Date.now() - card.checkingShownAt);
+      const delay = Math.max(0, MIN_CHECKING_VISIBLE_MS - elapsed);
+      if (delay) {
+        completion.timer = window.setTimeout(
+          () => revealCompletion(completion), delay);
+      } else {
+        revealCompletion(completion);
+      }
       return true;
     }
 

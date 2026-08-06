@@ -224,6 +224,11 @@
       opacity: 0.58;
     }
 
+    .vault-auto-scan-message[data-current="true"] {
+      animation: vault-notice-message-enter 160ms
+        cubic-bezier(0.25, 1, 0.5, 1);
+    }
+
     .vault-auto-scan-icon {
       display: grid;
       place-items: center;
@@ -374,6 +379,11 @@
       to { transform: rotate(360deg); }
     }
 
+    @keyframes vault-notice-message-enter {
+      from { opacity: 0; transform: translateY(2px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
     @media (pointer: coarse) {
       .vault-auto-scan-controls { min-height: 44px; }
       .vault-auto-scan-action {
@@ -384,6 +394,9 @@
 
     @media (prefers-reduced-motion: reduce) {
       .vault-auto-scan-row {
+        animation: none;
+      }
+      .vault-auto-scan-message[data-current="true"] {
         animation: none;
       }
       .vault-auto-scan-message[data-current="true"][data-state="checking"]
