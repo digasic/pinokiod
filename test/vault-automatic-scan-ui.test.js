@@ -102,9 +102,14 @@ test("the shared layout renders and reviews automatic possible-match notices", a
   const tray = dom.window.document.getElementById("vault-auto-scan-tray")
   assert.equal(tray.hidden, false)
   assert.equal(tray.querySelector(
+    ".vault-auto-scan-product").textContent, "Disk Saver")
+  assert.equal(tray.querySelector(
     ".vault-auto-scan-app").textContent, "ComfyUI")
   assert.equal(tray.querySelector(
-    ".vault-auto-scan-detail").textContent, "may have duplicate files")
+    ".vault-auto-scan-status").textContent,
+  "Possible duplicate files found")
+  assert.equal(tray.querySelectorAll(
+    ".vault-auto-scan-message").length, 1)
   assert.equal(tray.querySelector(".vault-auto-scan-value"), null)
   assert.equal(tray.querySelector(
     ".vault-auto-scan-action").textContent, "Review")
@@ -131,9 +136,119 @@ test("the shared layout renders and reviews automatic possible-match notices", a
   assert.equal(requests.some((request) =>
     request && request.url === "/info/vault/automatic-scans"), false)
   assert.match(script, /window\.location\.assign\(/)
-  assert.ok(script.indexOf("if (!openAutomaticReview(row.app, result.href))") <
-    script.indexOf("removeRow(item);", script.indexOf(
-      "if (!openAutomaticReview(row.app, result.href))")))
+  assert.ok(script.indexOf("if (!openAutomaticReview(card.app, result.href))") <
+    script.indexOf("removeCard(card.app);", script.indexOf(
+      "if (!openAutomaticReview(card.app, result.href))")))
+
+  dom.window.close()
+})
+
+test("automatic check states append within one card", async () => {
+  const template = await fs.promises.readFile(
+    path.join(root, "server", "views", "layout.ejs"), "utf8")
+  const script = await fs.promises.readFile(
+    path.join(root, "server", "public", "layout.js"), "utf8")
+  const html = ejs.render(template, {
+    theme: "light",
+    agent: "web",
+    initialPath: "/home",
+    defaultPath: "/home",
+    sessionId: null,
+    vaultEnabled: true
+  })
+  const dom = new JSDOM(html, {
+    runScripts: "outside-only",
+    pretendToBeVisual: true,
+    url: "http://localhost/"
+  })
+  const eventSources = []
+  dom.window.EventSource = class EventSource {
+    constructor(url) {
+      this.url = url
+      eventSources.push(this)
+    }
+    close() {}
+  }
+  dom.window.fetch = async (url) => {
+    throw new Error(`Unexpected request: ${url}`)
+  }
+
+  dom.window.eval(script)
+  await waitFor(() => eventSources.length === 1)
+  const send = (rows, settings = []) => eventSources[0].onmessage({
+    data: JSON.stringify({
+      enabled: true,
+      global_scan_ready: true,
+      rows,
+      settings
+    })
+  })
+  const row = (state, noticeId) => ({
+    app: "ComfyUI",
+    state,
+    notice_id: noticeId
+  })
+
+  send([row("checking", "checking:1:")])
+  const tray = dom.window.document.getElementById("vault-auto-scan-tray")
+  const card = tray.querySelector(".vault-auto-scan-row")
+  assert.ok(card)
+
+  send([row("paused", "paused:2:")], [
+    { app: "ComfyUI", mode: "manual" }
+  ])
+  assert.equal(tray.querySelector(".vault-auto-scan-row"), card)
+  assert.deepEqual([...card.querySelectorAll(".vault-auto-scan-status")]
+    .map((status) => status.textContent), [
+    "Checking for possible duplicate files...",
+    "Automatic checks are paused"
+  ])
+  assert.equal(card.querySelectorAll(
+    '.vault-auto-scan-message[data-current="true"]').length, 1)
+  assert.equal(card.querySelector(
+    '.vault-auto-scan-message[data-current="false"] button'), null)
+  assert.equal(card.querySelector(
+    ".vault-auto-scan-action").textContent, "Resume")
+
+  send([row("checking", "checking:3:")], [
+    { app: "ComfyUI", mode: "automatic" }
+  ])
+  assert.equal(tray.querySelector(".vault-auto-scan-row"), card)
+  assert.equal(card.querySelectorAll(".vault-auto-scan-message").length, 3)
+  assert.equal(card.querySelector(
+    '.vault-auto-scan-message[data-current="true"] .vault-auto-scan-status')
+    .textContent, "Checking again for possible duplicate files...")
+  assert.equal(card.querySelector(
+    ".vault-auto-scan-action").textContent, "Pause")
+
+  send([row("result", "result:4:result-a")], [
+    { app: "ComfyUI", mode: "automatic" }
+  ])
+  assert.equal(tray.querySelector(".vault-auto-scan-row"), card)
+  assert.equal(card.querySelectorAll(".vault-auto-scan-message").length, 4)
+  assert.equal(card.querySelector(
+    '.vault-auto-scan-message[data-current="true"] .vault-auto-scan-status')
+    .textContent, "Possible duplicate files found")
+  assert.equal(card.querySelector(".vault-auto-scan-settings"), null)
+  assert.equal(card.querySelector(
+    ".vault-auto-scan-action").textContent, "Review")
+
+  send([row("result", "result:4:result-a")], [
+    { app: "ComfyUI", mode: "automatic" }
+  ])
+  assert.equal(card.querySelectorAll(".vault-auto-scan-message").length, 4,
+    "repeated snapshots do not duplicate the current message")
+
+  send([
+    row("result", "result:4:result-a"),
+    { app: "OtherApp", state: "checking", notice_id: "checking:5:" }
+  ], [
+    { app: "ComfyUI", mode: "automatic" },
+    { app: "OtherApp", mode: "automatic" }
+  ])
+  assert.equal(tray.querySelectorAll(".vault-auto-scan-row").length, 2)
+  assert.deepEqual([...tray.querySelectorAll(".vault-auto-scan-app")]
+    .map((app) => app.textContent), ["ComfyUI", "OtherApp"])
 
   dom.window.close()
 })
@@ -205,7 +320,7 @@ test("checking notices expose settings, Pause, and dismissal", async () => {
     ".vault-auto-scan-app").textContent, "ComfyUI")
   assert.equal(tray.querySelector(
     ".vault-auto-scan-status").textContent,
-  "Checking for possible duplicate files…")
+  "Checking for possible duplicate files...")
   assert.equal(tray.querySelector(
     ".vault-auto-scan-settings").textContent,
   "Automatic check settings")
@@ -223,19 +338,9 @@ test("checking notices expose settings, Pause, and dismissal", async () => {
   assert.equal(tray.querySelector(
     ".vault-auto-scan-settings").disabled, false)
 
-  const relayed = []
-  iframe.contentWindow.postMessage = (message, targetOrigin) => {
-    relayed.push({ message, targetOrigin })
-  }
-  dom.window.dispatchEvent(new dom.window.MessageEvent("message", {
-    data: { e: "vault-auto-settings-ready" },
-    origin: dom.window.location.origin,
-    source: iframe.contentWindow
-  }))
-  tray.querySelector(".vault-auto-scan-settings").click()
-  await waitFor(() => relayed.length === 1)
-  assert.equal(relayed[0].message.e, "vault-auto-settings")
-  assert.equal(relayed[0].targetOrigin, dom.window.location.origin)
+  assert.doesNotMatch(script, /vaultAutoSettingsReady|vault-auto-settings-ready/)
+  assert.doesNotMatch(script,
+    /postMessage\(\s*\{ e: ['"]vault-auto-settings['"]/)
 
   tray.querySelector(".vault-auto-scan-close").click()
   await waitFor(() => tray.hidden)
@@ -380,10 +485,18 @@ test("an empty automatic check briefly confirms completion", async () => {
   assert.ok(completed)
   assert.equal(completed.querySelector(
     ".vault-auto-scan-app").textContent, "ComfyUI")
+  assert.deepEqual([...completed.querySelectorAll(
+    ".vault-auto-scan-status")].map((status) => status.textContent), [
+    "Checking for possible duplicate files...",
+    "No possible duplicate files found"
+  ])
+  assert.equal(completed.querySelectorAll(
+    ".vault-auto-scan-message").length, 2)
   assert.equal(completed.querySelector(
-    ".vault-auto-scan-status").textContent,
-  "No possible duplicate files found")
-  assert.ok(completed.querySelector(".vault-auto-scan-icon svg"))
+    '.vault-auto-scan-message[data-current="false"]')
+    .dataset.state, "checking")
+  assert.ok(completed.querySelector(
+    '.vault-auto-scan-message[data-current="true"] .vault-auto-scan-icon svg'))
   assert.equal(completed.querySelector(".vault-auto-scan-settings"), null)
   assert.equal(completed.querySelector(".vault-auto-scan-action"), null)
   assert.equal(completionTimers[0].delay, 4000)
@@ -426,6 +539,9 @@ test("an empty automatic check briefly confirms completion", async () => {
     }],
     settings: [{ app: "ComfyUI", mode: "automatic" }]
   })
+  const focusedClose = tray.querySelector(".vault-auto-scan-close")
+  focusedClose.focus()
+  const timersBeforeFocusedCompletion = completionTimers.length
   send({
     enabled: true,
     rows: [],
@@ -436,6 +552,13 @@ test("an empty automatic check briefly confirms completion", async () => {
     }
   })
   assert.equal(tray.hidden, false)
+  assert.equal(completionTimers.length, timersBeforeFocusedCompletion,
+    "completion does not start its timer while focus is already in the card")
+  focusedClose.dispatchEvent(new dom.window.FocusEvent("focusout", {
+    bubbles: true,
+    relatedTarget: null
+  }))
+  assert.equal(completionTimers.length, timersBeforeFocusedCompletion + 1)
   eventSources[0].onerror()
   await new Promise((resolve) => nativeSetTimeout(resolve, 0))
   assert.equal(tray.hidden, true,
@@ -614,6 +737,7 @@ test("the app sidebar mirrors Automatic and Manual Disk Saver modes", async () =
   assert.equal(label.textContent, "Auto")
   assert.match(template, /data-app-vault-mode/)
   assert.match(template, /app-vault-mode\.js/)
+  assert.doesNotMatch(template, /vault-auto-settings/)
   assert.match(template,
     /#save-space-tab\s*\{[^}]*width:\s*100%;[^}]*max-width:\s*none;/s)
   assert.match(template,

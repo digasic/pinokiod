@@ -241,12 +241,7 @@
     iframe.addEventListener('focus', markActive);
     iframe.addEventListener('pointerdown', markActive);
 
-    entry = {
-      container,
-      iframe,
-      updateNodeLocation,
-      vaultAutoSettingsReady: false,
-    };
+    entry = { container, iframe, updateNodeLocation };
     leafElements.set(node.id, entry);
     return entry;
   }
@@ -641,7 +636,6 @@
       leaf.src = state.defaultPath;
       const entry = leafElements.get(leaf.id);
       if (entry) {
-        entry.vaultAutoSettingsReady = false;
         entry.iframe.src = leaf.src;
       }
       cleanupSessionIfSingleLeaf();
@@ -688,7 +682,6 @@
       return false;
     }
     node.src = normalized;
-    entry.vaultAutoSettingsReady = false;
     entry.iframe.src = normalized;
     state.activeLeafId = frameId;
     saveStateToStorage();
@@ -697,16 +690,6 @@
 
   function onMessage(event) {
     if (!event || !event.data || typeof event.data !== 'object') {
-      return;
-    }
-    if (event.data.e === 'vault-auto-settings-ready' &&
-        event.origin === window.location.origin) {
-      for (const entry of leafElements.values()) {
-        if (entry.iframe && entry.iframe.contentWindow === event.source) {
-          entry.vaultAutoSettingsReady = true;
-          break;
-        }
-      }
       return;
     }
     if (event.data.e === 'layout-state-request') {
@@ -788,7 +771,6 @@
       if (node.type === 'leaf') {
         const entry = ensureLeafElement(node);
         if (entry && entry.iframe.src !== node.src) {
-          entry.vaultAutoSettingsReady = false;
           entry.iframe.src = node.src;
         }
       }
@@ -874,21 +856,23 @@
     const COMPLETION_VISIBLE_MS = 4000;
 
     let eventSource = null;
-    let visibleCheckingApps = new Set();
-    const completions = new Map();
+    const cards = new Map();
 
-    function statusText(row) {
-      if (row.state === 'paused') {
-        return 'Automatic checks are off';
+    function statusText(state) {
+      if (state === 'paused') return 'Automatic checks are paused';
+      if (state === 'result') return 'Possible duplicate files found';
+      if (state === 'complete') return 'No possible duplicate files found';
+      if (state === 'checking-again') {
+        return 'Checking again for possible duplicate files...';
       }
-      return 'Checking for possible duplicate files…';
+      return 'Checking for possible duplicate files...';
     }
 
-    function actionFor(row) {
-      if (row.state === 'paused') {
+    function actionFor(state) {
+      if (state === 'paused') {
         return { label: 'Resume', action: 'automatic_resume' };
       }
-      if (row.state === 'result') {
+      if (state === 'result') {
         return { label: 'Review', action: 'automatic_review' };
       }
       return { label: 'Pause', action: 'automatic_pause' };
@@ -915,21 +899,27 @@
       return result || {};
     }
 
-    function removeRow(item) {
-      item.remove();
-      tray.hidden = tray.childElementCount === 0;
-    }
-
-    function removeCompletion(app) {
-      const completion = completions.get(app);
+    function stopCompletion(card) {
+      const completion = card && card.completion;
       if (!completion) return;
       if (completion.timer) window.clearTimeout(completion.timer);
-      completions.delete(app);
-      removeRow(completion.item);
+      card.completion = null;
     }
 
-    function clearCompletions() {
-      [...completions.keys()].forEach(removeCompletion);
+    function removeCard(app) {
+      const card = cards.get(app);
+      if (card) {
+        stopCompletion(card);
+        card.item.remove();
+      }
+      cards.delete(app);
+      tray.hidden = cards.size === 0;
+    }
+
+    function resetCards() {
+      [...cards.keys()].forEach(removeCard);
+      tray.replaceChildren();
+      tray.hidden = true;
     }
 
     function scheduleCompletion(completion) {
@@ -937,11 +927,12 @@
       completion.startedAt = Date.now();
       completion.timer = window.setTimeout(() => {
         completion.timer = null;
-        removeCompletion(completion.app);
+        removeCard(completion.app);
       }, completion.remaining);
     }
 
     function setCompletionPaused(completion, reason, paused) {
+      if (!completion) return;
       if (paused) {
         if (completion.paused.has(reason)) return;
         if (!completion.paused.size && completion.timer) {
@@ -957,60 +948,6 @@
       if (!completion.paused.size) scheduleCompletion(completion);
     }
 
-    function startCompletion(app) {
-      if (completions.has(app)) return;
-      const item = document.createElement('div');
-      item.className = 'vault-auto-scan-row';
-      item.dataset.state = 'complete';
-
-      const close = document.createElement('button');
-      close.type = 'button';
-      close.className = 'vault-auto-scan-close';
-      close.setAttribute('aria-label',
-        `Dismiss Disk Saver completion for ${app}`);
-      close.title = 'Dismiss';
-      close.textContent = '×';
-
-      const icon = document.createElement('span');
-      icon.className = 'vault-auto-scan-icon';
-      icon.innerHTML = COMPLETE_ICON;
-
-      const copy = document.createElement('span');
-      copy.className = 'vault-auto-scan-copy';
-      const appName = document.createElement('span');
-      appName.className = 'vault-auto-scan-app';
-      appName.textContent = app;
-      appName.title = app;
-      const status = document.createElement('span');
-      status.className = 'vault-auto-scan-status';
-      status.textContent = 'No possible duplicate files found';
-      copy.append(appName, status);
-      item.append(close, icon, copy);
-
-      const completion = {
-        app,
-        item,
-        timer: null,
-        remaining: COMPLETION_VISIBLE_MS,
-        startedAt: 0,
-        paused: new Set()
-      };
-      close.addEventListener('click', () => removeCompletion(app));
-      item.addEventListener('mouseenter', () =>
-        setCompletionPaused(completion, 'pointer', true));
-      item.addEventListener('mouseleave', () =>
-        setCompletionPaused(completion, 'pointer', false));
-      item.addEventListener('focusin', () =>
-        setCompletionPaused(completion, 'focus', true));
-      item.addEventListener('focusout', (event) => {
-        if (!item.contains(event.relatedTarget)) {
-          setCompletionPaused(completion, 'focus', false);
-        }
-      });
-      completions.set(app, completion);
-      scheduleCompletion(completion);
-    }
-
     function automaticSettingsKey(app) {
       return `pinokio:vault:auto-settings:${encodeURIComponent(app)}`;
     }
@@ -1024,24 +961,6 @@
       try {
         sessionStorage.setItem(storageKey, '1');
       } catch (_) {}
-      let frameId = state.activeLeafId;
-      if (!frameId || !leafElements.has(frameId)) {
-        frameId = leafElements.keys().next().value || null;
-      }
-      const node = frameId ? nodeById.get(frameId) : null;
-      const entry = frameId ? leafElements.get(frameId) : null;
-      let currentPath = '';
-      let targetPath = '';
-      try {
-        currentPath = new URL(node?.src || '', window.location.href).pathname;
-        targetPath = new URL(href, window.location.href).pathname;
-      } catch (_) {}
-      if (entry && entry.vaultAutoSettingsReady &&
-          currentPath && currentPath === targetPath) {
-        entry.iframe?.contentWindow?.postMessage(
-          { e: 'vault-auto-settings' }, window.location.origin);
-        return true;
-      }
       const opened = navigateActiveLeaf(href);
       if (!opened) {
         try { sessionStorage.removeItem(storageKey); } catch (_) {}
@@ -1067,166 +986,271 @@
       return opened;
     }
 
+    function createCard(app) {
+      const item = document.createElement('section');
+      item.className = 'vault-auto-scan-row';
+
+      const close = document.createElement('button');
+      close.type = 'button';
+      close.className = 'vault-auto-scan-close';
+      close.setAttribute('aria-label',
+        `Dismiss Disk Saver notification for ${app}`);
+      close.title = 'Dismiss';
+      close.textContent = '×';
+
+      const header = document.createElement('header');
+      header.className = 'vault-auto-scan-header';
+      const product = document.createElement('span');
+      product.className = 'vault-auto-scan-product';
+      product.textContent = 'Disk Saver';
+      const separator = document.createElement('span');
+      separator.className = 'vault-auto-scan-separator';
+      separator.setAttribute('aria-hidden', 'true');
+      separator.textContent = '·';
+      const appName = document.createElement('span');
+      appName.className = 'vault-auto-scan-app';
+      appName.textContent = app;
+      appName.title = app;
+      header.append(product, separator, appName);
+
+      const messages = document.createElement('div');
+      messages.className = 'vault-auto-scan-messages';
+      const controls = document.createElement('div');
+      controls.className = 'vault-auto-scan-controls';
+      item.append(close, header, messages, controls);
+
+      const card = {
+        app,
+        item,
+        messages,
+        controls,
+        currentState: null,
+        currentNoticeId: null,
+        dismissPending: false,
+        pointerInside: false,
+        focusInside: false,
+        completion: null
+      };
+      close.addEventListener('click', async () => {
+        if (card.currentState === 'complete') {
+          removeCard(app);
+          return;
+        }
+        card.dismissPending = card.currentState === 'checking';
+        close.disabled = true;
+        try {
+          const result = await requestAction(
+            'automatic_dismiss', app, card.currentNoticeId);
+          if (result.stale) {
+            card.dismissPending = false;
+            await loadState();
+            if (close.isConnected) close.disabled = false;
+            return;
+          }
+          removeCard(app);
+        } catch (error) {
+          console.warn('[Disk Saver] Automatic check dismissal failed', error);
+          card.dismissPending = false;
+          close.disabled = false;
+        }
+      });
+      item.addEventListener('mouseenter', () => {
+        card.pointerInside = true;
+        setCompletionPaused(card.completion, 'pointer', true);
+      });
+      item.addEventListener('mouseleave', () => {
+        card.pointerInside = false;
+        setCompletionPaused(card.completion, 'pointer', false);
+      });
+      item.addEventListener('focusin', () => {
+        card.focusInside = true;
+        setCompletionPaused(card.completion, 'focus', true);
+      });
+      item.addEventListener('focusout', (event) => {
+        if (!item.contains(event.relatedTarget)) {
+          card.focusInside = false;
+          setCompletionPaused(card.completion, 'focus', false);
+        }
+      });
+      cards.set(app, card);
+      return card;
+    }
+
+    function messageIcon(state) {
+      if (state === 'paused') return PAUSE_ICON;
+      if (state === 'result') return DRIVE_ICON;
+      if (state === 'complete') return COMPLETE_ICON;
+      return '';
+    }
+
+    function appendMessage(card, state) {
+      const previous = card.messages.querySelector('[data-current="true"]');
+      if (previous) {
+        previous.dataset.current = 'false';
+        previous.removeAttribute('aria-current');
+      }
+      const message = document.createElement('div');
+      message.className = 'vault-auto-scan-message';
+      message.dataset.state = state === 'checking-again' ? 'checking' : state;
+      message.dataset.current = 'true';
+      message.setAttribute('aria-current', 'true');
+      const icon = document.createElement('span');
+      icon.className = 'vault-auto-scan-icon';
+      icon.innerHTML = messageIcon(state);
+      const status = document.createElement('span');
+      status.className = 'vault-auto-scan-status';
+      status.textContent = statusText(state);
+      message.append(icon, status);
+      card.messages.appendChild(message);
+    }
+
+    function addSettingsButton(card) {
+      const settings = document.createElement('button');
+      settings.type = 'button';
+      settings.className = 'vault-auto-scan-settings';
+      settings.textContent = 'Automatic check settings';
+      settings.addEventListener('click', async () => {
+        settings.disabled = true;
+        try {
+          const result = await requestAction(
+            'automatic_settings', card.app);
+          if (!result.href || !openAutomaticSettings(card.app, result.href)) {
+            throw new Error('The app page is unavailable.');
+          }
+        } catch (error) {
+          console.warn('[Disk Saver] Automatic check settings failed', error);
+        } finally {
+          if (settings.isConnected) settings.disabled = false;
+        }
+      });
+      card.controls.appendChild(settings);
+    }
+
+    function addStateAction(card, row) {
+      const action = actionFor(row.state);
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'vault-auto-scan-action';
+      button.textContent = action.label;
+      button.addEventListener('click', async () => {
+        button.disabled = true;
+        try {
+          const result = await requestAction(
+            action.action, card.app, row.notice_id);
+          if (result.stale) {
+            await loadState();
+            if (button.isConnected) button.disabled = false;
+            return;
+          }
+          if (action.action === 'automatic_review' && result.href) {
+            if (!openAutomaticReview(card.app, result.href)) {
+              throw new Error('The app page could not be opened.');
+            }
+            removeCard(card.app);
+          } else {
+            await loadState();
+          }
+        } catch (error) {
+          console.warn('[Disk Saver] Automatic check action failed', error);
+          if (button.isConnected) button.disabled = false;
+        }
+      });
+      card.controls.appendChild(button);
+    }
+
+    function renderControls(card, row) {
+      card.controls.replaceChildren();
+      if (row.state === 'complete') return;
+      if (row.state !== 'result') addSettingsButton(card);
+      addStateAction(card, row);
+    }
+
+    function updateCard(row) {
+      let card = cards.get(row.app);
+      if (!card) card = createCard(row.app);
+      const unchanged = card.currentState === row.state &&
+        card.currentNoticeId === (row.notice_id || null);
+      if (unchanged) return card;
+      stopCompletion(card);
+      const displayState = row.state === 'checking' &&
+        card.currentState === 'paused' ? 'checking-again' : row.state;
+      appendMessage(card, displayState);
+      card.currentState = row.state;
+      card.currentNoticeId = row.notice_id || null;
+      card.dismissPending = false;
+      card.item.dataset.state = row.state;
+      renderControls(card, row);
+      return card;
+    }
+
+    function startCompletion(app) {
+      const card = cards.get(app);
+      if (!card || card.currentState !== 'checking' ||
+          card.dismissPending || card.completion) return false;
+      appendMessage(card, 'complete');
+      card.currentState = 'complete';
+      card.currentNoticeId = null;
+      card.item.dataset.state = 'complete';
+      renderControls(card, { state: 'complete' });
+      const completion = {
+        app,
+        timer: null,
+        remaining: COMPLETION_VISIBLE_MS,
+        startedAt: 0,
+        paused: new Set()
+      };
+      if (card.pointerInside) completion.paused.add('pointer');
+      if (card.focusInside) completion.paused.add('focus');
+      card.completion = completion;
+      scheduleCompletion(completion);
+      return true;
+    }
+
     function render(snapshot, options = {}) {
       if (!snapshot || snapshot.global_scan_ready !== true) {
-        [...completions.keys()].forEach(removeCompletion);
-        visibleCheckingApps = new Set();
-        tray.replaceChildren();
-        tray.hidden = true;
+        resetCards();
         return;
       }
-      const rows = snapshot && Array.isArray(snapshot.rows)
+      const rows = Array.isArray(snapshot.rows)
         ? snapshot.rows
         : [];
       const validRows = rows.filter((row) =>
         row && typeof row.app === 'string' && row.app);
       const liveApps = new Set(validRows.map((row) => row.app));
-      [...completions.keys()].forEach((app) => {
-        if (liveApps.has(app)) removeCompletion(app);
-      });
-      const manualApps = new Set(snapshot && Array.isArray(snapshot.settings)
+      const manualApps = new Set(Array.isArray(snapshot.settings)
         ? snapshot.settings.filter((setting) =>
           setting && setting.mode === 'manual').map((setting) => setting.app)
         : []);
-      manualApps.forEach(removeCompletion);
-
-      const completion = snapshot && snapshot.completion;
+      const retained = new Set();
+      validRows.forEach((row) => {
+        updateCard(row);
+        retained.add(row.app);
+      });
+      const completion = snapshot.completion;
       if (options.acceptCompletion && completion &&
           completion.outcome === 'no_possible_duplicates' &&
           typeof completion.app === 'string' && completion.app &&
-          visibleCheckingApps.has(completion.app) &&
           !liveApps.has(completion.app) &&
-          !manualApps.has(completion.app)) {
-        startCompletion(completion.app);
+          !manualApps.has(completion.app) &&
+          startCompletion(completion.app)) {
+        retained.add(completion.app);
       }
-
-      const fragment = document.createDocumentFragment();
+      cards.forEach((card, app) => {
+        if (card.completion && !manualApps.has(app)) retained.add(app);
+      });
+      [...cards.keys()].forEach((app) => {
+        if (!retained.has(app)) removeCard(app);
+      });
       validRows.forEach((row) => {
-        const item = document.createElement('div');
-        item.className = 'vault-auto-scan-row';
-        item.dataset.state = row.state || 'checking';
-
-        const close = document.createElement('button');
-        close.type = 'button';
-        close.className = 'vault-auto-scan-close';
-        close.setAttribute('aria-label', `Dismiss Disk Saver notification for ${row.app}`);
-        close.title = 'Dismiss';
-        close.textContent = '×';
-        close.addEventListener('click', async () => {
-          if (row.state === 'checking') visibleCheckingApps.delete(row.app);
-          close.disabled = true;
-          try {
-            const result = await requestAction(
-              'automatic_dismiss', row.app, row.notice_id);
-            if (result.stale) {
-              await loadState();
-              if (close.isConnected) close.disabled = false;
-              return;
-            }
-            removeRow(item);
-          } catch (error) {
-            console.warn('[Disk Saver] Automatic check dismissal failed', error);
-            if (row.state === 'checking' && item.isConnected) {
-              visibleCheckingApps.add(row.app);
-            }
-            close.disabled = false;
-          }
-        });
-
-        const icon = document.createElement('span');
-        icon.className = 'vault-auto-scan-icon';
-        if (row.state === 'paused') {
-          icon.innerHTML = PAUSE_ICON;
-        } else if (row.state === 'result') {
-          icon.innerHTML = DRIVE_ICON;
-        }
-
-        const copy = document.createElement('span');
-        copy.className = 'vault-auto-scan-copy';
-        const appName = document.createElement('span');
-        appName.className = 'vault-auto-scan-app';
-        appName.textContent = row.app;
-        appName.title = row.app;
-        const status = document.createElement('span');
-        status.className = 'vault-auto-scan-status';
-        if (row.state === 'result') {
-          const detail = document.createElement('span');
-          detail.className = 'vault-auto-scan-detail';
-          detail.textContent = 'may have duplicate files';
-          status.append(detail);
-        } else {
-          status.textContent = statusText(row);
-        }
-        copy.append(appName, status);
-
-        const controls = document.createElement('span');
-        controls.className = 'vault-auto-scan-controls';
-        if (row.state !== 'result') {
-          const settings = document.createElement('button');
-          settings.type = 'button';
-          settings.className = 'vault-auto-scan-settings';
-          settings.textContent = 'Automatic check settings';
-          settings.addEventListener('click', async () => {
-            settings.disabled = true;
-            try {
-              const result = await requestAction(
-                'automatic_settings', row.app);
-              if (!result.href || !openAutomaticSettings(row.app, result.href)) {
-                throw new Error('The app page is unavailable.');
-              }
-            } catch (error) {
-              console.warn('[Disk Saver] Automatic check settings failed', error);
-            } finally {
-              if (settings.isConnected) settings.disabled = false;
-            }
-          });
-          copy.appendChild(settings);
-        }
-
-        const action = actionFor(row);
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.className = 'vault-auto-scan-action';
-        button.textContent = action.label;
-        button.addEventListener('click', async () => {
-          button.disabled = true;
-          try {
-            const result = await requestAction(
-              action.action, row.app, row.notice_id);
-            if (result.stale) {
-              await loadState();
-              if (button.isConnected) button.disabled = false;
-              return;
-            }
-            if (action.action === 'automatic_review' && result.href) {
-              if (!openAutomaticReview(row.app, result.href)) {
-                throw new Error('The app page could not be opened.');
-              }
-              removeRow(item);
-            } else {
-              await loadState();
-            }
-          } catch (error) {
-            console.warn('[Disk Saver] Automatic check action failed', error);
-            button.disabled = false;
-          }
-        });
-
-        controls.appendChild(button);
-
-        item.append(close, icon, copy, controls);
-        fragment.appendChild(item);
+        const card = cards.get(row.app);
+        if (card) tray.appendChild(card.item);
       });
-      completions.forEach((completionRow) => {
-        if (!liveApps.has(completionRow.app)) {
-          fragment.appendChild(completionRow.item);
+      cards.forEach((card, app) => {
+        if (card.completion && !liveApps.has(app)) {
+          tray.appendChild(card.item);
         }
       });
-      tray.replaceChildren(fragment);
-      tray.hidden = tray.childElementCount === 0;
-      visibleCheckingApps = new Set(validRows
-        .filter((row) => row.state === 'checking')
-        .map((row) => row.app));
+      tray.hidden = cards.size === 0;
     }
 
     async function loadState() {
@@ -1262,7 +1286,7 @@
         }
       };
       eventSource.onerror = () => {
-        clearCompletions();
+        resetCards();
         loadState();
       };
     }

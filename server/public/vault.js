@@ -582,14 +582,6 @@ const connectAutomaticMode = () => {
     } catch (error) {}
   }
 }
-const requestAutomaticModeMenu = () => {
-  if (!IS_APP_MODE) return
-  if (automaticSettingsKey) {
-    try { sessionStorage.removeItem(automaticSettingsKey) } catch (error) {}
-  }
-  state.automaticModeMenuRequested = true
-  if (state.data) renderOverview()
-}
 const sourceById = (id) => (state.data.sources || []).find((source) => source.id === id)
 const sourceChildren = (id) => (state.data.sources || []).filter((source) => source.parent_id === id)
 const sourceIsWithinScope = (sourceId) => {
@@ -4186,12 +4178,6 @@ if (IS_APP_MODE) {
     const trigger = menu.querySelector("summary")
     if (trigger) trigger.focus()
   }, true)
-  window.addEventListener("message", (event) => {
-    if (event.source !== window.parent ||
-        event.origin !== window.location.origin ||
-        !event.data || event.data.e !== "vault-auto-settings") return
-    requestAutomaticModeMenu()
-  })
   loadAutomaticMode().finally(connectAutomaticMode)
   window.addEventListener("beforeunload", () => {
     if (automaticModeEventSource) automaticModeEventSource.close()
