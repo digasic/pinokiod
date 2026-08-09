@@ -7,6 +7,9 @@ const path = require("node:path")
 const { threadId } = require("node:worker_threads")
 const Database = require("better-sqlite3")
 const Vault = require("../kernel/vault")
+const {
+  CANDIDATE_SIZE_OPTIONS
+} = require("../kernel/vault/constants")
 
 const homes = []
 
@@ -31,7 +34,7 @@ const makeVault = async () => {
   const vault = new Vault(kernel)
   kernel.vault = vault
   await vault.init()
-  vault.sizeThreshold = 1
+  vault.sizeThreshold = CANDIDATE_SIZE_OPTIONS[0]
   return { home, kernel, vault }
 }
 
@@ -391,7 +394,10 @@ describe("Save Space engine", () => {
       return workSummary(...args)
     }
 
-    const started = await vault.perform("find_folders", { path: outside })
+    const started = await vault.perform("find_folders", {
+      path: outside,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
+    })
     assert.equal(started.started, true)
     await vault.folderDiscoveryPromise
     vault.refreshAnchorStores = refreshAnchorStores
@@ -470,7 +476,8 @@ describe("Save Space engine", () => {
     const unrelatedHash = (await vault.registry.getFile(unrelatedPath)).hash
     assert.ok(unrelatedHash)
     assert.equal((await vault.perform("find_folders", {
-      path: outside
+      path: outside,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
     })).started, true)
     await vault.folderDiscoveryPromise
 
@@ -574,7 +581,8 @@ describe("Save Space engine", () => {
 
     await vault.sweeper.scan()
     assert.equal((await vault.perform("find_folders", {
-      path: outside
+      path: outside,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
     })).started, true)
     await vault.folderDiscoveryPromise
 
@@ -636,7 +644,8 @@ describe("Save Space engine", () => {
 
     await write(path.join(outside, "models", "model.bin"), pair.contents)
     assert.equal((await vault.perform("find_folders", {
-      path: outside
+      path: outside,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
     })).started, true)
     await vault.folderDiscoveryPromise
 
@@ -668,7 +677,10 @@ describe("Save Space engine", () => {
       path.join(outside, "models", "model.bin"), contents)
     const canonicalOutsideFile = await fs.promises.realpath(outsideFile)
     await vault.sweeper.scan()
-    await vault.perform("find_folders", { path: outside })
+    await vault.perform("find_folders", {
+      path: outside,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
+    })
     await vault.folderDiscoveryPromise
     const discovery = vault.folderDiscoveryStatus()
     const results = await vault.folderDiscoveryResults()
@@ -723,7 +735,8 @@ describe("Save Space engine", () => {
       crypto.randomBytes(contents.length * 1000))
     await vault.sweeper.scan()
     assert.equal((await vault.perform("find_folders", {
-      path: outside
+      path: outside,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
     })).started, true)
     await vault.folderDiscoveryPromise
 
@@ -765,7 +778,10 @@ describe("Save Space engine", () => {
           crypto.randomBytes(extraSizes[index]))
       }
       await vault.sweeper.scan()
-      await vault.perform("find_folders", { path: outside })
+      await vault.perform("find_folders", {
+        path: outside,
+        candidate_size: CANDIDATE_SIZE_OPTIONS[0]
+      })
       await vault.folderDiscoveryPromise
       const folders = (await vault.registry.folderDiscoveryRecommendations(
         vault.folderFinder.runId)).items.map((entry) => entry.folder)
@@ -784,15 +800,16 @@ describe("Save Space engine", () => {
       [path.join(balanced.outside, "group")])
   })
 
-  test("Find folders uses the exact published threshold and waits for active scans", async () => {
+  test("Find folders uses a selected supported threshold and waits for active scans", async () => {
     const { home, vault } = await makeVault()
     const outside = await makeOutside()
-    const contents = crypto.randomBytes(4096)
+    const selectedThreshold = CANDIDATE_SIZE_OPTIONS[1]
+    const contents = crypto.randomBytes(selectedThreshold + 4096)
     await write(path.join(home, "api", "app", "model.bin"), contents)
     await write(path.join(outside, "models", "model.bin"), contents)
     await write(path.join(outside, "models", "below-threshold.bin"),
       crypto.randomBytes(512))
-    vault.sizeThreshold = 1234
+    vault.sizeThreshold = 0
     await vault.sweeper.scan()
 
     const stageDiscoveryFiles = vault.registry.stageFolderDiscoveryFiles
@@ -805,17 +822,68 @@ describe("Save Space engine", () => {
 
     vault.scanPromise = new Promise(() => {})
     assert.match((await vault.perform("find_folders", {
-      path: outside
+      path: outside,
+      candidate_size: selectedThreshold
     })).error, /current scan/i)
     vault.scanPromise = null
 
-    const started = await vault.perform("find_folders", { path: outside })
-    assert.equal(started.threshold, 1234)
+    const started = await vault.perform("find_folders", {
+      path: outside,
+      candidate_size: selectedThreshold
+    })
+    assert.equal(started.threshold, selectedThreshold)
     await vault.folderDiscoveryPromise
-    assert.equal(vault.folderDiscoveryStatus().threshold, 1234)
+    assert.equal(vault.folderDiscoveryStatus().threshold, selectedThreshold)
     assert.equal(vault.folderDiscoveryStatus().result_count, 1)
     assert.ok(stagedSizes.length > 0)
-    assert.ok(stagedSizes.every((size) => size >= 1234))
+    assert.ok(stagedSizes.every((size) => size >= selectedThreshold))
+    await close(vault)
+  })
+
+  test("Find folders requires a new global scan for a lower threshold", async () => {
+    const { vault } = await makeVault()
+    const outside = await makeOutside()
+    const indexedThreshold = CANDIDATE_SIZE_OPTIONS[1]
+    vault.sizeThreshold = indexedThreshold
+    await vault.sweeper.scan()
+
+    const result = await vault.perform("find_folders", {
+      path: outside,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
+    })
+    assert.match(result.error, /global scan.*minimum file size/i)
+    assert.equal(vault.folderDiscoveryPromise, null)
+    await close(vault)
+  })
+
+  test("Find folders requires an explicit supported threshold", async () => {
+    const { vault } = await makeVault()
+    const outside = await makeOutside()
+
+    assert.match((await vault.perform("find_folders", {
+      path: outside
+    })).error, /valid minimum file size/i)
+    assert.match((await vault.perform("find_folders", {
+      path: outside,
+      candidate_size: 123
+    })).error, /valid minimum file size/i)
+    assert.equal(vault.folderDiscoveryPromise, null)
+    await close(vault)
+  })
+
+  test("Find folders does not infer a missing indexed threshold", async () => {
+    const { vault } = await makeVault()
+    const outside = await makeOutside()
+    vault.scanForScope = async () => ({
+      ts: Date.now(),
+      outcome: "complete"
+    })
+
+    assert.match((await vault.perform("find_folders", {
+      path: outside,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
+    })).error, /new global scan/i)
+    assert.equal(vault.folderDiscoveryPromise, null)
     await close(vault)
   })
 
@@ -839,7 +907,8 @@ describe("Save Space engine", () => {
     }
     try {
       assert.equal((await vault.perform("find_folders", {
-        path: outside
+        path: outside,
+        candidate_size: CANDIDATE_SIZE_OPTIONS[0]
       })).started, true)
       await vault.folderDiscoveryPromise
     } finally {
@@ -875,7 +944,8 @@ describe("Save Space engine", () => {
     }
 
     assert.equal((await vault.perform("find_folders", {
-      path: outside
+      path: outside,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
     })).started, true)
     await vault.folderDiscoveryPromise
 
@@ -911,7 +981,8 @@ describe("Save Space engine", () => {
     await publishing
     assert.match((await vault.clearFolderDiscovery()).error,
       /finish being added/i)
-    assert.match((await vault.startFolderDiscovery(outside)).error,
+    assert.match((await vault.startFolderDiscovery(
+      outside, CANDIDATE_SIZE_OPTIONS[0])).error,
       /finish being added/i)
     releasePublish()
     assert.equal((await adding).created_count, 1)
@@ -922,14 +993,16 @@ describe("Save Space engine", () => {
   test("Find folders requires a published global scan and rejects covered roots", async () => {
     const { home, vault } = await makeVault()
     assert.match((await vault.perform("find_folders", {
-      path: home
+      path: home,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
     })).error, /global scan/i)
 
     await write(path.join(home, "api", "app", "model.bin"),
       crypto.randomBytes(4096))
     await vault.sweeper.scan()
     assert.equal((await vault.perform("find_folders", {
-      path: home
+      path: home,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
     })).started, true)
     await vault.folderDiscoveryPromise
     assert.equal(vault.folderDiscoveryStatus().phase, "failed")
@@ -955,7 +1028,8 @@ describe("Save Space engine", () => {
     }
 
     assert.equal((await vault.perform("find_folders", {
-      path: outside
+      path: outside,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
     })).started, true)
     await waitForEngine(() => !!vault.folderFinder.currentHash)
     assert.equal((await vault.perform(

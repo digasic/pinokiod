@@ -736,6 +736,17 @@ describe("Save Space scans", () => {
         LIMIT 128
       `).all("plan").map((row) => row.detail).join(" ")
       assert.match(comparisonPlan, /scan_files_comparison_pending_idx/)
+      const reclassificationPlan = registry.database.prepare(`
+        EXPLAIN QUERY PLAN
+        SELECT *
+        FROM files
+        WHERE hash = ? AND dev IN (?)
+        ORDER BY path
+      `).all("a".repeat(64), 1).map((row) => row.detail).join(" ")
+      assert.match(
+        reclassificationPlan,
+        /files_hash_device_path_idx/
+      )
 
       const runId = registry.beginScan()
       const entries = []

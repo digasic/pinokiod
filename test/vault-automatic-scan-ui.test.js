@@ -6,6 +6,7 @@ const ejs = require("ejs")
 const { JSDOM } = require("jsdom")
 
 const root = path.resolve(__dirname, "..")
+const plain = (value) => JSON.parse(JSON.stringify(value))
 
 const waitFor = async (condition) => {
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -70,6 +71,11 @@ test("the shared layout renders and reviews automatic possible-match notices", a
 
   dom.window.eval(script)
   await waitFor(() => eventSources.length === 1)
+  const layoutFrame = dom.window.document.querySelector(".layout-leaf iframe")
+  const stateMessages = []
+  layoutFrame.contentWindow.postMessage = (payload, targetOrigin) => {
+    stateMessages.push({ payload, targetOrigin })
+  }
   eventSources[0].onmessage({
     data: JSON.stringify({
       enabled: true,
@@ -89,6 +95,7 @@ test("the shared layout renders and reviews automatic possible-match notices", a
     data: JSON.stringify({
       enabled: true,
       global_scan_ready: true,
+      settings: [{ app: "ComfyUI", mode: "manual" }],
       rows: [{
         app: "ComfyUI",
         state: "result",
@@ -116,14 +123,33 @@ test("the shared layout renders and reviews automatic possible-match notices", a
   assert.ok(tray.querySelector(".vault-auto-scan-close"))
   assert.equal(eventSources[0].url,
     "/info/vault/automatic-scans/events")
+  assert.deepEqual(plain(stateMessages.at(-1)), {
+    payload: {
+      e: "vault-automatic-scan-state",
+      snapshot: {
+        global_scan_ready: true,
+        settings: [{ app: "ComfyUI", mode: "manual" }]
+      }
+    },
+    targetOrigin: "http://localhost"
+  })
+  const messagesBeforeReplay = stateMessages.length
+  dom.window.dispatchEvent(new dom.window.MessageEvent("message", {
+    data: { e: "vault-automatic-scan-state-request" },
+    origin: "http://localhost",
+    source: layoutFrame.contentWindow
+  }))
+  assert.equal(stateMessages.length, messagesBeforeReplay + 1)
+  assert.deepEqual(plain(stateMessages.at(-1).payload),
+    plain(stateMessages.at(-2).payload))
 
   tray.querySelector(".vault-auto-scan-action").click()
   await waitFor(() => {
-    const iframe = dom.window.document.querySelector(".layout-leaf iframe")
-    return iframe && iframe.getAttribute("src") ===
+    return layoutFrame && layoutFrame.getAttribute("src") ===
       "/v/ComfyUI?pinokio_home_select=%7B%22selector%22%3A%22%23save-space-tab%22%7D"
   })
-  assert.equal(tray.hidden, true)
+  assert.ok(tray.querySelector(".vault-auto-scan-row.is-exiting"))
+  await waitFor(() => tray.hidden)
   assert.equal(dom.window.sessionStorage.getItem(
     "pinokio:vault:auto-review:ComfyUI"), "1")
   const actionRequest = requests.find((request) =>
@@ -162,6 +188,19 @@ test("automatic check states append within one card", async () => {
     url: "http://localhost/"
   })
   const eventSources = []
+  const reflows = []
+  dom.window.HTMLElement.prototype.getBoundingClientRect = function () {
+    if (!this.classList.contains("vault-auto-scan-row")) {
+      return { left: 0, top: 0 }
+    }
+    const rows = [...this.parentElement.querySelectorAll(
+      ".vault-auto-scan-row")]
+    return { left: 0, top: (rows.indexOf(this) - rows.length) * 100 }
+  }
+  dom.window.HTMLElement.prototype.animate = function (frames, options) {
+    reflows.push({ target: this, frames, options })
+    return { cancel() {} }
+  }
   dom.window.EventSource = class EventSource {
     constructor(url) {
       this.url = url
@@ -249,6 +288,19 @@ test("automatic check states append within one card", async () => {
   assert.equal(tray.querySelectorAll(".vault-auto-scan-row").length, 2)
   assert.deepEqual([...tray.querySelectorAll(".vault-auto-scan-app")]
     .map((app) => app.textContent), ["ComfyUI", "OtherApp"])
+
+  send([row("result", "result:4:result-a")], [
+    { app: "ComfyUI", mode: "automatic" }
+  ])
+  await waitFor(() => tray.querySelectorAll(
+    ".vault-auto-scan-row").length === 1)
+  assert.equal(reflows.length, 1)
+  assert.equal(reflows[0].target, card)
+  assert.deepEqual(plain(reflows[0].frames), [
+    { transform: "translate3d(0px, -100px, 0)" },
+    { transform: "translate3d(0, 0, 0)" }
+  ])
+  assert.equal(reflows[0].options.duration, 180)
 
   dom.window.close()
 })
@@ -554,7 +606,8 @@ test("an empty automatic check briefly confirms completion", async () => {
   }))
   assert.equal(completionTimers.length, 3)
   completionTimers[2].callback()
-  assert.equal(tray.hidden, true)
+  assert.ok(completed.classList.contains("is-exiting"))
+  await waitFor(() => tray.hidden)
 
   send({
     enabled: true,
@@ -582,7 +635,17 @@ test("an empty automatic check briefly confirms completion", async () => {
   assert.equal(revealTimers.length, revealsBeforeFocusedCompletion + 1)
   assert.equal(completionTimers.length, timersBeforeFocusedCompletion,
     "completion dismissal cannot start before its result is revealed")
+  eventSources[0].onerror()
+  await new Promise((resolve) => nativeSetTimeout(resolve, 0))
+  assert.equal(tray.hidden, false,
+    "a reconnect cannot erase a pending completion reveal")
+  assert.equal(tray.querySelector(".vault-auto-scan-close"), focusedClose)
+  assert.equal(tray.querySelector(
+    '.vault-auto-scan-row[data-state="complete"]'), null)
   revealTimers.at(-1).callback()
+  const focusedCompleted = tray.querySelector(
+    '.vault-auto-scan-row[data-state="complete"]')
+  assert.ok(focusedCompleted)
   assert.equal(completionTimers.length, timersBeforeFocusedCompletion,
     "completion does not start its timer while focus is already in the card")
   focusedClose.dispatchEvent(new dom.window.FocusEvent("focusout", {
@@ -590,10 +653,9 @@ test("an empty automatic check briefly confirms completion", async () => {
     relatedTarget: null
   }))
   assert.equal(completionTimers.length, timersBeforeFocusedCompletion + 1)
-  eventSources[0].onerror()
-  await new Promise((resolve) => nativeSetTimeout(resolve, 0))
-  assert.equal(tray.hidden, true,
-    "a reconnect drops presentation-only completion state")
+  completionTimers.at(-1).callback()
+  assert.ok(focusedCompleted.classList.contains("is-exiting"))
+  await waitFor(() => tray.hidden)
 
   send({
     enabled: true,
@@ -692,80 +754,117 @@ test("the app workspace focuses Scan this app without starting it after Review",
     /automaticReviewRequested[\s\S]{0,200}(post\(|btn-scan\.click)/)
 })
 
-test("the app sidebar mirrors Automatic and Manual Disk Saver modes", async () => {
+test("the app sidebar mirrors the shared layout state without another event stream", async () => {
   const template = await fs.promises.readFile(
     path.join(root, "server", "views", "app.ejs"), "utf8")
   const server = await fs.promises.readFile(
     path.join(root, "server", "index.js"), "utf8")
   const script = await fs.promises.readFile(
     path.join(root, "server", "public", "app-vault-mode.js"), "utf8")
+  const vaultScript = await fs.promises.readFile(
+    path.join(root, "server", "public", "vault.js"), "utf8")
+  const parent = new JSDOM("", { url: "http://localhost/" })
   const dom = new JSDOM(`<a id="save-space-tab">
     <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic" data-ready="true">
       <span data-app-vault-mode-label>Auto</span>
     </span>
-  </a>`, {
+  </a><iframe name="app-vault"></iframe>`, {
     runScripts: "outside-only",
     url: "http://localhost/v/ComfyUI"
   })
-  const eventSources = []
+  const parentMessages = []
+  const vaultMessages = []
+  Object.defineProperty(dom.window, "parent", {
+    configurable: true,
+    value: parent.window
+  })
+  parent.window.postMessage = (payload, targetOrigin) => {
+    parentMessages.push({ payload, targetOrigin })
+  }
+  const vaultFrame = dom.window.document.querySelector(
+    'iframe[name="app-vault"]')
+  vaultFrame.contentWindow.postMessage = (payload, targetOrigin) => {
+    vaultMessages.push({ payload, targetOrigin })
+  }
   dom.window.EventSource = class EventSource {
-    constructor(url) {
-      this.url = url
-      eventSources.push(this)
+    constructor() {
+      throw new Error("An app page must not open an EventSource.")
     }
-    close() {}
+  }
+  dom.window.fetch = async () => {
+    throw new Error("The parent replay arrived; no fallback fetch is needed.")
   }
 
   dom.window.eval(script)
   const status = dom.window.document.querySelector("[data-app-vault-mode]")
   const label = status.querySelector("[data-app-vault-mode-label]")
-  assert.equal(eventSources.length, 1)
-  assert.equal(eventSources[0].url,
-    "/info/vault/automatic-scans/events")
+  assert.deepEqual(plain(parentMessages), [{
+    payload: { e: "vault-automatic-scan-state-request" },
+    targetOrigin: "http://localhost"
+  }])
   assert.equal(status.dataset.mode, "automatic")
   assert.equal(status.hidden, false)
   assert.equal(label.textContent, "Auto")
   assert.equal(dom.window.document.getElementById("save-space-tab")
     .getAttribute("aria-label"), "Disk Saver — Automatic checking")
 
-  eventSources[0].onmessage({
-    data: JSON.stringify({
+  dom.window.dispatchEvent(new dom.window.MessageEvent("message", {
+    source: parent.window,
+    origin: "http://localhost",
+    data: {
+      e: "vault-automatic-scan-state",
+      snapshot: {
       global_scan_ready: true,
       settings: [{ app: "ComfyUI", mode: "manual" }]
-    })
-  })
+      }
+    }
+  }))
   assert.equal(status.dataset.mode, "manual")
   assert.equal(status.hidden, false)
   assert.equal(label.textContent, "Manual")
   assert.equal(dom.window.document.getElementById("save-space-tab")
     .getAttribute("aria-label"), "Disk Saver — Manual checking")
-
-  eventSources[0].onmessage({
-    data: JSON.stringify({ global_scan_ready: true, settings: [] })
+  assert.deepEqual(plain(vaultMessages.at(-1)), {
+    payload: {
+      e: "vault-automatic-scan-state",
+      snapshot: {
+        global_scan_ready: true,
+        settings: [{ app: "ComfyUI", mode: "manual" }]
+      }
+    },
+    targetOrigin: "http://localhost"
   })
-  assert.equal(status.dataset.mode, "automatic")
-  assert.equal(status.hidden, false)
-  assert.equal(label.textContent, "Auto")
 
-  eventSources[0].onmessage({
-    data: JSON.stringify({
-      global_scan_ready: false,
-      settings: [{ app: "ComfyUI", mode: "automatic" }]
-    })
-  })
-  assert.equal(status.dataset.ready, "false")
-  assert.equal(label.textContent, "Set up")
-  assert.equal(dom.window.document.getElementById("save-space-tab")
-    .getAttribute("aria-label"), "Disk Saver — Set up required")
-
-  eventSources[0].onmessage({
-    data: JSON.stringify({
-      global_scan_ready: true,
-      settings: [{ app: "ComfyUI", mode: "automatic" }]
-    })
-  })
+  dom.window.dispatchEvent(new dom.window.MessageEvent("message", {
+    source: vaultFrame.contentWindow,
+    origin: "http://localhost",
+    data: {
+      e: "vault-automatic-mode-changed",
+      app: "ComfyUI",
+      mode: "automatic"
+    }
+  }))
   assert.equal(status.dataset.ready, "true")
+  assert.equal(status.dataset.mode, "automatic")
   assert.equal(label.textContent, "Auto")
+  assert.deepEqual(plain(parentMessages.at(-1)), {
+    payload: {
+      e: "vault-automatic-mode-changed",
+      app: "ComfyUI",
+      mode: "automatic"
+    },
+    targetOrigin: "http://localhost"
+  })
+
+  const repliesBeforeRequest = vaultMessages.length
+  dom.window.dispatchEvent(new dom.window.MessageEvent("message", {
+    source: vaultFrame.contentWindow,
+    origin: "http://localhost",
+    data: { e: "vault-automatic-scan-state-request" }
+  }))
+  assert.equal(vaultMessages.length, repliesBeforeRequest + 1)
+  assert.equal(vaultMessages.at(-1).payload.snapshot.settings[0].mode,
+    "automatic")
   assert.match(template, /data-app-vault-mode/)
   assert.match(template, /app-vault-mode\.js/)
   assert.doesNotMatch(template, /vault-auto-settings/)
@@ -790,6 +889,102 @@ test("the app sidebar mirrors Automatic and Manual Disk Saver modes", async () =
   assert.match(server,
     /result\.vault_automatic_mode = setting && setting\.mode === "manual"/)
   assert.match(server, /result\.vault_global_scan_ready/)
+  assert.doesNotMatch(script, /EventSource/)
+  assert.doesNotMatch(vaultScript, /EventSource/)
+  assert.match(script, /vault-automatic-scan-state-request/)
+  assert.match(vaultScript, /vault-automatic-scan-state-request/)
 
   dom.window.close()
+  parent.window.close()
+})
+
+test("a standalone app badge uses one finite status request", async () => {
+  const script = await fs.promises.readFile(
+    path.join(root, "server", "public", "app-vault-mode.js"), "utf8")
+  const dom = new JSDOM(`<a id="save-space-tab">
+    <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic" data-ready="true">
+      <span data-app-vault-mode-label>Auto</span>
+    </span>
+  </a>`, {
+    runScripts: "outside-only",
+    url: "http://localhost/v/ComfyUI"
+  })
+  const requests = []
+  dom.window.fetch = async (url) => {
+    requests.push(url)
+    return {
+      ok: true,
+      json: async () => ({
+        global_scan_ready: false,
+        settings: [{ app: "ComfyUI", mode: "manual" }]
+      })
+    }
+  }
+  dom.window.EventSource = class EventSource {
+    constructor() {
+      throw new Error("A standalone app must not open an EventSource.")
+    }
+  }
+
+  dom.window.eval(script)
+  await waitFor(() => dom.window.document.querySelector(
+    "[data-app-vault-mode-label]").textContent === "Set up")
+  assert.deepEqual(requests, ["/info/vault/automatic-scans"])
+  assert.equal(dom.window.document.querySelector(
+    "[data-app-vault-mode]").dataset.mode, "manual")
+
+  dom.window.close()
+})
+
+test("a late parent state is not overwritten by the app badge fallback", async () => {
+  const script = await fs.promises.readFile(
+    path.join(root, "server", "public", "app-vault-mode.js"), "utf8")
+  const parent = new JSDOM("", { url: "http://localhost/" })
+  const dom = new JSDOM(`<a id="save-space-tab">
+    <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic" data-ready="true">
+      <span data-app-vault-mode-label>Auto</span>
+    </span>
+  </a>`, {
+    runScripts: "outside-only",
+    url: "http://localhost/v/ComfyUI"
+  })
+  Object.defineProperty(dom.window, "parent", {
+    configurable: true,
+    value: parent.window
+  })
+  parent.window.postMessage = () => {}
+  const setTimeout = dom.window.setTimeout.bind(dom.window)
+  dom.window.setTimeout = (callback, delay, ...args) =>
+    setTimeout(callback, delay === 500 ? 0 : delay, ...args)
+  let resolveFallback
+  dom.window.fetch = () => new Promise((resolve) => {
+    resolveFallback = resolve
+  })
+
+  dom.window.eval(script)
+  await waitFor(() => typeof resolveFallback === "function")
+  dom.window.dispatchEvent(new dom.window.MessageEvent("message", {
+    source: parent.window,
+    origin: "http://localhost",
+    data: {
+      e: "vault-automatic-scan-state",
+      snapshot: {
+        global_scan_ready: true,
+        settings: [{ app: "ComfyUI", mode: "manual" }]
+      }
+    }
+  }))
+  resolveFallback({
+    ok: true,
+    json: async () => ({
+      global_scan_ready: true,
+      settings: [{ app: "ComfyUI", mode: "automatic" }]
+    })
+  })
+  await new Promise((resolve) => setTimeout(resolve, 10))
+
+  assert.equal(dom.window.document.querySelector(
+    "[data-app-vault-mode]").dataset.mode, "manual")
+  dom.window.close()
+  parent.window.close()
 })

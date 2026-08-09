@@ -910,6 +910,39 @@ body[data-vault-mode="global"] .vault-explorer {
   display: grid;
   gap: 0;
 }
+.vault-find-size-setting {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 16px;
+  min-height: 68px;
+  padding: 12px 18px;
+  border-bottom: 1px solid var(--task-border);
+  background: var(--task-panel);
+}
+.vault-find-size-copy {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+  color: var(--task-text);
+  cursor: pointer;
+}
+.vault-find-size-copy strong {
+  font-size: 12.5px;
+  font-weight: 650;
+  line-height: 1.2;
+}
+.vault-find-size-copy span {
+  color: var(--task-muted);
+  font-size: 10.5px;
+  font-weight: 450;
+  line-height: 1.2;
+}
+.vault-select.vault-find-size-select {
+  min-width: 118px;
+  height: 34px;
+  cursor: pointer;
+}
 .vault-find-choice {
   display: grid;
   width: 100%;
@@ -1302,20 +1335,6 @@ body[data-vault-mode="global"] .vault-explorer {
   font-size: 9.5px;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-.vault-find-tree-badge {
-  flex: 0 0 auto;
-  padding: 2px 5px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--task-accent) 13%, var(--task-panel));
-  color: var(--task-text);
-  font-size: 8.5px;
-  font-weight: 670;
-  line-height: 1.2;
-}
-.vault-find-tree-badge.broader {
-  background: var(--task-soft);
-  color: var(--task-muted);
 }
 .vault-find-tree-saving {
   color: var(--task-text);
@@ -2037,6 +2056,11 @@ body.dark .vault-row-action .vault-text-button:hover:not(:disabled) {
 }
 @media (max-width: 520px) {
   .vault-storage-legend { column-gap: 14px; row-gap: 4px; }
+  .vault-find-size-setting {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+  .vault-select.vault-find-size-select { width: 100%; }
 }
 @media (pointer: coarse) {
   .vault-page {
@@ -2048,6 +2072,7 @@ body.dark .vault-row-action .vault-text-button:hover:not(:disabled) {
   .vault-result .vault-button,
   .vault-group-action .vault-button { min-height: 44px; }
   .vault-scan-size-option { min-height: 44px; }
+  .vault-select.vault-find-size-select { height: 44px; }
   .vault-icon-button { width: 44px; height: 44px; }
   .vault-find-tree-row {
     grid-template-columns: 44px 44px 17px minmax(0, 1fr);

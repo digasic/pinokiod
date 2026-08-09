@@ -168,6 +168,8 @@ class RegistryCore {
         updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS files_hash_path_idx ON files(hash, path);
+      CREATE INDEX IF NOT EXISTS files_hash_device_path_idx
+        ON files(hash, dev, path);
       CREATE INDEX IF NOT EXISTS files_inode_path_idx
         ON files(dev, ino, path);
       CREATE INDEX IF NOT EXISTS files_status_path_idx
@@ -2110,7 +2112,8 @@ class RegistryCore {
     const rootRow = this.database.prepare(`
       SELECT run.root, run.file_count, run.bytes,
         run.eligible_file_count, run.eligible_bytes,
-        node.selected, node.selected_inside, node.recommended, node.broader
+        node.selected, node.selected_inside, node.recommended, node.broader,
+        node.direct_file_count
       FROM folder_discovery_runs run
       LEFT JOIN folder_discovery_nodes node
         ON node.run_id = run.id AND node.folder = run.root
@@ -2124,7 +2127,7 @@ class RegistryCore {
     const items = this.database.prepare(`
       SELECT folder, parent, file_count, bytes, eligible_file_count,
         eligible_bytes, child_count, selected, selected_inside,
-        recommended, broader
+        recommended, broader, direct_file_count
       FROM folder_discovery_nodes
       WHERE run_id = ? AND parent = ? AND file_count > 0
       ORDER BY bytes DESC, file_count DESC, folder
@@ -2146,7 +2149,8 @@ class RegistryCore {
       selected: !!row.selected,
       selected_inside: Number(row.selected_inside) || 0,
       recommended: !!row.recommended,
-      broader: !!row.broader
+      broader: !!row.broader,
+      direct_file_count: Number(row.direct_file_count) || 0
     }))
     return {
       root: rootRow
@@ -2162,7 +2166,8 @@ class RegistryCore {
             selected: !!rootRow.selected,
             selected_inside: Number(rootRow.selected_inside) || 0,
             recommended: !!rootRow.recommended,
-            broader: !!rootRow.broader
+            broader: !!rootRow.broader,
+            direct_file_count: Number(rootRow.direct_file_count) || 0
           }
         : null,
       items,
@@ -2196,7 +2201,7 @@ class RegistryCore {
     const items = this.database.prepare(`
       SELECT folder, parent, file_count, bytes, eligible_file_count,
         eligible_bytes, child_count, selected, selected_inside,
-        recommended, broader
+        recommended, broader, direct_file_count
       FROM folder_discovery_nodes
       WHERE run_id = ? AND parent = ? AND file_count > 0
       ORDER BY bytes DESC, file_count DESC, folder
@@ -2213,7 +2218,8 @@ class RegistryCore {
       selected: !!row.selected,
       selected_inside: Number(row.selected_inside) || 0,
       recommended: !!row.recommended,
-      broader: !!row.broader
+      broader: !!row.broader,
+      direct_file_count: Number(row.direct_file_count) || 0
     }))
     return {
       folder: parent,

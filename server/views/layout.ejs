@@ -173,7 +173,14 @@
       border-radius: 10px;
       box-shadow: 0 8px 24px var(--layout-shadow);
       pointer-events: auto;
-      animation: vault-notice-enter 180ms cubic-bezier(0.25, 1, 0.5, 1);
+      animation: vault-notice-enter 220ms cubic-bezier(0.22, 1, 0.36, 1)
+        var(--vault-notice-enter-delay, 0ms) backwards;
+    }
+
+    .vault-auto-scan-row.is-exiting {
+      pointer-events: none;
+      animation: vault-notice-exit 150ms cubic-bezier(0.7, 0, 0.84, 0)
+        forwards;
     }
 
     .vault-auto-scan-header {
@@ -225,7 +232,7 @@
     }
 
     .vault-auto-scan-message[data-current="true"] {
-      animation: vault-notice-message-enter 160ms
+      animation: vault-notice-message-enter 180ms
         cubic-bezier(0.25, 1, 0.5, 1);
     }
 
@@ -370,9 +377,25 @@
       color: var(--vault-notice-accent);
     }
 
+    .vault-auto-scan-message[data-current="true"][data-state="complete"]
+      .vault-auto-scan-icon {
+      animation: vault-notice-complete 180ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+
     @keyframes vault-notice-enter {
-      from { opacity: 0; transform: translateY(6px); }
-      to { opacity: 1; transform: translateY(0); }
+      from {
+        opacity: 0;
+        transform: translate3d(8px, 10px, 0) scale(0.985);
+      }
+      to { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+    }
+
+    @keyframes vault-notice-exit {
+      from { opacity: 1; transform: translate3d(0, 0, 0) scale(1); }
+      to {
+        opacity: 0;
+        transform: translate3d(14px, 0, 0) scale(0.99);
+      }
     }
 
     @keyframes vault-notice-spin {
@@ -380,8 +403,13 @@
     }
 
     @keyframes vault-notice-message-enter {
-      from { opacity: 0; transform: translateY(2px); }
+      from { opacity: 0; transform: translateY(4px); }
       to { opacity: 1; transform: translateY(0); }
+    }
+
+    @keyframes vault-notice-complete {
+      from { opacity: 0; transform: scale(0.82); }
+      to { opacity: 1; transform: scale(1); }
     }
 
     @media (pointer: coarse) {
@@ -396,7 +424,14 @@
       .vault-auto-scan-row {
         animation: none;
       }
+      .vault-auto-scan-row.is-exiting {
+        animation: none;
+      }
       .vault-auto-scan-message[data-current="true"] {
+        animation: none;
+      }
+      .vault-auto-scan-message[data-current="true"][data-state="complete"]
+        .vault-auto-scan-icon {
         animation: none;
       }
       .vault-auto-scan-message[data-current="true"][data-state="checking"]

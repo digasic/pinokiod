@@ -163,7 +163,9 @@ const makePage = async (status, options = {}) => {
     }
   )
   const requests = []
+  const getRequests = []
   const parentNavigations = []
+  const parentMessages = []
   const selectedSources = new Set(options.folderDiscoverySelected || [])
   const recommendedSources = new Set()
   const confirmations = []
@@ -172,6 +174,10 @@ const makePage = async (status, options = {}) => {
   const pendingFolderDiscoveryStarts = []
   const pendingFolderDiscoverySelections = []
   const pendingFolderDiscoveryAdds = []
+  let resolveAutomaticStatus = null
+  const deferredAutomaticStatus = options.deferAutomaticStatus
+    ? new Promise((resolve) => { resolveAutomaticStatus = resolve })
+    : null
   const within = (ancestor, candidate) => ancestor === candidate ||
     candidate.startsWith(`${ancestor.replace(/\/$/, "")}/`)
   const discoveryResultsFrom = (response) =>
@@ -252,21 +258,50 @@ const makePage = async (status, options = {}) => {
   dom.window.requestAnimationFrame = (callback) =>
     dom.window.setTimeout(callback, 0)
   if (options.embeddedApp) {
-    Object.defineProperty(dom.window, "parent", {
-      configurable: true,
-      value: {
-        location: {
-          assign(target) {
-            parentNavigations.push(target)
-          }
+    const embeddedParent = {
+      location: {
+        assign(target) {
+          parentNavigations.push(target)
+        }
+      },
+      postMessage(payload, targetOrigin) {
+        parentMessages.push({ payload, targetOrigin })
+        if (payload && payload.e === "vault-automatic-scan-state-request" &&
+            options.embeddedAutomaticReply !== false) {
+          dom.window.setTimeout(() => {
+            const event = new dom.window.Event("message")
+            Object.defineProperties(event, {
+              source: { value: embeddedParent },
+              origin: { value: dom.window.location.origin },
+              data: {
+                value: {
+                  e: "vault-automatic-scan-state",
+                  snapshot: options.embeddedAutomaticSnapshot || {
+                    global_scan_ready: !!(status &&
+                      typeof status === "object" &&
+                      status.global_scan_ready === true),
+                    settings: [{ app: "app", mode: "automatic" }]
+                  }
+                }
+              }
+            })
+            dom.window.dispatchEvent(event)
+          }, 0)
         }
       }
+    }
+    Object.defineProperty(dom.window, "parent", {
+      configurable: true,
+      value: embeddedParent
     })
   }
-  if (options.fastStatusRetry) {
+  if (options.fastStatusRetry || options.fastAutomaticFallback) {
     const setTimeout = dom.window.setTimeout.bind(dom.window)
-    dom.window.setTimeout = (callback, delay, ...args) =>
-      setTimeout(callback, delay === 5000 ? 0 : delay, ...args)
+    dom.window.setTimeout = (callback, delay, ...args) => {
+      const fastDelay = (options.fastStatusRetry && delay === 5000) ||
+        (options.fastAutomaticFallback && delay === 500)
+      return setTimeout(callback, fastDelay ? 0 : delay, ...args)
+    }
   }
   if (appMode && options.automaticSettingsRequested) {
     dom.window.sessionStorage.setItem(
@@ -322,7 +357,7 @@ const makePage = async (status, options = {}) => {
         : payload.action === "cancel_scan"
           ? { cancel_requested: true }
         : payload.action === "find_folders"
-          ? { started: true, threshold: 100000000 }
+          ? { started: true, threshold: payload.candidate_size }
         : payload.action === "cancel_find_folders"
           ? { cancel_requested: true }
         : payload.action === "clear_find_folders"
@@ -357,6 +392,7 @@ const makePage = async (status, options = {}) => {
       statusFailuresAfterFindFolders -= 1
       return { ok: false, status: 503, json: async () => ({}) }
     }
+    getRequests.push(url)
     const parsed = new URL(url, "http://localhost")
     const parent = parsed.searchParams.get("folder_discovery_parent")
     const childPage = Number(
@@ -376,6 +412,10 @@ const makePage = async (status, options = {}) => {
             pages: 1
           }
       : typeof status === "function" ? status(url) : status
+    if (options.deferAutomaticStatus &&
+        url === "/info/vault/automatic-scans") {
+      await deferredAutomaticStatus
+    }
     return {
       ok: true,
       status: 200,
@@ -410,16 +450,22 @@ const makePage = async (status, options = {}) => {
     const pending = pendingFolderDiscoveryAdds.shift()
     pending()
   }
+  const releaseAutomaticStatus = () => {
+    if (resolveAutomaticStatus) resolveAutomaticStatus()
+  }
   return {
     dom,
     requests,
+    getRequests,
     parentNavigations,
+    parentMessages,
     confirmations,
     pickerRequests,
     choosePickedPath,
     releaseFolderDiscoveryStart,
     releaseFolderDiscoverySelection,
-    releaseFolderDiscoveryAdd
+    releaseFolderDiscoveryAdd,
+    releaseAutomaticStatus
   }
 }
 
@@ -464,6 +510,8 @@ describe("Save Space interface", () => {
     assert.doesNotMatch(combined, /Scan all locations/)
     assert.match(combined, /data-find-home-folder/)
     assert.match(combined, /data-find-other-folder/)
+    assert.match(combined, /vault-find-candidate-size/)
+    assert.match(combined, /Search files this size and larger/)
     assert.doesNotMatch(combined,
       /data-choose-find-root|find_folders_intro|choose_folder_or_drive/)
     assert.match(combined, /No folders with duplicate files found/)
@@ -927,6 +975,8 @@ describe("Save Space interface", () => {
     const status = fixture([item()])
     const { dom, requests, pickerRequests } = await makePage(status)
     const document = dom.window.document
+    const candidateBase = process.platform === "win32" ? 1024 : 1000
+    const selectedThreshold = 50 * candidateBase ** 2
 
     document.getElementById("btn-find-folders").click()
     await waitFor(() => document.querySelector("[data-find-home-folder]"))
@@ -934,7 +984,16 @@ describe("Save Space interface", () => {
     assert.equal(document.getElementById("vault-find-title").textContent,
       "Choose where to search")
     assert.match(document.getElementById("vault-find-body").textContent,
-      /Home folder\s*\/Users\/test\s*Another folder…\s*Choose a folder or drive/)
+      /Minimum file size\s*Search files this size and larger[\s\S]*Home folder\s*\/Users\/test\s*Another folder…\s*Choose a folder or drive/)
+    const threshold = document.getElementById(
+      "vault-find-candidate-size")
+    assert.equal(threshold.value, String(100 * candidateBase ** 2))
+    threshold.value = String(selectedThreshold)
+    threshold.dispatchEvent(new dom.window.Event("change", {
+      bubbles: true
+    }))
+    assert.match(document.getElementById(
+      "vault-scan-size-label").textContent, /50 MB\+/)
     assert.equal(document.activeElement.hasAttribute(
       "data-find-home-folder"), true)
     assert.equal(pickerRequests.length, 0)
@@ -946,9 +1005,40 @@ describe("Save Space interface", () => {
       request.action === "find_folders"))
     assert.equal(requests.find((entry) =>
       entry.action === "find_folders").path, "/Users/test")
+    assert.equal(requests.find((entry) =>
+      entry.action === "find_folders").candidate_size,
+      selectedThreshold)
     assert.equal(pickerRequests.length, 0)
     await waitFor(() => document.getElementById(
       "vault-find-overlay").hidden)
+    dom.window.close()
+  })
+
+  test("Find folders explains when a lower threshold needs a global scan", async () => {
+    const message = "Run a global scan with this minimum file size before searching folders."
+    const { dom, requests } = await makePage(fixture([item()]), {
+      actionResults: {
+        find_folders: { error: message }
+      }
+    })
+    const document = dom.window.document
+    const candidateBase = process.platform === "win32" ? 1024 : 1000
+
+    document.getElementById("btn-find-folders").click()
+    await waitFor(() => document.querySelector("[data-find-home-folder]"))
+    const threshold = document.getElementById("vault-find-candidate-size")
+    threshold.value = String(50 * candidateBase ** 2)
+    threshold.dispatchEvent(new dom.window.Event("change", { bubbles: true }))
+    document.querySelector("[data-find-home-folder]").click()
+
+    await waitFor(() => document.querySelector(
+      ".vault-find-partial[role='alert']"))
+    assert.equal(document.querySelector(
+      ".vault-find-partial[role='alert']").textContent.trim(), message)
+    assert.ok(document.querySelector("[data-find-home-folder]"))
+    assert.equal(requests.find((request) =>
+      request.action === "find_folders").candidate_size,
+      50 * candidateBase ** 2)
     dom.window.close()
   })
 
@@ -1184,13 +1274,15 @@ describe("Save Space interface", () => {
 
   test("Find folders shows truthful live discovery and determinate verification progress", async () => {
     const discovering = fixture([item()])
+    const candidateBase = process.platform === "win32" ? 1024 : 1000
+    discovering.last_scan.candidate_min_bytes = candidateBase ** 2
     discovering.folder_discovery = {
       active: true,
       pending: false,
       phase: "discovering",
       root: "/Users/test",
       started: Date.now() - 125000,
-      threshold: 100000000,
+      threshold: 100 * candidateBase ** 2,
       dirs: 1234,
       files: 32013427,
       candidates: 0,
@@ -1222,6 +1314,10 @@ describe("Save Space interface", () => {
     assert.match(discoveryBody.textContent,
       /Currently scanning\/Users\/test\/Library\/Application Support/)
     assert.match(discoveryBody.textContent, /Active now/)
+    assert.match(discoveryBody.textContent,
+      /Minimum file size: 100 MB/)
+    assert.doesNotMatch(discoveryBody.textContent,
+      /Minimum file size: 1 MB/)
     assert.equal(discoveryBody.textContent.includes("files/sec"), false)
     assert.match(discoveryBody.textContent, /2m \d+s elapsed/)
     assert.equal(discoveryBody.textContent.includes("Updated"), false)
@@ -1232,6 +1328,20 @@ describe("Save Space interface", () => {
     await waitFor(() => discoveryBody.textContent.includes("files/sec"))
     assert.match(discoveryBody.textContent, /[\d,]+ files\/sec/)
     discoveringDom.window.close()
+
+    const missingThreshold = fixture([item()])
+    missingThreshold.last_scan.candidate_min_bytes = candidateBase ** 2
+    missingThreshold.folder_discovery = Object.assign(
+      {}, discovering.folder_discovery)
+    delete missingThreshold.folder_discovery.threshold
+    const { dom: missingThresholdDom } = await makePage(missingThreshold)
+    const missingThresholdDocument = missingThresholdDom.window.document
+    await startHomeFolderDiscovery(missingThresholdDocument)
+    await waitFor(() => missingThresholdDocument.getElementById(
+      "vault-find-body").textContent.includes("Currently scanning"))
+    assert.doesNotMatch(missingThresholdDocument.getElementById(
+      "vault-find-body").textContent, /Minimum file size:/)
+    missingThresholdDom.window.close()
 
     const liveDiscovery = fixture([item()])
     liveDiscovery.folder_discovery = Object.assign(
@@ -1393,9 +1503,9 @@ describe("Save Space interface", () => {
       "Suggested locations")
     assert.match(modal.textContent, /Verified identical files only/)
     assert.match(modal.textContent, /Partial results/)
-    assert.match(modal.textContent, /Choose locations to add/)
-    assert.match(modal.textContent, /Select the locations you want to add\./)
-    assert.match(modal.textContent, /Broader scan/)
+    assert.match(modal.textContent, /Choose folders to watch/)
+    assert.match(modal.textContent,
+      /Nothing is scanned or changed until you run a scan\./)
     assert.match(modal.textContent, /23 identical files/)
     assert.match(modal.querySelector(".vault-find-results-footer").textContent,
       /0 locations selected0 identical files · Can save 0 B/)
@@ -1405,8 +1515,7 @@ describe("Save Space interface", () => {
       '[data-select-found-folder="/Users/test"]'
     ).closest(".vault-find-tree-row")
     assert.doesNotMatch(rootRow.textContent, /selected inside/)
-    assert.equal([...modal.querySelectorAll(".vault-find-tree-badge")]
-      .some((badge) => badge.textContent === "Recommended"), false)
+    assert.equal(modal.querySelector(".vault-find-tree-badge"), null)
     assert.equal(document.querySelector(
       '[data-select-found-folder="/Users/test/Library/OtherApp/models"]'),
     null)
@@ -1419,14 +1528,12 @@ describe("Save Space interface", () => {
     assert.equal(document.querySelector(
       '[data-toggle-found-folder="/Users/test/Library/OtherApp"]')
       .getAttribute("aria-expanded"), "true")
-    assert.match(modal.textContent, /80 files · 12 GB scan scope/)
+    assert.match(modal.textContent, /adds 12 GB to future scans/)
     const expandedParentRow = document.querySelector(
       '[data-select-found-folder="/Users/test/Library/OtherApp"]'
     ).closest(".vault-find-tree-row")
     assert.doesNotMatch(expandedParentRow.textContent, /selected inside/)
-    assert.equal([...modal.querySelectorAll(".vault-find-tree-badge")]
-      .some((badge) => badge.textContent === "Recommended"), true)
-    assert.match(modal.textContent, /modelsRecommended/)
+    assert.equal(modal.querySelector(".vault-find-tree-badge"), null)
     document.querySelector(
       '[data-toggle-found-folder="/Users/test/Library/OtherApp"]')
       .click()
@@ -1632,7 +1739,8 @@ describe("Save Space interface", () => {
         file_count: 2,
         bytes: 12000,
         eligible_file_count: 20,
-        eligible_bytes: 50000
+        eligible_bytes: 50000,
+        direct_file_count: 1
       },
       items: [{
         folder: "/Users/test/first",
@@ -1679,8 +1787,14 @@ describe("Save Space interface", () => {
     assert.equal(add.disabled, true)
     assert.match(document.querySelector(".vault-find-results-footer")
       .textContent, /0 locations selected/)
-    assert.match(recommendation.closest(".vault-find-tree-row").textContent,
-      /Recommended/)
+    assert.equal(document.querySelector(".vault-find-tree-badge"), null)
+    const rootRow = document.querySelector(
+      '[data-select-found-folder="/Users/test"]'
+    ).closest(".vault-find-tree-row")
+    assert.match(rootRow.textContent, /1 file here/)
+    assert.doesNotMatch(
+      recommendation.closest(".vault-find-tree-row").textContent,
+      /file here/)
 
     recommendation.click()
     await waitFor(() => requests.some((request) =>
@@ -2267,7 +2381,13 @@ describe("Save Space interface", () => {
       saved_by_sharing: 0,
       pending_bytes: 0
     })
-    const { dom, requests, parentNavigations } = await makePage(status, {
+    const {
+      dom,
+      requests,
+      getRequests,
+      parentNavigations,
+      parentMessages
+    } = await makePage(status, {
       appMode: true,
       embeddedApp: true,
       scopeId: "app:app",
@@ -2297,6 +2417,22 @@ describe("Save Space interface", () => {
       request.action === "automatic_set_mode"))
     await waitFor(() => document.getElementById(
       "vault-auto-mode").classList.contains("manual"))
+    assert.deepEqual(JSON.parse(JSON.stringify(parentMessages)), [
+      {
+        payload: { e: "vault-automatic-scan-state-request" },
+        targetOrigin: "http://localhost"
+      },
+      {
+        payload: {
+          e: "vault-automatic-mode-changed",
+          app: "app",
+          mode: "manual"
+        },
+        targetOrigin: "http://localhost"
+      }
+    ])
+    assert.equal(getRequests.includes(
+      "/info/vault/automatic-scans"), false)
     assert.match(document.querySelector(".vault-summary-value").textContent,
       /Run an initial scan to enable app scans/)
     assert.equal(document.getElementById("vault-explorer").style.display,
@@ -2414,6 +2550,69 @@ describe("Save Space interface", () => {
       mode: "manual"
     })
 
+    dom.window.close()
+  })
+
+  test("an embedded app workspace fetches status only when its parent does not reply", async () => {
+    const { dom, getRequests, parentMessages } = await makePage(
+      fixture([item()]), {
+        appMode: true,
+        embeddedApp: true,
+        embeddedAutomaticReply: false,
+        fastAutomaticFallback: true,
+        scopeId: "app:app"
+      })
+
+    await waitFor(() => dom.window.document.getElementById(
+      "vault-auto-mode"))
+    assert.deepEqual(JSON.parse(JSON.stringify(parentMessages)), [{
+      payload: { e: "vault-automatic-scan-state-request" },
+      targetOrigin: "http://localhost"
+    }])
+    assert.equal(getRequests.filter((url) =>
+      url === "/info/vault/automatic-scans").length, 1)
+
+    dom.window.close()
+  })
+
+  test("a late parent state wins over an app workspace fallback", async () => {
+    const {
+      dom,
+      getRequests,
+      releaseAutomaticStatus
+    } = await makePage(fixture([item()]), {
+      appMode: true,
+      embeddedApp: true,
+      embeddedAutomaticReply: false,
+      fastAutomaticFallback: true,
+      deferAutomaticStatus: true,
+      scopeId: "app:app"
+    })
+
+    await waitFor(() => getRequests.includes(
+      "/info/vault/automatic-scans"))
+    const event = new dom.window.Event("message")
+    Object.defineProperties(event, {
+      source: { value: dom.window.parent },
+      origin: { value: dom.window.location.origin },
+      data: {
+        value: {
+          e: "vault-automatic-scan-state",
+          snapshot: {
+            global_scan_ready: true,
+            settings: [{ app: "app", mode: "manual" }]
+          }
+        }
+      }
+    })
+    dom.window.dispatchEvent(event)
+    await waitFor(() => dom.window.document.getElementById(
+      "vault-auto-mode").classList.contains("manual"))
+    await releaseAutomaticStatus()
+    await settle()
+
+    assert.equal(dom.window.document.getElementById(
+      "vault-auto-mode").classList.contains("manual"), true)
     dom.window.close()
   })
 

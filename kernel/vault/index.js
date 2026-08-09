@@ -1494,7 +1494,7 @@ class Vault {
     }
   }
 
-  async startFolderDiscovery(selectedRoot) {
+  async startFolderDiscovery(selectedRoot, selectedThreshold) {
     if (!this.enabled || !this.folderFinder) {
       return { started: false, disabled: true }
     }
@@ -1509,6 +1509,9 @@ class Vault {
         !path.isAbsolute(selectedRoot.trim())) {
       return { error: "Choose a valid folder or drive." }
     }
+    if (!CANDIDATE_SIZE_OPTIONS.includes(selectedThreshold)) {
+      return { error: "Choose a valid minimum file size." }
+    }
     if (this.scanPromise) {
       return { error: "Wait for the current scan to finish." }
     }
@@ -1520,10 +1523,15 @@ class Vault {
       return { error: "Run a global scan before finding folders." }
     }
     const publishedThreshold = Number(globalScan.candidate_min_bytes)
-    const threshold = Number.isFinite(publishedThreshold) &&
-      publishedThreshold >= 0
-      ? publishedThreshold
-      : this.sizeThreshold
+    if (!Number.isFinite(publishedThreshold) || publishedThreshold < 0) {
+      return { error: "Run a new global scan before finding folders." }
+    }
+    if (selectedThreshold < publishedThreshold) {
+      return {
+        error: "Run a global scan with this minimum file size before searching folders."
+      }
+    }
+    const threshold = selectedThreshold
     const partial = !!globalScan.partial || (
       Array.isArray(globalScan.exclusions) &&
       globalScan.exclusions.length > 0
@@ -1832,7 +1840,10 @@ class Vault {
       case "cancel_scan":
         return this.cancelScan()
       case "find_folders":
-        return this.startFolderDiscovery(payload.path)
+        return this.startFolderDiscovery(
+          payload.path,
+          payload.candidate_size
+        )
       case "cancel_find_folders":
         return this.cancelFolderDiscovery()
       case "clear_find_folders":

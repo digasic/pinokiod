@@ -485,6 +485,70 @@
     });
   }
 
+  let latestAutomaticScanState = null;
+
+  function automaticScanState(snapshot) {
+    const settings = snapshot && Array.isArray(snapshot.settings)
+      ? snapshot.settings.filter((setting) =>
+        setting && typeof setting.app === 'string' && setting.app).map((setting) => ({
+          app: setting.app,
+          mode: setting.mode === 'manual' ? 'manual' : 'automatic',
+        }))
+      : [];
+    return {
+      global_scan_ready: !!(snapshot && snapshot.global_scan_ready === true),
+      settings,
+    };
+  }
+
+  function sendAutomaticScanState(targetWindow) {
+    if (!targetWindow || !latestAutomaticScanState) {
+      return;
+    }
+    try {
+      targetWindow.postMessage({
+        e: 'vault-automatic-scan-state',
+        snapshot: latestAutomaticScanState,
+      }, window.location.origin);
+    } catch (_) {}
+  }
+
+  function broadcastAutomaticScanState(snapshot) {
+    latestAutomaticScanState = automaticScanState(snapshot);
+    leafElements.forEach((entry) => {
+      sendAutomaticScanState(entry.iframe?.contentWindow || null);
+    });
+  }
+
+  function isLeafWindow(sourceWindow) {
+    if (!sourceWindow) return false;
+    for (const entry of leafElements.values()) {
+      if (entry.iframe && entry.iframe.contentWindow === sourceWindow) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function mergeAutomaticMode(app, mode) {
+    if (!latestAutomaticScanState || typeof app !== 'string' || !app) {
+      return;
+    }
+    const settings = latestAutomaticScanState.settings.filter((setting) =>
+      setting.app !== app);
+    settings.push({
+      app,
+      mode: mode === 'manual' ? 'manual' : 'automatic',
+    });
+    latestAutomaticScanState = {
+      global_scan_ready: latestAutomaticScanState.global_scan_ready,
+      settings,
+    };
+    leafElements.forEach((entry) => {
+      sendAutomaticScanState(entry.iframe?.contentWindow || null);
+    });
+  }
+
   let activeResize = null;
 
   function beginResize(splitId, pointerEvent) {
@@ -692,6 +756,20 @@
     if (!event || !event.data || typeof event.data !== 'object') {
       return;
     }
+    if (event.data.e === 'vault-automatic-scan-state-request') {
+      if (event.origin === window.location.origin &&
+          isLeafWindow(event.source)) {
+        sendAutomaticScanState(event.source);
+      }
+      return;
+    }
+    if (event.data.e === 'vault-automatic-mode-changed') {
+      if (event.origin === window.location.origin &&
+          isLeafWindow(event.source)) {
+        mergeAutomaticMode(event.data.app, event.data.mode);
+      }
+      return;
+    }
     if (event.data.e === 'layout-state-request') {
       let frameEntry = null;
       let frameId = null;
@@ -855,9 +933,12 @@
       </svg>`;
     const MIN_CHECKING_VISIBLE_MS = 500;
     const COMPLETION_VISIBLE_MS = 4000;
+    const NOTICE_EXIT_MS = 150;
+    const NOTICE_REFLOW_MS = 180;
 
     let eventSource = null;
     const cards = new Map();
+    let desiredCardOrder = [];
 
     function statusText(state) {
       if (state === 'paused') return 'Automatic checks are paused';
@@ -907,20 +988,92 @@
       card.completion = null;
     }
 
+    function reducedMotionRequested() {
+      return typeof window.matchMedia === 'function' &&
+        window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
+
+    function syncTrayVisibility() {
+      tray.hidden = !tray.querySelector('.vault-auto-scan-row');
+    }
+
+    function reorderCards() {
+      const exiting = tray.querySelector('.vault-auto-scan-row.is-exiting');
+      desiredCardOrder.forEach((app) => {
+        const card = cards.get(app);
+        if (!card || !card.item) return;
+        if (!card.item.isConnected || !exiting) {
+          tray.appendChild(card.item);
+        }
+      });
+    }
+
+    function cardPositions() {
+      const positions = new Map();
+      tray.querySelectorAll(
+        '.vault-auto-scan-row:not(.is-exiting)').forEach((item) => {
+        positions.set(item, item.getBoundingClientRect());
+      });
+      return positions;
+    }
+
+    function animateCardReflow(before) {
+      if (reducedMotionRequested()) return;
+      before.forEach((bounds, item) => {
+        if (!item.isConnected || typeof item.animate !== 'function') return;
+        const next = item.getBoundingClientRect();
+        const x = bounds.left - next.left;
+        const y = bounds.top - next.top;
+        if (Math.abs(x) < 0.5 && Math.abs(y) < 0.5) return;
+        item.animate([
+          { transform: `translate3d(${x}px, ${y}px, 0)` },
+          { transform: 'translate3d(0, 0, 0)' }
+        ], {
+          duration: NOTICE_REFLOW_MS,
+          easing: 'cubic-bezier(0.25, 1, 0.5, 1)'
+        });
+      });
+    }
+
+    function finishCardRemoval(card) {
+      const before = cardPositions();
+      card.item.remove();
+      reorderCards();
+      syncTrayVisibility();
+      animateCardReflow(before);
+    }
+
     function removeCard(app) {
       const card = cards.get(app);
-      if (card) {
-        stopCompletion(card);
-        card.item.remove();
-      }
+      if (!card) return;
+      stopCompletion(card);
       cards.delete(app);
-      tray.hidden = cards.size === 0;
+      if (!card.item.isConnected || reducedMotionRequested()) {
+        finishCardRemoval(card);
+        return;
+      }
+      card.item.classList.add('is-exiting');
+      let finished = false;
+      let fallbackTimer = null;
+      const onAnimationEnd = (event) => {
+        if (event.target === card.item &&
+            event.animationName === 'vault-notice-exit') finish();
+      };
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        if (fallbackTimer !== null) window.clearTimeout(fallbackTimer);
+        card.item.removeEventListener('animationend', onAnimationEnd);
+        finishCardRemoval(card);
+      };
+      card.item.addEventListener('animationend', onAnimationEnd);
+      fallbackTimer = window.setTimeout(finish, NOTICE_EXIT_MS + 50);
     }
 
     function resetCards() {
+      desiredCardOrder = [];
       [...cards.keys()].forEach(removeCard);
-      tray.replaceChildren();
-      tray.hidden = true;
+      syncTrayVisibility();
     }
 
     function scheduleCompletion(completion) {
@@ -1033,6 +1186,7 @@
         dismissPending: false,
         pointerInside: false,
         focusInside: false,
+        isNew: true,
         completion: null
       };
       close.addEventListener('click', async () => {
@@ -1229,6 +1383,7 @@
     }
 
     function render(snapshot, options = {}) {
+      broadcastAutomaticScanState(snapshot);
       if (!snapshot || snapshot.global_scan_ready !== true) {
         resetCards();
         return;
@@ -1244,8 +1399,15 @@
           setting && setting.mode === 'manual').map((setting) => setting.app)
         : []);
       const retained = new Set();
+      let enteringCardIndex = 0;
       validRows.forEach((row) => {
-        updateCard(row);
+        const card = updateCard(row);
+        if (card.isNew) {
+          card.item.style.setProperty('--vault-notice-enter-delay',
+            `${Math.min(enteringCardIndex, 2) * 30}ms`);
+          card.isNew = false;
+          enteringCardIndex += 1;
+        }
         retained.add(row.app);
       });
       const completion = snapshot.completion;
@@ -1260,19 +1422,21 @@
       cards.forEach((card, app) => {
         if (card.completion && !manualApps.has(app)) retained.add(app);
       });
+      const order = [];
+      validRows.forEach((row) => {
+        if (!order.includes(row.app)) order.push(row.app);
+      });
+      cards.forEach((card, app) => {
+        if (card.completion && !liveApps.has(app) && !order.includes(app)) {
+          order.push(app);
+        }
+      });
+      desiredCardOrder = order;
       [...cards.keys()].forEach((app) => {
         if (!retained.has(app)) removeCard(app);
       });
-      validRows.forEach((row) => {
-        const card = cards.get(row.app);
-        if (card) tray.appendChild(card.item);
-      });
-      cards.forEach((card, app) => {
-        if (card.completion && !liveApps.has(app)) {
-          tray.appendChild(card.item);
-        }
-      });
-      tray.hidden = cards.size === 0;
+      reorderCards();
+      syncTrayVisibility();
     }
 
     async function loadState() {
@@ -1308,7 +1472,6 @@
         }
       };
       eventSource.onerror = () => {
-        resetCards();
         loadState();
       };
     }

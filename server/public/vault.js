@@ -25,6 +25,7 @@ const COPY = {
   home_folder_unavailable: "The home folder is unavailable.",
   find_already_running: "Another folder search is already running.",
   find_requires_scan: "Run a global scan before searching for more savings.",
+  find_minimum_size_help: "Search files this size and larger",
   find_wait_for_scan: "Wait for the current scan to finish.",
   find_waiting: "Waiting to search",
   find_searching: "Searching folders",
@@ -52,11 +53,11 @@ const COPY = {
   matching_bytes: "{size} matched",
   can_save_selection: "Can save {size}",
   calculating_savings: "Calculating savings…",
-  choose_locations: "Choose locations to add",
-  choose_locations_hint: "Select the locations you want to add.",
-  recommended: "Recommended",
-  broader_scan: "Broader scan",
-  scan_scope: "{count} files · {size} scan scope",
+  choose_locations: "Choose folders to watch",
+  choose_locations_hint: "Pinokio tracks these folders for duplicates. Nothing is scanned or changed until you run a scan.",
+  scan_scope: "adds {size} to future scans",
+  files_here_one: "1 file here",
+  files_here: "{count} files here",
   selected_inside: "{count} selected inside",
   selected_location: "1 location selected",
   selected_locations: "{count} locations selected",
@@ -539,7 +540,6 @@ const post = async (payload) => {
 const openGlobalWorkspace = () => {
   window.parent.location.assign("/vault")
 }
-let automaticModeEventSource = null
 const applyAutomaticScanSnapshot = (snapshot) => {
   if (!IS_APP_MODE) return
   const settings = snapshot && Array.isArray(snapshot.settings)
@@ -561,26 +561,56 @@ const applyAutomaticScanSnapshot = (snapshot) => {
     else renderOverview()
   }
 }
+let automaticModeParentVersion = 0
+let automaticModeFallbackTimer = null
 const loadAutomaticMode = async () => {
   if (!IS_APP_MODE) return
+  const requestedAtParentVersion = automaticModeParentVersion
   try {
     const response = await fetch("/info/vault/automatic-scans", {
       credentials: "same-origin",
       cache: "no-store"
     })
     if (!response.ok) return
-    applyAutomaticScanSnapshot(await response.json())
+    const snapshot = await response.json()
+    if (window.parent !== window &&
+        automaticModeParentVersion !== requestedAtParentVersion) return
+    applyAutomaticScanSnapshot(snapshot)
   } catch (error) {}
 }
-const connectAutomaticMode = () => {
-  if (!IS_APP_MODE || typeof window.EventSource !== "function") return
-  automaticModeEventSource = new window.EventSource(
-    "/info/vault/automatic-scans/events")
-  automaticModeEventSource.onmessage = (event) => {
-    try {
-      applyAutomaticScanSnapshot(JSON.parse(event.data))
-    } catch (error) {}
+const requestAutomaticModeFromParent = () => {
+  if (!IS_APP_MODE || window.parent === window) return false
+  try {
+    window.parent.postMessage({
+      e: "vault-automatic-scan-state-request"
+    }, window.location.origin)
+    return true
+  } catch (error) {
+    return false
   }
+}
+const notifyAutomaticModeChanged = (mode) => {
+  if (!IS_APP_MODE || window.parent === window) return
+  try {
+    window.parent.postMessage({
+      e: "vault-automatic-mode-changed",
+      app: APP_NAME,
+      mode: mode === "manual" ? "manual" : "automatic"
+    }, window.location.origin)
+  } catch (error) {}
+}
+const onAutomaticModeMessage = (event) => {
+  if (!IS_APP_MODE || window.parent === window ||
+      !event || event.source !== window.parent ||
+      event.origin !== window.location.origin ||
+      !event.data || typeof event.data !== "object" ||
+      event.data.e !== "vault-automatic-scan-state") return
+  automaticModeParentVersion += 1
+  if (automaticModeFallbackTimer !== null) {
+    window.clearTimeout(automaticModeFallbackTimer)
+    automaticModeFallbackTimer = null
+  }
+  applyAutomaticScanSnapshot(event.data.snapshot)
 }
 const sourceById = (id) => (state.data.sources || []).find((source) => source.id === id)
 const sourceChildren = (id) => (state.data.sources || []).filter((source) => source.parent_id === id)
@@ -775,15 +805,9 @@ const folderDiscoveryComplete = (discovery) => !!(
     .includes(discovery.phase)
 )
 
-const folderDiscoveryThreshold = () => {
-  const scan = state.data && state.data.last_scan
-  const threshold = scan && Number(scan.candidate_min_bytes)
-  if (!Number.isFinite(threshold)) return defaultCandidateSize
-  return Math.max(0, threshold)
-}
-
-const folderDiscoveryThresholdLabel = () => {
-  const threshold = folderDiscoveryThreshold()
+const folderDiscoveryThresholdLabel = (discovery) => {
+  const threshold = Number(discovery && discovery.threshold)
+  if (!Number.isFinite(threshold) || threshold < 0) return null
   return threshold === 0 ? COPY.all : fmt(threshold)
 }
 
@@ -896,23 +920,18 @@ const renderFolderDiscoveryNode = (
   const nestedSelectionCount = Math.max(
     0, Number(node.selected_inside) || 0)
   const count = Math.max(0, Number(node.file_count) || 0)
-  const eligibleCount = Math.max(count,
-    Number(node.eligible_file_count) || 0)
   const eligibleBytes = Math.max(Number(node.bytes) || 0,
     Number(node.eligible_bytes) || 0)
   const matchLabel = count === 1
     ? COPY.matching_file
     : COPY.matching_files.replace("{count}", count)
-  const scanLabel = COPY.scan_scope
-    .replace("{count}", eligibleCount)
-    .replace("{size}", fmt(eligibleBytes))
-  const isRecommended = !!node.recommended
-  const isBroader = !isRecommended && !!node.broader
-  const scopeBadge = isRecommended
-    ? `<span class="vault-find-tree-badge">${esc(COPY.recommended)}</span>`
-    : isBroader
-      ? `<span class="vault-find-tree-badge broader">${esc(COPY.broader_scan)}</span>`
-      : ""
+  const scanLabel = COPY.scan_scope.replace("{size}", fmt(eligibleBytes))
+  const directCount = Math.max(0, Number(node.direct_file_count) || 0)
+  const filesHereLabel = directCount && (hasChildren || options.root)
+    ? directCount === 1
+      ? COPY.files_here_one
+      : COPY.files_here.replace("{count}", directCount)
+    : null
   const toggle = hasChildren
     ? `<button class="vault-find-tree-toggle" type="button" data-toggle-found-folder="${attr(node.folder)}" aria-label="${attr(expanded ? COPY.collapse : COPY.expand)}" aria-expanded="${expanded ? "true" : "false"}"><i class="fa-solid fa-chevron-right" aria-hidden="true"></i></button>`
     : `<span class="vault-find-tree-toggle-spacer" aria-hidden="true"></span>`
@@ -931,6 +950,7 @@ const renderFolderDiscoveryNode = (
     "{count}", nestedSelectionCount)
   const detailLabel = [
     nestedSelectionCount ? nestedSelectionLabel : null,
+    filesHereLabel,
     COPY.matching_bytes.replace("{size}", fmt(Number(node.bytes) || 0)),
     scanLabel
   ].filter(Boolean).join(" · ")
@@ -940,7 +960,7 @@ const renderFolderDiscoveryNode = (
       ${toggle}
       <label class="vault-find-tree-check-target"><input class="vault-find-tree-check" type="checkbox" data-select-found-folder="${attr(node.folder)}" aria-label="${attr(`Select ${node.folder}`)}"${checked ? " checked" : ""}${state.folderDiscoverySelectionPending ? " disabled" : ""}></label>
       <i class="fa-regular fa-folder vault-find-tree-icon" aria-hidden="true"></i>
-      <div class="vault-find-tree-copy" title="${attr(node.folder)}"><div class="vault-find-tree-name"><strong>${esc(node.name || basename(node.folder) || node.folder)}</strong>${scopeBadge}</div>${showPath ? `<span>${esc(node.folder)}</span>` : ""}</div>
+      <div class="vault-find-tree-copy" title="${attr(node.folder)}"><div class="vault-find-tree-name"><strong>${esc(node.name || basename(node.folder) || node.folder)}</strong></div>${showPath ? `<span>${esc(node.folder)}</span>` : ""}</div>
       <div class="vault-find-tree-saving"><strong>${esc(matchLabel)}</strong><span>${esc(detailLabel)}</span></div>
     </div>${childRows}
   </div>`
@@ -1108,6 +1128,9 @@ const folderDiscoveryFocusToken = () => {
   const active = document.activeElement
   const overlay = el("vault-find-overlay")
   if (!active || !overlay || !overlay.contains(active)) return null
+  if (active.id === "vault-find-candidate-size") {
+    return { id: active.id }
+  }
   const attributes = [
     "data-select-found-folder",
     "data-toggle-found-folder",
@@ -1130,6 +1153,11 @@ const folderDiscoveryFocusToken = () => {
 
 const restoreFolderDiscoveryFocus = (token) => {
   if (!token) return
+  if (token.id) {
+    const target = el(token.id)
+    if (target && !target.disabled) target.focus({ preventScroll: true })
+    return
+  }
   const candidates = document.querySelectorAll(`[${token.attribute}]`)
   const target = [...candidates].find((candidate) =>
     candidate.getAttribute(token.attribute) === token.value)
@@ -1205,6 +1233,15 @@ const renderFolderDiscovery = () => {
   if (choosingRoot) {
     const homeLabel = HOME_PATH || COPY.home_folder_unavailable
     setFolderDiscoveryBody(body, `${localErrorBanner}<div class="vault-find-chooser">
+      <div class="vault-find-size-setting">
+        <label class="vault-find-size-copy" for="vault-find-candidate-size">
+          <strong>${esc(COPY.minimum_file_size)}</strong>
+          <span id="vault-find-size-help">${esc(COPY.find_minimum_size_help)}</span>
+        </label>
+        <select class="vault-select vault-find-size-select" id="vault-find-candidate-size" aria-describedby="vault-find-size-help">
+          ${candidateSizeOptions.map((size) => `<option value="${size}" ${size === candidateSize() ? "selected" : ""}>${esc(candidateSizeLabel(size))}</option>`).join("")}
+        </select>
+      </div>
       <button class="vault-button vault-find-choice recommended" type="button" data-find-home-folder title="${attr(homeLabel)}" ${HOME_PATH ? "" : "disabled"}>
         <i class="fa-solid fa-house" aria-hidden="true"></i>
         <span class="vault-find-choice-copy"><strong>${esc(COPY.search_home_folder)}</strong><span class="vault-find-choice-path">${esc(homeLabel)}</span></span>
@@ -1246,7 +1283,10 @@ const renderFolderDiscovery = () => {
       ? Math.max(0, now - lastActivity)
       : 0
     const stalled = lastActivity > 0 && inactiveMs >= 10000
-    const thresholdDetail = `${COPY.minimum_file_size}: ${folderDiscoveryThresholdLabel()}`
+    const thresholdLabel = folderDiscoveryThresholdLabel(discovery)
+    const thresholdDetail = thresholdLabel
+      ? `${COPY.minimum_file_size}: ${thresholdLabel}`
+      : ""
     const currentFolder = discovery.current_folder || discovery.root || ""
     const currentDetail = discovery.phase === "hashing" && discovery.current_file
       ? discovery.current_file
@@ -1302,7 +1342,7 @@ const renderFolderDiscovery = () => {
       <div class="vault-find-progress-heading"><i class="${progressIcon}" aria-hidden="true"></i><span>${esc(label)}</span></div>
       <div class="vault-find-root" title="${attr(discovery.root || "")}">${esc(discovery.root || "")}</div>
       ${activity}
-      <div class="vault-find-threshold">${esc(thresholdDetail)}</div>
+      ${thresholdDetail ? `<div class="vault-find-threshold">${esc(thresholdDetail)}</div>` : ""}
       <div class="vault-find-actions"><button class="vault-button" type="button" data-cancel-find-folders ${state.folderDiscoveryCancelRequested ? "disabled" : ""}>${esc(state.folderDiscoveryCancelRequested ? COPY.cancelling : COPY.cancel)}</button></div>
     </div>`, focusToken)
     return
@@ -3115,7 +3155,11 @@ const startFolderDiscovery = async (folderPath) => {
   renderFolderDiscovery()
   try {
     resetFolderDiscoveryChoices()
-    const result = await post({ action: "find_folders", path: folderPath })
+    const result = await post({
+      action: "find_folders",
+      path: folderPath,
+      candidate_size: candidateSize()
+    })
     if (result.error) throw new Error(result.error)
     if (!result.started && !result.already_running) {
       throw new Error(COPY.action_not_completed)
@@ -3213,6 +3257,7 @@ document.addEventListener("click", async (event) => {
       })
       if (result.error) throw new Error(result.error)
       state.automaticMode = result.mode
+      notifyAutomaticModeChanged(result.mode)
     } catch (error) {
       state.feedback = {
         error: true,
@@ -3853,7 +3898,7 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key !== "Tab") return
   const focusable = [...dialog.querySelectorAll(
-    "button:not([disabled]), input:not([disabled]), summary, [href], [tabindex]:not([tabindex='-1'])"
+    "button:not([disabled]), input:not([disabled]), select:not([disabled]), summary, [href], [tabindex]:not([tabindex='-1'])"
   )].filter((candidate) => !candidate.closest("[hidden]"))
   if (!focusable.length) {
     event.preventDefault()
@@ -4099,7 +4144,8 @@ document.addEventListener("change", async (event) => {
     syncPageSelectionCheckbox()
     return
   }
-  if (event.target.id === "vault-candidate-size") {
+  if (["vault-candidate-size", "vault-find-candidate-size"]
+      .includes(event.target.id)) {
     const size = Number(event.target.value)
     state.candidateSize = candidateSizeOptions.includes(size)
       ? size
@@ -4181,10 +4227,15 @@ if (IS_APP_MODE) {
     const trigger = menu.querySelector("summary")
     if (trigger) trigger.focus()
   }, true)
-  loadAutomaticMode().finally(connectAutomaticMode)
-  window.addEventListener("beforeunload", () => {
-    if (automaticModeEventSource) automaticModeEventSource.close()
-  }, { once: true })
+  window.addEventListener("message", onAutomaticModeMessage)
+  if (requestAutomaticModeFromParent()) {
+    automaticModeFallbackTimer = window.setTimeout(() => {
+      automaticModeFallbackTimer = null
+      loadAutomaticMode()
+    }, 500)
+  } else {
+    loadAutomaticMode()
+  }
 }
 el("vault-pane").setAttribute("aria-label", COPY.files_region)
 refresh()
