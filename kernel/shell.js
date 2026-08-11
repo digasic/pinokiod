@@ -290,6 +290,7 @@ class Shell {
       }
     }
 
+    setDefaultEnvValue(this.env, "UV_HTTP_TIMEOUT", "60")
     setDefaultEnvValue(this.env, "HF_HUB_DISABLE_UPDATE_CHECK", "1")
     setDefaultEnvValue(this.env, "HF_TOKEN_PATH", this.kernel.envs?.HF_TOKEN_PATH || path.resolve(this.kernel.homedir, "cache", "HF_AUTH", "token"))
 

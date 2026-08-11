@@ -174,6 +174,28 @@ test('Shell.activate keeps managed Python downloads automatic on every platform'
   }
 })
 
+test('Shell.init_env defaults the uv HTTP timeout without overriding apps', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pinokio-shell-uv-timeout-'))
+  await fs.mkdir(path.join(root, 'api'), { recursive: true })
+  await fs.writeFile(path.join(root, 'ENVIRONMENT'), 'PINOKIO_TEST_ENV=1\n')
+
+  const defaultShell = createShell(createKernel(root))
+  await defaultShell.init_env({
+    path: process.cwd(),
+    env: {}
+  })
+  assert.equal(defaultShell.env.UV_HTTP_TIMEOUT, '60')
+
+  const overrideShell = createShell(createKernel(root))
+  await overrideShell.init_env({
+    path: process.cwd(),
+    env: {
+      UV_HTTP_TIMEOUT: '120'
+    }
+  })
+  assert.equal(overrideShell.env.UV_HTTP_TIMEOUT, '120')
+})
+
 test('Shell.init_env disables Hugging Face hub update checks by default without overriding apps', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pinokio-shell-hf-env-'))
   await fs.mkdir(path.join(root, 'api'), { recursive: true })
