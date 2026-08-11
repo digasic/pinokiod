@@ -512,6 +512,12 @@ describe("Save Space scans", () => {
       assert.ok(rows.length <= 128)
       return rows
     }
+    const stagedBatches = []
+    const setStageHashes = vault.registry.setStageHashes.bind(vault.registry)
+    vault.registry.setStageHashes = async (runId, entries) => {
+      stagedBatches.push(entries.length)
+      return setStageHashes(runId, entries)
+    }
     let hashes = 0
     const hashFile = vault.hashFile.bind(vault)
     vault.hashFile = async (...args) => {
@@ -522,6 +528,7 @@ describe("Save Space scans", () => {
     await vault.sweeper.scan()
 
     assert.equal(hashes, 3)
+    assert.deepEqual(stagedBatches, [3])
     assert.deepEqual(workCalls.map((call) => call.rows), [3, 0])
     assert.equal(workCalls[0].cursor, null)
     for (const call of workCalls.slice(1)) {
@@ -725,6 +732,25 @@ describe("Save Space scans", () => {
         FROM sqlite_temp_master
         WHERE type = 'table' AND name GLOB 'scan_*'
       `).get().count, 6)
+      const scanFilesSql = registry.database.prepare(`
+        SELECT sql FROM sqlite_temp_master
+        WHERE type = 'table' AND name = 'scan_files'
+      `).get().sql
+      assert.doesNotMatch(scanFilesSql, /WITHOUT ROWID/)
+      const compactIndexes = new Map(registry.database.prepare(`
+        SELECT name, sql FROM sqlite_temp_master
+        WHERE type = 'index' AND name IN (
+          'scan_files_group_idx',
+          'scan_files_work_idx',
+          'scan_files_inode_path_idx'
+        )
+      `).all().map((row) => [row.name, row.sql]))
+      assert.match(compactIndexes.get("scan_files_group_idx"),
+        /WHERE hash IS NOT NULL/)
+      assert.doesNotMatch(compactIndexes.get("scan_files_work_idx"),
+        /path/)
+      assert.match(compactIndexes.get("scan_files_inode_path_idx"),
+        /WHERE nlink > 1 AND ino != 0/)
       const comparisonPlan = registry.database.prepare(`
         EXPLAIN QUERY PLAN
         SELECT *
@@ -736,6 +762,105 @@ describe("Save Space scans", () => {
         LIMIT 128
       `).all("plan").map((row) => row.detail).join(" ")
       assert.match(comparisonPlan, /scan_files_comparison_pending_idx/)
+      const scopedAnchorPlan = registry.database.prepare(`
+        EXPLAIN QUERY PLAN
+        SELECT anchor.*
+        FROM anchors anchor
+        WHERE anchor.verified_at IS NOT NULL
+          AND anchor.store_id = ?
+          AND (anchor.store_id, anchor.hash) > (?, ?)
+          AND (
+            EXISTS (
+              SELECT 1
+              FROM scan_files selected INDEXED BY scan_files_work_idx
+              WHERE selected.run_id = ?
+                AND selected.comparison_only = 0
+                AND selected.size = anchor.size
+                AND selected.dev = anchor.dev
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM scan_files selected INDEXED BY scan_files_inode_path_idx
+              WHERE selected.run_id = ?
+                AND selected.comparison_only = 0
+                AND selected.nlink > 1
+                AND selected.dev = anchor.dev
+                AND selected.ino != 0
+                AND selected.ino = anchor.ino
+            )
+          )
+        ORDER BY anchor.store_id, anchor.hash
+        LIMIT ?
+      `).all("store", "", "", "plan", "plan", 128)
+        .map((row) => row.detail).join(" ")
+      assert.match(scopedAnchorPlan,
+        /scan_files_work_idx.*run_id=.*size=.*dev=/)
+      assert.match(scopedAnchorPlan,
+        /scan_files_inode_path_idx.*run_id=.*dev=.*ino=/)
+      const anchorCandidatePlan = registry.database.prepare(`
+        EXPLAIN QUERY PLAN
+        UPDATE scan_files INDEXED BY scan_files_work_idx
+        SET hash_needed = 1
+        WHERE run_id = ?
+          AND size = ?
+          AND dev = ?
+          AND comparison_only = 0
+          AND hash IS NULL
+          AND hash_needed = 0
+          AND (? = 0 OR ino = 0 OR ino != ?)
+      `).all("plan", 1, 1, 1, 1)
+        .map((row) => row.detail).join(" ")
+      assert.match(anchorCandidatePlan,
+        /scan_files_work_idx.*run_id=.*size=.*dev=/)
+      const managedInodePlan = registry.database.prepare(`
+        EXPLAIN QUERY PLAN
+        UPDATE scan_files INDEXED BY scan_files_inode_path_idx SET
+          managed = 1,
+          status = 'linked',
+          hash = COALESCE(hash, ?),
+          hash_needed = 0
+        WHERE run_id = ?
+          AND comparison_only = 0
+          AND nlink > 1
+          AND dev = ?
+          AND ino = ?
+          AND ino != 0
+      `).all("hash", "plan", 1, 1)
+        .map((row) => row.detail).join(" ")
+      assert.match(managedInodePlan,
+        /scan_files_inode_path_idx.*run_id=.*dev=.*ino=/)
+      const publicationPeerPlan = registry.database.prepare(`
+        EXPLAIN QUERY PLAN
+        SELECT 1
+        FROM scan_files peer INDEXED BY scan_files_group_idx
+        WHERE peer.run_id = ?
+          AND peer.hash = ?
+          AND peer.dev = ?
+          AND peer.path != ?
+          AND peer.source_id NOT IN (?)
+      `).all("plan", "hash", 1, "path", "source")
+        .map((row) => row.detail).join(" ")
+      assert.match(publicationPeerPlan,
+        /scan_files_group_idx.*run_id=.*hash=.*dev=/)
+      const publicationAnchorPlan = registry.database.prepare(`
+        EXPLAIN QUERY PLAN
+        SELECT 1
+        FROM scan_anchors anchor
+          INDEXED BY scan_anchors_publication_idx
+        WHERE anchor.run_id = ?
+          AND anchor.dev = ?
+          AND anchor.hash_name = ?
+          AND anchor.verify_attempted = 1
+          AND anchor.verified_hash IS NULL
+      `).all("plan", 1, "hash")
+        .map((row) => row.detail).join(" ")
+      assert.match(publicationAnchorPlan,
+        /scan_anchors_publication_idx.*run_id=.*dev=.*verified_hash=.*hash_name=/)
+      const anchorHashPlan = registry.database.prepare(`
+        EXPLAIN QUERY PLAN
+        SELECT * FROM anchors WHERE hash = ? ORDER BY store_id
+      `).all("hash").map((row) => row.detail).join(" ")
+      assert.match(anchorHashPlan, /anchors_hash_store_idx.*hash=/)
       const reclassificationPlan = registry.database.prepare(`
         EXPLAIN QUERY PLAN
         SELECT *

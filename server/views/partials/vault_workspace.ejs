@@ -5,8 +5,21 @@
         <div class='vault-metrics' id='vault-metrics'></div>
         <div class='vault-overview-actions'>
           <% if (appMode) { %>
-          <select class='vault-select' id='vault-candidate-size'></select>
-          <button class='vault-button' id='btn-scan' type='button'></button>
+          <div class='vault-app-scan-control' id='vault-app-scan-control'>
+            <select class='vault-select' id='vault-candidate-size'></select>
+            <span class='vault-app-scan-action'>
+              <button class='vault-button' id='btn-scan' type='button'></button>
+            </span>
+            <aside class='vault-scan-coachmark' id='vault-scan-coachmark' role='note' aria-live='polite' aria-atomic='true' aria-labelledby='vault-scan-coachmark-title' aria-describedby='vault-scan-coachmark-instruction vault-scan-coachmark-disclosure' hidden>
+              <span class='vault-scan-coachmark-badge'>New</span>
+              <button class='vault-scan-coachmark-close' type='button' data-dismiss-automatic-scan-coachmark aria-label='Dismiss explanation'>
+                <i class='fa-solid fa-xmark' aria-hidden='true'></i>
+              </button>
+              <h2 id='vault-scan-coachmark-title'>Automatic checking found possible duplicates</h2>
+              <p id='vault-scan-coachmark-instruction'>Choose a minimum file size, then click <strong id='vault-scan-coachmark-action'></strong> to review them.</p>
+              <p class='vault-scan-coachmark-disclosure' id='vault-scan-coachmark-disclosure'>Scanning may use CPU for a few minutes. Nothing changes until you review the results.</p>
+            </aside>
+          </div>
           <% } else { %>
           <div class='vault-scan-control' id='vault-scan-control'>
             <button class='vault-button vault-scan-action' id='btn-scan' type='button'></button>

@@ -9,6 +9,7 @@ const Sweeper = require("./sweeper")
 const FolderFinder = require("./folder_finder")
 const AutomaticScans = require("./automatic_scans")
 const { fileSnapshot, sameSnapshot, sameContentState } = require("./snapshot")
+const { cancelledError } = require("./operation_errors")
 const {
   SIZE_THRESHOLD,
   CANDIDATE_SIZE_OPTIONS,
@@ -37,11 +38,7 @@ const USER_WORK_ACTIONS = new Set([
   "reclaim_all"
 ])
 const AUTOMATIC_ACTIONS = new Set([
-  "automatic_pause",
-  "automatic_resume",
-  "automatic_review",
-  "automatic_dismiss",
-  "automatic_settings",
+  "automatic_acknowledge",
   "automatic_set_mode"
 ])
 const PERMISSION_DENIED_CODES = new Set(["EACCES", "EPERM"])
@@ -234,6 +231,7 @@ class Vault {
     this._anchorStoresByDevice = new Map()
     this.operationTail = Promise.resolve()
     this.registryInitializationPromise = null
+    this.registryRestartPromise = null
     this.initializationPromise = null
     this.scanPromise = null
     this.scanCompletionPromise = null
@@ -248,6 +246,42 @@ class Vault {
     this.folderDiscoveryCancelRequested = false
     this.folderDiscoveryCommitPromise = null
     this.automaticScans = new AutomaticScans(this)
+  }
+
+  async dispose() {
+    const failures = []
+    const settle = async (promise) => {
+      if (!promise) return
+      try {
+        await promise
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+
+    await settle(this.automaticScans.dispose())
+    if (this.scanPromise) this.cancelScan()
+    if (this.folderDiscoveryPromise) this.cancelFolderDiscovery()
+    if (this.fileActionProgress) this.cancelFileAction()
+    await settle(this.operationTail)
+    await settle(this.scanCompletionPromise)
+    await settle(this.folderDiscoveryCommitPromise)
+    await settle(this.registryRestartPromise)
+
+    if (this.worker) {
+      const worker = this.worker
+      this.failHashWorker(worker, cancelledError("Vault disposed."))
+      await settle(worker.terminate())
+    }
+    if (this.registry) {
+      const registry = this.registry
+      this.registry = null
+      await settle(registry.close())
+    }
+    this.initialized = false
+    this.sweeper = null
+    this.folderFinder = null
+    if (failures.length) throw failures[0]
   }
 
   get root() {
@@ -618,6 +652,9 @@ class Vault {
   }
 
   ensureRegistryInitialized() {
+    if (this.registryRestartPromise) {
+      return this.registryRestartPromise.then(() => ({ enabled: true }))
+    }
     if (this.registry) return Promise.resolve({ enabled: true })
     if (!this.registryInitializationPromise) {
       this.registryInitializationPromise = this.initializeRegistryStorage()
@@ -644,6 +681,7 @@ class Vault {
 
   async ensureInitialized() {
     if (!this.enabled) return { enabled: false }
+    await this.ensureRegistryInitialized()
     if (this.initialized) return { enabled: true, mode: this.mode }
     if (!this.initializationPromise) {
       this.initializationPromise = this.initializeStorage().finally(() => {
@@ -655,6 +693,7 @@ class Vault {
 
   async openWorkspace() {
     if (!this.initialized) return this.ensureInitialized()
+    await this.ensureRegistryInitialized()
     await this.refreshAnchorStores()
     await this.refreshSources()
     return { enabled: true, mode: this.mode }
@@ -673,6 +712,10 @@ class Vault {
         return this.automaticScans.snapshot()
       }
       await this.ensureRegistryInitialized()
+    }
+    if (!this.automaticScans.supported) {
+      await this.automaticScans.refreshGlobalScanReady()
+      return this.automaticScans.snapshot()
     }
     await this.automaticScans.hydrate()
     await this.automaticScans.refreshGlobalScanReady()
@@ -936,7 +979,7 @@ class Vault {
     }
     for (const [id, job] of [...this.workerJobs]) {
       if (job.worker !== worker) continue
-      clearTimeout(job.inactivityTimer)
+      job.cleanup()
       this.workerJobs.delete(id)
       job.reject(error)
     }
@@ -944,6 +987,10 @@ class Vault {
   }
 
   async hashFile(filePath, options = {}) {
+    const signal = options.signal
+    if (signal && signal.aborted) {
+      throw cancelledError("Hashing cancelled.")
+    }
     if (this.workerIdleTimer) {
       clearTimeout(this.workerIdleTimer)
       this.workerIdleTimer = null
@@ -962,7 +1009,7 @@ class Vault {
           job.reportProgress(bytesRead)
           return
         }
-        clearTimeout(job.inactivityTimer)
+        job.cleanup()
         this.workerJobs.delete(id)
         if (error) {
           const failure = new Error(error)
@@ -1016,7 +1063,22 @@ class Vault {
           } catch (error) {}
         },
         inactivityTimer: null,
-        resetInactivity: null
+        resetInactivity: null,
+        cancel: null,
+        cleanup: null
+      }
+      job.cancel = () => {
+        if (!this.workerJobs.has(id)) return
+        try {
+          worker.postMessage({ id, cancel: true })
+        } catch (error) {
+          const failure = cancelledError("Hashing cancelled.")
+          this.failHashWorker(worker, failure, true)
+        }
+      }
+      job.cleanup = () => {
+        clearTimeout(job.inactivityTimer)
+        if (signal) signal.removeEventListener("abort", job.cancel)
       }
       job.resetInactivity = () => {
         clearTimeout(job.inactivityTimer)
@@ -1031,9 +1093,11 @@ class Vault {
         if (job.inactivityTimer.unref) job.inactivityTimer.unref()
       }
       this.workerJobs.set(id, job)
+      if (signal) signal.addEventListener("abort", job.cancel, { once: true })
       job.resetInactivity()
       try {
         worker.postMessage({ id, filePath })
+        if (signal && signal.aborted) job.cancel()
       } catch (error) {
         const failure = new Error(error && error.message
           ? error.message
@@ -1696,6 +1760,9 @@ class Vault {
     this.scanPromise = tracked
     const completion = tracked.then(async () => {
       try {
+        if (this.registryRestartPromise) {
+          await this.registryRestartPromise
+        }
         await this.automaticScans.scanFinished({
           scopeId,
           result: scanResult,
@@ -1719,22 +1786,56 @@ class Vault {
     if (!this.scanPromise || !this.sweeper) {
       return { cancel_requested: false }
     }
+    // Publication is one atomic commit. Once it starts, let it finish so a
+    // committed result can never be reported as cancelled.
+    if (this.sweeper.state.active &&
+        this.sweeper.state.phase === "publishing") {
+      return { cancel_requested: false }
+    }
     this.scanCancelRequested = true
+    const error = new Error("Scan cancelled.")
+    error.code = "EVAULTCANCELLED"
+    const cancelRequested = this.sweeper.state.active
+      ? this.sweeper.cancel()
+      : true
     if (this.sweeper.state.active && this.sweeper.currentHash &&
         this.worker) {
-      const error = new Error("Scan cancelled.")
-      error.code = "EVAULTCANCELLED"
       this.failHashWorker(this.worker, error, true)
     }
+    if (this.sweeper.state.active && this.registry &&
+        !this.registryRestartPromise) {
+      const registry = this.registry
+      const restart = registry.restart(error).catch((restartError) => {
+        if (this.registry === registry) {
+          this.registry = null
+          this.initialized = false
+          this.sweeper = null
+        }
+        this.scanError = restartError && restartError.message
+          ? restartError.message
+          : String(restartError)
+        throw restartError
+      })
+      const tracked = restart.finally(() => {
+        if (this.registryRestartPromise === tracked) {
+          this.registryRestartPromise = null
+        }
+      })
+      this.registryRestartPromise = tracked
+      // The action returns immediately; subsequent work awaits this promise.
+      tracked.catch(() => {})
+    }
     return {
-      cancel_requested: this.sweeper.state.active
-        ? this.sweeper.cancel()
-        : true
+      cancel_requested: cancelRequested
     }
   }
 
   async perform(action, payload = {}) {
     if (!this.enabled) return { error: "Disk Saver is disabled." }
+    if (AUTOMATIC_ACTIONS.has(action) &&
+        !this.automaticScans.supported) {
+      return { error: "Automatic checks are unavailable on this platform." }
+    }
     const userWorkAction = USER_WORK_ACTIONS.has(action)
     if (userWorkAction) await this.automaticScans.beforeUserWork()
     try {
@@ -1744,29 +1845,13 @@ class Vault {
         await this.ensureInitialized()
       }
       switch (action) {
-      case "automatic_pause":
-      case "automatic_resume":
-      case "automatic_review":
-      case "automatic_dismiss":
-      case "automatic_settings":
+      case "automatic_acknowledge":
       case "automatic_set_mode": {
         if (typeof payload.app !== "string" || !payload.app) {
           return { error: "Choose an app." }
         }
-        if (action === "automatic_pause") {
-          return this.automaticScans.pause(payload.app, payload.notice_id)
-        }
-        if (action === "automatic_resume") {
-          return this.automaticScans.resume(payload.app, payload.notice_id)
-        }
-        if (action === "automatic_review") {
-          return this.automaticScans.review(payload.app, payload.notice_id)
-        }
-        if (action === "automatic_dismiss") {
-          return this.automaticScans.dismiss(payload.app, payload.notice_id)
-        }
-        if (action === "automatic_settings") {
-          return this.automaticScans.settingsLink(payload.app)
+        if (action === "automatic_acknowledge") {
+          return this.automaticScans.acknowledge(payload.app, payload.signature)
         }
         return this.automaticScans.setMode(payload.app, payload.mode)
       }
@@ -3304,9 +3389,15 @@ class Vault {
     }
 
     const lastScan = await this.scanForScope(scopeId)
-    const globalScanReady = scopeId
-      ? await this.globalScanReady()
-      : this.globalScanIsReady(lastScan)
+    const globalScan = scopeId ? await this.scanForScope(null) : lastScan
+    const globalScanReady = this.globalScanIsReady(globalScan)
+    const publishedCandidateMinimum = globalScan
+      ? Number(globalScan.candidate_min_bytes)
+      : NaN
+    const globalCandidateMinimum = Number.isFinite(
+      publishedCandidateMinimum) && publishedCandidateMinimum >= 0
+      ? publishedCandidateMinimum
+      : SIZE_THRESHOLD
     const before = lastScan && Number.isFinite(lastScan.bytes_total)
       ? lastScan.bytes_total
       : 0
@@ -3344,6 +3435,7 @@ class Vault {
     const result = {
       enabled: true,
       global_scan_ready: globalScanReady,
+      global_candidate_min_bytes: globalCandidateMinimum,
       mode: this.mode,
       scan: this.scanStatus(),
       last_scan: lastScan,

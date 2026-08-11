@@ -61,7 +61,8 @@ class Scanner {
 
   async hashStable(entry, options = {}) {
     const result = await this.vault.hashFile(entry.path, {
-      onProgress: options.onProgress
+      onProgress: options.onProgress,
+      signal: options.signal
     })
     const current = await fs.promises.lstat(entry.path)
     const stable = current.isFile() &&

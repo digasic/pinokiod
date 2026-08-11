@@ -108,7 +108,8 @@ const COPY = {
   scan_app: "Scan this app",
   setup_disk_saver: "Set up Disk Saver",
   setup_title: "Run an initial scan to enable app scans",
-  setup_description: "This creates the file index used to compare apps and enables automatic checks.",
+  setup_description: "This creates the file index used to compare apps.",
+  setup_automatic_description: "It also enables automatic checks.",
   scan_again: "Scan again",
   cancel_scan: "Cancel scan",
   scanning: "Scanning…",
@@ -356,35 +357,42 @@ const duplicateGroupPageSelectionUrl = () => {
   return `/info/dedup?${query.toString()}`
 }
 const reviewedScanKey = `pinokio:vault:reviewed-scan:${SCOPE_ID || "global"}`
-const candidateSizeKey = "pinokio:vault:candidate-size"
 const externalPromptKey = "pinokio:vault:external-prompt-dismissed"
-const automaticSettingsKey = APP_NAME
-  ? `pinokio:vault:auto-settings:${encodeURIComponent(APP_NAME)}`
+const automaticScanFocusKey = APP_NAME
+  ? `pinokio:vault:auto-scan-focus:${encodeURIComponent(APP_NAME)}`
   : null
-const automaticReviewKey = APP_NAME
-  ? `pinokio:vault:auto-review:${encodeURIComponent(APP_NAME)}`
+const automaticScanCoachmarkSeenPrefix = APP_NAME
+  ? `pinokio:vault:auto-scan-coachmark-seen:${encodeURIComponent(APP_NAME)}`
   : null
-const consumeAutomaticSettingsRequest = () => {
-  if (!automaticSettingsKey) return false
+const consumeAutomaticScanFocusRequest = () => {
+  if (!automaticScanFocusKey) return false
   try {
-    const requested = sessionStorage.getItem(automaticSettingsKey) === "1"
-    if (requested) sessionStorage.removeItem(automaticSettingsKey)
-    return requested
+    const signature = sessionStorage.getItem(automaticScanFocusKey)
+    if (signature !== null) sessionStorage.removeItem(automaticScanFocusKey)
+    return signature || null
+  } catch (error) {
+    return null
+  }
+}
+const automaticScanCoachmarkSeen = (signature) => {
+  if (!automaticScanCoachmarkSeenPrefix || !signature) return false
+  try {
+    return sessionStorage.getItem(
+      `${automaticScanCoachmarkSeenPrefix}:${signature}`) === "1"
   } catch (error) {
     return false
   }
 }
-const consumeAutomaticReviewRequest = () => {
-  if (!automaticReviewKey) return false
+const rememberAutomaticScanCoachmark = (signature) => {
+  if (!automaticScanCoachmarkSeenPrefix || !signature) return
   try {
-    const requested = sessionStorage.getItem(automaticReviewKey) === "1"
-    if (requested) sessionStorage.removeItem(automaticReviewKey)
-    return requested
-  } catch (error) {
-    return false
-  }
+    sessionStorage.setItem(
+      `${automaticScanCoachmarkSeenPrefix}:${signature}`, "1")
+  } catch (error) {}
 }
 const candidateSizeBase = document.body.dataset.platform === "win32" ? 1024 : 1000
+const AUTOMATIC_SUPPORTED = document.body.dataset.platform === "darwin" ||
+  document.body.dataset.platform === "win32"
 const defaultCandidateSize = 100 * candidateSizeBase ** 2
 const candidateSizeOptions = [0]
   .concat([1, 10, 50, 100, 500].map((value) => value * candidateSizeBase ** 2))
@@ -394,6 +402,7 @@ const PAGE_SIZE = 500
 const state = {
   data: null,
   candidateSize: defaultCandidateSize,
+  candidateSizeInitialized: false,
   view: "all",
   sourceId: SCOPE_ID,
   query: "",
@@ -419,8 +428,8 @@ const state = {
   actionRequest: false,
   automaticMode: null,
   automaticModeUpdating: false,
-  automaticModeMenuRequested: consumeAutomaticSettingsRequest(),
-  automaticReviewRequested: consumeAutomaticReviewRequest(),
+  automaticScanPendingSignature: consumeAutomaticScanFocusRequest(),
+  automaticScanCoachmarkSignature: null,
   scanCancelRequested: false,
   folderDiscoveryOpen: false,
   folderDiscoveryChoosingRoot: false,
@@ -541,7 +550,7 @@ const openGlobalWorkspace = () => {
   window.parent.location.assign("/vault")
 }
 const applyAutomaticScanSnapshot = (snapshot) => {
-  if (!IS_APP_MODE) return
+  if (!IS_APP_MODE || !AUTOMATIC_SUPPORTED) return
   const settings = snapshot && Array.isArray(snapshot.settings)
     ? snapshot.settings
     : []
@@ -564,7 +573,7 @@ const applyAutomaticScanSnapshot = (snapshot) => {
 let automaticModeParentVersion = 0
 let automaticModeFallbackTimer = null
 const loadAutomaticMode = async () => {
-  if (!IS_APP_MODE) return
+  if (!IS_APP_MODE || !AUTOMATIC_SUPPORTED) return
   const requestedAtParentVersion = automaticModeParentVersion
   try {
     const response = await fetch("/info/vault/automatic-scans", {
@@ -579,7 +588,9 @@ const loadAutomaticMode = async () => {
   } catch (error) {}
 }
 const requestAutomaticModeFromParent = () => {
-  if (!IS_APP_MODE || window.parent === window) return false
+  if (!IS_APP_MODE || !AUTOMATIC_SUPPORTED || window.parent === window) {
+    return false
+  }
   try {
     window.parent.postMessage({
       e: "vault-automatic-scan-state-request"
@@ -590,7 +601,7 @@ const requestAutomaticModeFromParent = () => {
   }
 }
 const notifyAutomaticModeChanged = (mode) => {
-  if (!IS_APP_MODE || window.parent === window) return
+  if (!IS_APP_MODE || !AUTOMATIC_SUPPORTED || window.parent === window) return
   try {
     window.parent.postMessage({
       e: "vault-automatic-mode-changed",
@@ -599,12 +610,27 @@ const notifyAutomaticModeChanged = (mode) => {
     }, window.location.origin)
   } catch (error) {}
 }
-const onAutomaticModeMessage = (event) => {
-  if (!IS_APP_MODE || window.parent === window ||
+const onAutomaticScanMessage = (event) => {
+  if (!IS_APP_MODE || !AUTOMATIC_SUPPORTED || window.parent === window ||
       !event || event.source !== window.parent ||
       event.origin !== window.location.origin ||
-      !event.data || typeof event.data !== "object" ||
-      event.data.e !== "vault-automatic-scan-state") return
+      !event.data || typeof event.data !== "object") return
+  if (event.data.e === "vault-automatic-scan-focus" &&
+      event.data.app === APP_NAME) {
+    const signature = typeof event.data.signature === "string"
+      ? event.data.signature
+      : ""
+    if (!signature) return
+    try { sessionStorage.removeItem(automaticScanFocusKey) } catch (error) {}
+    if (state.automaticScanCoachmarkSignature === signature) return
+    if (state.automaticScanCoachmarkSignature) {
+      dismissAutomaticScanCoachmark()
+    }
+    state.automaticScanPendingSignature = signature
+    if (state.data) renderOverview()
+    return
+  }
+  if (event.data.e !== "vault-automatic-scan-state") return
   automaticModeParentVersion += 1
   if (automaticModeFallbackTimer !== null) {
     window.clearTimeout(automaticModeFallbackTimer)
@@ -2200,7 +2226,7 @@ const storageSummaryMarkup = (segments, logicalBytes) => {
 }
 
 const automaticModeMarkup = () => {
-  if (!IS_APP_MODE || !state.automaticMode) return ""
+  if (!IS_APP_MODE || !AUTOMATIC_SUPPORTED || !state.automaticMode) return ""
   const automatic = state.automaticMode === "automatic"
   const label = automatic ? COPY.automatic : COPY.manual
   return `<details class="vault-auto-mode ${automatic ? "automatic" : "manual"}" id="vault-auto-mode">
@@ -2228,29 +2254,73 @@ const appSetupRequired = () => IS_APP_MODE && state.data &&
 const restoreAutomaticModeMenu = (open) => {
   const modeMenu = el("vault-auto-mode")
   if (modeMenu && open) modeMenu.open = true
-  if (!modeMenu || !state.automaticModeMenuRequested) return
-  state.automaticModeMenuRequested = false
-  modeMenu.classList.add("targeted")
-  const trigger = modeMenu.querySelector("summary")
+}
+
+const dismissAutomaticScanCoachmark = (restoreFocus = false) => {
+  const coachmark = el("vault-scan-coachmark")
+  const control = el("vault-app-scan-control")
+  const scanButton = el("btn-scan")
+  state.automaticScanCoachmarkSignature = null
+  if (coachmark) coachmark.hidden = true
+  if (control) control.classList.remove("coachmark-visible")
+  if (scanButton && scanButton.getAttribute("aria-describedby") ===
+      "vault-scan-coachmark-instruction vault-scan-coachmark-disclosure") {
+    scanButton.removeAttribute("aria-describedby")
+  }
+  if (restoreFocus && scanButton && scanButton.isConnected &&
+      !scanButton.disabled) {
+    scanButton.focus()
+  }
+}
+
+const presentAutomaticScanCoachmark = (scanButton, signature) => {
+  const coachmark = el("vault-scan-coachmark")
+  const control = el("vault-app-scan-control")
+  const actionLabel = el("vault-scan-coachmark-action")
+  state.automaticScanPendingSignature = null
+  if (!coachmark || !control || !actionLabel || !signature ||
+      automaticScanCoachmarkSeen(signature)) return
+  rememberAutomaticScanCoachmark(signature)
+  state.automaticScanCoachmarkSignature = signature
+  actionLabel.textContent = scanButton.textContent.trim()
+  coachmark.hidden = false
+  control.classList.add("coachmark-visible")
+  scanButton.setAttribute("aria-describedby",
+    "vault-scan-coachmark-instruction vault-scan-coachmark-disclosure")
   requestAnimationFrame(() => {
-    if (trigger && trigger.isConnected) trigger.focus()
+    if (state.automaticScanCoachmarkSignature !== signature ||
+        !scanButton.isConnected ||
+        scanButton.disabled || scanActive(state.data && state.data.scan)) {
+      return
+    }
+    scanButton.focus()
   })
-  setTimeout(() => {
-    if (modeMenu.isConnected) modeMenu.classList.remove("targeted")
-  }, 1600)
+}
+
+const syncAutomaticScanCoachmark = (scanButton, activeScan) => {
+  if (!IS_APP_MODE || !AUTOMATIC_SUPPORTED) return
+  if (activeScan || scanButton.disabled) {
+    if (state.automaticScanCoachmarkSignature) {
+      dismissAutomaticScanCoachmark()
+    }
+    return
+  }
+  if (state.automaticScanCoachmarkSignature) return
+  const signature = state.automaticScanPendingSignature
+  if (!signature) return
+  presentAutomaticScanCoachmark(scanButton, signature)
 }
 
 const renderSetupOverview = () => {
   const metrics = el("vault-metrics")
   const existingModeMenu = el("vault-auto-mode")
-  const modeMenuOpen = !!(existingModeMenu && existingModeMenu.open) ||
-    state.automaticModeMenuRequested
+  const modeMenuOpen = !!(existingModeMenu && existingModeMenu.open)
   metrics.classList.add("summary")
   metrics.innerHTML = `
     <div class="vault-summary-main">
       <div class="vault-summary-label"><i class="fa-solid fa-hard-drive"></i><span>${esc(COPY.save_space)}</span>${automaticModeMarkup()}</div>
       <div class="vault-summary-value">${esc(COPY.setup_title)}</div>
-      <p class="vault-setup-copy">${esc(COPY.setup_description)}</p>
+      <p class="vault-setup-copy">${esc(COPY.setup_description)}${AUTOMATIC_SUPPORTED ? ` ${esc(COPY.setup_automatic_description)}` : ""}</p>
     </div>
     <div class="vault-summary-side"></div>`
   restoreAutomaticModeMenu(modeMenuOpen)
@@ -2264,6 +2334,9 @@ const renderSetupOverview = () => {
   const scanState = el("vault-scan-state")
   scanState.classList.remove("show")
   scanState.innerHTML = ""
+  if (state.automaticScanCoachmarkSignature) {
+    dismissAutomaticScanCoachmark()
+  }
 }
 
 const renderNormalOverview = () => {
@@ -2276,8 +2349,7 @@ const renderNormalOverview = () => {
     data.inventory && data.inventory.shareable_duplicates) || 0)
   const metrics = el("vault-metrics")
   const existingModeMenu = el("vault-auto-mode")
-  const modeMenuOpen = !!(existingModeMenu && existingModeMenu.open) ||
-    state.automaticModeMenuRequested
+  const modeMenuOpen = !!(existingModeMenu && existingModeMenu.open)
   metrics.classList.add("summary")
   {
     const fallbackLogicalBytes = IS_APP_MODE
@@ -2358,22 +2430,12 @@ const renderNormalOverview = () => {
   const scanIsPrimary = firstScan || (!activeScan && !actionableDuplicates)
   scanButton.classList.toggle("primary", scanIsPrimary)
   scanButton.disabled = busyElsewhere || state.scanCancelRequested
-  if (state.automaticReviewRequested && !activeScan &&
-      !scanButton.disabled) {
-    requestAnimationFrame(() => {
-      if (!state.automaticReviewRequested || !scanButton.isConnected ||
-          scanButton.disabled || scanActive(state.data && state.data.scan)) {
-        return
-      }
-      state.automaticReviewRequested = false
-      scanButton.focus()
-    })
-  }
   const candidateSizeSelect = el("vault-candidate-size")
   if (candidateSizeSelect) {
     candidateSizeSelect.hidden = false
     candidateSizeSelect.disabled = activeScan
   }
+  syncAutomaticScanCoachmark(scanButton, activeScan)
   const scanControl = el("vault-scan-control")
   if (scanControl) scanControl.classList.toggle("single", activeScan)
   const scanSizeMenu = el("vault-scan-size-menu")
@@ -2779,6 +2841,13 @@ const settleFolderDiscoveryStart = () => {
   state.folderDiscoveryLocalError = null
 }
 const applyFullData = (data) => {
+  if (!state.candidateSizeInitialized) {
+    const published = Number(data && data.global_candidate_min_bytes)
+    state.candidateSize = candidateSizeOptions.includes(published)
+      ? published
+      : defaultCandidateSize
+    state.candidateSizeInitialized = true
+  }
   const scanning = scanActive(data.scan)
   const findingFolders = folderDiscoveryActive(data.folder_discovery)
   const contextualScan = !IS_APP_MODE || !data.scan || data.scan.scope_id === SCOPE_ID
@@ -3240,6 +3309,10 @@ const closeScanSizeMenu = () => {
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("button")
   if (!target) return
+  if (target.hasAttribute("data-dismiss-automatic-scan-coachmark")) {
+    dismissAutomaticScanCoachmark(true)
+    return
+  }
   if (target.hasAttribute("data-automatic-mode")) {
     const mode = target.dataset.automaticMode
     const menu = el("vault-auto-mode")
@@ -3278,7 +3351,7 @@ document.addEventListener("click", async (event) => {
     const size = Number(target.dataset.candidateSize)
     if (candidateSizeOptions.includes(size)) {
       state.candidateSize = size
-      try { localStorage.setItem(candidateSizeKey, String(size)) } catch (error) {}
+      state.candidateSizeInitialized = true
       closeScanSizeMenu()
       renderCandidateSizeControl()
     }
@@ -3660,6 +3733,9 @@ document.addEventListener("click", async (event) => {
       target.disabled = false
     }
   } else if (target.id === "btn-scan") {
+    if (state.automaticScanCoachmarkSignature) {
+      dismissAutomaticScanCoachmark()
+    }
     if (scanMatchesContext(state.data && state.data.scan)) {
       state.scanCancelRequested = true
       renderOverview()
@@ -4150,7 +4226,7 @@ document.addEventListener("change", async (event) => {
     state.candidateSize = candidateSizeOptions.includes(size)
       ? size
       : defaultCandidateSize
-    try { localStorage.setItem(candidateSizeKey, String(candidateSize())) } catch (error) {}
+    state.candidateSizeInitialized = true
     renderCandidateSizeControl()
     return
   }
@@ -4161,17 +4237,6 @@ document.addEventListener("change", async (event) => {
   refresh(true)
 })
 
-let initialCandidateSize = defaultCandidateSize
-try {
-  const storedValue = localStorage.getItem(candidateSizeKey)
-  if (storedValue !== null) {
-    const storedCandidateSize = Number(storedValue)
-    if (candidateSizeOptions.includes(storedCandidateSize)) {
-      initialCandidateSize = storedCandidateSize
-    }
-  }
-} catch (error) {}
-state.candidateSize = initialCandidateSize
 const candidateSizeSelect = el("vault-candidate-size")
 if (candidateSizeSelect) {
   candidateSizeSelect.setAttribute("aria-label", COPY.minimum_file_size)
@@ -4214,20 +4279,25 @@ if (disclosureMenus.length) {
     }
   }, true)
 }
-if (IS_APP_MODE) {
+if (IS_APP_MODE && AUTOMATIC_SUPPORTED) {
   document.addEventListener("pointerdown", (event) => {
     const menu = el("vault-auto-mode")
     if (menu && menu.open && !menu.contains(event.target)) menu.open = false
   }, true)
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return
+    if (state.automaticScanCoachmarkSignature) {
+      event.preventDefault()
+      dismissAutomaticScanCoachmark(true)
+      return
+    }
     const menu = el("vault-auto-mode")
     if (!menu || !menu.open) return
     menu.open = false
     const trigger = menu.querySelector("summary")
     if (trigger) trigger.focus()
   }, true)
-  window.addEventListener("message", onAutomaticModeMessage)
+  window.addEventListener("message", onAutomaticScanMessage)
   if (requestAutomaticModeFromParent()) {
     automaticModeFallbackTimer = window.setTimeout(() => {
       automaticModeFallbackTimer = null

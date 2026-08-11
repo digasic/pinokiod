@@ -4103,9 +4103,61 @@ body.dark .disk-usage {
   min-width: 0;
 }
 .appcanvas.vertical > aside .menu-actions #save-space-tab {
+  position: relative;
+  isolation: isolate;
   width: 100%;
   max-width: none;
   box-sizing: border-box;
+}
+.appcanvas.vertical > aside .menu-actions #save-space-tab::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  background: var(--pinokio-sidebar-notice-flash-bg);
+  opacity: 0;
+  pointer-events: none;
+}
+.appcanvas.vertical > aside .menu-actions #save-space-tab > .tab {
+  position: relative;
+  z-index: 1;
+}
+.app-vault-result-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border: 1px solid rgba(255,255,255,0.28);
+  border-radius: 4px;
+  color: #fff;
+  background: #b91c1c;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.2;
+  letter-spacing: 0.01em;
+  white-space: nowrap;
+}
+.app-vault-result-badge[hidden] {
+  display: none;
+}
+body.dark .app-vault-result-badge {
+  border-color: rgba(255,255,255,0.22);
+  color: #fff;
+  background: #dc2626;
+}
+#save-space-tab.app-vault-result-attention::before {
+  animation: app-vault-result-attention 800ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes app-vault-result-attention {
+  0%, 100% { opacity: 0; }
+  35%, 65% { opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #save-space-tab.app-vault-result-attention::before {
+    animation: none;
+  }
 }
 .app-vault-mode {
   flex: 0 0 auto;
@@ -8207,7 +8259,9 @@ body.dark .pinokio-custom-terminal-header {
 <script src="/tippy-bundle.umd.min.js"></script>
 <script src="/tab-link-popover.js"></script>
 <script src="/browser-popout-surface.js"></script>
+<% if (typeof vault_automatic_supported === 'undefined' || vault_automatic_supported) { %>
 <script src="/app-vault-mode.js" defer></script>
+<% } %>
 <script>
 (function() {
   try {
@@ -8508,14 +8562,24 @@ body.dark .pinokio-custom-terminal-header {
         <% if (typeof vault_enabled !== 'undefined' && vault_enabled) { %>
         <% const vaultAutomaticMode = typeof vault_automatic_mode === 'string' && vault_automatic_mode === 'manual' ? 'manual' : 'automatic' %>
         <% const vaultGlobalScanReady = typeof vault_global_scan_ready !== 'undefined' && vault_global_scan_ready === true %>
-        <a id='save-space-tab' data-mode="refresh" target="app-vault" href="/vault/app/<%=encodeURIComponent(name)%>" class="btn header-item frame-link" data-index="vault" data-static="retain" data-tab-link-popover="false" aria-label="<%=vaultGlobalScanReady ? `Disk Saver — ${vaultAutomaticMode === 'automatic' ? 'Automatic' : 'Manual'} checking` : 'Disk Saver — Set up required'%>">
+        <% const vaultAutomaticSupported = typeof vault_automatic_supported === 'undefined' || vault_automatic_supported === true %>
+        <% const vaultAutomaticResultSignature = vaultAutomaticSupported && typeof vault_automatic_result_signature === 'string' ? vault_automatic_result_signature : '' %>
+        <% const vaultSidebarLabel = !vaultGlobalScanReady ? 'Disk Saver — Set up required' : vaultAutomaticSupported ? `Disk Saver — ${vaultAutomaticMode === 'automatic' ? 'Automatic' : 'Manual'} checking${vaultAutomaticResultSignature ? ' — Duplicate files found' : ''}` : 'Disk Saver' %>
+        <a id='save-space-tab' data-mode="refresh" target="app-vault" href="/vault/app/<%=encodeURIComponent(name)%>" class="btn header-item frame-link<%=vaultAutomaticResultSignature ? ' app-vault-result-attention' : ''%>" data-index="vault" data-static="retain" data-tab-link-popover="false" aria-label="<%=vaultSidebarLabel%>">
           <div class='tab'>
             <i class="fa-solid fa-hard-drive menu-action-leading-icon"></i>
             <div class='display'>Disk Saver</div>
+            <% if (vaultAutomaticSupported) { %>
+              <span class="app-vault-result-badge" data-app-vault-result-badge title="New duplicate files found" aria-hidden="true" <%=vaultAutomaticResultSignature ? '' : 'hidden'%>>New</span>
+            <% } %>
             <div class='flexible'></div>
-            <span class="app-vault-mode" data-app-vault-mode data-app="<%=name%>" data-mode="<%=vaultAutomaticMode%>" data-ready="<%=vaultGlobalScanReady ? 'true' : 'false'%>" aria-hidden="true">
-              <span data-app-vault-mode-label><%=vaultGlobalScanReady ? (vaultAutomaticMode === 'automatic' ? 'Auto' : 'Manual') : 'Set up'%></span>
-            </span>
+            <% if (vaultAutomaticSupported) { %>
+              <span class="app-vault-mode" data-app-vault-mode data-app="<%=name%>" data-mode="<%=vaultAutomaticMode%>" data-ready="<%=vaultGlobalScanReady ? 'true' : 'false'%>" data-result-signature="<%=vaultAutomaticResultSignature%>" aria-hidden="true">
+                <span data-app-vault-mode-label><%=vaultGlobalScanReady ? (vaultAutomaticMode === 'automatic' ? 'Auto' : 'Manual') : 'Set up'%></span>
+              </span>
+            <% } else if (!vaultGlobalScanReady) { %>
+              <span class="app-vault-mode" aria-hidden="true"><span>Set up</span></span>
+            <% } %>
             <i class="fa-solid fa-angle-down app-vault-mode-chevron" aria-hidden="true"></i>
           </div>
         </a>
@@ -11017,6 +11081,12 @@ const rerenderMenuSection = (container, html) => {
       targetFrame = document.querySelector(`iframe[name='${target.target}']`)
     } else if (target.closest(".n")) {
       targetFrame = document.querySelector(`iframe[name='${target.target}']`)
+    } else if (target.dataset.static === "retain") {
+      const frameName = target.getAttribute("target") || ""
+      const escapedFrameName = escapeTargetSelector(frameName)
+      targetFrame = escapedFrameName
+        ? document.querySelector(`main.browserview iframe[name="${escapedFrameName}"]`)
+        : null
     }
 
         /*

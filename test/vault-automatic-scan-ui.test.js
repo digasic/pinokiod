@@ -13,10 +13,10 @@ const waitFor = async (condition) => {
     if (condition()) return
     await new Promise((resolve) => setTimeout(resolve, 5))
   }
-  throw new Error("Timed out waiting for the automatic check tray.")
+  throw new Error("Timed out waiting for automatic scan state.")
 }
 
-test("the shared layout renders and reviews automatic possible-match notices", async () => {
+test("the shared layout relays verified results without notification UI", async () => {
   const template = await fs.promises.readFile(
     path.join(root, "server", "views", "layout.ejs"), "utf8")
   const script = await fs.promises.readFile(
@@ -34,7 +34,6 @@ test("the shared layout renders and reviews automatic possible-match notices", a
     pretendToBeVisual: true,
     url: "http://localhost/"
   })
-  const requests = []
   const eventSources = []
   dom.window.EventSource = class EventSource {
     constructor(url) {
@@ -43,29 +42,7 @@ test("the shared layout renders and reviews automatic possible-match notices", a
     }
     close() {}
   }
-  dom.window.fetch = async (url, options = {}) => {
-    requests.push({ url, options })
-    if (url === "/info/vault/automatic-scans") {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          enabled: true,
-          global_scan_ready: true,
-          rows: []
-        })
-      }
-    }
-    if (url === "/vault/action") {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          reviewed: true,
-          href: "/v/ComfyUI?pinokio_home_select=%7B%22selector%22%3A%22%23save-space-tab%22%7D"
-        })
-      }
-    }
+  dom.window.fetch = async (url) => {
     throw new Error(`Unexpected request: ${url}`)
   }
 
@@ -83,14 +60,11 @@ test("the shared layout renders and reviews automatic possible-match notices", a
       rows: [{
         app: "ComfyUI",
         state: "checking",
-        notice_id: "checking:0:"
+        signature: "a".repeat(64)
       }]
     })
   })
-  assert.equal(dom.window.document.getElementById(
-    "vault-auto-scan-tray").hidden, true)
-  assert.equal(dom.window.document.querySelector(
-    ".vault-auto-scan-row"), null)
+  assert.equal(stateMessages.at(-1).payload.snapshot.rows.length, 0)
   eventSources[0].onmessage({
     data: JSON.stringify({
       enabled: true,
@@ -99,28 +73,14 @@ test("the shared layout renders and reviews automatic possible-match notices", a
       rows: [{
         app: "ComfyUI",
         state: "result",
-        notice_id: "result:1:result-a"
+        signature: "b".repeat(64)
       }]
     })
   })
-  await waitFor(() => dom.window.document.querySelector(
-    ".vault-auto-scan-row"))
-
-  const tray = dom.window.document.getElementById("vault-auto-scan-tray")
-  assert.equal(tray.hidden, false)
-  assert.equal(tray.querySelector(
-    ".vault-auto-scan-product").textContent, "Disk Saver")
-  assert.equal(tray.querySelector(
-    ".vault-auto-scan-app").textContent, "ComfyUI")
-  assert.equal(tray.querySelector(
-    ".vault-auto-scan-status").textContent,
-  "Possible duplicate files found")
-  assert.equal(tray.querySelectorAll(
-    ".vault-auto-scan-message").length, 1)
-  assert.equal(tray.querySelector(".vault-auto-scan-value"), null)
-  assert.equal(tray.querySelector(
-    ".vault-auto-scan-action").textContent, "Review")
-  assert.ok(tray.querySelector(".vault-auto-scan-close"))
+  assert.equal(dom.window.document.getElementById("vault-auto-scan-tray"), null)
+  assert.equal(dom.window.document.querySelector(".vault-auto-scan-row"), null)
+  assert.doesNotMatch(template, /vault-auto-scan-(tray|row|action)/)
+  assert.doesNotMatch(script, /createCard|automatic_dismiss/)
   assert.equal(eventSources[0].url,
     "/info/vault/automatic-scans/events")
   assert.deepEqual(plain(stateMessages.at(-1)), {
@@ -128,6 +88,11 @@ test("the shared layout renders and reviews automatic possible-match notices", a
       e: "vault-automatic-scan-state",
       snapshot: {
         global_scan_ready: true,
+        rows: [{
+          app: "ComfyUI",
+          state: "result",
+          signature: "b".repeat(64)
+        }],
         settings: [{ app: "ComfyUI", mode: "manual" }]
       }
     },
@@ -143,554 +108,10 @@ test("the shared layout renders and reviews automatic possible-match notices", a
   assert.deepEqual(plain(stateMessages.at(-1).payload),
     plain(stateMessages.at(-2).payload))
 
-  tray.querySelector(".vault-auto-scan-action").click()
-  await waitFor(() => {
-    return layoutFrame && layoutFrame.getAttribute("src") ===
-      "/v/ComfyUI?pinokio_home_select=%7B%22selector%22%3A%22%23save-space-tab%22%7D"
-  })
-  assert.ok(tray.querySelector(".vault-auto-scan-row.is-exiting"))
-  await waitFor(() => tray.hidden)
-  assert.equal(dom.window.sessionStorage.getItem(
-    "pinokio:vault:auto-review:ComfyUI"), "1")
-  const actionRequest = requests.find((request) =>
-    request && request.url === "/vault/action")
-  assert.deepEqual(JSON.parse(actionRequest.options.body), {
-    action: "automatic_review",
-    app: "ComfyUI",
-    notice_id: "result:1:result-a"
-  })
-  assert.equal(requests.some((request) =>
-    request && request.url === "/info/vault/automatic-scans"), false)
-  assert.match(script, /window\.location\.assign\(/)
-  assert.ok(script.indexOf("if (!openAutomaticReview(card.app, result.href))") <
-    script.indexOf("removeCard(card.app);", script.indexOf(
-      "if (!openAutomaticReview(card.app, result.href))")))
-
   dom.window.close()
 })
 
-test("automatic check states append within one card", async () => {
-  const template = await fs.promises.readFile(
-    path.join(root, "server", "views", "layout.ejs"), "utf8")
-  const script = await fs.promises.readFile(
-    path.join(root, "server", "public", "layout.js"), "utf8")
-  const html = ejs.render(template, {
-    theme: "light",
-    agent: "web",
-    initialPath: "/home",
-    defaultPath: "/home",
-    sessionId: null,
-    vaultEnabled: true
-  })
-  const dom = new JSDOM(html, {
-    runScripts: "outside-only",
-    pretendToBeVisual: true,
-    url: "http://localhost/"
-  })
-  const eventSources = []
-  const reflows = []
-  dom.window.HTMLElement.prototype.getBoundingClientRect = function () {
-    if (!this.classList.contains("vault-auto-scan-row")) {
-      return { left: 0, top: 0 }
-    }
-    const rows = [...this.parentElement.querySelectorAll(
-      ".vault-auto-scan-row")]
-    return { left: 0, top: (rows.indexOf(this) - rows.length) * 100 }
-  }
-  dom.window.HTMLElement.prototype.animate = function (frames, options) {
-    reflows.push({ target: this, frames, options })
-    return { cancel() {} }
-  }
-  dom.window.EventSource = class EventSource {
-    constructor(url) {
-      this.url = url
-      eventSources.push(this)
-    }
-    close() {}
-  }
-  dom.window.fetch = async (url) => {
-    throw new Error(`Unexpected request: ${url}`)
-  }
-
-  dom.window.eval(script)
-  await waitFor(() => eventSources.length === 1)
-  const send = (rows, settings = []) => eventSources[0].onmessage({
-    data: JSON.stringify({
-      enabled: true,
-      global_scan_ready: true,
-      rows,
-      settings
-    })
-  })
-  const row = (state, noticeId) => ({
-    app: "ComfyUI",
-    state,
-    notice_id: noticeId
-  })
-
-  send([row("checking", "checking:1:")])
-  const tray = dom.window.document.getElementById("vault-auto-scan-tray")
-  const card = tray.querySelector(".vault-auto-scan-row")
-  assert.ok(card)
-
-  send([row("paused", "paused:2:")], [
-    { app: "ComfyUI", mode: "manual" }
-  ])
-  assert.equal(tray.querySelector(".vault-auto-scan-row"), card)
-  assert.deepEqual([...card.querySelectorAll(".vault-auto-scan-status")]
-    .map((status) => status.textContent), [
-    "Checking for possible duplicate files...",
-    "Automatic checks are paused"
-  ])
-  assert.equal(card.querySelectorAll(
-    '.vault-auto-scan-message[data-current="true"]').length, 1)
-  assert.equal(card.querySelector(
-    '.vault-auto-scan-message[data-current="false"] button'), null)
-  assert.equal(card.querySelector(
-    ".vault-auto-scan-action").textContent, "Resume")
-
-  send([row("checking", "checking:3:")], [
-    { app: "ComfyUI", mode: "automatic" }
-  ])
-  assert.equal(tray.querySelector(".vault-auto-scan-row"), card)
-  assert.equal(card.querySelectorAll(".vault-auto-scan-message").length, 3)
-  assert.equal(card.querySelector(
-    '.vault-auto-scan-message[data-current="true"] .vault-auto-scan-status')
-    .textContent, "Checking again for possible duplicate files...")
-  assert.equal(card.querySelector(
-    ".vault-auto-scan-action").textContent, "Pause")
-
-  send([row("result", "result:4:result-a")], [
-    { app: "ComfyUI", mode: "automatic" }
-  ])
-  assert.equal(tray.querySelector(".vault-auto-scan-row"), card)
-  assert.equal(card.querySelectorAll(".vault-auto-scan-message").length, 4)
-  assert.equal(card.querySelector(
-    '.vault-auto-scan-message[data-current="true"] .vault-auto-scan-status')
-    .textContent, "Possible duplicate files found")
-  assert.equal(card.querySelector(".vault-auto-scan-settings"), null)
-  assert.equal(card.querySelector(
-    ".vault-auto-scan-action").textContent, "Review")
-
-  send([row("result", "result:4:result-a")], [
-    { app: "ComfyUI", mode: "automatic" }
-  ])
-  assert.equal(card.querySelectorAll(".vault-auto-scan-message").length, 4,
-    "repeated snapshots do not duplicate the current message")
-
-  send([
-    row("result", "result:4:result-a"),
-    { app: "OtherApp", state: "checking", notice_id: "checking:5:" }
-  ], [
-    { app: "ComfyUI", mode: "automatic" },
-    { app: "OtherApp", mode: "automatic" }
-  ])
-  assert.equal(tray.querySelectorAll(".vault-auto-scan-row").length, 2)
-  assert.deepEqual([...tray.querySelectorAll(".vault-auto-scan-app")]
-    .map((app) => app.textContent), ["ComfyUI", "OtherApp"])
-
-  send([row("result", "result:4:result-a")], [
-    { app: "ComfyUI", mode: "automatic" }
-  ])
-  await waitFor(() => tray.querySelectorAll(
-    ".vault-auto-scan-row").length === 1)
-  assert.equal(reflows.length, 1)
-  assert.equal(reflows[0].target, card)
-  assert.deepEqual(plain(reflows[0].frames), [
-    { transform: "translate3d(0px, -100px, 0)" },
-    { transform: "translate3d(0, 0, 0)" }
-  ])
-  assert.equal(reflows[0].options.duration, 180)
-
-  dom.window.close()
-})
-
-test("checking notices expose settings, Pause, and dismissal", async () => {
-  const template = await fs.promises.readFile(
-    path.join(root, "server", "views", "layout.ejs"), "utf8")
-  const script = await fs.promises.readFile(
-    path.join(root, "server", "public", "layout.js"), "utf8")
-  const html = ejs.render(template, {
-    theme: "light",
-    agent: "web",
-    initialPath: "/v/ComfyUI",
-    defaultPath: "/home",
-    sessionId: null,
-    vaultEnabled: true
-  })
-  const dom = new JSDOM(html, {
-    runScripts: "outside-only",
-    pretendToBeVisual: true,
-    url: "http://localhost/"
-  })
-  const requests = []
-  const eventSources = []
-  dom.window.EventSource = class EventSource {
-    constructor(url) {
-      this.url = url
-      eventSources.push(this)
-    }
-    close() {}
-  }
-  dom.window.fetch = async (url, options = {}) => {
-    const payload = options.body ? JSON.parse(options.body) : null
-    requests.push({ url, payload })
-    if (url === "/vault/action") {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => payload.action === "automatic_settings"
-          ? {
-              app: "ComfyUI",
-              href: "/v/ComfyUI?pinokio_home_select=%7B%22selector%22%3A%22%23save-space-tab%22%7D"
-            }
-          : { dismissed: true, app: "ComfyUI" }
-      }
-    }
-    throw new Error(`Unexpected request: ${url}`)
-  }
-
-  dom.window.eval(script)
-  await waitFor(() => eventSources.length === 1)
-  eventSources[0].onmessage({
-    data: JSON.stringify({
-      enabled: true,
-      global_scan_ready: true,
-      rows: [{
-        app: "ComfyUI",
-        state: "checking",
-        savings: 0,
-        notice_id: "checking:1:"
-      }]
-    })
-  })
-  await waitFor(() => dom.window.document.querySelector(
-    ".vault-auto-scan-row"))
-
-  const tray = dom.window.document.getElementById("vault-auto-scan-tray")
-  assert.equal(tray.querySelector(
-    ".vault-auto-scan-app").textContent, "ComfyUI")
-  assert.equal(tray.querySelector(
-    ".vault-auto-scan-status").textContent,
-  "Checking for possible duplicate files...")
-  assert.equal(tray.querySelector(
-    ".vault-auto-scan-settings").textContent,
-  "Automatic check settings")
-  assert.equal(tray.querySelector(
-    ".vault-auto-scan-action").textContent, "Pause")
-
-  tray.querySelector(".vault-auto-scan-settings").click()
-  await waitFor(() => requests.some((request) =>
-    request.payload && request.payload.action === "automatic_settings"))
-  const iframe = dom.window.document.querySelector(".layout-leaf iframe")
-  await waitFor(() => iframe.getAttribute("src") ===
-    "/v/ComfyUI?pinokio_home_select=%7B%22selector%22%3A%22%23save-space-tab%22%7D")
-  assert.equal(dom.window.sessionStorage.getItem(
-    "pinokio:vault:auto-settings:ComfyUI"), "1")
-  assert.equal(tray.querySelector(
-    ".vault-auto-scan-settings").disabled, false)
-
-  assert.doesNotMatch(script, /vaultAutoSettingsReady|vault-auto-settings-ready/)
-  assert.doesNotMatch(script,
-    /postMessage\(\s*\{ e: ['"]vault-auto-settings['"]/)
-
-  tray.querySelector(".vault-auto-scan-close").click()
-  await waitFor(() => tray.hidden)
-  assert.ok(requests.some((request) =>
-    request.payload && request.payload.action === "automatic_dismiss" &&
-      request.payload.notice_id === "checking:1:"))
-  dom.window.close()
-})
-
-test("an empty automatic check briefly confirms completion", async () => {
-  const template = await fs.promises.readFile(
-    path.join(root, "server", "views", "layout.ejs"), "utf8")
-  const script = await fs.promises.readFile(
-    path.join(root, "server", "public", "layout.js"), "utf8")
-  const html = ejs.render(template, {
-    theme: "light",
-    agent: "web",
-    initialPath: "/v/ComfyUI",
-    defaultPath: "/home",
-    sessionId: null,
-    vaultEnabled: true
-  })
-  const dom = new JSDOM(html, {
-    runScripts: "outside-only",
-    pretendToBeVisual: true,
-    url: "http://localhost/"
-  })
-  const eventSources = []
-  const requests = []
-  const revealTimers = []
-  const completionTimers = []
-  const nativeSetTimeout = dom.window.setTimeout.bind(dom.window)
-  const nativeClearTimeout = dom.window.clearTimeout.bind(dom.window)
-  dom.window.setTimeout = (callback, delay, ...args) => {
-    if (delay <= 500 && delay > 400) {
-      const timer = {
-        callback,
-        delay,
-        cleared: false,
-        id: 9000 + revealTimers.length
-      }
-      revealTimers.push(timer)
-      return timer.id
-    }
-    if (delay <= 4000 && delay > 3500) {
-      const timer = {
-        callback,
-        delay,
-        cleared: false,
-        id: 10000 + completionTimers.length
-      }
-      completionTimers.push(timer)
-      return timer.id
-    }
-    return nativeSetTimeout(callback, delay, ...args)
-  }
-  dom.window.clearTimeout = (id) => {
-    const timer = [...revealTimers, ...completionTimers]
-      .find((candidate) => candidate.id === id)
-    if (timer) {
-      timer.cleared = true
-      return
-    }
-    nativeClearTimeout(id)
-  }
-  dom.window.EventSource = class EventSource {
-    constructor(url) {
-      this.url = url
-      eventSources.push(this)
-    }
-    close() {}
-  }
-  dom.window.fetch = async (url, options = {}) => {
-    requests.push({ url, options })
-    if (url === "/info/vault/automatic-scans") {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({
-          enabled: true,
-          global_scan_ready: true,
-          rows: [],
-          settings: [{ app: "ComfyUI", mode: "automatic" }]
-        })
-      }
-    }
-    if (url === "/vault/action") {
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ dismissed: true, app: "ComfyUI" })
-      }
-    }
-    throw new Error(`Unexpected request: ${url}`)
-  }
-
-  dom.window.eval(script)
-  await waitFor(() => eventSources.length === 1)
-  const send = (payload) => eventSources[0].onmessage({
-    data: JSON.stringify(Object.assign({ global_scan_ready: true }, payload))
-  })
-
-  send({
-    enabled: true,
-    rows: [],
-    settings: [{ app: "ComfyUI", mode: "automatic" }],
-    completion: {
-      app: "ComfyUI",
-      outcome: "no_possible_duplicates"
-    }
-  })
-  const tray = dom.window.document.getElementById("vault-auto-scan-tray")
-  assert.equal(tray.hidden, true,
-    "a completion event cannot appear without a visible checking row")
-
-  send({
-    enabled: true,
-    rows: [
-      {
-        app: "ComfyUI",
-        state: "checking",
-        notice_id: "checking:1:"
-      },
-      {
-        app: "OtherApp",
-        state: "paused",
-        notice_id: "paused:1:"
-      }
-    ],
-    settings: [
-      { app: "ComfyUI", mode: "automatic" },
-      { app: "OtherApp", mode: "manual" }
-    ]
-  })
-  send({
-    enabled: true,
-    rows: [{
-      app: "OtherApp",
-      state: "paused",
-      notice_id: "paused:1:"
-    }],
-    settings: [
-      { app: "ComfyUI", mode: "automatic" },
-      { app: "OtherApp", mode: "manual" }
-    ],
-    completion: {
-      app: "ComfyUI",
-      outcome: "no_possible_duplicates"
-    }
-  })
-
-  const checking = [...tray.querySelectorAll(".vault-auto-scan-row")]
-    .find((card) => card.querySelector(
-      ".vault-auto-scan-app").textContent === "ComfyUI")
-  assert.ok(checking)
-  assert.equal(checking.dataset.state, "checking")
-  assert.equal(checking.querySelectorAll(
-    ".vault-auto-scan-message").length, 1)
-  assert.equal(tray.querySelector(
-    '.vault-auto-scan-row[data-state="complete"]'), null,
-  "the checking phase remains visible before an immediate result")
-  assert.equal(revealTimers.length, 1)
-  assert.ok(revealTimers[0].delay <= 500)
-
-  revealTimers[0].callback()
-  const completed = tray.querySelector(
-    '.vault-auto-scan-row[data-state="complete"]')
-  assert.ok(completed)
-  assert.equal(completed.querySelector(
-    ".vault-auto-scan-app").textContent, "ComfyUI")
-  assert.deepEqual([...completed.querySelectorAll(
-    ".vault-auto-scan-status")].map((status) => status.textContent), [
-    "Checking for possible duplicate files...",
-    "No possible duplicate files found"
-  ])
-  assert.equal(completed.querySelectorAll(
-    ".vault-auto-scan-message").length, 2)
-  assert.equal(completed.querySelector(
-    '.vault-auto-scan-message[data-current="false"]')
-    .dataset.state, "checking")
-  assert.ok(completed.querySelector(
-    '.vault-auto-scan-message[data-current="true"] .vault-auto-scan-icon svg'))
-  assert.equal(completed.querySelector(".vault-auto-scan-settings"), null)
-  assert.equal(completed.querySelector(".vault-auto-scan-action"), null)
-  assert.equal(completionTimers[0].delay, 4000)
-
-  tray.querySelector(
-    '.vault-auto-scan-row[data-state="paused"] .vault-auto-scan-action').click()
-  await waitFor(() => requests.some((request) =>
-    request.url === "/info/vault/automatic-scans"))
-  await new Promise((resolve) => nativeSetTimeout(resolve, 0))
-  assert.equal(completed.isConnected, true,
-    "refreshing durable tray state preserves an active completion")
-  assert.equal(completionTimers.length, 1,
-    "a durable state refresh does not restart the completion timer")
-
-  completed.dispatchEvent(new dom.window.MouseEvent("mouseenter"))
-  assert.equal(completionTimers[0].cleared, true)
-  completed.dispatchEvent(new dom.window.MouseEvent("mouseleave"))
-  assert.equal(completionTimers.length, 2)
-  assert.ok(completionTimers[1].delay <= 4000)
-
-  const closeButton = completed.querySelector(".vault-auto-scan-close")
-  closeButton.dispatchEvent(new dom.window.FocusEvent("focusin", {
-    bubbles: true
-  }))
-  assert.equal(completionTimers[1].cleared, true)
-  closeButton.dispatchEvent(new dom.window.FocusEvent("focusout", {
-    bubbles: true,
-    relatedTarget: null
-  }))
-  assert.equal(completionTimers.length, 3)
-  completionTimers[2].callback()
-  assert.ok(completed.classList.contains("is-exiting"))
-  await waitFor(() => tray.hidden)
-
-  send({
-    enabled: true,
-    rows: [{
-      app: "ComfyUI",
-      state: "checking",
-      notice_id: "checking:2:"
-    }],
-    settings: [{ app: "ComfyUI", mode: "automatic" }]
-  })
-  const focusedClose = tray.querySelector(".vault-auto-scan-close")
-  focusedClose.focus()
-  const revealsBeforeFocusedCompletion = revealTimers.length
-  const timersBeforeFocusedCompletion = completionTimers.length
-  send({
-    enabled: true,
-    rows: [],
-    settings: [{ app: "ComfyUI", mode: "automatic" }],
-    completion: {
-      app: "ComfyUI",
-      outcome: "no_possible_duplicates"
-    }
-  })
-  assert.equal(tray.hidden, false)
-  assert.equal(revealTimers.length, revealsBeforeFocusedCompletion + 1)
-  assert.equal(completionTimers.length, timersBeforeFocusedCompletion,
-    "completion dismissal cannot start before its result is revealed")
-  eventSources[0].onerror()
-  await new Promise((resolve) => nativeSetTimeout(resolve, 0))
-  assert.equal(tray.hidden, false,
-    "a reconnect cannot erase a pending completion reveal")
-  assert.equal(tray.querySelector(".vault-auto-scan-close"), focusedClose)
-  assert.equal(tray.querySelector(
-    '.vault-auto-scan-row[data-state="complete"]'), null)
-  revealTimers.at(-1).callback()
-  const focusedCompleted = tray.querySelector(
-    '.vault-auto-scan-row[data-state="complete"]')
-  assert.ok(focusedCompleted)
-  assert.equal(completionTimers.length, timersBeforeFocusedCompletion,
-    "completion does not start its timer while focus is already in the card")
-  focusedClose.dispatchEvent(new dom.window.FocusEvent("focusout", {
-    bubbles: true,
-    relatedTarget: null
-  }))
-  assert.equal(completionTimers.length, timersBeforeFocusedCompletion + 1)
-  completionTimers.at(-1).callback()
-  assert.ok(focusedCompleted.classList.contains("is-exiting"))
-  await waitFor(() => tray.hidden)
-
-  send({
-    enabled: true,
-    rows: [{
-      app: "ComfyUI",
-      state: "checking",
-      notice_id: "checking:3:"
-    }],
-    settings: [{ app: "ComfyUI", mode: "automatic" }]
-  })
-  tray.querySelector(".vault-auto-scan-close").click()
-  send({
-    enabled: true,
-    rows: [],
-    settings: [{ app: "ComfyUI", mode: "automatic" }],
-    completion: {
-      app: "ComfyUI",
-      outcome: "no_possible_duplicates"
-    }
-  })
-  await waitFor(() => tray.hidden)
-  assert.equal(tray.querySelector(
-    '.vault-auto-scan-row[data-state="complete"]'), null,
-  "a closed checking row cannot be replaced by completion")
-  assert.ok(requests.some((request) => {
-    if (request.url !== "/vault/action" || !request.options.body) return false
-    const payload = JSON.parse(request.options.body)
-    return payload.action === "automatic_dismiss" &&
-      payload.notice_id === "checking:3:"
-  }))
-
-  dom.window.close()
-})
-
-test("the shared layout does not initialize automatic notices when Vault is disabled", async () => {
+test("the shared layout does not initialize automatic status when Vault is disabled", async () => {
   const template = await fs.promises.readFile(
     path.join(root, "server", "views", "layout.ejs"), "utf8")
   const script = await fs.promises.readFile(
@@ -717,8 +138,41 @@ test("the shared layout does not initialize automatic notices when Vault is disa
   await new Promise((resolve) => setTimeout(resolve, 20))
 
   assert.equal(fetched, false)
-  assert.equal(dom.window.document.getElementById(
-    "vault-auto-scan-tray").hidden, true)
+  assert.equal(dom.window.document.getElementById("vault-auto-scan-tray"), null)
+  dom.window.close()
+})
+
+test("the shared layout exposes no automatic result transport on Linux", async () => {
+  const template = await fs.promises.readFile(
+    path.join(root, "server", "views", "layout.ejs"), "utf8")
+  const script = await fs.promises.readFile(
+    path.join(root, "server", "public", "layout.js"), "utf8")
+  const html = ejs.render(template, {
+    theme: "light",
+    agent: "web",
+    initialPath: "/home",
+    defaultPath: "/home",
+    sessionId: null,
+    vaultEnabled: true,
+    vaultAutomaticSupported: false
+  })
+  const dom = new JSDOM(html, {
+    runScripts: "outside-only",
+    pretendToBeVisual: true,
+    url: "http://localhost/"
+  })
+  dom.window.EventSource = class EventSource {
+    constructor() {
+      throw new Error("Linux must not open an automatic status stream.")
+    }
+  }
+  dom.window.fetch = async () => {
+    throw new Error("Linux must not fetch automatic status.")
+  }
+
+  dom.window.eval(script)
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.equal(dom.window.document.getElementById("vault-auto-scan-tray"), null)
   dom.window.close()
 })
 
@@ -735,23 +189,166 @@ test("the automatic check event stream handles disconnects before initialization
   assert.ok(route.indexOf('req.once("close", close)') <
     route.indexOf("await vault.automaticScanStatus()"))
   assert.ok(route.indexOf("if (disconnected()) return") <
-    route.indexOf("vault.automaticScans.subscribe(send)"))
+    route.indexOf("vault.automaticScans.subscribe(send, reconnect)"))
+  assert.match(route,
+    /vault\.automaticScans\.subscribe\(send, reconnect\)/)
 })
 
-test("the app workspace focuses Scan this app without starting it after Review", async () => {
+test("the app workspace presents the automatic-result coachmark without starting a scan", async () => {
   const source = await fs.promises.readFile(
     path.join(root, "server", "public", "vault.js"), "utf8")
+  const workspace = await fs.promises.readFile(
+    path.join(root, "server", "views", "partials", "vault_workspace.ejs"),
+    "utf8")
+  const presentStart = source.indexOf(
+    "const presentAutomaticScanCoachmark")
+  const presentEnd = source.indexOf(
+    "const syncAutomaticScanCoachmark", presentStart)
+  const present = source.slice(presentStart, presentEnd)
 
   assert.match(source,
-    /pinokio:vault:auto-review:\$\{encodeURIComponent\(APP_NAME\)\}/)
-  assert.match(source,
-    /state\.automaticReviewRequested && !activeScan &&\s*!scanButton\.disabled/)
+    /pinokio:vault:auto-scan-focus:\$\{encodeURIComponent\(APP_NAME\)\}/)
+  assert.match(source, /automaticScanCoachmarkSeen/)
+  assert.match(source, /automaticScanPendingSignature/)
   assert.match(source,
     /scanActive\(state\.data && state\.data\.scan\)/)
-  assert.match(source, /state\.automaticReviewRequested = false/)
   assert.match(source, /scanButton\.focus\(\)/)
-  assert.doesNotMatch(source,
-    /automaticReviewRequested[\s\S]{0,200}(post\(|btn-scan\.click)/)
+  assert.match(workspace, /Automatic checking found possible duplicates/)
+  assert.match(workspace, /Scanning may use CPU for a few minutes/)
+  assert.match(workspace, /id='vault-scan-coachmark-action'/)
+  assert.match(present,
+    /actionLabel\.textContent = scanButton\.textContent\.trim\(\)/)
+  assert.doesNotMatch(present, /innerHTML|post\(|btn-scan\.click/)
+})
+
+test("selecting a badged row acknowledges it without delaying navigation", async () => {
+  const script = await fs.promises.readFile(
+    path.join(root, "server", "public", "app-vault-mode.js"), "utf8")
+  const parent = new JSDOM("", { url: "http://localhost/" })
+  const dom = new JSDOM(`<a id="save-space-tab" href="/vault/app/ComfyUI" target="app-vault">
+    <span data-app-vault-result-badge></span>
+    <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic"
+      data-ready="true" data-result-signature="${"a".repeat(64)}">
+      <span data-app-vault-mode-label>Auto</span>
+    </span>
+  </a><iframe name="app-vault" src="/vault/app/ComfyUI"></iframe>`, {
+    runScripts: "outside-only",
+    pretendToBeVisual: true,
+    url: "http://localhost/v/ComfyUI"
+  })
+  Object.defineProperty(dom.window, "parent", {
+    configurable: true,
+    value: parent.window
+  })
+  parent.window.postMessage = () => {}
+  const focusMessages = []
+  dom.window.document.querySelector('iframe[name="app-vault"]')
+    .contentWindow.postMessage = (payload, targetOrigin) => {
+      focusMessages.push({ payload, targetOrigin })
+    }
+  const requests = []
+  dom.window.fetch = async (url, options = {}) => {
+    requests.push({ url, options })
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ acknowledged: true, app: "ComfyUI" })
+    }
+  }
+
+  dom.window.eval(script)
+  const tab = dom.window.document.getElementById("save-space-tab")
+  let preventedByHandler = null
+  tab.addEventListener("click", (event) => {
+    preventedByHandler = event.defaultPrevented
+    event.preventDefault()
+  })
+  tab.click()
+
+  await waitFor(() => requests.length === 1)
+  assert.equal(preventedByHandler, false)
+  assert.equal(tab.querySelector("[data-app-vault-result-badge]").hidden, true)
+  assert.equal(dom.window.sessionStorage.getItem(
+    "pinokio:vault:auto-scan-focus:ComfyUI"), "a".repeat(64))
+  assert.deepEqual(plain(focusMessages), [{
+    payload: {
+      e: "vault-automatic-scan-focus",
+      app: "ComfyUI",
+      signature: "a".repeat(64)
+    },
+    targetOrigin: "http://localhost"
+  }])
+  assert.equal(requests[0].url, "/vault/action")
+  assert.deepEqual(JSON.parse(requests[0].options.body), {
+    action: "automatic_acknowledge",
+    app: "ComfyUI",
+    signature: "a".repeat(64)
+  })
+
+  dom.window.close()
+  parent.window.close()
+})
+
+test("a retained Disk Saver handoff targets the visible existing frame", async () => {
+  const template = await fs.promises.readFile(
+    path.join(root, "server", "views", "app.ejs"), "utf8")
+  const script = await fs.promises.readFile(
+    path.join(root, "server", "public", "app-vault-mode.js"), "utf8")
+  const retainedStart = template.indexOf(
+    'target.dataset.static === "retain"')
+  const retainedEnd = template.indexOf("/*", retainedStart)
+  const retainedResolution = template.slice(retainedStart, retainedEnd)
+
+  assert.ok(retainedStart >= 0)
+  assert.match(retainedResolution,
+    /main\.browserview iframe\[name="\$\{escapedFrameName\}"\]/)
+
+  const signature = "f".repeat(64)
+  const parent = new JSDOM("", { url: "http://localhost/" })
+  const dom = new JSDOM(`<a id="save-space-tab" href="/vault/app/ComfyUI" target="app-vault">
+    <span data-app-vault-result-badge></span>
+    <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic"
+      data-ready="true" data-result-signature="${signature}">
+      <span data-app-vault-mode-label>Auto</span>
+    </span>
+  </a><main class="browserview">
+    <iframe id="hidden-vault" class="hidden" name="app-vault" src="/vault/app/ComfyUI"></iframe>
+    <iframe id="visible-vault" name="app-vault" src="/vault/app/ComfyUI"></iframe>
+  </main>`, {
+    runScripts: "outside-only",
+    pretendToBeVisual: true,
+    url: "http://localhost/v/ComfyUI"
+  })
+  Object.defineProperty(dom.window, "parent", {
+    configurable: true,
+    value: parent.window
+  })
+  parent.window.postMessage = () => {}
+  const hiddenMessages = []
+  const visibleMessages = []
+  dom.window.document.getElementById("hidden-vault")
+    .contentWindow.postMessage = (payload) => hiddenMessages.push(payload)
+  dom.window.document.getElementById("visible-vault")
+    .contentWindow.postMessage = (payload) => visibleMessages.push(payload)
+  dom.window.fetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ acknowledged: true, app: "ComfyUI" })
+  })
+
+  dom.window.eval(script)
+  dom.window.document.getElementById("save-space-tab").click()
+  await waitFor(() => visibleMessages.length === 1)
+
+  assert.deepEqual(hiddenMessages, [])
+  assert.deepEqual(plain(visibleMessages), [{
+    e: "vault-automatic-scan-focus",
+    app: "ComfyUI",
+    signature
+  }])
+
+  dom.window.close()
+  parent.window.close()
 })
 
 test("the app sidebar mirrors the shared layout state without another event stream", async () => {
@@ -765,7 +362,9 @@ test("the app sidebar mirrors the shared layout state without another event stre
     path.join(root, "server", "public", "vault.js"), "utf8")
   const parent = new JSDOM("", { url: "http://localhost/" })
   const dom = new JSDOM(`<a id="save-space-tab">
-    <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic" data-ready="true">
+    <span data-app-vault-result-badge hidden></span>
+    <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic"
+      data-ready="true" data-result-signature="">
       <span data-app-vault-mode-label>Auto</span>
     </span>
   </a><iframe name="app-vault"></iframe>`, {
@@ -798,6 +397,9 @@ test("the app sidebar mirrors the shared layout state without another event stre
   dom.window.eval(script)
   const status = dom.window.document.querySelector("[data-app-vault-mode]")
   const label = status.querySelector("[data-app-vault-mode-label]")
+  const badge = dom.window.document.querySelector(
+    "[data-app-vault-result-badge]")
+  const tab = dom.window.document.getElementById("save-space-tab")
   assert.deepEqual(plain(parentMessages), [{
     payload: { e: "vault-automatic-scan-state-request" },
     targetOrigin: "http://localhost"
@@ -814,26 +416,62 @@ test("the app sidebar mirrors the shared layout state without another event stre
     data: {
       e: "vault-automatic-scan-state",
       snapshot: {
-      global_scan_ready: true,
-      settings: [{ app: "ComfyUI", mode: "manual" }]
+        global_scan_ready: true,
+        rows: [{
+          app: "ComfyUI",
+          state: "result",
+          signature: "b".repeat(64)
+        }],
+        settings: [{ app: "ComfyUI", mode: "manual" }]
       }
     }
   }))
   assert.equal(status.dataset.mode, "manual")
   assert.equal(status.hidden, false)
   assert.equal(label.textContent, "Manual")
-  assert.equal(dom.window.document.getElementById("save-space-tab")
-    .getAttribute("aria-label"), "Disk Saver — Manual checking")
+  assert.equal(badge.hidden, false)
+  assert.equal(tab.classList.contains("app-vault-result-attention"), true)
+  assert.equal(tab.getAttribute("aria-label"),
+    "Disk Saver — Manual checking — Duplicate files found")
   assert.deepEqual(plain(vaultMessages.at(-1)), {
     payload: {
       e: "vault-automatic-scan-state",
       snapshot: {
         global_scan_ready: true,
+        rows: [{
+          app: "ComfyUI",
+          state: "result",
+          signature: "b".repeat(64)
+        }],
         settings: [{ app: "ComfyUI", mode: "manual" }]
       }
     },
     targetOrigin: "http://localhost"
   })
+
+  const animationEnd = new dom.window.Event("animationend")
+  Object.defineProperty(animationEnd, "animationName", {
+    value: "app-vault-result-attention"
+  })
+  tab.dispatchEvent(animationEnd)
+  assert.equal(tab.classList.contains("app-vault-result-attention"), false)
+  dom.window.dispatchEvent(new dom.window.MessageEvent("message", {
+    source: parent.window,
+    origin: "http://localhost",
+    data: {
+      e: "vault-automatic-scan-state",
+      snapshot: {
+        global_scan_ready: true,
+        rows: [{
+          app: "ComfyUI",
+          state: "result",
+          signature: "b".repeat(64)
+        }],
+        settings: [{ app: "ComfyUI", mode: "manual" }]
+      }
+    }
+  }))
+  assert.equal(tab.classList.contains("app-vault-result-attention"), false)
 
   dom.window.dispatchEvent(new dom.window.MessageEvent("message", {
     source: vaultFrame.contentWindow,
@@ -847,6 +485,7 @@ test("the app sidebar mirrors the shared layout state without another event stre
   assert.equal(status.dataset.ready, "true")
   assert.equal(status.dataset.mode, "automatic")
   assert.equal(label.textContent, "Auto")
+  assert.equal(badge.hidden, false)
   assert.deepEqual(plain(parentMessages.at(-1)), {
     payload: {
       e: "vault-automatic-mode-changed",
@@ -865,7 +504,20 @@ test("the app sidebar mirrors the shared layout state without another event stre
   assert.equal(vaultMessages.length, repliesBeforeRequest + 1)
   assert.equal(vaultMessages.at(-1).payload.snapshot.settings[0].mode,
     "automatic")
+  assert.equal(vaultMessages.at(-1).payload.snapshot.rows[0].signature,
+    "b".repeat(64))
   assert.match(template, /data-app-vault-mode/)
+  assert.match(template, /data-app-vault-result-badge/)
+  assert.match(template,
+    /class="app-vault-result-badge"[\s\S]{0,200}>New<\/span>/)
+  assert.match(template,
+    /\.app-vault-result-badge\s*\{[^}]*color:\s*#fff;[^}]*background:\s*#b91c1c;/s)
+  assert.match(template,
+    /body\.dark \.app-vault-result-badge\s*\{[^}]*background:\s*#dc2626;/s)
+  assert.match(template,
+    /#save-space-tab::before\s*\{[^}]*background:\s*var\(--pinokio-sidebar-notice-flash-bg\);/s)
+  assert.doesNotMatch(template,
+    /\.app-vault-result-badge\s*\{[^}]*border-radius:\s*50%/s)
   assert.match(template, /app-vault-mode\.js/)
   assert.doesNotMatch(template, /vault-auto-settings/)
   assert.match(template,
@@ -886,9 +538,13 @@ test("the app sidebar mirrors the shared layout state without another event stre
     /\.app-autolaunch-status\s*\{[^}]*font-size:\s*12px;[^}]*font-weight:\s*500;[^}]*letter-spacing:\s*0;/s)
   assert.doesNotMatch(template, /data-app-vault-mode[^>]*hidden/)
   assert.doesNotMatch(template, /app-vault-mode-dot/)
+  assert.match(template, /@keyframes app-vault-result-attention/)
+  assert.match(template,
+    /@media \(prefers-reduced-motion: reduce\)[\s\S]*app-vault-result-attention/)
   assert.match(server,
     /result\.vault_automatic_mode = setting && setting\.mode === "manual"/)
   assert.match(server, /result\.vault_global_scan_ready/)
+  assert.match(server, /result\.vault_automatic_result_signature/)
   assert.doesNotMatch(script, /EventSource/)
   assert.doesNotMatch(vaultScript, /EventSource/)
   assert.match(script, /vault-automatic-scan-state-request/)
@@ -898,11 +554,13 @@ test("the app sidebar mirrors the shared layout state without another event stre
   parent.window.close()
 })
 
-test("a standalone app badge uses one finite status request", async () => {
+test("a standalone app restores its result badge with one finite request", async () => {
   const script = await fs.promises.readFile(
     path.join(root, "server", "public", "app-vault-mode.js"), "utf8")
   const dom = new JSDOM(`<a id="save-space-tab">
-    <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic" data-ready="true">
+    <span data-app-vault-result-badge hidden></span>
+    <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic"
+      data-ready="true" data-result-signature="">
       <span data-app-vault-mode-label>Auto</span>
     </span>
   </a>`, {
@@ -915,7 +573,12 @@ test("a standalone app badge uses one finite status request", async () => {
     return {
       ok: true,
       json: async () => ({
-        global_scan_ready: false,
+        global_scan_ready: true,
+        rows: [{
+          app: "ComfyUI",
+          state: "result",
+          signature: "c".repeat(64)
+        }],
         settings: [{ app: "ComfyUI", mode: "manual" }]
       })
     }
@@ -928,10 +591,13 @@ test("a standalone app badge uses one finite status request", async () => {
 
   dom.window.eval(script)
   await waitFor(() => dom.window.document.querySelector(
-    "[data-app-vault-mode-label]").textContent === "Set up")
+    "[data-app-vault-result-badge]").hidden === false)
   assert.deepEqual(requests, ["/info/vault/automatic-scans"])
   assert.equal(dom.window.document.querySelector(
     "[data-app-vault-mode]").dataset.mode, "manual")
+  assert.equal(dom.window.document.getElementById("save-space-tab")
+    .getAttribute("aria-label"),
+  "Disk Saver — Manual checking — Duplicate files found")
 
   dom.window.close()
 })
@@ -985,6 +651,64 @@ test("a late parent state is not overwritten by the app badge fallback", async (
 
   assert.equal(dom.window.document.querySelector(
     "[data-app-vault-mode]").dataset.mode, "manual")
+  dom.window.close()
+  parent.window.close()
+})
+
+test("a stale parent replay cannot clear a server-rendered result", async () => {
+  const script = await fs.promises.readFile(
+    path.join(root, "server", "public", "app-vault-mode.js"), "utf8")
+  const signature = "d".repeat(64)
+  const parent = new JSDOM("", { url: "http://localhost/" })
+  const dom = new JSDOM(`<a id="save-space-tab">
+    <span data-app-vault-result-badge></span>
+    <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic"
+      data-ready="true" data-result-signature="${signature}">
+      <span data-app-vault-mode-label>Auto</span>
+    </span>
+  </a>`, {
+    runScripts: "outside-only",
+    url: "http://localhost/v/ComfyUI"
+  })
+  Object.defineProperty(dom.window, "parent", {
+    configurable: true,
+    value: parent.window
+  })
+  parent.window.postMessage = () => {}
+  const requests = []
+  dom.window.fetch = async (url) => {
+    requests.push(url)
+    return {
+      ok: true,
+      json: async () => ({
+        global_scan_ready: true,
+        rows: [{ app: "ComfyUI", state: "result", signature }],
+        settings: [{ app: "ComfyUI", mode: "automatic" }]
+      })
+    }
+  }
+
+  dom.window.eval(script)
+  dom.window.dispatchEvent(new dom.window.MessageEvent("message", {
+    source: parent.window,
+    origin: "http://localhost",
+    data: {
+      e: "vault-automatic-scan-state",
+      snapshot: {
+        global_scan_ready: true,
+        rows: [],
+        settings: []
+      }
+    }
+  }))
+
+  await waitFor(() => requests.length === 1)
+  assert.deepEqual(requests, ["/info/vault/automatic-scans"])
+  assert.equal(dom.window.document.querySelector(
+    "[data-app-vault-result-badge]").hidden, false)
+  assert.equal(dom.window.document.querySelector(
+    "[data-app-vault-mode]").dataset.resultSignature, signature)
+
   dom.window.close()
   parent.window.close()
 })

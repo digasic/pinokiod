@@ -1,5 +1,6 @@
 const { after, beforeEach, describe, test } = require("node:test")
 const assert = require("node:assert/strict")
+const crypto = require("node:crypto")
 const fs = require("node:fs")
 const os = require("node:os")
 const path = require("node:path")
@@ -28,8 +29,11 @@ const makeVault = async (home, options = {}) => {
   }
   const kernel = {
     homedir: home,
-    platform: process.platform,
-    api
+    platform: options.platform || "darwin",
+    api,
+    automaticWatcher: options.automaticWatcher || {
+      subscribe: async () => ({ unsubscribe: async () => {} })
+    }
   }
   const vault = new Vault(kernel)
   kernel.vault = vault
@@ -62,8 +66,21 @@ const close = async (vault) => {
   if (vault.automaticScans.active && vault.automaticScans.active.promise) {
     await vault.automaticScans.active.promise.catch(() => {})
   }
+  await vault.automaticScans.stopWatcher().catch(() => {})
   if (vault.worker) await vault.worker.terminate().catch(() => {})
   if (vault.registry) await vault.registry.close()
+}
+
+const collect = (vault, app, paths) => {
+  const collected = new Set((paths || []).map((filePath) =>
+    path.resolve(filePath)))
+  vault.automaticScans.changedPaths.set(app, collected)
+  return collected
+}
+
+const makeAutomatic = (vault = {}) => {
+  vault.kernel = Object.assign({ platform: "darwin" }, vault.kernel)
+  return new AutomaticScans(vault)
 }
 
 describe("automatic app checks", () => {
@@ -78,7 +95,7 @@ describe("automatic app checks", () => {
     }
   })
 
-  test("reading notice state does not create Vault storage", async () => {
+  test("reading automatic result state does not create Vault storage", async () => {
     const home = await makeHome()
     const vault = await makeVault(home, {
       deferStorage: true,
@@ -94,7 +111,7 @@ describe("automatic app checks", () => {
   })
 
   test("missing readiness state keeps automatic checks locked", async () => {
-    const automatic = new AutomaticScans({ enabled: true })
+    const automatic = makeAutomatic({ enabled: true })
 
     await automatic.refreshGlobalScanReady()
 
@@ -102,8 +119,285 @@ describe("automatic app checks", () => {
     assert.deepEqual(automatic.snapshot().rows, [])
   })
 
-  test("automatic checks wait one second after an app stops", () => {
-    assert.equal(AutomaticScans.STOP_SETTLE_MS, 1000)
+  test("only verified-match results are public while a check runs", () => {
+    const automatic = makeAutomatic({ enabled: true })
+    automatic.globalScanReady = true
+    automatic.entries.set("new-app", {
+      app: "new-app",
+      state: "checking",
+      updated_at: 2,
+      previous: null,
+      hidden: false
+    })
+    const previous = {
+      app: "known-app",
+      state: "result",
+      signature: "a".repeat(64),
+      updated_at: 1,
+      previous: null,
+      hidden: false
+    }
+    automatic.entries.set("known-app", {
+      app: "known-app",
+      state: "checking",
+      updated_at: 3,
+      previous,
+      hidden: false
+    })
+
+    assert.deepEqual(automatic.snapshot().rows, [{
+      app: "known-app",
+      state: "result",
+      signature: "a".repeat(64)
+    }])
+  })
+
+  test("republishing the same result keeps its public identity", async () => {
+    const automatic = makeAutomatic({
+      enabled: true,
+      registry: {
+        setAutomaticAppScanState: async () => ({ updated_at: 2 })
+      }
+    })
+    automatic.globalScanReady = true
+    automatic.hydrated = true
+    automatic.log = () => {}
+    const signature = "a".repeat(64)
+    automatic.entries.set("demo", {
+      app: "demo",
+      state: "result",
+      signature,
+      updated_at: 1,
+      previous: null,
+      hidden: false
+    })
+
+    await automatic.publishResultNow("demo", {
+      signature,
+      verified_files: 1
+    })
+
+    assert.deepEqual(automatic.snapshot().rows, [{
+      app: "demo",
+      state: "result",
+      signature
+    }])
+  })
+
+  test("automatic checks wait two seconds after an app stops", () => {
+    assert.equal(AutomaticScans.STOP_SETTLE_MS, 2000)
+  })
+
+  test("one API watcher collects only paths changed while an app runs", async () => {
+    const home = await makeHome()
+    const appRoot = path.join(home, "api", "watched-app")
+    const scriptPath = path.join(appRoot, "start.js")
+    const changedPath = path.join(appRoot, "model.bin")
+    await fs.promises.mkdir(appRoot)
+    let callback = null
+    let subscriptions = 0
+    const vault = await makeVault(home, {
+      deferStorage: true,
+      automaticWatcher: {
+        subscribe: async (root, listener) => {
+          assert.equal(root, path.join(home, "api"))
+          subscriptions += 1
+          callback = listener
+          return { unsubscribe: async () => {} }
+        }
+      }
+    })
+
+    assert.equal(await vault.automaticScans.startWatcher(), true)
+    assert.equal(await vault.automaticScans.startWatcher(), false)
+    assert.equal(subscriptions, 1)
+    callback(null, [{ type: "update", path: changedPath }])
+    assert.equal(vault.automaticScans.changedPaths.size, 0)
+
+    vault.automaticScans.handleStarted(scriptPath)
+    callback(null, [
+      { type: "update", path: changedPath },
+      { type: "update", path: path.join(home, "api", "other", "x.bin") }
+    ])
+    assert.deepEqual([...vault.automaticScans.changedPaths.get(
+      "watched-app")], [changedPath])
+    assert.equal(vault.registry, null)
+    assert.equal(fs.existsSync(path.join(home, "vault")), false)
+    await close(vault)
+  })
+
+  test("disposing automatic checks releases the watcher and pending work", async () => {
+    const home = await makeHome()
+    const appRoot = path.join(home, "api", "disposed-app")
+    const scriptPath = path.join(appRoot, "start.js")
+    const changedPath = path.join(appRoot, "model.bin")
+    await fs.promises.mkdir(appRoot)
+    let callback = null
+    let subscriptions = 0
+    let unsubscriptions = 0
+    let streamClosures = 0
+    let lateSnapshots = 0
+    const vault = await makeVault(home, {
+      deferStorage: true,
+      automaticWatcher: {
+        subscribe: async (_root, listener) => {
+          subscriptions += 1
+          callback = listener
+          return {
+            unsubscribe: async () => { unsubscriptions += 1 }
+          }
+        }
+      }
+    })
+
+    assert.equal(await vault.automaticScans.startWatcher(), true)
+    vault.automaticScans.handleStarted(scriptPath)
+    callback(null, [{ type: "update", path: changedPath }])
+    vault.automaticScans.scheduleStoppedApp("disposed-app", 60_000)
+    vault.automaticScans.subscribe(() => {}, () => { streamClosures += 1 })
+    assert.equal(vault.automaticScans.pendingStops.size, 1)
+
+    await vault.automaticScans.dispose()
+    callback(null, [{ type: "update", path: changedPath }])
+    vault.automaticScans.subscribe(
+      () => { lateSnapshots += 1 },
+      () => { streamClosures += 1 }
+    )
+
+    assert.equal(subscriptions, 1)
+    assert.equal(unsubscriptions, 1)
+    assert.equal(streamClosures, 2)
+    assert.equal(lateSnapshots, 0)
+    assert.equal(await vault.automaticScans.startWatcher(), false)
+    assert.equal(vault.automaticScans.pendingStops.size, 0)
+    assert.equal(vault.automaticScans.observedApps.size, 0)
+    assert.equal(vault.automaticScans.changedPaths.size, 0)
+    await close(vault)
+  })
+
+  test("disposal waits for an in-flight lifecycle callback", async () => {
+    const home = await makeHome()
+    const vault = await makeVault(home, { deferStorage: true })
+    let release
+    let disposed = false
+    vault.automaticScans.handleStoppedNow = () => new Promise((resolve) => {
+      release = resolve
+    })
+
+    const stopping = vault.automaticScans.handleStopped(
+      path.join(home, "api", "demo", "start.js"))
+    const disposing = vault.automaticScans.dispose().then(() => {
+      disposed = true
+    })
+    await new Promise((resolve) => setImmediate(resolve))
+
+    assert.equal(disposed, false)
+    release()
+    await Promise.all([stopping, disposing])
+    assert.equal(disposed, true)
+    await close(vault)
+  })
+
+  test("disposal stops a drain waiting for readiness", async () => {
+    let release
+    let waiting = false
+    let appRootChecks = 0
+    let checksStarted = 0
+    const automatic = makeAutomatic({
+      enabled: true,
+      registry: {},
+      runExclusive: async () => { checksStarted += 1 }
+    })
+    automatic.entries.set("demo", {
+      app: "demo",
+      state: "checking",
+      paths: []
+    })
+    automatic.refreshGlobalScanReady = async () => {
+      waiting = true
+      await new Promise((resolve) => { release = resolve })
+      automatic.globalScanReady = true
+    }
+    automatic.appRootIsAvailable = async () => {
+      appRootChecks += 1
+      return true
+    }
+
+    automatic.schedule()
+    await waitFor(() => waiting, "readiness pause")
+    let disposed = false
+    const disposing = automatic.dispose().then(() => { disposed = true })
+    await new Promise((resolve) => setImmediate(resolve))
+
+    assert.equal(disposed, false)
+    release()
+    await disposing
+    assert.equal(appRootChecks, 0)
+    assert.equal(checksStarted, 0)
+  })
+
+  test("disposal stops a drain waiting for the app root", async () => {
+    let release
+    let waiting = false
+    let checksStarted = 0
+    const automatic = makeAutomatic({
+      enabled: true,
+      registry: {},
+      runExclusive: async () => { checksStarted += 1 }
+    })
+    automatic.entries.set("demo", {
+      app: "demo",
+      state: "checking",
+      paths: []
+    })
+    automatic.globalScanReady = true
+    automatic.refreshGlobalScanReady = async () => {}
+    automatic.appRootIsAvailable = async () => {
+      waiting = true
+      return new Promise((resolve) => { release = () => resolve(true) })
+    }
+
+    automatic.schedule()
+    await waitFor(() => waiting, "app-root pause")
+    const disposing = automatic.dispose()
+    release()
+    await disposing
+
+    assert.equal(checksStarted, 0)
+  })
+
+  test("Linux starts no watcher and ignores automatic lifecycle work", async () => {
+    const home = await makeHome()
+    const appRoot = path.join(home, "api", "linux-app")
+    const scriptPath = path.join(appRoot, "start.js")
+    await fs.promises.mkdir(appRoot)
+    let subscriptions = 0
+    const vault = await makeVault(home, {
+      deferStorage: true,
+      platform: "linux",
+      automaticWatcher: {
+        subscribe: async () => {
+          subscriptions += 1
+          return { unsubscribe: async () => {} }
+        }
+      }
+    })
+
+    assert.equal(await vault.automaticScans.startWatcher(), false)
+    vault.automaticScans.handleStarted(scriptPath)
+    assert.equal(vault.automaticScans.recordChangedPath(
+      path.join(appRoot, "model.bin")), false)
+    await vault.automaticScans.handleStopped(scriptPath)
+    assert.equal(subscriptions, 0)
+    assert.equal(vault.automaticScans.observedApps.size, 0)
+    assert.equal(vault.automaticScans.changedPaths.size, 0)
+    assert.equal(vault.automaticScans.pendingStops.size, 0)
+    assert.match((await vault.perform("automatic_set_mode", {
+      app: "linux-app",
+      mode: "automatic"
+    })).error, /unavailable/i)
+    assert.equal(fs.existsSync(path.join(home, "vault")), false)
+    await close(vault)
   })
 
   test("disabled Vault ignores app-stop events", async () => {
@@ -137,11 +431,15 @@ describe("automatic app checks", () => {
       globalScanReady: async () => true,
       automaticScanStatus: async () => ({ rows: [] })
     }
-    const automatic = new AutomaticScans(vault)
+    const automatic = makeAutomatic(vault)
     let settledApp = null
+    automatic.appRootIsAvailable = async () => true
     automatic.scheduleStoppedApp = (app) => { settledApp = app }
 
     const started = automatic.handleStarted("/pinokio/api/demo/start.js")
+    automatic.changedPaths.set("demo", new Set([
+      "/pinokio/api/demo/model.bin"
+    ]))
     const stopped = automatic.handleStopped("/pinokio/api/demo/start.js")
     vault.enabled = true
     resolveReady({ enabled: true })
@@ -164,6 +462,8 @@ describe("automatic app checks", () => {
 
     vault.automaticScans.handleStarted(firstScript)
     vault.automaticScans.handleStarted(secondScript)
+    vault.automaticScans.recordChangedPath(path.join(firstRoot, "model.bin"))
+    vault.automaticScans.recordChangedPath(path.join(secondRoot, "model.bin"))
     await vault.automaticScans.handleStopped(firstScript)
     await vault.automaticScans.handleStopped(secondScript)
 
@@ -202,6 +502,7 @@ describe("automatic app checks", () => {
     api.running.next = true
     api.running_paths.next = nextScript
     vault.automaticScans.handleStarted(nextScript)
+    vault.automaticScans.recordChangedPath(path.join(appRoot, "model.bin"))
     delete api.running.next
     delete api.running_paths.next
     await vault.automaticScans.handleStopped(nextScript)
@@ -225,6 +526,7 @@ describe("automatic app checks", () => {
     })
 
     vault.automaticScans.handleStarted(scriptPath)
+    vault.automaticScans.recordChangedPath(path.join(appRoot, "model.bin"))
     const stopped = vault.automaticScans.handleStopped(scriptPath)
     await waitFor(() => typeof releaseLookup === "function", "state lookup")
     vault.automaticScans.handleStarted(scriptPath)
@@ -250,6 +552,7 @@ describe("automatic app checks", () => {
     vault.automaticScans.stopSettleMs = 20
 
     vault.automaticScans.handleStarted(scriptPath)
+    vault.automaticScans.recordChangedPath(path.join(appRoot, "model.bin"))
     await vault.automaticScans.handleStopped(scriptPath)
     await fs.promises.rm(appRoot, { recursive: true })
     await waitFor(() => !vault.automaticScans.entries.has(app) &&
@@ -264,7 +567,33 @@ describe("automatic app checks", () => {
     await close(vault)
   })
 
-  test("an existing version-3 registry gains precheck fields safely", async () => {
+  test("a deleted app with no collected paths loses automatic state", async () => {
+    const home = await makeHome()
+    const app = "deleted-without-paths"
+    const appRoot = path.join(home, "api", app)
+    const scriptPath = path.join(appRoot, "start.js")
+    await fs.promises.mkdir(appRoot)
+    const vault = await makeVault(home)
+    const signature = "a".repeat(64)
+    await vault.registry.setAutomaticAppScanMode(app, "automatic")
+    await vault.registry.setAutomaticAppScanState(
+      app, "result", { signature })
+    await vault.automaticScans.hydrate()
+
+    vault.automaticScans.handleStarted(scriptPath)
+    assert.equal(vault.automaticScans.recordChangedPath(appRoot), false)
+    await fs.promises.rm(appRoot, { recursive: true })
+    await vault.automaticScans.handleStopped(scriptPath)
+
+    assert.equal(vault.automaticScans.pendingStops.size, 0)
+    assert.equal(vault.automaticScans.entries.has(app), false)
+    assert.equal(vault.automaticScans.settings.has(app), false)
+    assert.deepEqual(await vault.registry.automaticAppScanStates(), [])
+    assert.deepEqual(await vault.registry.automaticAppScanSettings(), [])
+    await close(vault)
+  })
+
+  test("an existing version-3 registry gains verification storage safely", async () => {
     const home = await makeHome()
     const root = path.join(home, "vault")
     await fs.promises.mkdir(root)
@@ -293,12 +622,65 @@ describe("automatic app checks", () => {
     ).all().map((row) => row.name)
 
     assert.ok(columns.includes("signature"))
+    assert.equal(!!registry.database.prepare(`
+      SELECT 1 FROM sqlite_master
+      WHERE type = 'table' AND name = 'hash_cache'
+    `).get(), true)
+    const hashCacheIndexes = registry.database.prepare(
+      "PRAGMA index_list(hash_cache)"
+    ).all().map((row) => row.name)
+    assert.ok(hashCacheIndexes.includes("hash_cache_updated_idx"))
     assert.deepEqual(registry.automaticAppScanStates(), [{
       app: "legacy-pause",
       state: "paused",
       signature: null,
       updated_at: 2
     }])
+    registry.close()
+  })
+
+  test("the reusable hash cache evicts entries beyond its fixed bound", async () => {
+    const home = await makeHome()
+    const root = path.join(home, "vault")
+    const registry = new RegistryCore(root)
+    await registry.load()
+    const hash = "a".repeat(64)
+    registry.database.exec(`
+      WITH RECURSIVE cached(value) AS (
+        SELECT 1
+        UNION ALL
+        SELECT value + 1 FROM cached WHERE value < 100001
+      )
+      INSERT INTO hash_cache(
+        path, hash, size, mtime, ctime, dev, ino, updated_at
+      )
+      SELECT
+        '/cached/' || printf('%06d', value),
+        '${hash}', 1, 1, 1, 1, value, value
+      FROM cached
+    `)
+    const latest = path.join(home, "latest.bin")
+
+    const result = registry.rememberHashCache([{
+      path: latest,
+      hash,
+      size: 1,
+      mtime: 1,
+      ctime: 1,
+      dev: 1,
+      ino: 100002
+    }])
+
+    assert.equal(result.pruned, 2)
+    assert.equal(registry.database.prepare(
+      "SELECT COUNT(*) AS count FROM hash_cache"
+    ).get().count, 100000)
+    assert.equal(registry.database.prepare(
+      "SELECT 1 FROM hash_cache WHERE path = ?"
+    ).get("/cached/000001"), undefined)
+    assert.equal(!!registry.database.prepare(
+      "SELECT 1 FROM hash_cache WHERE path = ?"
+    ).get(latest), true)
     registry.close()
   })
 
@@ -325,31 +707,39 @@ describe("automatic app checks", () => {
       `)
       insert.run("demo", "C:\\App\\Z.bin", 1)
       insert.run("demo", "C:\\App\\a.bin", 2)
-      const before = registry.automaticPrecheckResult("demo").signature
+      const hash = "a".repeat(64)
+      const before = registry.automaticPrecheckResult("demo", [{
+        path: "C:\\App\\Z.bin",
+        hash
+      }]).signature
       registry.abortAutomaticPrecheck("demo")
       insert.run("demo", "C:\\App\\z.bin", 1)
       insert.run("demo", "C:\\App\\a.bin", 2)
-      assert.equal(registry.automaticPrecheckResult("demo").signature, before)
+      assert.equal(registry.automaticPrecheckResult("demo", [{
+        path: "C:\\App\\z.bin",
+        hash
+      }]).signature, before)
     } finally {
       registry.close()
       Object.defineProperty(process, "platform", platform)
     }
   })
 
-  test("the final app-process stop runs only a metadata precheck", async () => {
+  test("the final app-process stop verifies only changed candidates", async () => {
     const home = await makeHome()
     const appRoot = path.join(home, "api", "demo")
     const scriptPath = path.join(appRoot, "start.js")
     await fs.promises.mkdir(appRoot)
     await fs.promises.writeFile(path.join(appRoot, "first.bin"), "aaaa")
-    await fs.promises.writeFile(path.join(appRoot, "second.bin"), "bbbb")
+    await fs.promises.writeFile(path.join(appRoot, "second.bin"), "aaaa")
+    await fs.promises.writeFile(path.join(appRoot, "unchanged.bin"), "aaaa")
     const api = {
       running: { worker: true },
       running_paths: { worker: path.join(appRoot, "worker.js") },
       ondata() {}
     }
     const vault = await makeVault(home, { api, deferStorage: true })
-    vault.automaticScans.sizeThreshold = 1
+    vault.automaticScans.candidateThreshold = async () => 1
     vault.automaticScans.stopSettleMs = 10
     vault.refreshAnchorStores = async () => {
       throw new Error("The automatic check must not inspect anchor stores.")
@@ -357,12 +747,20 @@ describe("automatic app checks", () => {
     vault.refreshSources = async () => {
       throw new Error("The automatic check must not refresh scan locations.")
     }
-    vault.hashFile = async () => {
-      throw new Error("The automatic check must not hash files.")
+    const hashedPaths = []
+    const originalHashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath, options) => {
+      hashedPaths.push(filePath)
+      return originalHashFile(filePath, options)
+    }
+    vault.scanner.walk = async () => {
+      throw new Error("The automatic check must not walk the app.")
     }
 
     vault.automaticScans.handleStarted(scriptPath)
     vault.automaticScans.handleStarted(api.running_paths.worker)
+    vault.automaticScans.recordChangedPath(path.join(appRoot, "first.bin"))
+    vault.automaticScans.recordChangedPath(path.join(appRoot, "second.bin"))
     await vault.automaticScans.handleStopped(scriptPath)
     assert.equal(fs.existsSync(path.join(home, "vault")), false)
 
@@ -378,6 +776,10 @@ describe("automatic app checks", () => {
       app: row.app,
       state: row.state
     })), [{ app: "demo", state: "result" }])
+    assert.deepEqual(hashedPaths.sort(), [
+      path.join(appRoot, "first.bin"),
+      path.join(appRoot, "second.bin")
+    ].sort())
     assert.equal(vault.scanPromise, null)
     assert.equal(vault.initialized, false)
     assert.equal(vault.sweeper, null)
@@ -390,11 +792,260 @@ describe("automatic app checks", () => {
     assert.equal(restoredStatus.rows[0].state, "result")
     assert.equal(restored.initialized, false)
     assert.equal(restored.sweeper, null)
-    const reviewed = await restored.perform("automatic_review", { app: "demo" })
-    assert.equal(new URL(reviewed.href, "http://localhost").pathname, "/v/demo")
+    const acknowledged = await restored.perform("automatic_acknowledge", {
+      app: "demo",
+      signature: restoredStatus.rows[0].signature
+    })
+    assert.deepEqual(acknowledged, { acknowledged: true, app: "demo" })
     assert.equal(restored.initialized, false)
     assert.deepEqual((await restored.automaticScanStatus()).rows, [])
     await close(restored)
+  })
+
+  test("equal-size files with different contents do not publish a result", async () => {
+    const home = await makeHome()
+    const app = "different-content-app"
+    const appRoot = path.join(home, "api", app)
+    const first = path.join(appRoot, "first.bin")
+    const second = path.join(appRoot, "second.bin")
+    await fs.promises.mkdir(appRoot)
+    await fs.promises.writeFile(first, "aaaa")
+    await fs.promises.writeFile(second, "bbbb")
+    const vault = await makeVault(home)
+    vault.automaticScans.candidateThreshold = async () => 1
+    const hashedPaths = []
+    const verifiedPaths = []
+    const originalHashFile = vault.hashFile.bind(vault)
+    const originalVerify = vault.automaticScans.verifiedAutomaticHash.bind(
+      vault.automaticScans)
+    vault.hashFile = async (filePath, options) => {
+      hashedPaths.push(filePath)
+      return originalHashFile(filePath, options)
+    }
+    vault.automaticScans.verifiedAutomaticHash = async (...args) => {
+      verifiedPaths.push(args[1].path)
+      return originalVerify(...args)
+    }
+
+    vault.automaticScans.queueApp(app, [first, second])
+    await waitFor(() => !vault.automaticScans.active &&
+      !vault.automaticScans.entries.has(app))
+
+    assert.deepEqual(hashedPaths.sort(), [first, second].sort())
+    assert.deepEqual(verifiedPaths.sort(), [first, second].sort())
+    assert.deepEqual(vault.automaticScans.snapshot().rows, [])
+    await close(vault)
+  })
+
+  test("hash worker cancellation interrupts a read without poisoning the worker", async () => {
+    const home = await makeHome()
+    const large = path.join(home, "large.bin")
+    const small = path.join(home, "small.bin")
+    await fs.promises.writeFile(large, "x")
+    await fs.promises.truncate(large, 32 * 1024 * 1024)
+    await fs.promises.writeFile(small, "still-works")
+    const vault = await makeVault(home)
+    const controller = new AbortController()
+
+    const pending = vault.hashFile(large, { signal: controller.signal })
+    controller.abort()
+    await assert.rejects(pending,
+      (error) => error && error.code === "EVAULTCANCELLED")
+
+    const result = await vault.hashFile(small)
+    assert.equal(result.hash, crypto.createHash("sha256")
+      .update("still-works").digest("hex"))
+    await close(vault)
+  })
+
+  test("automatic cancellation aborts the active hash and keeps completed hashes", async () => {
+    const home = await makeHome()
+    const app = "cancelled-hash-app"
+    const appRoot = path.join(home, "api", app)
+    const candidate = path.join(appRoot, "candidate.bin")
+    const peer = path.join(home, "peer.bin")
+    await fs.promises.mkdir(appRoot)
+    await fs.promises.writeFile(candidate, "same-content")
+    await fs.promises.writeFile(peer, "same-content")
+    const vault = await makeVault(home, { deferStorage: true })
+    await vault.ensureRegistryInitialized()
+    vault.automaticScans.candidateThreshold = async () => 1
+    const peerStat = await fs.promises.lstat(peer)
+    await vault.registry.upsertFile({
+      path: peer,
+      hash: null,
+      size: peerStat.size,
+      mtime: peerStat.mtimeMs,
+      ctime: peerStat.ctimeMs,
+      dev: peerStat.dev,
+      ino: peerStat.ino,
+      mode: peerStat.mode,
+      uid: peerStat.uid,
+      gid: peerStat.gid,
+      source_id: "app:peer",
+      app: "peer",
+      status: "reference",
+      unavailable_reason: null,
+      updated_at: Date.now()
+    })
+    const originalHashFile = vault.hashFile.bind(vault)
+    let peerBegan
+    const peerBeganPromise = new Promise((resolve) => { peerBegan = resolve })
+    let receivedSignal = false
+    vault.hashFile = async (filePath, options = {}) => {
+      if (path.resolve(filePath) !== path.resolve(peer)) {
+        return originalHashFile(filePath, options)
+      }
+      receivedSignal = !!options.signal
+      peerBegan()
+      return new Promise((_resolve, reject) => {
+        const cancel = () => {
+          const error = new Error("Hashing cancelled.")
+          error.code = "EVAULTCANCELLED"
+          reject(error)
+        }
+        if (options.signal.aborted) cancel()
+        else options.signal.addEventListener("abort", cancel, { once: true })
+      })
+    }
+
+    vault.automaticScans.queueApp(app, [candidate])
+    await peerBeganPromise
+    assert.equal(vault.automaticScans.cancelActive(app, "app-started"), true)
+    await waitFor(() => !vault.automaticScans.active)
+    assert.equal(receivedSignal, true)
+
+    const candidateStat = await fs.promises.lstat(candidate)
+    await vault.registry.beginAutomaticPrecheck(app)
+    await vault.registry.stageAutomaticPrecheckFiles(app, [{
+      path: candidate,
+      size: candidateStat.size,
+      mtime: candidateStat.mtimeMs,
+      ctime: candidateStat.ctimeMs,
+      dev: candidateStat.dev,
+      ino: candidateStat.ino,
+      nlink: candidateStat.nlink,
+      mode: candidateStat.mode,
+      uid: candidateStat.uid,
+      gid: candidateStat.gid
+    }])
+    const cached = (await vault.registry.automaticPrecheckEntries(app))
+      .entries.find((entry) => entry.kind === "changed")
+    assert.equal(cached.hash, crypto.createHash("sha256")
+      .update("same-content").digest("hex"))
+    await vault.registry.abortAutomaticPrecheck(app)
+    await close(vault)
+  })
+
+  test("automatic hashes survive restart and seed later scans", async () => {
+    const home = await makeHome()
+    const app = "cached-hash-app"
+    const appRoot = path.join(home, "api", app)
+    const first = path.join(appRoot, "first.bin")
+    const second = path.join(appRoot, "second.bin")
+    await fs.promises.mkdir(appRoot)
+    await fs.promises.writeFile(first, "same")
+    await fs.promises.writeFile(second, "same")
+
+    const initial = await makeVault(home)
+    initial.automaticScans.candidateThreshold = async () => 1
+    initial.automaticScans.queueApp(app, [first, second])
+    await waitFor(() => !initial.automaticScans.active &&
+      initial.automaticScans.entries.get(app)?.state === "result")
+    await close(initial)
+
+    const restored = await makeVault(home)
+    restored.automaticScans.candidateThreshold = async () => 1
+    await restored.automaticScanStatus()
+    await restored.registry.setAutomaticAppScanState(app, null)
+    restored.automaticScans.entries.delete(app)
+    restored.hashFile = async () => {
+      throw new Error("A valid cached hash must be reused.")
+    }
+
+    restored.automaticScans.queueApp(app, [first, second])
+    await waitFor(() => !restored.automaticScans.active &&
+      restored.automaticScans.entries.get(app)?.state === "result")
+
+    assert.equal((await restored.perform("scan", {
+      scope_id: `app:${app}`,
+      candidate_size: 0
+    })).started, true)
+    await waitFor(() => !restored.scanPromise &&
+      !restored.scanCompletionPromise, "cached app scan")
+    assert.ok(await restored.registry.scanFor(`app:${app}`))
+    await close(restored)
+  })
+
+  test("a cached hash is ignored after an equal-size content change", async () => {
+    const home = await makeHome()
+    const app = "changed-cache-app"
+    const appRoot = path.join(home, "api", app)
+    const first = path.join(appRoot, "first.bin")
+    const second = path.join(appRoot, "second.bin")
+    await fs.promises.mkdir(appRoot)
+    await fs.promises.writeFile(first, "same")
+    await fs.promises.writeFile(second, "same")
+    const vault = await makeVault(home)
+    vault.automaticScans.candidateThreshold = async () => 1
+
+    vault.automaticScans.queueApp(app, [first, second])
+    await waitFor(() => !vault.automaticScans.active &&
+      vault.automaticScans.entries.get(app)?.state === "result")
+    await vault.registry.setAutomaticAppScanState(app, null)
+    vault.automaticScans.entries.delete(app)
+    await fs.promises.writeFile(second, "diff")
+    const hashedPaths = []
+    const originalHashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath, options) => {
+      hashedPaths.push(filePath)
+      return originalHashFile(filePath, options)
+    }
+
+    vault.automaticScans.queueApp(app, [first, second])
+    await waitFor(() => !vault.automaticScans.active &&
+      !vault.automaticScans.entries.has(app))
+
+    assert.deepEqual(hashedPaths, [second])
+    assert.deepEqual(vault.automaticScans.snapshot().rows, [])
+    await close(vault)
+  })
+
+  test("changed paths beneath symbolic-link ancestors are not inspected", async () => {
+    const home = await makeHome()
+    const app = "linked-path-app"
+    const appRoot = path.join(home, "api", app)
+    const outsideRoot = path.join(home, "outside")
+    const directPath = path.join(appRoot, "direct.bin")
+    const outsidePath = path.join(outsideRoot, "outside.bin")
+    const linkPath = path.join(appRoot, "linked")
+    const linkedPath = path.join(linkPath, "outside.bin")
+    await fs.promises.mkdir(appRoot)
+    await fs.promises.mkdir(outsideRoot)
+    await fs.promises.writeFile(directPath, "same")
+    await fs.promises.writeFile(outsidePath, "same")
+    await fs.promises.symlink(
+      outsideRoot,
+      linkPath,
+      process.platform === "win32" ? "junction" : "dir"
+    )
+    const vault = await makeVault(home)
+    vault.automaticScans.candidateThreshold = async () => 1
+    const inspected = []
+    const originalStat = vault.automaticScans.statChangedPaths.bind(
+      vault.automaticScans)
+    vault.automaticScans.statChangedPaths = (paths, options, onSettled) => {
+      inspected.push(...paths)
+      return originalStat(paths, options, onSettled)
+    }
+
+    vault.automaticScans.queueApp(app, [directPath, linkedPath])
+    await waitFor(() => !vault.automaticScans.active &&
+      !vault.automaticScans.entries.has(app), "linked path precheck")
+
+    assert.deepEqual(inspected, [directPath])
+    assert.deepEqual(vault.automaticScans.snapshot().rows, [])
+    await close(vault)
   })
 
   test("an app removed during its active check loses automatic state", async () => {
@@ -408,11 +1059,12 @@ describe("automatic app checks", () => {
     await vault.registry.setAutomaticAppScanState(
       app, "result", { signature })
     await vault.automaticScans.hydrate()
-    vault.scanner.walk = async () => {
+    vault.automaticScans.statChangedPaths = async () => {
       await fs.promises.rm(appRoot, { recursive: true })
+      return [null]
     }
 
-    vault.automaticScans.queueApp(app)
+    vault.automaticScans.queueApp(app, [path.join(appRoot, "model.bin")])
     await waitFor(() => !vault.automaticScans.active &&
       !vault.automaticScans.entries.has(app), "active app deletion")
 
@@ -438,16 +1090,15 @@ describe("automatic app checks", () => {
       broadcasts.push(snapshot)
     })
 
-    vault.automaticScans.queueApp("threshold-app")
+    vault.automaticScans.queueApp("threshold-app", [
+      path.join(appRoot, "first.bin"),
+      path.join(appRoot, "second.bin")
+    ])
     await waitFor(() => !vault.automaticScans.active &&
       !vault.automaticScans.entries.has("threshold-app"))
 
     assert.deepEqual(vault.automaticScans.snapshot().rows, [])
-    assert.deepEqual(broadcasts.find((snapshot) => snapshot.completion)
-      ?.completion, {
-      app: "threshold-app",
-      outcome: "no_possible_duplicates"
-    })
+    assert.equal(broadcasts.some((snapshot) => snapshot.completion), false)
     assert.equal("completion" in vault.automaticScans.snapshot(), false)
     let restoredSnapshot = null
     const unsubscribeRestored = vault.automaticScans.subscribe((snapshot) => {
@@ -460,7 +1111,7 @@ describe("automatic app checks", () => {
     await close(vault)
   })
 
-  test("published file metadata can be a peer without reading the peer path", async () => {
+  test("missing published peers cannot produce a verified result", async () => {
     const home = await makeHome()
     const appRoot = path.join(home, "api", "sqlite-peer-app")
     const candidate = path.join(appRoot, "candidate.bin")
@@ -469,7 +1120,7 @@ describe("automatic app checks", () => {
     const vault = await makeVault(home, { deferStorage: true })
     await vault.ensureRegistryInitialized()
     assert.equal(vault.initialized, false)
-    vault.automaticScans.sizeThreshold = 1
+    vault.automaticScans.candidateThreshold = async () => 1
     const stat = await fs.promises.lstat(candidate)
     const missingPeer = path.join(home, "peer-does-not-exist.bin")
     await vault.registry.upsertFile({
@@ -490,11 +1141,64 @@ describe("automatic app checks", () => {
       updated_at: Date.now()
     })
 
-    vault.automaticScans.queueApp("sqlite-peer-app")
+    vault.automaticScans.queueApp("sqlite-peer-app", [candidate])
     await waitFor(() => !vault.automaticScans.active &&
-      vault.automaticScans.entries.get("sqlite-peer-app")?.state === "result")
+      !vault.automaticScans.entries.has("sqlite-peer-app"))
 
     assert.equal(fs.existsSync(missingPeer), false)
+    assert.deepEqual(vault.automaticScans.snapshot().rows, [])
+    await close(vault)
+  })
+
+  test("stable published hashes are reused without rereading contents", async () => {
+    const home = await makeHome()
+    const app = "published-hash-app"
+    const appRoot = path.join(home, "api", app)
+    const candidate = path.join(appRoot, "candidate.bin")
+    const peer = path.join(home, "published-peer.bin")
+    await fs.promises.mkdir(appRoot)
+    await fs.promises.writeFile(candidate, "same-content")
+    await fs.promises.writeFile(peer, "same-content")
+    const vault = await makeVault(home, { deferStorage: true })
+    await vault.ensureRegistryInitialized()
+    vault.automaticScans.candidateThreshold = async () => 1
+    const candidateStat = await fs.promises.lstat(candidate)
+    const peerStat = await fs.promises.lstat(peer)
+    const hash = crypto.createHash("sha256")
+      .update("same-content").digest("hex")
+    const published = (filePath, stat, sourceId, sourceApp) => ({
+      path: filePath,
+      hash,
+      size: stat.size,
+      mtime: stat.mtimeMs,
+      ctime: stat.ctimeMs,
+      dev: stat.dev,
+      ino: stat.ino,
+      mode: stat.mode,
+      uid: stat.uid,
+      gid: stat.gid,
+      source_id: sourceId,
+      app: sourceApp,
+      status: "reference",
+      unavailable_reason: null,
+      updated_at: Date.now()
+    })
+    await vault.registry.upsertFile(published(
+      candidate, candidateStat, `app:${app}`, app))
+    await vault.registry.upsertFile(published(
+      peer, peerStat, "app:peer", "peer"))
+    const hashedPaths = []
+    const originalHashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath, options) => {
+      hashedPaths.push(filePath)
+      return originalHashFile(filePath, options)
+    }
+
+    vault.automaticScans.queueApp(app, [candidate])
+    await waitFor(() => !vault.automaticScans.active &&
+      vault.automaticScans.entries.get(app)?.state === "result")
+
+    assert.deepEqual(hashedPaths, [])
     assert.equal(vault.automaticScans.snapshot().rows[0].state, "result")
     await close(vault)
   })
@@ -508,7 +1212,7 @@ describe("automatic app checks", () => {
     const vault = await makeVault(home, { deferStorage: true })
     await vault.ensureRegistryInitialized()
     assert.equal(vault.initialized, false)
-    vault.automaticScans.sizeThreshold = 1
+    vault.automaticScans.candidateThreshold = async () => 1
     const stat = await fs.promises.lstat(candidate)
     const base = {
       hash: null,
@@ -535,7 +1239,7 @@ describe("automatic app checks", () => {
       unavailable_reason: null
     }))
 
-    vault.automaticScans.queueApp("no-peer-app")
+    vault.automaticScans.queueApp("no-peer-app", [candidate])
     await waitFor(() => !vault.automaticScans.active &&
       !vault.automaticScans.entries.has("no-peer-app"))
 
@@ -543,16 +1247,19 @@ describe("automatic app checks", () => {
     await close(vault)
   })
 
-  test("a current verified store record can be a metadata peer", async () => {
+  test("a current verified store record can be a verified peer", async () => {
     const home = await makeHome()
     const appRoot = path.join(home, "api", "store-peer-app")
     const candidate = path.join(appRoot, "candidate.bin")
     await fs.promises.mkdir(appRoot)
     await fs.promises.writeFile(candidate, "same-size")
+    const anchorPath = path.join(home, "anchor.bin")
+    await fs.promises.writeFile(anchorPath, "same-size")
     const vault = await makeVault(home)
-    vault.automaticScans.sizeThreshold = 1
+    vault.automaticScans.candidateThreshold = async () => 1
     const stat = await fs.promises.lstat(candidate)
-    const hash = "1".repeat(64)
+    const anchorStat = await fs.promises.lstat(anchorPath)
+    const hash = crypto.createHash("sha256").update("same-size").digest("hex")
     await vault.registry.upsertContent({
       hash,
       size: stat.size,
@@ -561,22 +1268,22 @@ describe("automatic app checks", () => {
       anchor_present: true
     })
     await vault.registry.upsertAnchor({
-      store_id: "metadata-only-store",
+      store_id: "verified-store",
       hash,
-      path: path.join(home, "missing-anchor.bin"),
+      path: anchorPath,
       verified_at: Date.now(),
-      dev: stat.dev,
-      ino: stat.ino + 1000,
-      size: stat.size,
-      mtime: 1,
-      ctime: 1,
-      nlink: 1,
-      mode: stat.mode,
-      uid: stat.uid,
-      gid: stat.gid
+      dev: anchorStat.dev,
+      ino: anchorStat.ino,
+      size: anchorStat.size,
+      mtime: anchorStat.mtimeMs,
+      ctime: anchorStat.ctimeMs,
+      nlink: anchorStat.nlink,
+      mode: anchorStat.mode,
+      uid: anchorStat.uid,
+      gid: anchorStat.gid
     })
 
-    vault.automaticScans.queueApp("store-peer-app")
+    vault.automaticScans.queueApp("store-peer-app", [candidate])
     await waitFor(() => !vault.automaticScans.active &&
       vault.automaticScans.entries.get("store-peer-app")?.state === "result")
 
@@ -584,33 +1291,42 @@ describe("automatic app checks", () => {
     await close(vault)
   })
 
-  test("dismissal is remembered until the possible-match set changes", async () => {
+  test("acknowledgement is remembered until the verified-match set changes", async () => {
     const home = await makeHome()
-    const appRoot = path.join(home, "api", "dismissed-app")
+    const appRoot = path.join(home, "api", "acknowledged-app")
     await fs.promises.mkdir(appRoot)
     await fs.promises.writeFile(path.join(appRoot, "first.bin"), "aaaa")
-    await fs.promises.writeFile(path.join(appRoot, "second.bin"), "bbbb")
+    await fs.promises.writeFile(path.join(appRoot, "second.bin"), "aaaa")
     const vault = await makeVault(home)
-    vault.automaticScans.sizeThreshold = 1
+    vault.automaticScans.candidateThreshold = async () => 1
 
-    vault.automaticScans.queueApp("dismissed-app")
+    const acknowledgedPaths = [
+      path.join(appRoot, "first.bin"),
+      path.join(appRoot, "second.bin")
+    ]
+    vault.automaticScans.queueApp("acknowledged-app", acknowledgedPaths)
     await waitFor(() => !vault.automaticScans.active &&
-      vault.automaticScans.entries.get("dismissed-app")?.state === "result")
-    await vault.perform("automatic_dismiss", { app: "dismissed-app" })
+      vault.automaticScans.entries.get("acknowledged-app")?.state === "result")
+    const signature = vault.automaticScans.snapshot().rows[0].signature
+    await vault.perform("automatic_acknowledge", {
+      app: "acknowledged-app",
+      signature
+    })
     assert.deepEqual(vault.automaticScans.snapshot().rows, [])
 
-    vault.automaticScans.queueApp("dismissed-app")
+    vault.automaticScans.queueApp("acknowledged-app", acknowledgedPaths)
     await waitFor(() => !vault.automaticScans.active &&
-      vault.automaticScans.entries.get("dismissed-app")?.state === "result")
+      vault.automaticScans.entries.get("acknowledged-app")?.state === "result")
     assert.deepEqual(vault.automaticScans.snapshot().rows, [])
 
-    await fs.promises.writeFile(path.join(appRoot, "third.bin"), "cccc")
+    await fs.promises.writeFile(path.join(appRoot, "third.bin"), "aaaa")
     const previousSignature = vault.automaticScans.entries.get(
-      "dismissed-app").signature
-    vault.automaticScans.queueApp("dismissed-app")
+      "acknowledged-app").signature
+    vault.automaticScans.queueApp("acknowledged-app", acknowledgedPaths.concat(
+      path.join(appRoot, "third.bin")))
     await waitFor(() => !vault.automaticScans.active &&
-      vault.automaticScans.entries.get("dismissed-app")?.state === "result" &&
-      vault.automaticScans.entries.get("dismissed-app")?.signature !==
+      vault.automaticScans.entries.get("acknowledged-app")?.state === "result" &&
+      vault.automaticScans.entries.get("acknowledged-app")?.signature !==
         previousSignature)
     assert.equal(vault.automaticScans.snapshot().rows[0].state, "result")
     await close(vault)
@@ -621,16 +1337,23 @@ describe("automatic app checks", () => {
     const appRoot = path.join(home, "api", "empty-app")
     await fs.promises.mkdir(appRoot)
     await fs.promises.writeFile(path.join(appRoot, "first.bin"), "aaaa")
-    await fs.promises.writeFile(path.join(appRoot, "second.bin"), "bbbb")
+    await fs.promises.writeFile(path.join(appRoot, "second.bin"), "aaaa")
     const vault = await makeVault(home)
-    vault.automaticScans.sizeThreshold = 1
+    vault.automaticScans.candidateThreshold = async () => 1
 
-    vault.automaticScans.queueApp("empty-app")
+    const emptyPaths = [
+      path.join(appRoot, "first.bin"),
+      path.join(appRoot, "second.bin")
+    ]
+    vault.automaticScans.queueApp("empty-app", emptyPaths)
     await waitFor(() => !vault.automaticScans.active &&
       vault.automaticScans.entries.get("empty-app")?.state === "result")
-    await vault.perform("automatic_dismiss", { app: "empty-app" })
+    await vault.perform("automatic_acknowledge", {
+      app: "empty-app",
+      signature: vault.automaticScans.snapshot().rows[0].signature
+    })
     await fs.promises.unlink(path.join(appRoot, "second.bin"))
-    vault.automaticScans.queueApp("empty-app")
+    vault.automaticScans.queueApp("empty-app", [emptyPaths[0]])
     await waitFor(() => !vault.automaticScans.active &&
       !vault.automaticScans.entries.has("empty-app"))
 
@@ -640,16 +1363,20 @@ describe("automatic app checks", () => {
     await close(vault)
   })
 
-  test("an app restart cancels an active check and restores the prior notice", async () => {
+  test("an app restart cancels an active check and restores the prior result", async () => {
     const home = await makeHome()
     const appRoot = path.join(home, "api", "restart-app")
     const scriptPath = path.join(appRoot, "start.js")
     await fs.promises.mkdir(appRoot)
     await fs.promises.writeFile(path.join(appRoot, "first.bin"), "aaaa")
-    await fs.promises.writeFile(path.join(appRoot, "second.bin"), "bbbb")
+    await fs.promises.writeFile(path.join(appRoot, "second.bin"), "aaaa")
     const vault = await makeVault(home)
-    vault.automaticScans.sizeThreshold = 1
-    vault.automaticScans.queueApp("restart-app")
+    vault.automaticScans.candidateThreshold = async () => 1
+    const restartPaths = [
+      path.join(appRoot, "first.bin"),
+      path.join(appRoot, "second.bin")
+    ]
+    vault.automaticScans.queueApp("restart-app", restartPaths)
     await waitFor(() => !vault.automaticScans.active &&
       vault.automaticScans.entries.get("restart-app")?.state === "result")
     const previous = vault.automaticScans.entries.get("restart-app")
@@ -657,18 +1384,19 @@ describe("automatic app checks", () => {
     let release
     let began
     const beganPromise = new Promise((resolve) => { began = resolve })
-    const originalWalk = vault.scanner.walk.bind(vault.scanner)
-    vault.scanner.walk = async (_root, options) => {
+    const originalStat = vault.automaticScans.statChangedPaths.bind(
+      vault.automaticScans)
+    vault.automaticScans.statChangedPaths = async (paths, options) => {
       began()
       await new Promise((resolve) => { release = resolve })
-      options.checkpoint()
+      return originalStat(paths, options)
     }
-    vault.automaticScans.queueApp("restart-app")
+    vault.automaticScans.queueApp("restart-app", restartPaths)
     await beganPromise
     vault.automaticScans.handleStarted(scriptPath)
     release()
     await waitFor(() => !vault.automaticScans.active)
-    vault.scanner.walk = originalWalk
+    vault.automaticScans.statChangedPaths = originalStat
 
     const restored = vault.automaticScans.entries.get("restart-app")
     assert.equal(restored.state, "result")
@@ -684,7 +1412,7 @@ describe("automatic app checks", () => {
     const writeStart = new Promise((resolve) => { writeStarted = resolve })
     const writeWait = new Promise((resolve) => { releaseWrite = resolve })
     const writes = []
-    const automatic = new AutomaticScans({
+    const automatic = makeAutomatic({
       enabled: true,
       registry: {
         setAutomaticAppScanState: async (_app, state, options) => {
@@ -731,7 +1459,7 @@ describe("automatic app checks", () => {
 
     const finishing = automatic.precheckFinished(active, {
       signature: replacementSignature,
-      possible_files: 1
+      verified_files: 1
     }, null)
     await writeStart
     assert.equal(automatic.cancelActive("demo", "app-started"), true)
@@ -767,7 +1495,7 @@ describe("automatic app checks", () => {
     const writeStart = new Promise((resolve) => { writeStarted = resolve })
     const writeWait = new Promise((resolve) => { releaseWrite = resolve })
     const writes = []
-    const automatic = new AutomaticScans({
+    const automatic = makeAutomatic({
       enabled: true,
       registry: {
         setAutomaticAppScanState: async (_app, state, options) => {
@@ -800,7 +1528,7 @@ describe("automatic app checks", () => {
     automatic.active = active
     const finishing = automatic.precheckFinished(active, {
       signature: "b".repeat(64),
-      possible_files: 1
+      verified_files: 1
     }, null)
     active.promise = finishing
 
@@ -821,8 +1549,8 @@ describe("automatic app checks", () => {
     assert.equal(automatic.manualDepth, 0)
   })
 
-  test("a fatal precheck error restores the prior possible-match notice", async () => {
-    const automatic = new AutomaticScans({ enabled: true })
+  test("a fatal precheck error restores the prior verified-match result", async () => {
+    const automatic = makeAutomatic({ enabled: true })
     const previous = {
       app: "demo",
       state: "result",
@@ -855,71 +1583,9 @@ describe("automatic app checks", () => {
     assert.equal(automatic.entries.get("demo").signature, previous.signature)
   })
 
-  test("a failed Pause leaves the active check unchanged", async () => {
-    const automatic = new AutomaticScans({
-      enabled: true,
-      registry: {
-        setAutomaticAppScanMode: async () => {
-          throw new Error("database failed")
-        }
-      }
-    })
-    automatic.globalScanReady = true
-    automatic.hydrated = true
-    automatic.log = () => {}
-    automatic.active = {
-      app: "demo",
-      cancelled: false,
-      reason: null,
-      promise: null
-    }
-    automatic.entries.set("demo", {
-      app: "demo",
-      state: "checking",
-      updated_at: 1,
-      previous: null,
-      hidden: false
-    })
-
-    await assert.rejects(() => automatic.pause("demo"), /database failed/)
-
-    assert.equal(automatic.active.cancelled, false)
-    assert.equal(automatic.entries.get("demo").state, "checking")
-  })
-
-  test("a failed Resume preserves Manual mode and its paused notice", async () => {
-    const automatic = new AutomaticScans({
-      enabled: true,
-      registry: {
-        setAutomaticAppScanMode: async () => {
-          throw new Error("database failed")
-        }
-      }
-    })
-    automatic.appRootIsAvailable = async () => true
-    automatic.hydrated = true
-    automatic.settings.set("demo", {
-      mode: "manual",
-      acknowledged_signature: null,
-      updated_at: 1
-    })
-    automatic.entries.set("demo", {
-      app: "demo",
-      state: "paused",
-      updated_at: 1,
-      previous: null,
-      hidden: false
-    })
-
-    await assert.rejects(() => automatic.resume("demo"), /database failed/)
-
-    assert.equal(automatic.modeFor("demo"), "manual")
-    assert.equal(automatic.entries.get("demo").state, "paused")
-  })
-
-  test("a stale checking action cannot dismiss its replacement result", async () => {
+  test("a stale result action cannot acknowledge its replacement", async () => {
     const acknowledgements = []
-    const automatic = new AutomaticScans({
+    const automatic = makeAutomatic({
       enabled: true,
       registry: {
         setAutomaticAppScanState: async () => ({ updated_at: 2 }),
@@ -932,25 +1598,59 @@ describe("automatic app checks", () => {
     automatic.globalScanReady = true
     automatic.hydrated = true
     automatic.log = () => {}
-    automatic.entries.set("demo", {
+    const previous = {
       app: "demo",
-      state: "checking",
+      state: "result",
+      signature: "a".repeat(64),
       updated_at: 1,
       previous: null,
       hidden: false
-    })
-    const checkingNotice = automatic.snapshot().rows[0].notice_id
+    }
+    automatic.entries.set("demo", previous)
+    const previousSignature = automatic.snapshot().rows[0].signature
     await automatic.publishResultNow("demo", {
       signature: "b".repeat(64),
-      possible_files: 1
+      verified_files: 1
     })
 
-    assert.deepEqual(await automatic.dismiss("demo", checkingNotice), {
+    assert.deepEqual(await automatic.acknowledge("demo", previousSignature), {
       stale: true,
       app: "demo"
     })
     assert.equal(automatic.snapshot().rows[0].state, "result")
     assert.deepEqual(acknowledgements, [])
+  })
+
+  test("prechecks observe cancellation while metadata paths settle", async () => {
+    const home = await makeHome()
+    const app = "settled-cancellation-app"
+    const appRoot = path.join(home, "api", app)
+    const changedPath = path.join(appRoot, "model.bin")
+    await fs.promises.mkdir(appRoot)
+    await fs.promises.writeFile(changedPath, "model")
+    const vault = await makeVault(home)
+    const active = {
+      app,
+      paths: [changedPath],
+      cancelled: false,
+      reason: null
+    }
+    vault.automaticScans.active = active
+    vault.automaticScans.statChangedPaths = async (
+      _paths, _options, onSettled) => {
+      assert.equal(typeof onSettled, "function")
+      active.cancelled = true
+      active.reason = "manual"
+      onSettled(0, null)
+      assert.fail("cancelled metadata work continued")
+    }
+
+    await assert.rejects(
+      vault.automaticScans.runPrecheck(active),
+      (error) => error && error.code === "EVAULTCANCELLED")
+    assert.equal((await vault.registry.automaticPrecheckResult(app)).files, 0)
+    vault.automaticScans.active = null
+    await close(vault)
   })
 
   test("user-started work preempts an automatic check and keeps priority", async () => {
@@ -962,18 +1662,23 @@ describe("automatic app checks", () => {
     const vault = await makeVault(home, { deferStorage: true })
     await vault.ensureRegistryInitialized()
     assert.equal(vault.initialized, false)
-    vault.automaticScans.sizeThreshold = 1
+    vault.automaticScans.candidateThreshold = async () => 1
     let release
     let began
     const beganPromise = new Promise((resolve) => { began = resolve })
-    const originalWalk = vault.scanner.walk.bind(vault.scanner)
-    vault.scanner.walk = async (_root, options) => {
+    const originalStat = vault.automaticScans.statChangedPaths.bind(
+      vault.automaticScans)
+    vault.automaticScans.statChangedPaths = async (
+      paths, options, onSettled) => {
       began()
       await new Promise((resolve) => { release = resolve })
-      options.checkpoint()
+      return originalStat(paths, options, onSettled)
     }
 
-    vault.automaticScans.queueApp("priority-app")
+    vault.automaticScans.queueApp("priority-app", [
+      path.join(appRoot, "first.bin"),
+      path.join(appRoot, "second.bin")
+    ])
     await beganPromise
     const manual = vault.perform("scan", {
       scope_id: "app:priority-app",
@@ -981,7 +1686,7 @@ describe("automatic app checks", () => {
     })
     await waitFor(() => vault.automaticScans.active?.cancelled === true,
       "user work to preempt the automatic check")
-    vault.scanner.walk = originalWalk
+    vault.automaticScans.statChangedPaths = originalStat
     release()
 
     assert.equal((await manual).started, true)
@@ -992,58 +1697,18 @@ describe("automatic app checks", () => {
     await close(vault)
   })
 
-  test("Pause cancels checking, persists Manual mode, and Resume rechecks", async () => {
-    const home = await makeHome()
-    const appRoot = path.join(home, "api", "paused-app")
-    await fs.promises.mkdir(appRoot)
-    await fs.promises.writeFile(path.join(appRoot, "first.bin"), "aaaa")
-    await fs.promises.writeFile(path.join(appRoot, "second.bin"), "bbbb")
-    const vault = await makeVault(home, { deferStorage: true })
-    await vault.ensureRegistryInitialized()
-    vault.automaticScans.sizeThreshold = 1
-    let release
-    let began
-    const beganPromise = new Promise((resolve) => { began = resolve })
-    const originalWalk = vault.scanner.walk.bind(vault.scanner)
-    vault.scanner.walk = async (_root, options) => {
-      began()
-      await new Promise((resolve) => { release = resolve })
-      options.checkpoint()
-    }
-
-    vault.automaticScans.queueApp("paused-app")
-    await beganPromise
-    assert.deepEqual(await vault.perform("automatic_pause", {
-      app: "paused-app"
-    }), { paused: true, app: "paused-app", mode: "manual" })
-    release()
-    await waitFor(() => !vault.automaticScans.active)
-    assert.equal(vault.automaticScans.snapshot().rows[0].state, "paused")
-    assert.equal(vault.automaticScans.modeFor("paused-app"), "manual")
-    assert.equal(vault.initialized, false)
-
-    await vault.perform("automatic_dismiss", { app: "paused-app" })
-    assert.deepEqual(vault.automaticScans.snapshot().rows, [])
-    assert.equal(vault.automaticScans.modeFor("paused-app"), "manual")
-
-    vault.scanner.walk = originalWalk
-    await vault.perform("automatic_resume", { app: "paused-app" })
-    await waitFor(() => !vault.automaticScans.active &&
-      vault.automaticScans.entries.get("paused-app")?.state === "result")
-    assert.equal(vault.automaticScans.modeFor("paused-app"), "automatic")
-    assert.equal(vault.initialized, false)
-    await close(vault)
-  })
-
-  test("a completed manual app scan clears the possible-match notice", async () => {
+  test("a completed manual app scan clears the verified-match result", async () => {
     const home = await makeHome()
     const appRoot = path.join(home, "api", "manual-app")
     await fs.promises.mkdir(appRoot)
     await fs.promises.writeFile(path.join(appRoot, "first.bin"), "aaaa")
-    await fs.promises.writeFile(path.join(appRoot, "second.bin"), "bbbb")
+    await fs.promises.writeFile(path.join(appRoot, "second.bin"), "aaaa")
     const vault = await makeVault(home)
-    vault.automaticScans.sizeThreshold = 1
-    vault.automaticScans.queueApp("manual-app")
+    vault.automaticScans.candidateThreshold = async () => 1
+    vault.automaticScans.queueApp("manual-app", [
+      path.join(appRoot, "first.bin"),
+      path.join(appRoot, "second.bin")
+    ])
     await waitFor(() => !vault.automaticScans.active &&
       vault.automaticScans.entries.get("manual-app")?.state === "result")
 
@@ -1070,7 +1735,7 @@ describe("automatic app checks", () => {
         return { kind: "app", app: scopeId.slice(4) }
       }
     }
-    const automatic = new AutomaticScans(vault)
+    const automatic = makeAutomatic(vault)
     automatic.hydrated = true
     automatic.log = () => {}
     automatic.broadcast = () => {}
@@ -1103,7 +1768,7 @@ describe("automatic app checks", () => {
     assert.equal(automatic.pendingStops.size, 0)
   })
 
-  test("a file action clears only notices for affected apps", async () => {
+  test("a file action clears only results for affected apps", async () => {
     const writes = []
     const vault = {
       enabled: true,
@@ -1124,7 +1789,7 @@ describe("automatic app checks", () => {
       fileActionCancelRequested: false,
       fileActionProgress: null
     }
-    const automatic = new AutomaticScans(vault)
+    const automatic = makeAutomatic(vault)
     vault.automaticScans = automatic
     automatic.hydrated = true
     automatic.log = () => {}
@@ -1235,6 +1900,37 @@ describe("automatic app checks", () => {
     assert.deepEqual([...changedHashes], ["a".repeat(64)])
   })
 
+  test("a temporary Manual switch does not lose a running app's paths", async () => {
+    const home = await makeHome()
+    const appRoot = path.join(home, "api", "mode-switch-app")
+    const scriptPath = path.join(appRoot, "start.js")
+    const changedPath = path.join(appRoot, "model.bin")
+    await fs.promises.mkdir(appRoot)
+    const api = {
+      running: { app: true },
+      running_paths: { app: scriptPath },
+      ondata() {}
+    }
+    const vault = await makeVault(home, { api })
+
+    vault.automaticScans.handleStarted(scriptPath)
+    vault.automaticScans.recordChangedPath(changedPath)
+    await vault.perform("automatic_set_mode", {
+      app: "mode-switch-app",
+      mode: "manual"
+    })
+    assert.deepEqual([...vault.automaticScans.changedPaths.get(
+      "mode-switch-app")], [changedPath])
+    await vault.perform("automatic_set_mode", {
+      app: "mode-switch-app",
+      mode: "automatic"
+    })
+    assert.deepEqual([...vault.automaticScans.changedPaths.get(
+      "mode-switch-app")], [changedPath])
+
+    await close(vault)
+  })
+
   test("Manual mode persists and prevents later automatic checks", async () => {
     const home = await makeHome()
     const appRoot = path.join(home, "api", "manual-mode-app")
@@ -1244,9 +1940,6 @@ describe("automatic app checks", () => {
     assert.deepEqual(await first.perform("automatic_set_mode", {
       app: "../outside",
       mode: "manual"
-    }), { error: "That app is no longer available." })
-    assert.deepEqual(await first.perform("automatic_settings", {
-      app: "../outside"
     }), { error: "That app is no longer available." })
     assert.deepEqual(await first.perform("automatic_set_mode", {
       app: "manual-mode-app",
@@ -1258,8 +1951,11 @@ describe("automatic app checks", () => {
     assert.equal((await restored.automaticScanStatus()).settings[0].mode,
       "manual")
     restored.automaticScans.handleStarted(scriptPath)
+    restored.automaticScans.recordChangedPath(
+      path.join(appRoot, "model.bin"))
     await restored.automaticScans.handleStopped(scriptPath)
     assert.equal(restored.automaticScans.pendingStops.size, 0)
+    assert.equal(restored.automaticScans.changedPaths.size, 0)
     assert.deepEqual(restored.automaticScans.snapshot().rows, [])
     await close(restored)
   })
@@ -1269,7 +1965,7 @@ describe("automatic app checks", () => {
     const appRoot = path.join(home, "api", "deleted-app")
     await fs.promises.mkdir(appRoot)
     const first = await makeVault(home)
-    await first.registry.setAutomaticAppScanMode("deleted-app", "manual", true)
+    await first.registry.setAutomaticAppScanMode("deleted-app", "manual")
     await close(first)
     await fs.promises.rm(appRoot, { recursive: true })
 
@@ -1278,6 +1974,75 @@ describe("automatic app checks", () => {
     assert.deepEqual(await restored.registry.automaticAppScanStates(), [])
     assert.deepEqual(await restored.registry.automaticAppScanSettings(), [])
     await close(restored)
+  })
+
+  test("automatic precheck registry reads are paged without duplicates", async () => {
+    const home = await makeHome()
+    const vault = await makeVault(home)
+    const app = "paged-app"
+    const entries = []
+    for (let index = 0; index < 5; index++) {
+      const filePath = path.join(home, "api", app, `${index}.bin`)
+      await fs.promises.mkdir(path.dirname(filePath), { recursive: true })
+      await fs.promises.writeFile(filePath, Buffer.alloc(index + 1, index))
+      const stat = await fs.promises.lstat(filePath)
+      entries.push({
+        path: filePath,
+        size: stat.size,
+        mtime: stat.mtimeMs,
+        ctime: stat.ctimeMs,
+        dev: stat.dev,
+        ino: stat.ino,
+        nlink: stat.nlink,
+        mode: stat.mode,
+        uid: stat.uid,
+        gid: stat.gid
+      })
+    }
+    await vault.registry.beginAutomaticPrecheck(app)
+    await vault.registry.stageAutomaticPrecheckFiles(app, entries)
+
+    const paths = []
+    let cursor = null
+    do {
+      const page = await vault.registry.automaticPrecheckEntries(
+        app, cursor, 2)
+      assert.ok(page.entries.length <= 2)
+      paths.push(...page.entries.map((entry) => entry.path))
+      cursor = page.next_cursor
+    } while (cursor)
+
+    assert.equal(paths.length, entries.length)
+    assert.equal(new Set(paths).size, entries.length)
+    await vault.registry.abortAutomaticPrecheck(app)
+    await close(vault)
+  })
+
+  test("Kernel restart waits for the complete previous Vault to dispose", async () => {
+    const calls = []
+    const fakeKernel = {
+      vault: {
+        ready: Promise.resolve().then(() => { calls.push("ready") }),
+        dispose: async () => { calls.push("dispose") }
+      }
+    }
+
+    assert.equal(
+      await Kernel.prototype.disposeVault.call(fakeKernel),
+      true)
+    assert.deepEqual(calls, ["ready", "dispose"])
+  })
+
+  test("Vault disposal closes its registry process", async () => {
+    const home = await makeHome()
+    const vault = await makeVault(home)
+    const registryPid = vault.registry.worker.pid
+
+    await vault.dispose()
+
+    assert.equal(vault.registry, null)
+    assert.equal(vault.worker, null)
+    assert.throws(() => process.kill(registryPid, 0), { code: "ESRCH" })
   })
 
   test("Vault observation preserves existing lifecycle return values", () => {

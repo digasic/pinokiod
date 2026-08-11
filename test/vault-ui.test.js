@@ -137,6 +137,7 @@ const waitFor = async (condition) => {
 const settle = () => new Promise((resolve) => setTimeout(resolve, 30))
 const makePage = async (status, options = {}) => {
   const appMode = !!options.appMode
+  const platform = options.platform || process.platform
   const deferFolderDiscoverySelection =
     !!options.deferFolderDiscoverySelection
   const deferFolderDiscoveryAdd = !!options.deferFolderDiscoveryAdd
@@ -154,7 +155,7 @@ const makePage = async (status, options = {}) => {
     appMode
   })
   const dom = new JSDOM(
-    `<body data-platform="${process.platform}" data-agent="electron" data-vault-mode="${appMode ? "app" : "global"}" data-vault-scope="${scopeId}" data-vault-app="${appMode ? "app" : ""}" data-vault-home="${homePath}">${workspace}</body>`,
+    `<body data-platform="${platform}" data-agent="electron" data-vault-mode="${appMode ? "app" : "global"}" data-vault-scope="${scopeId}" data-vault-app="${appMode ? "app" : ""}" data-vault-home="${homePath}">${workspace}</body>`,
     {
       runScripts: "outside-only",
       url: appMode
@@ -177,6 +178,11 @@ const makePage = async (status, options = {}) => {
   let resolveAutomaticStatus = null
   const deferredAutomaticStatus = options.deferAutomaticStatus
     ? new Promise((resolve) => { resolveAutomaticStatus = resolve })
+    : null
+  let resolveInitialStatus = null
+  let initialStatusPending = !!options.deferInitialStatus
+  const deferredInitialStatus = initialStatusPending
+    ? new Promise((resolve) => { resolveInitialStatus = resolve })
     : null
   const within = (ancestor, candidate) => ancestor === candidate ||
     candidate.startsWith(`${ancestor.replace(/\/$/, "")}/`)
@@ -303,13 +309,17 @@ const makePage = async (status, options = {}) => {
       return setTimeout(callback, fastDelay ? 0 : delay, ...args)
     }
   }
-  if (appMode && options.automaticSettingsRequested) {
+  if (appMode && options.automaticScanFocusRequested) {
+    const signature = typeof options.automaticScanFocusRequested === "string"
+      ? options.automaticScanFocusRequested
+      : "a".repeat(64)
     dom.window.sessionStorage.setItem(
-      "pinokio:vault:auto-settings:app", "1")
+      "pinokio:vault:auto-scan-focus:app", signature)
   }
-  if (appMode && options.automaticReviewRequested) {
-    dom.window.sessionStorage.setItem(
-      "pinokio:vault:auto-review:app", "1")
+  if (options.storedCandidateSize !== undefined) {
+    dom.window.localStorage.setItem(
+      "pinokio:vault:candidate-size",
+      String(options.storedCandidateSize))
   }
   dom.window.Socket = class {
     run(payload, callback) {
@@ -394,6 +404,10 @@ const makePage = async (status, options = {}) => {
     }
     getRequests.push(url)
     const parsed = new URL(url, "http://localhost")
+    if (initialStatusPending && parsed.pathname === "/info/dedup") {
+      initialStatusPending = false
+      await deferredInitialStatus
+    }
     const parent = parsed.searchParams.get("folder_discovery_parent")
     const childPage = Number(
       parsed.searchParams.get("folder_discovery_child_page")) || 0
@@ -424,8 +438,10 @@ const makePage = async (status, options = {}) => {
   }
   dom.window.eval(await source(path.join(publicRoot, "storage-size.js")))
   dom.window.eval(await source(path.join(publicRoot, "vault.js")))
-  await waitFor(() => dom.window.document.querySelector(
-    ".vault-summary-value"))
+  if (!options.returnBeforeInitialStatus) {
+    await waitFor(() => dom.window.document.querySelector(
+      ".vault-summary-value"))
+  }
   const choosePickedPath = (folderPath) => {
     const pending = pendingPickers.shift()
     if (!pending) throw new Error("No folder picker is waiting for a selection.")
@@ -453,6 +469,9 @@ const makePage = async (status, options = {}) => {
   const releaseAutomaticStatus = () => {
     if (resolveAutomaticStatus) resolveAutomaticStatus()
   }
+  const releaseInitialStatus = () => {
+    if (resolveInitialStatus) resolveInitialStatus()
+  }
   return {
     dom,
     requests,
@@ -465,7 +484,8 @@ const makePage = async (status, options = {}) => {
     releaseFolderDiscoveryStart,
     releaseFolderDiscoverySelection,
     releaseFolderDiscoveryAdd,
-    releaseAutomaticStatus
+    releaseAutomaticStatus,
+    releaseInitialStatus
   }
 }
 
@@ -833,6 +853,61 @@ describe("Save Space interface", () => {
     await waitFor(() => document.getElementById("vault-feedback")
       .textContent.includes("Disk Saver cannot modify this file or its folder"))
 
+    dom.window.close()
+  })
+
+  test("the scan minimum follows the latest global scan, not browser storage", async () => {
+    const candidateBase = process.platform === "win32" ? 1024 : 1000
+    const published = 50 * candidateBase ** 2
+    const stored = 10 * candidateBase ** 2
+    const { dom, requests } = await makePage(fixture([], {
+      global_candidate_min_bytes: published
+    }), {
+      storedCandidateSize: stored
+    })
+    const document = dom.window.document
+
+    assert.match(document.getElementById("vault-scan-size-label").textContent,
+      /50 MB\+/)
+    document.getElementById("btn-scan").click()
+    await waitFor(() => requests.some((request) =>
+      request.action === "scan"))
+    assert.equal(requests.find((request) =>
+      request.action === "scan").candidate_size, published)
+
+    await settle()
+    dom.window.close()
+  })
+
+  test("a threshold chosen before initial status remains selected", async () => {
+    const candidateBase = process.platform === "win32" ? 1024 : 1000
+    const published = 50 * candidateBase ** 2
+    const selected = 10 * candidateBase ** 2
+    const {
+      dom,
+      requests,
+      releaseInitialStatus
+    } = await makePage(fixture([], {
+      global_candidate_min_bytes: published
+    }), {
+      deferInitialStatus: true,
+      returnBeforeInitialStatus: true
+    })
+    const document = dom.window.document
+
+    document.querySelector(`[data-candidate-size="${selected}"]`).click()
+    releaseInitialStatus()
+    await waitFor(() => document.querySelector(".vault-summary-value"))
+
+    assert.match(document.getElementById("vault-scan-size-label").textContent,
+      /10 MB\+/)
+    document.getElementById("btn-scan").click()
+    await waitFor(() => requests.some((request) =>
+      request.action === "scan"))
+    assert.equal(requests.find((request) =>
+      request.action === "scan").candidate_size, selected)
+
+    await settle()
     dom.window.close()
   })
 
@@ -2332,12 +2407,18 @@ describe("Save Space interface", () => {
     })
     const { dom } = await makePage(status, {
       appMode: true,
+      platform: "darwin",
+      automaticScanFocusRequested: "e".repeat(64),
       scopeId: "app:app"
     })
-    const scanButton = dom.window.document.getElementById("btn-scan")
+    const document = dom.window.document
+    const scanButton = document.getElementById("btn-scan")
 
     assert.match(scanButton.textContent, /Scan this app/)
     assert.equal(scanButton.classList.contains("primary"), true)
+    assert.match(document.getElementById("vault-scan-coachmark").textContent,
+      /click Scan this app to review them/)
+    await waitFor(() => document.activeElement === scanButton)
 
     dom.window.close()
   })
@@ -2445,6 +2526,31 @@ describe("Save Space interface", () => {
     dom.window.close()
   })
 
+  test("Linux app workspaces expose no automatic-check UI or requests", async () => {
+    const status = fixture([], {
+      global_scan_ready: false,
+      last_scan: null,
+      logical_bytes: 0,
+      saved_by_sharing: 0,
+      pending_bytes: 0
+    })
+    const { dom, getRequests } = await makePage(status, {
+      appMode: true,
+      platform: "linux",
+      scopeId: "app:app"
+    })
+    const document = dom.window.document
+
+    assert.equal(document.getElementById("vault-auto-mode"), null)
+    assert.equal(getRequests.includes("/info/vault/automatic-scans"), false)
+    assert.match(document.querySelector(".vault-setup-copy").textContent,
+      /creates the file index used to compare apps/)
+    assert.doesNotMatch(document.querySelector(
+      ".vault-setup-copy").textContent, /automatic/i)
+
+    dom.window.close()
+  })
+
   test("app setup remains visible during global scan progress", async () => {
     let progressRequests = 0
     const status = fixture([], {
@@ -2521,7 +2627,6 @@ describe("Save Space interface", () => {
     const { dom, requests } = await makePage(fixture([item()]), {
       appMode: true,
       scopeId: "app:app",
-      automaticSettingsRequested: true,
       actionResults: {
         automatic_set_mode: { app: "app", mode: "manual" }
       }
@@ -2531,10 +2636,8 @@ describe("Save Space interface", () => {
 
     let selector = document.getElementById("vault-auto-mode")
     assert.equal(selector.classList.contains("automatic"), true)
-    assert.equal(selector.open, true)
+    assert.equal(selector.open, false)
     assert.match(selector.querySelector("summary").textContent, /Automatic/)
-    assert.equal(dom.window.sessionStorage.getItem(
-      "pinokio:vault:auto-settings:app"), null)
 
     selector.querySelector('[data-automatic-mode="manual"]').click()
     await waitFor(() => requests.some((request) =>
@@ -2616,7 +2719,7 @@ describe("Save Space interface", () => {
     dom.window.close()
   })
 
-  test("Review waits to focus Scan this app until it is available", async () => {
+  test("badge acknowledgement waits to explain Scan this app until it is available", async () => {
     let current = fixture([item()], {
       scan: {
         active: true,
@@ -2627,17 +2730,20 @@ describe("Save Space interface", () => {
     })
     const { dom, requests } = await makePage(() => current, {
       appMode: true,
+      platform: "darwin",
       scopeId: "app:app",
-      automaticReviewRequested: true
+      automaticScanFocusRequested: "a".repeat(64)
     })
     const document = dom.window.document
     const scanButton = document.getElementById("btn-scan")
+    const coachmark = document.getElementById("vault-scan-coachmark")
 
     assert.equal(scanButton.disabled, false)
     assert.match(scanButton.textContent, /Cancel scan/)
     assert.notEqual(document.activeElement, scanButton)
+    assert.equal(coachmark.hidden, true)
     assert.equal(dom.window.sessionStorage.getItem(
-      "pinokio:vault:auto-review:app"), null)
+      "pinokio:vault:auto-scan-focus:app"), null)
 
     current = fixture([item()])
     for (let attempt = 0; attempt < 400 &&
@@ -2647,6 +2753,130 @@ describe("Save Space interface", () => {
 
     assert.equal(document.activeElement, scanButton)
     assert.equal(scanButton.disabled, false)
+    assert.equal(coachmark.hidden, false)
+    assert.match(coachmark.textContent,
+      /Automatic checking found possible duplicates/)
+    assert.match(coachmark.textContent, /click Scan again to review them/)
+    assert.match(coachmark.textContent,
+      /Scanning may use CPU for a few minutes/)
+    assert.equal(coachmark.querySelectorAll("button").length, 1)
+    assert.equal(coachmark.querySelector("button").getAttribute("aria-label"),
+      "Dismiss explanation")
+    assert.equal(document.getElementById("vault-candidate-size").hidden, false)
+    assert.match(document.getElementById("vault-table-wrap").textContent,
+      /model\.bin/)
+    assert.equal(requests.some((request) => request.action === "scan"), false)
+
+    coachmark.querySelector("[data-dismiss-automatic-scan-coachmark]").click()
+    assert.equal(coachmark.hidden, true)
+    assert.match(document.getElementById("vault-table-wrap").textContent,
+      /model\.bin/)
+    assert.equal(requests.some((request) => request.action === "scan"), false)
+    dom.window.close()
+  })
+
+  test("a retained app workspace handles a live badge coachmark request", async () => {
+    const { dom, requests } = await makePage(fixture([item()]), {
+      appMode: true,
+      platform: "darwin",
+      embeddedApp: true,
+      scopeId: "app:app"
+    })
+    const document = dom.window.document
+    const scanButton = document.getElementById("btn-scan")
+    const candidateSize = document.getElementById("vault-candidate-size")
+    const selectedSize = candidateSize.options[1].value
+    candidateSize.value = selectedSize
+    candidateSize.dispatchEvent(new dom.window.Event("change", {
+      bubbles: true
+    }))
+    document.querySelector('[data-view="duplicates"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+    const resultsBeforeHandoff = document.getElementById("vault-table-wrap")
+    const resultsTextBeforeHandoff = resultsBeforeHandoff.textContent
+    const focusKey = "pinokio:vault:auto-scan-focus:app"
+    const signature = "b".repeat(64)
+    dom.window.sessionStorage.setItem(focusKey, signature)
+    const event = new dom.window.Event("message")
+    Object.defineProperties(event, {
+      source: { value: dom.window.parent },
+      origin: { value: dom.window.location.origin },
+      data: {
+        value: {
+          e: "vault-automatic-scan-focus",
+          app: "app",
+          signature
+        }
+      }
+    })
+
+    dom.window.dispatchEvent(event)
+    await waitFor(() => document.activeElement === scanButton)
+
+    assert.equal(dom.window.sessionStorage.getItem(focusKey), null)
+    assert.equal(requests.some((request) => request.action === "scan"), false)
+    const coachmark = document.getElementById("vault-scan-coachmark")
+    assert.equal(coachmark.hidden, false)
+    assert.equal(candidateSize.value, selectedSize)
+    assert.ok(document.querySelector('[data-view="duplicates"].selected'))
+    assert.equal(document.getElementById("vault-table-wrap"),
+      resultsBeforeHandoff)
+    assert.equal(resultsBeforeHandoff.textContent, resultsTextBeforeHandoff)
+
+    scanButton.click()
+    await waitFor(() => requests.some((request) => request.action === "scan"))
+    assert.equal(coachmark.hidden, true)
+    assert.equal(requests.filter((request) => request.action === "scan").length,
+      1)
+    await settle()
+    dom.window.close()
+  })
+
+  test("the automatic-result coachmark is shown once per signature and Escape dismisses it", async () => {
+    const { dom, requests } = await makePage(fixture([item()]), {
+      appMode: true,
+      platform: "darwin",
+      embeddedApp: true,
+      scopeId: "app:app"
+    })
+    const document = dom.window.document
+    const coachmark = document.getElementById("vault-scan-coachmark")
+    const sendFocus = (signature) => {
+      const event = new dom.window.Event("message")
+      Object.defineProperties(event, {
+        source: { value: dom.window.parent },
+        origin: { value: dom.window.location.origin },
+        data: {
+          value: {
+            e: "vault-automatic-scan-focus",
+            app: "app",
+            signature
+          }
+        }
+      })
+      dom.window.dispatchEvent(event)
+    }
+    const firstSignature = "c".repeat(64)
+    const secondSignature = "d".repeat(64)
+
+    sendFocus(firstSignature)
+    assert.equal(coachmark.hidden, false)
+    document.dispatchEvent(new dom.window.KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true
+    }))
+    assert.equal(coachmark.hidden, true)
+
+    sendFocus(firstSignature)
+    assert.equal(coachmark.hidden, true)
+    sendFocus(secondSignature)
+    assert.equal(coachmark.hidden, false)
+    assert.equal(dom.window.sessionStorage.getItem(
+      `pinokio:vault:auto-scan-coachmark-seen:app:${secondSignature}`), "1")
+    coachmark.querySelector("[data-dismiss-automatic-scan-coachmark]").click()
+    sendFocus(firstSignature)
+    assert.equal(coachmark.hidden, true)
     assert.equal(requests.some((request) => request.action === "scan"), false)
     dom.window.close()
   })

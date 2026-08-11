@@ -5,6 +5,7 @@ const Database = require("better-sqlite3")
 
 const DATABASE_APPLICATION_ID = 0x5641554c
 const DATABASE_VERSION = 3
+const HASH_CACHE_MAX_ENTRIES = 100000
 
 const isMissing = (error) => !!(error &&
   (error.code === "ENOENT" || error.code === "ENOTDIR"))
@@ -148,6 +149,8 @@ class RegistryCore {
         ON anchors(dev, ino);
       CREATE INDEX IF NOT EXISTS anchors_size_device_path_idx
         ON anchors(size, dev, path);
+      CREATE INDEX IF NOT EXISTS anchors_hash_store_idx
+        ON anchors(hash, store_id);
       CREATE TABLE IF NOT EXISTS files (
         path TEXT PRIMARY KEY,
         hash TEXT,
@@ -187,6 +190,20 @@ class RegistryCore {
       CREATE INDEX IF NOT EXISTS files_size_path_idx ON files(size, path);
       CREATE INDEX IF NOT EXISTS files_size_device_path_idx
         ON files(size, dev, path);
+
+      CREATE TABLE IF NOT EXISTS hash_cache (
+        path TEXT PRIMARY KEY,
+        hash TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        mtime REAL NOT NULL,
+        ctime REAL NOT NULL,
+        dev INTEGER NOT NULL,
+        ino INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS hash_cache_updated_idx
+        ON hash_cache(updated_at DESC, path);
+
       CREATE TABLE IF NOT EXISTS file_summaries (
         source_id TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -370,13 +387,13 @@ class RegistryCore {
   createScanSchema() {
     this.database.exec(`
       CREATE TEMP TABLE scan_runs (
-        id TEXT PRIMARY KEY,
+        id INTEGER PRIMARY KEY,
         scope_id TEXT,
         started_at INTEGER NOT NULL
       ) WITHOUT ROWID;
 
       CREATE TEMP TABLE scan_exclusions (
-        run_id TEXT NOT NULL,
+        run_id INTEGER NOT NULL,
         path TEXT NOT NULL,
         prefix TEXT NOT NULL,
         source_id TEXT,
@@ -387,7 +404,7 @@ class RegistryCore {
       ) WITHOUT ROWID;
 
       CREATE TEMP TABLE scan_files (
-        run_id TEXT NOT NULL,
+        run_id INTEGER NOT NULL,
         path TEXT NOT NULL,
         size INTEGER NOT NULL,
         mtime REAL NOT NULL,
@@ -412,22 +429,24 @@ class RegistryCore {
         comparison_verified INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (run_id, path),
         FOREIGN KEY (run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
-      ) WITHOUT ROWID;
+      );
       CREATE INDEX temp.scan_files_group_idx
-        ON scan_files(run_id, hash, dev, status, path);
+        ON scan_files(run_id, hash, dev)
+        WHERE hash IS NOT NULL;
       CREATE INDEX temp.scan_files_work_idx
-        ON scan_files(run_id, size, dev, ino, path);
+        ON scan_files(run_id, size, dev);
       CREATE INDEX temp.scan_files_hash_work_idx
         ON scan_files(run_id, size, dev, ino, path)
         WHERE hash IS NULL AND hash_attempted = 0 AND hash_needed = 1;
       CREATE INDEX temp.scan_files_inode_path_idx
-        ON scan_files(run_id, dev, ino, path);
+        ON scan_files(run_id, dev, ino, path)
+        WHERE nlink > 1 AND ino != 0;
       CREATE INDEX temp.scan_files_comparison_pending_idx
         ON scan_files(run_id, comparison_verified, path)
         WHERE comparison_only = 1;
 
       CREATE TEMP TABLE scan_anchors (
-        run_id TEXT NOT NULL,
+        run_id INTEGER NOT NULL,
         store_id TEXT NOT NULL,
         hash_name TEXT NOT NULL,
         path TEXT NOT NULL,
@@ -449,9 +468,11 @@ class RegistryCore {
         ON scan_anchors(run_id, dev, ino);
       CREATE INDEX temp.scan_anchors_size_idx
         ON scan_anchors(run_id, size);
+      CREATE INDEX temp.scan_anchors_publication_idx
+        ON scan_anchors(run_id, dev, verified_hash, hash_name);
 
       CREATE TEMP TABLE scan_linked_groups (
-        run_id TEXT NOT NULL,
+        run_id INTEGER NOT NULL,
         hash TEXT NOT NULL,
         dev INTEGER NOT NULL,
         mode_bits INTEGER NOT NULL,
@@ -464,7 +485,7 @@ class RegistryCore {
         ON scan_linked_groups(run_id, hash, dev);
 
       CREATE TEMP TABLE scan_stores (
-        run_id TEXT NOT NULL,
+        run_id INTEGER NOT NULL,
         store_id TEXT NOT NULL,
         dev INTEGER NOT NULL,
         can_link INTEGER NOT NULL,
@@ -483,12 +504,18 @@ class RegistryCore {
         app TEXT NOT NULL,
         path TEXT NOT NULL,
         size INTEGER NOT NULL,
+        mtime REAL NOT NULL DEFAULT 0,
+        ctime REAL NOT NULL DEFAULT 0,
         dev INTEGER NOT NULL,
         ino INTEGER NOT NULL,
+        nlink INTEGER NOT NULL DEFAULT 1,
+        mode INTEGER NOT NULL DEFAULT 0,
+        uid INTEGER NOT NULL DEFAULT 0,
+        gid INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (app, path)
       ) WITHOUT ROWID;
       CREATE INDEX IF NOT EXISTS temp.automatic_precheck_match_idx
-        ON automatic_precheck_files(app, dev, size, ino, path);
+        ON automatic_precheck_files(app, dev, size, path);
     `)
   }
 
@@ -2669,7 +2696,7 @@ class RegistryCore {
     }))
   }
 
-  setAutomaticAppScanMode(app, mode, showPausedNotice = false) {
+  setAutomaticAppScanMode(app, mode) {
     if (typeof app !== "string" || !app) {
       throw new Error("An app is required for automatic scan settings.")
     }
@@ -2677,33 +2704,14 @@ class RegistryCore {
       throw new Error("Invalid automatic scan mode.")
     }
     const updatedAt = Date.now()
-    this.transaction(() => {
-      this.database.prepare(`
-        INSERT INTO automatic_app_scan_settings(
-          app, mode, acknowledged_signature, updated_at
-        ) VALUES (?, ?, NULL, ?)
-        ON CONFLICT(app) DO UPDATE SET
-          mode = excluded.mode,
-          updated_at = excluded.updated_at
-      `).run(app, mode, updatedAt)
-      if (mode === "manual" && showPausedNotice) {
-        this.database.prepare(`
-          INSERT INTO automatic_app_scans(
-            app, state, savings, signature, updated_at
-          ) VALUES (?, 'paused', 0, NULL, ?)
-          ON CONFLICT(app) DO UPDATE SET
-            state = 'paused',
-            savings = 0,
-            signature = NULL,
-            updated_at = excluded.updated_at
-        `).run(app, updatedAt)
-      } else {
-        this.database.prepare(`
-          DELETE FROM automatic_app_scans
-          WHERE app = ? AND state = 'paused'
-        `).run(app)
-      }
-    })
+    this.database.prepare(`
+      INSERT INTO automatic_app_scan_settings(
+        app, mode, acknowledged_signature, updated_at
+      ) VALUES (?, ?, NULL, ?)
+      ON CONFLICT(app) DO UPDATE SET
+        mode = excluded.mode,
+        updated_at = excluded.updated_at
+    `).run(app, mode, updatedAt)
     return { mode, updated_at: updatedAt }
   }
 
@@ -2742,12 +2750,22 @@ class RegistryCore {
       throw new Error("An app is required for an automatic check.")
     }
     const insert = this.database.prepare(`
-      INSERT INTO automatic_precheck_files(app, path, size, dev, ino)
-      VALUES (@app, @path, @size, @dev, @ino)
+      INSERT INTO automatic_precheck_files(
+        app, path, size, mtime, ctime, dev, ino, nlink, mode, uid, gid
+      ) VALUES (
+        @app, @path, @size, @mtime, @ctime, @dev, @ino, @nlink,
+        @mode, @uid, @gid
+      )
       ON CONFLICT(app, path) DO UPDATE SET
         size = excluded.size,
+        mtime = excluded.mtime,
+        ctime = excluded.ctime,
         dev = excluded.dev,
-        ino = excluded.ino
+        ino = excluded.ino,
+        nlink = excluded.nlink,
+        mode = excluded.mode,
+        uid = excluded.uid,
+        gid = excluded.gid
     `)
     let changes = 0
     this.transaction(() => {
@@ -2757,64 +2775,242 @@ class RegistryCore {
           app,
           path: path.resolve(entry.path),
           size: Math.max(0, Number(entry.size) || 0),
+          mtime: Number(entry.mtime) || 0,
+          ctime: Number(entry.ctime) || 0,
           dev: Number(entry.dev) || 0,
-          ino: Number(entry.ino) || 0
+          ino: Number(entry.ino) || 0,
+          nlink: Math.max(0, Number(entry.nlink) || 0),
+          mode: Number(entry.mode) || 0,
+          uid: Number(entry.uid) || 0,
+          gid: Number(entry.gid) || 0
         }).changes
       }
     })
     return { changes }
   }
 
-  automaticPrecheckResult(app) {
+  automaticPrecheckEntries(app, cursor = null, limit = 256) {
     if (typeof app !== "string" || !app) {
       throw new Error("An app is required for an automatic check.")
     }
-    const differentPath = `
-      pinokio_path_key(peer.path) != pinokio_path_key(candidate.path)
-    `
-    const sameFile = `NOT (
-      candidate.ino != 0 AND peer.ino != 0 AND candidate.ino = peer.ino
-    )`
-    const rows = this.database.prepare(`
-      SELECT candidate.path, candidate.dev, candidate.size
-      FROM automatic_precheck_files candidate
-      WHERE candidate.app = ?
-        AND (
-          EXISTS (
-            SELECT 1 FROM automatic_precheck_files peer
-            WHERE peer.app = candidate.app
-              AND peer.dev = candidate.dev
-              AND peer.size = candidate.size
-              AND ${differentPath}
-              AND ${sameFile}
-          )
-          OR EXISTS (
-            SELECT 1 FROM files peer
-            WHERE peer.dev = candidate.dev
-              AND peer.size = candidate.size
-              AND peer.unavailable_reason IS NOT 'stale'
-              AND ${differentPath}
-              AND ${sameFile}
-          )
-          OR EXISTS (
-            SELECT 1 FROM anchors peer
-            WHERE peer.verified_at IS NOT NULL
-              AND peer.dev = candidate.dev
-              AND peer.size = candidate.size
-              AND ${differentPath}
-              AND ${sameFile}
-          )
+    const pageSize = Math.max(1, Math.min(1000, Number(limit) || 256))
+    const after = cursor && typeof cursor === "object" ? cursor : {}
+    let phase = ["changed", "anchor", "file"].includes(after.phase)
+      ? after.phase
+      : null
+    let dev = Number(after.dev) || 0
+    let size = Number(after.size) || 0
+    let afterPath = typeof after.path === "string" ? after.path : ""
+    if (!phase) {
+      const group = this.database.prepare(`
+        SELECT dev, size
+        FROM automatic_precheck_files
+        WHERE app = @app AND (
+          @has_cursor = 0 OR dev > @dev OR (dev = @dev AND size > @size)
         )
-      ORDER BY pinokio_path_key(candidate.path), candidate.dev, candidate.size
+        GROUP BY dev, size
+        ORDER BY dev, size
+        LIMIT 1
+      `).get({
+        app,
+        has_cursor: cursor ? 1 : 0,
+        dev,
+        size
+      })
+      if (!group) return { entries: [], next_cursor: null }
+      phase = "changed"
+      dev = group.dev
+      size = group.size
+      afterPath = ""
+    }
+
+    let rows
+    if (phase === "changed") {
+      rows = this.database.prepare(`
+        SELECT
+          'changed' AS kind,
+          candidate.path,
+          candidate.size,
+          candidate.mtime,
+          candidate.ctime,
+          candidate.dev,
+          candidate.ino,
+          candidate.nlink,
+          candidate.mode,
+          candidate.uid,
+          candidate.gid,
+          COALESCE(published.hash, cached.hash) AS hash
+        FROM automatic_precheck_files candidate
+        LEFT JOIN files published
+          ON published.path = candidate.path
+          AND published.size = candidate.size
+          AND published.mtime = candidate.mtime
+          AND published.ctime = candidate.ctime
+          AND published.dev = candidate.dev
+          AND published.ino = candidate.ino
+          AND published.unavailable_reason IS NOT 'stale'
+        LEFT JOIN hash_cache cached
+          ON cached.path = candidate.path
+          AND cached.size = candidate.size
+          AND cached.mtime = candidate.mtime
+          AND cached.ctime = candidate.ctime
+          AND cached.dev = candidate.dev
+          AND cached.ino = candidate.ino
+        WHERE candidate.app = @app
+          AND candidate.dev = @dev
+          AND candidate.size = @size
+          AND candidate.path > @path
+        ORDER BY candidate.path
+        LIMIT @limit
+      `).all({ app, dev, size, path: afterPath, limit: pageSize })
+    } else if (phase === "anchor") {
+      rows = this.database.prepare(`
+        SELECT
+          'anchor' AS kind,
+          path,
+          size,
+          mtime,
+          ctime,
+          dev,
+          ino,
+          nlink,
+          mode,
+          uid,
+          gid,
+          hash
+        FROM anchors
+        WHERE dev = @dev
+          AND size = @size
+          AND path > @path
+          AND verified_at IS NOT NULL
+        ORDER BY path
+        LIMIT @limit
+      `).all({ dev, size, path: afterPath, limit: pageSize })
+    } else {
+      rows = this.database.prepare(`
+        SELECT
+          'file' AS kind,
+          peer.path,
+          peer.size,
+          peer.mtime,
+          peer.ctime,
+          peer.dev,
+          peer.ino,
+          1 AS nlink,
+          peer.mode,
+          peer.uid,
+          peer.gid,
+          COALESCE(peer.hash, cached.hash) AS hash
+        FROM files peer
+        LEFT JOIN hash_cache cached
+          ON cached.path = peer.path
+          AND cached.size = peer.size
+          AND cached.mtime = peer.mtime
+          AND cached.ctime = peer.ctime
+          AND cached.dev = peer.dev
+          AND cached.ino = peer.ino
+        WHERE peer.dev = @dev
+          AND peer.size = @size
+          AND peer.path > @path
+          AND peer.unavailable_reason IS NOT 'stale'
+        ORDER BY peer.path
+        LIMIT @limit
+      `).all({ dev, size, path: afterPath, limit: pageSize })
+    }
+
+    return {
+      entries: rows,
+      next_cursor: rows.length === pageSize
+        ? {
+            phase,
+            dev,
+            size,
+            path: rows.at(-1).path
+          }
+        : phase === "changed"
+          ? { phase: "anchor", dev, size, path: "" }
+          : phase === "anchor"
+            ? { phase: "file", dev, size, path: "" }
+            : { phase: "group", dev, size, path: "" }
+    }
+  }
+
+  rememberHashCache(entries = []) {
+    const insert = this.database.prepare(`
+      INSERT INTO hash_cache(
+        path, hash, size, mtime, ctime, dev, ino, updated_at
+      ) VALUES (
+        @path, @hash, @size, @mtime, @ctime, @dev, @ino, @updated_at
+      )
+      ON CONFLICT(path) DO UPDATE SET
+        hash = excluded.hash,
+        size = excluded.size,
+        mtime = excluded.mtime,
+        ctime = excluded.ctime,
+        dev = excluded.dev,
+        ino = excluded.ino,
+        updated_at = excluded.updated_at
+    `)
+    let changes = 0
+    let pruned = 0
+    const updatedAt = Date.now()
+    this.transaction(() => {
+      for (const entry of entries || []) {
+        if (!entry || typeof entry.path !== "string" || !entry.path ||
+            typeof entry.hash !== "string" ||
+            !/^[a-f0-9]{64}$/.test(entry.hash)) continue
+        changes += insert.run({
+          path: path.resolve(entry.path),
+          hash: entry.hash,
+          size: Math.max(0, Number(entry.size) || 0),
+          mtime: Number(entry.mtime) || 0,
+          ctime: Number(entry.ctime) || 0,
+          dev: Number(entry.dev) || 0,
+          ino: Number(entry.ino) || 0,
+          updated_at: updatedAt
+        }).changes
+      }
+      pruned = this.database.prepare(`
+        DELETE FROM hash_cache
+        WHERE path IN (
+          SELECT path FROM hash_cache
+          ORDER BY updated_at DESC, path
+          LIMIT -1 OFFSET ?
+        )
+      `).run(HASH_CACHE_MAX_ENTRIES).changes
+    })
+    return { changes, pruned }
+  }
+
+  automaticPrecheckResult(app, verified = []) {
+    if (typeof app !== "string" || !app) {
+      throw new Error("An app is required for an automatic check.")
+    }
+    const hashes = new Map()
+    for (const entry of verified || []) {
+      if (!entry || typeof entry.path !== "string" ||
+          typeof entry.hash !== "string" ||
+          !/^[a-f0-9]{64}$/.test(entry.hash)) continue
+      hashes.set(canonicalPathKey(entry.path), entry.hash)
+    }
+    const rows = this.database.prepare(`
+      SELECT path, dev, size
+      FROM automatic_precheck_files
+      WHERE app = ?
+      ORDER BY pinokio_path_key(path), dev, size
     `).iterate(app)
     const digest = crypto.createHash("sha256")
     let files = 0
     for (const row of rows) {
+      const hash = hashes.get(canonicalPathKey(row.path))
+      if (!hash) continue
       digest.update(canonicalPathKey(row.path))
       digest.update("\0")
       digest.update(String(row.dev))
       digest.update("\0")
       digest.update(String(row.size))
+      digest.update("\0")
+      digest.update(hash)
       digest.update("\n")
       files += 1
     }
@@ -2852,7 +3048,7 @@ class RegistryCore {
     if (typeof app !== "string" || !app) {
       throw new Error("An app is required for automatic scan state.")
     }
-    if (state !== null && state !== "paused" && state !== "result") {
+    if (state !== null && state !== "result") {
       throw new Error("Invalid automatic scan state.")
     }
     const updateAcknowledgement = !!options &&
@@ -2922,7 +3118,10 @@ class RegistryCore {
   }
 
   beginScan(scopeId = null) {
-    const id = crypto.randomUUID()
+    // The scan schema is reset for every run, so a compact integer is enough.
+    // Repeating a UUID in tens of millions of temporary rows and indexes turns
+    // an All files scan into many gigabytes of avoidable I/O.
+    const id = 1
     this.scanSizes.clear()
     this.scanInodes.clear()
     this.scanAnchorInodes.clear()
@@ -3165,6 +3364,12 @@ class RegistryCore {
       WHERE path IN (${placeholders(resolvedEntries)})
     `).all(...resolvedEntries.map((candidate) => candidate.path))
       .map((row) => [row.path, row]))
+    const cachedByPath = new Map(this.database.prepare(`
+      SELECT path, hash, size, mtime, ctime, dev, ino
+      FROM hash_cache
+      WHERE path IN (${placeholders(resolvedEntries)})
+    `).all(...resolvedEntries.map((candidate) => candidate.path))
+      .map((row) => [row.path, row]))
     const wantedInodes = new Map()
     for (const candidate of resolvedEntries) {
       const { entry } = candidate
@@ -3243,13 +3448,21 @@ class RegistryCore {
         previous.mtime === entry.mtime &&
         previous.ctime === entry.ctime
       const reusableHash = unchanged ? previous.hash : null
+      const cached = cachedByPath.get(resolved.path)
+      const cacheUnchanged = cached &&
+        cached.dev === entry.dev &&
+        cached.ino === entry.ino &&
+        cached.size === entry.size &&
+        cached.mtime === entry.mtime &&
+        cached.ctime === entry.ctime
       staged.push({
         entry,
         path: resolved.path,
         managed,
         hashNeeded: false,
         linked: managed,
-        hash: entry.hash || reusableHash || null,
+        hash: entry.hash || reusableHash ||
+          (cacheUnchanged ? cached.hash : null) || null,
         oldStatus: unchanged ? previous.status : null,
         oldHash: unchanged ? previous.hash : null
       })
@@ -3397,8 +3610,10 @@ class RegistryCore {
         SELECT
           ?, existing.path, existing.size, existing.mtime, existing.ctime,
           existing.dev, existing.ino, 1, existing.mode, existing.uid,
-          existing.gid, existing.source_id, existing.app, existing.hash,
-          CASE WHEN existing.hash IS NULL THEN 1 ELSE 0 END,
+          existing.gid, existing.source_id, existing.app,
+          COALESCE(existing.hash, cached.hash),
+          CASE WHEN COALESCE(existing.hash, cached.hash) IS NULL
+            THEN 1 ELSE 0 END,
           CASE WHEN existing.status = 'linked' THEN 1 ELSE 0 END,
           CASE WHEN existing.status = 'linked' THEN 'linked' END,
           existing.status, existing.hash, 1
@@ -3410,6 +3625,13 @@ class RegistryCore {
         ) matches
         JOIN files existing INDEXED BY files_size_device_path_idx
           ON existing.size = matches.size AND existing.dev = matches.dev
+        LEFT JOIN hash_cache cached
+          ON cached.path = existing.path
+          AND cached.size = existing.size
+          AND cached.mtime = existing.mtime
+          AND cached.ctime = existing.ctime
+          AND cached.dev = existing.dev
+          AND cached.ino = existing.ino
         WHERE existing.source_id NOT IN (${sourceSlots})
           AND existing.unavailable_reason IS NOT 'stale'
       `).run(runId, runId, ...sources, ...sources).changes
@@ -3449,26 +3671,33 @@ class RegistryCore {
       WHERE anchor.verified_at IS NOT NULL
         AND anchor.store_id IN (${placeholders(stores)})
         AND (anchor.store_id, anchor.hash) > (?, ?)
-        AND EXISTS (
-          SELECT 1
-          FROM scan_files selected
-          WHERE selected.run_id = ?
-            AND selected.comparison_only = 0
-            AND selected.dev = anchor.dev
-            AND (
-              selected.size = anchor.size OR
-              (
-                selected.ino != 0 AND
-                selected.ino = anchor.ino
-              )
-            )
-      )
+        AND (
+          EXISTS (
+            SELECT 1
+            FROM scan_files selected INDEXED BY scan_files_work_idx
+            WHERE selected.run_id = ?
+              AND selected.comparison_only = 0
+              AND selected.size = anchor.size
+              AND selected.dev = anchor.dev
+          )
+          OR EXISTS (
+            SELECT 1
+            FROM scan_files selected INDEXED BY scan_files_inode_path_idx
+            WHERE selected.run_id = ?
+              AND selected.comparison_only = 0
+              AND selected.nlink > 1
+              AND selected.dev = anchor.dev
+              AND selected.ino != 0
+              AND selected.ino = anchor.ino
+          )
+        )
       ORDER BY anchor.store_id, anchor.hash
       LIMIT ?
     `).all(
       ...stores,
       afterStore,
       afterHash,
+      runId,
       runId,
       Math.max(1, Math.min(1024, Number(limit) || 128))
     )
@@ -3534,16 +3763,28 @@ class RegistryCore {
         verified_hash = excluded.verified_hash
     `)
     const markManaged = this.database.prepare(`
-      UPDATE scan_files SET
+      UPDATE scan_files INDEXED BY scan_files_inode_path_idx SET
         managed = 1,
         status = 'linked',
         hash = COALESCE(hash, ?),
         hash_needed = 0
       WHERE run_id = ?
         AND comparison_only = 0
+        AND nlink > 1
         AND dev = ?
         AND ino = ?
         AND ino != 0
+    `)
+    const markHashNeeded = this.database.prepare(`
+      UPDATE scan_files INDEXED BY scan_files_work_idx
+      SET hash_needed = 1
+      WHERE run_id = ?
+        AND size = ?
+        AND dev = ?
+        AND comparison_only = 0
+        AND hash IS NULL
+        AND hash_needed = 0
+        AND (? = 0 OR ino = 0 OR ino != ?)
     `)
     this.transaction(() => {
       for (const entry of entries) {
@@ -3580,6 +3821,13 @@ class RegistryCore {
             entry.dev,
             entry.ino
           )
+          markHashNeeded.run(
+            runId,
+            entry.size,
+            entry.dev,
+            entry.ino,
+            entry.ino
+          )
         } else {
           this.addScanHashWork({
             entry,
@@ -3594,26 +3842,6 @@ class RegistryCore {
         sizeState.hashNeeded = true
         this.scanSizes.set(entry.size, sizeState)
       }
-      this.database.prepare(`
-        UPDATE scan_files AS candidate
-        SET hash_needed = 1
-        WHERE candidate.run_id = ?
-          AND candidate.comparison_only = 0
-          AND candidate.hash IS NULL
-          AND EXISTS (
-            SELECT 1
-            FROM scan_anchors anchor
-            WHERE anchor.run_id = candidate.run_id
-              AND anchor.verified_hash IS NOT NULL
-              AND anchor.size = candidate.size
-              AND anchor.dev = candidate.dev
-              AND (
-                anchor.ino = 0 OR
-                candidate.ino = 0 OR
-                anchor.ino != candidate.ino
-              )
-          )
-      `).run(runId)
     })
     return { work: this.scanHashWork() }
   }
@@ -3625,7 +3853,11 @@ class RegistryCore {
           runId, anchor.dev, anchor.ino, verifiedHash)
         this.database.prepare(`
           UPDATE scan_files SET hash = ?, hash_attempted = 1
-          WHERE run_id = ? AND dev = ? AND ino = ? AND hash IS NULL
+          WHERE run_id = ?
+            AND nlink > 1
+            AND dev = ?
+            AND ino = ?
+            AND hash IS NULL
         `).run(verifiedHash, runId, anchor.dev, anchor.ino)
       })
       return
@@ -3680,6 +3912,7 @@ class RegistryCore {
           SELECT peer.hash
           FROM scan_files peer
           WHERE peer.run_id = candidate.run_id
+            AND peer.nlink > 1
             AND peer.dev = candidate.dev
             AND peer.ino = candidate.ino
             AND peer.hash IS NOT NULL
@@ -3698,6 +3931,7 @@ class RegistryCore {
             SELECT 1
             FROM scan_files inode_peer
             WHERE inode_peer.run_id = candidate.run_id
+              AND inode_peer.nlink > 1
               AND inode_peer.dev = candidate.dev
               AND inode_peer.ino = candidate.ino
               AND inode_peer.hash IS NULL
@@ -3719,6 +3953,31 @@ class RegistryCore {
     })
   }
 
+  setStageHashes(runId, entries) {
+    const values = (Array.isArray(entries) ? entries : []).filter((entry) =>
+      entry &&
+      typeof entry.path === "string" &&
+      typeof entry.hash === "string")
+    if (!values.length) return { changes: 0, preview: null }
+    const hashes = [...new Set(values.map((entry) => entry.hash))]
+    const previewBefore = this.scanPreviewGroups(runId, hashes)
+    const update = this.database.prepare(`
+      UPDATE scan_files SET hash = ?, hash_attempted = 1
+      WHERE run_id = ? AND path = ?
+    `)
+    let changes = 0
+    this.transaction(() => {
+      for (const entry of values) {
+        changes += update.run(
+          entry.hash, runId, path.resolve(entry.path)).changes
+      }
+    })
+    return {
+      changes,
+      preview: this.scanPreviewChange(runId, hashes, previewBefore)
+    }
+  }
+
   setStageHash(runId, filePath, hash) {
     const previewBefore = this.scanPreviewGroups(runId, [hash])
     const result = this.database.prepare(`
@@ -3737,7 +3996,11 @@ class RegistryCore {
     this.transaction(() => {
       result = this.database.prepare(`
         UPDATE scan_files SET hash = ?, hash_attempted = 1
-        WHERE run_id = ? AND dev = ? AND ino = ? AND hash IS NULL
+        WHERE run_id = ?
+          AND nlink > 1
+          AND dev = ?
+          AND ino = ?
+          AND hash IS NULL
       `).run(hash, runId, dev, ino)
       this.checkScanAnchorsForInode(runId, dev, ino, hash)
     })
@@ -3761,6 +4024,7 @@ class RegistryCore {
         SELECT *
         FROM scan_files
         WHERE run_id = ?
+          AND nlink > 1
           AND dev = ?
           AND ino = ?
           AND hash IS NULL
@@ -3838,7 +4102,7 @@ class RegistryCore {
           AND candidate.source_id IN (${placeholders(sourceList)})
           AND EXISTS (
             SELECT 1
-            FROM scan_files peer
+            FROM scan_files peer INDEXED BY scan_files_group_idx
             WHERE peer.run_id = candidate.run_id
               AND peer.hash = candidate.hash
               AND peer.dev = candidate.dev
@@ -3897,7 +4161,9 @@ class RegistryCore {
           AND candidate.status IS NULL
           AND candidate.hash IS NOT NULL
           AND EXISTS (
-            SELECT 1 FROM scan_anchors anchor
+            SELECT 1
+            FROM scan_anchors anchor
+              INDEXED BY scan_anchors_publication_idx
             WHERE anchor.run_id = candidate.run_id
               AND anchor.dev = candidate.dev
               AND anchor.hash_name = candidate.hash
@@ -3930,14 +4196,17 @@ class RegistryCore {
           )
           AND (
             EXISTS (
-              SELECT 1 FROM scan_files peer
-                WHERE peer.run_id = candidate.run_id
-                  AND peer.hash = candidate.hash
-                  AND peer.dev = candidate.dev
-                  AND peer.path != candidate.path
+              SELECT 1
+              FROM scan_files peer INDEXED BY scan_files_group_idx
+              WHERE peer.run_id = candidate.run_id
+                AND peer.hash = candidate.hash
+                AND peer.dev = candidate.dev
+                AND peer.path != candidate.path
               )
               OR EXISTS (
-                SELECT 1 FROM scan_anchors anchor
+                SELECT 1
+                FROM scan_anchors anchor
+                  INDEXED BY scan_anchors_publication_idx
                 WHERE anchor.run_id = candidate.run_id
                   AND anchor.verified_hash = candidate.hash
                   AND anchor.dev = candidate.dev
@@ -4251,7 +4520,7 @@ class RegistryCore {
             AND existing.app IS candidate.app
             AND EXISTS (
               SELECT 1
-              FROM scan_files selected
+              FROM scan_files selected INDEXED BY scan_files_group_idx
               WHERE selected.run_id = candidate.run_id
                 AND selected.comparison_only = 0
                 AND selected.source_id IN (${placeholders(sourceList)})
@@ -4593,6 +4862,7 @@ class RegistryCore {
   clearFiles() {
     this.transaction(() => {
       this.database.prepare("DELETE FROM files").run()
+      this.database.prepare("DELETE FROM hash_cache").run()
       this.rebuildSavings()
     })
   }

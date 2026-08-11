@@ -4,11 +4,12 @@ const crypto = require("node:crypto")
 const fs = require("node:fs")
 const os = require("node:os")
 const path = require("node:path")
-const { threadId } = require("node:worker_threads")
 const Database = require("better-sqlite3")
 const Vault = require("../kernel/vault")
+const Registry = require("../kernel/vault/registry")
 const {
-  CANDIDATE_SIZE_OPTIONS
+  CANDIDATE_SIZE_OPTIONS,
+  SIZE_THRESHOLD
 } = require("../kernel/vault/constants")
 
 const homes = []
@@ -109,15 +110,38 @@ describe("Save Space engine", () => {
     assert.equal(fs.existsSync(path.join(home, "vault")), false)
   })
 
-  test("SQLite is owned by a dedicated worker", async () => {
+  test("SQLite is owned by a dedicated process", async () => {
     const { vault } = await makeVault()
 
     assert.ok(vault.registry.worker)
-    assert.notEqual(vault.registry.worker.threadId, threadId)
+    assert.ok(Number.isInteger(vault.registry.worker.pid))
+    assert.notEqual(vault.registry.worker.pid, process.pid)
     assert.equal(vault.registry.database, undefined)
     assert.equal(await vault.registry.countFiles(), 0)
 
     await close(vault)
+  })
+
+  test("a blocked native registry query can be killed and reopened", async () => {
+    const root = await makeOutside()
+    const registry = new Registry(root, {
+      workerPath: path.resolve(
+        __dirname, "fixtures", "vault-registry-blocking-worker.js")
+    })
+    await registry.load()
+    const originalPid = registry.worker.pid
+    assert.deepEqual(await registry.call("block"), { started: true })
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    const cancelled = new Error("Scan cancelled.")
+    cancelled.code = "EVAULTCANCELLED"
+    const started = Date.now()
+    await registry.restart(cancelled)
+
+    assert.ok(Date.now() - started < 2000)
+    assert.notEqual(registry.worker.pid, originalPid)
+    assert.deepEqual(await registry.call("load"), { existed: false })
+    await registry.close()
   })
 
   test("ordinary pages reuse sources until Save Space is opened again", async () => {
@@ -148,6 +172,151 @@ describe("Save Space engine", () => {
     assert.equal(vault.globalScanIsReady(scan("failed")), false)
     assert.equal(vault.globalScanIsReady(null), false)
 
+    await close(vault)
+  })
+
+  test("the published global scan minimum is reused by automatic checks", async () => {
+    const { vault } = await makeVault()
+    const selected = CANDIDATE_SIZE_OPTIONS[2]
+
+    assert.equal((await vault.status()).global_candidate_min_bytes,
+      SIZE_THRESHOLD)
+    assert.deepEqual(await vault.perform("scan", {
+      candidate_size: selected
+    }), { started: true })
+    await waitForEngine(() => !vault.scanPromise &&
+      !vault.scanCompletionPromise)
+
+    assert.equal((await vault.status()).global_candidate_min_bytes, selected)
+    assert.equal(await vault.automaticScans.candidateThreshold(), selected)
+
+    await close(vault)
+  })
+
+  test("cancel scan recycles a registry call that is no longer returning", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "one", "model.bin"), contents)
+    await write(path.join(home, "api", "two", "model.bin"), contents)
+    let entered
+    let rejectStage
+    const stageEntered = new Promise((resolve) => { entered = resolve })
+    const registry = vault.registry
+    const restart = registry.restart.bind(registry)
+    registry.setStageHashes = async () => new Promise((resolve, reject) => {
+      rejectStage = reject
+      entered()
+    })
+    registry.restart = async (error) => {
+      rejectStage(error)
+      return restart(error)
+    }
+
+    assert.deepEqual(vault.startScan(), { started: true })
+    await stageEntered
+    assert.deepEqual(vault.cancelScan(), { cancel_requested: true })
+    await waitForEngine(() =>
+      !vault.scanPromise &&
+      !vault.scanCompletionPromise &&
+      !vault.registryRestartPromise)
+
+    assert.equal(vault.scanStatus().phase, "cancelled")
+    assert.equal(await vault.registry.countFiles(), 0)
+    await close(vault)
+  })
+
+  test("cancelling a pending scan start leaves the engine reusable", async () => {
+    const { vault } = await makeVault()
+    const registry = vault.registry
+    const beginScan = registry.beginScan.bind(registry)
+    const restart = registry.restart.bind(registry)
+    let entered
+    let rejectBegin
+    const beginEntered = new Promise((resolve) => { entered = resolve })
+    registry.beginScan = () => new Promise((_resolve, reject) => {
+      rejectBegin = reject
+      entered()
+    })
+    registry.restart = async (error) => {
+      rejectBegin(error)
+      return restart(error)
+    }
+
+    assert.deepEqual(vault.startScan(), { started: true })
+    await beginEntered
+    assert.deepEqual(vault.cancelScan(), { cancel_requested: true })
+    await waitForEngine(() =>
+      !vault.scanPromise &&
+      !vault.scanCompletionPromise &&
+      !vault.registryRestartPromise)
+
+    assert.equal(vault.scanStatus().active, false)
+    assert.equal(vault.scanStatus().phase, "cancelled")
+    registry.beginScan = beginScan
+    registry.restart = restart
+    assert.deepEqual(vault.startScan(), { started: true })
+    await waitForEngine(() => !vault.scanPromise)
+    assert.equal(vault.scanStatus().phase, "complete")
+    await close(vault)
+  })
+
+  test("cancelling active hashing preserves the cancelled outcome", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    await write(path.join(home, "api", "one", "model.bin"), contents)
+    await write(path.join(home, "api", "two", "model.bin"), contents)
+    let entered
+    const hashEntered = new Promise((resolve) => { entered = resolve })
+    vault.scanner.hashStable = () => new Promise((_resolve, reject) => {
+      const worker = { terminate: async () => {} }
+      vault.worker = worker
+      vault.workerJobs.set("test", {
+        worker,
+        cleanup() {},
+        reject
+      })
+      entered()
+    })
+
+    assert.deepEqual(vault.startScan(), { started: true })
+    await hashEntered
+    assert.deepEqual(vault.cancelScan(), { cancel_requested: true })
+    await waitForEngine(() =>
+      !vault.scanPromise &&
+      !vault.scanCompletionPromise &&
+      !vault.registryRestartPromise)
+
+    assert.equal(vault.scanStatus().phase, "cancelled")
+    assert.equal(vault.scanError, null)
+    assert.equal(await vault.registry.countFiles(), 0)
+    await close(vault)
+  })
+
+  test("publication finishes atomically instead of accepting cancellation", async () => {
+    const { vault } = await makeVault()
+    const publishScan = vault.registry.publishScan.bind(vault.registry)
+    let entered
+    let release
+    const publishEntered = new Promise((resolve) => { entered = resolve })
+    const publishGate = new Promise((resolve) => { release = resolve })
+    vault.registry.publishScan = async (...args) => {
+      entered()
+      await publishGate
+      return publishScan(...args)
+    }
+
+    assert.deepEqual(vault.startScan(), { started: true })
+    await publishEntered
+    const registryPid = vault.registry.worker.pid
+    assert.deepEqual(vault.cancelScan(), { cancel_requested: false })
+    assert.equal(vault.registryRestartPromise, null)
+    assert.equal(vault.registry.worker.pid, registryPid)
+    release()
+    await waitForEngine(() =>
+      !vault.scanPromise && !vault.scanCompletionPromise)
+
+    assert.equal(vault.scanStatus().phase, "complete")
+    assert.equal(vault.registry.worker.pid, registryPid)
     await close(vault)
   })
 

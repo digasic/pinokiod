@@ -1993,8 +1993,11 @@ class Server {
     const vault = this.kernel.vault
     if (vault && vault.ready) await vault.ready
     result.vault_enabled = !!(vault && vault.enabled)
+    result.vault_automatic_supported = !!(
+      vault && vault.automaticScans && vault.automaticScans.supported)
     result.vault_automatic_mode = "automatic"
     result.vault_global_scan_ready = false
+    result.vault_automatic_result_signature = null
     if (result.vault_enabled) {
       try {
         const snapshot = await vault.automaticScanStatus()
@@ -2007,6 +2010,14 @@ class Server {
         result.vault_automatic_mode = setting && setting.mode === "manual"
           ? "manual"
           : "automatic"
+        const automaticResult = Array.isArray(snapshot && snapshot.rows)
+          ? snapshot.rows.find((item) =>
+            item && item.app === name && item.state === "result")
+          : null
+        result.vault_automatic_result_signature = automaticResult &&
+          typeof automaticResult.signature === "string"
+          ? automaticResult.signature
+          : null
       } catch (_) {}
     }
     if (!registryEnabled) {
@@ -6685,6 +6696,9 @@ class Server {
     this.app = express();
     this.app.use((req, res, next) => {
       res.locals.vaultEnabled = !!(this.kernel.vault && this.kernel.vault.enabled)
+      res.locals.vaultAutomaticSupported = !!(
+        this.kernel.vault && this.kernel.vault.automaticScans &&
+        this.kernel.vault.automaticScans.supported)
       next()
     })
     this.app.use(cors({
@@ -15755,7 +15769,7 @@ class Server {
 //    }))
 
 
-    // Automatic app-scan notices are read separately so loading the shared
+    // Automatic app-scan state is read separately so loading the shared
     // layout never creates Disk Saver storage.
     this.app.get("/info/vault/automatic-scans", ex(async (req, res) => {
       if (!privacyFilterCache.isSameOriginRequest(req)) {
@@ -15765,6 +15779,10 @@ class Server {
       const vault = this.kernel.vault
       if (vault && vault.ready) await vault.ready
       if (!vault || !vault.enabled) {
+        res.sendStatus(404)
+        return
+      }
+      if (!vault.automaticScans.supported) {
         res.sendStatus(404)
         return
       }
@@ -15788,12 +15806,23 @@ class Server {
         if (heartbeat) clearInterval(heartbeat)
         unsubscribe()
       }
+      const reconnect = () => {
+        try {
+          if (!disconnected()) res.end()
+        } finally {
+          close()
+        }
+      }
       req.once("close", close)
       res.once("close", close)
       const vault = this.kernel.vault
       if (vault && vault.ready) await vault.ready
       if (disconnected()) return
       if (!vault || !vault.enabled) {
+        res.sendStatus(404)
+        return
+      }
+      if (!vault.automaticScans.supported) {
         res.sendStatus(404)
         return
       }
@@ -15811,7 +15840,7 @@ class Server {
         if (disconnected()) return
         res.write(`data: ${JSON.stringify(snapshot)}\n\n`)
       }
-      unsubscribe = vault.automaticScans.subscribe(send)
+      unsubscribe = vault.automaticScans.subscribe(send, reconnect)
       if (disconnected()) {
         unsubscribe()
         return

@@ -91,11 +91,12 @@ class Sweeper {
     })
 
     const registry = this.vault.registry
-    const runId = await registry.beginScan(scopeId)
+    let runId = null
     let outcome = "failed"
     let fatalError = null
     let affectedApps = []
     try {
+      runId = await registry.beginScan(scopeId)
       await this.vault.refreshSources()
       if (!scopeId) {
         const unavailable = this.vault.sources().find((source) =>
@@ -174,7 +175,7 @@ class Sweeper {
         ? publication.affected_apps
         : []
     } catch (error) {
-      await registry.abortScan(runId).catch(() => {})
+      if (runId !== null) await registry.abortScan(runId).catch(() => {})
       if (error && error.code === "EVAULTCANCELLED") {
         outcome = "cancelled"
       } else {
@@ -435,6 +436,7 @@ class Sweeper {
       this.checkpoint()
       const batch = await this.vault.registry.hashWorkBatch(runId, cursor)
       if (!batch.length) return
+      const completed = []
       for (const candidate of batch) {
         this.checkpoint()
         cursor = {
@@ -450,12 +452,23 @@ class Sweeper {
           this.applyPreview(updated.preview)
           continue
         }
-        await this.hashCandidateRoutes(runId, candidate)
+        await this.hashCandidateRoutes(runId, candidate, completed)
+      }
+      if (completed.length) {
+        this.checkpoint()
+        const updated = await this.vault.registry.setStageHashes(
+          runId,
+          completed.map((entry) => ({
+            path: entry.path,
+            hash: entry.hash
+          }))
+        )
+        this.applyPreview(updated.preview)
       }
     }
   }
 
-  async hashCandidateRoutes(runId, work) {
+  async hashCandidateRoutes(runId, work, completed = null) {
     let candidate = work
     let deferCompletion = false
     while (candidate) {
@@ -494,21 +507,32 @@ class Sweeper {
           deferCompletion = !candidate && retry.anchor_fallback
           continue
         }
-        const updated = candidate.nlink > 1 && candidate.ino !== 0
-          ? await this.vault.registry.setStageInodeHash(
-            runId, candidate.dev, candidate.ino, verified.result.hash)
-          : await this.vault.registry.setStageHash(
-            runId, candidate.path, verified.result.hash)
+        const staged = completed &&
+          !(candidate.nlink > 1 && candidate.ino !== 0)
+          ? null
+          : candidate.nlink > 1 && candidate.ino !== 0
+            ? await this.vault.registry.setStageInodeHash(
+              runId, candidate.dev, candidate.ino, verified.result.hash)
+            : await this.vault.registry.setStageHash(
+              runId, candidate.path, verified.result.hash)
+        if (!staged) {
+          completed.push({
+            path: candidate.path,
+            hash: verified.result.hash
+          })
+        }
         this.state.hashed += 1
         this.state.hash_bytes += verified.result.size
-        this.state.inode_reuses += Math.max(0, updated.changes - 1)
-        this.applyPreview(updated.preview)
+        if (staged) {
+          this.state.inode_reuses += Math.max(0, staged.changes - 1)
+          this.applyPreview(staged.preview)
+        }
         candidate = null
         deferCompletion = false
       } catch (error) {
+        if (error && error.code === "EVAULTCANCELLED") throw error
         const retry = await this.vault.registry.markStageHashFailed(
           runId, candidate)
-        if (error && error.code === "EVAULTCANCELLED") throw error
         if (!candidate.comparison_only && !this.recordExclusion(
           error, candidate.path, candidate.source_id, null, candidate
         )) throw error
@@ -565,10 +589,10 @@ class Sweeper {
             completeWork = !retry.retry_available
           }
         } catch (error) {
+          if (error && error.code === "EVAULTCANCELLED") throw error
           const retry =
             await this.vault.registry.markAnchorVerificationFailed(
               runId, anchor)
-          if (error && error.code === "EVAULTCANCELLED") throw error
           if (!this.recordExclusion(error, anchor.path)) throw error
           completeWork = !retry.retry_available
         } finally {

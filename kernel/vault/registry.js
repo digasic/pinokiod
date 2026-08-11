@@ -1,9 +1,19 @@
 const path = require("path")
-const { Worker } = require("worker_threads")
+const { fork } = require("child_process")
+
+const waitForExit = (worker) => new Promise((resolve) => {
+  if (!worker || worker.exitCode !== null || worker.signalCode !== null) {
+    resolve()
+    return
+  }
+  worker.once("exit", resolve)
+})
 
 class Registry {
-  constructor(root) {
+  constructor(root, options = {}) {
     this.root = path.resolve(root)
+    this.workerPath = path.resolve(
+      options.workerPath || path.resolve(__dirname, "registry_worker.js"))
     this.worker = null
     this.sequence = 0
     this.pending = new Map()
@@ -13,9 +23,13 @@ class Registry {
   async load() {
     if (this.worker) return this.call("load")
     this.closed = false
-    const worker = new Worker(
-      path.resolve(__dirname, "registry_worker.js"),
-      { workerData: { root: this.root } }
+    const worker = fork(
+      this.workerPath,
+      [this.root],
+      {
+        stdio: ["ignore", "inherit", "inherit", "ipc"],
+        serialization: "advanced"
+      }
     )
     this.worker = worker
     worker.on("message", (message) => {
@@ -31,10 +45,13 @@ class Registry {
         pending.resolve(message.result)
       }
     })
-    worker.on("error", (error) => this.fail(error))
+    worker.on("error", (error) => {
+      if (this.worker === worker) this.fail(error)
+    })
     worker.on("exit", (code) => {
-      if (this.worker === worker) this.worker = null
-      if (!this.closed) {
+      const active = this.worker === worker
+      if (active) this.worker = null
+      if (active && !this.closed) {
         this.fail(new Error(`Registry worker exited with code ${code}`))
       }
     })
@@ -43,7 +60,8 @@ class Registry {
     } catch (error) {
       this.closed = true
       if (this.worker === worker) this.worker = null
-      await worker.terminate().catch(() => {})
+      worker.kill("SIGKILL")
+      await waitForExit(worker)
       throw error
     }
   }
@@ -62,12 +80,30 @@ class Registry {
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject })
       try {
-        this.worker.postMessage({ id, method, args })
+        this.worker.send({ id, method, args }, (error) => {
+          if (!error) return
+          const pending = this.pending.get(id)
+          if (!pending) return
+          this.pending.delete(id)
+          pending.reject(error)
+        })
       } catch (error) {
         this.pending.delete(id)
         reject(error)
       }
     })
+  }
+
+  async restart(error = null) {
+    const failure = error || new Error("Registry worker restarted.")
+    const worker = this.worker
+    if (!worker) return this.load()
+    if (this.worker === worker) this.worker = null
+    this.fail(failure)
+    worker.kill("SIGKILL")
+    await waitForExit(worker)
+    this.closed = false
+    return this.load()
   }
 
   async close() {
@@ -78,7 +114,8 @@ class Registry {
       await this.call("close")
     } finally {
       if (this.worker === worker) this.worker = null
-      await worker.terminate()
+      worker.kill("SIGTERM")
+      await waitForExit(worker)
     }
   }
 }
@@ -128,6 +165,8 @@ for (const method of [
   "setAutomaticAppScanAcknowledgement",
   "beginAutomaticPrecheck",
   "stageAutomaticPrecheckFiles",
+  "automaticPrecheckEntries",
+  "rememberHashCache",
   "automaticPrecheckResult",
   "abortAutomaticPrecheck",
   "removeAutomaticAppScanApp",
@@ -145,6 +184,7 @@ for (const method of [
   "stagedHashWork",
   "stageAnchors",
   "hashWorkBatch",
+  "setStageHashes",
   "setStageHash",
   "setStageInodeHash",
   "markStageHashFailed",

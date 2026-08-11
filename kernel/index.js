@@ -1062,6 +1062,19 @@ class Kernel {
   kill() {
     process.kill(process.pid, "SIGTERM")
   }
+  async disposeVault() {
+    const vault = this.vault
+    if (!vault) return false
+    if (vault.ready) await Promise.resolve(vault.ready).catch(() => {})
+    try {
+      await vault.dispose()
+      return true
+    } catch (error) {
+      console.warn("Vault cleanup error:",
+        error && error.message ? error.message : error)
+      return false
+    }
+  }
 ///  async fileserver() {
 ///    await this.exec({
 ///      message: `npx -y filexplorer --serveDirectory ${this.homedir}`
@@ -1079,6 +1092,8 @@ class Kernel {
     })
 
     let home = this.store.get("home") || process.env.PINOKIO_HOME
+    await this.disposeVault()
+    this.vault = null
     this.homedir = home
 
     // reset shells if they exist
@@ -1247,12 +1262,20 @@ class Kernel {
       await this.git.loadCheckpoints()
       console.timeEnd("git.loadCheckpoints")
 
-      // Shared model store: startup reads only the enable flag. Registry and
-      // filesystem initialization are deferred until a Vault page or action
-      // calls ensureInitialized().
-      this.vault = new Vault(this)
+      // Disk Saver startup reads the enable flag and, where supported, starts
+      // its native API-directory watcher. Registry and scan initialization
+      // remain deferred until a Disk Saver page or action needs them.
+      const vault = new Vault(this)
+      this.vault = vault
       if (this.homedir) {
-        this.vault.ready = this.vault.init({ deferStorage: true }).catch((err) => {
+        vault.ready = vault.init({ deferStorage: true }).then(
+          async (result) => {
+            if (result && result.enabled) {
+              await vault.automaticScans.startWatcher()
+            }
+            return result
+          }
+        ).catch((err) => {
           // Keep an enabled Vault retryable after transient registry or
           // filesystem errors. A genuinely disabled Vault already has
           // enabled=false from its environment check.

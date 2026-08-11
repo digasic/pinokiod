@@ -1,7 +1,6 @@
-const { parentPort, workerData } = require("worker_threads")
 const RegistryCore = require("./registry_core")
 
-const registry = new RegistryCore(workerData.root)
+const registry = new RegistryCore(process.argv[2])
 let queue = Promise.resolve()
 
 const serializeError = (error) => ({
@@ -10,7 +9,11 @@ const serializeError = (error) => ({
   stack: error && error.stack ? error.stack : null
 })
 
-parentPort.on("message", ({ id, method, args }) => {
+const reply = (message) => {
+  if (process.connected) process.send(message)
+}
+
+process.on("message", ({ id, method, args }) => {
   queue = queue.then(async () => {
     if (!method || typeof registry[method] !== "function") {
       const error = new Error(`Unknown registry command: ${method}`)
@@ -19,7 +22,15 @@ parentPort.on("message", ({ id, method, args }) => {
     }
     return registry[method](...(Array.isArray(args) ? args : []))
   }).then(
-    (result) => parentPort.postMessage({ id, result }),
-    (error) => parentPort.postMessage({ id, error: serializeError(error) })
+    (result) => reply({ id, result }),
+    (error) => reply({ id, error: serializeError(error) })
   )
+})
+
+process.on("disconnect", () => {
+  try {
+    registry.close()
+  } finally {
+    process.exit(0)
+  }
 })
