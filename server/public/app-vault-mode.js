@@ -167,7 +167,8 @@
         tab.classList.remove("app-vault-result-attention")
       }
     })
-    tab.addEventListener("click", () => {
+    tab.addEventListener("click", (event) => {
+      if (!event.isTrusted) return
       const signature = status.dataset.resultSignature || ""
       if (!signature) return
       requestAutomaticScanFocus(signature)

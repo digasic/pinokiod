@@ -221,7 +221,7 @@ test("the app workspace presents the automatic-result coachmark without starting
   assert.doesNotMatch(present, /innerHTML|post\(|btn-scan\.click/)
 })
 
-test("selecting a badged row acknowledges it without delaying navigation", async () => {
+test("user-selecting a badged row acknowledges it without delaying navigation", async () => {
   const script = await fs.promises.readFile(
     path.join(root, "server", "public", "app-vault-mode.js"), "utf8")
   const parent = new JSDOM("", { url: "http://localhost/" })
@@ -256,14 +256,19 @@ test("selecting a badged row acknowledges it without delaying navigation", async
     }
   }
 
-  dom.window.eval(script)
   const tab = dom.window.document.getElementById("save-space-tab")
-  let preventedByHandler = null
-  tab.addEventListener("click", (event) => {
-    preventedByHandler = event.defaultPrevented
-    event.preventDefault()
+  let clickHandler
+  const addEventListener = tab.addEventListener.bind(tab)
+  tab.addEventListener = (type, listener, options) => {
+    if (type === "click") clickHandler = listener
+    addEventListener(type, listener, options)
+  }
+  dom.window.eval(script)
+  let preventedByHandler = false
+  clickHandler({
+    isTrusted: true,
+    preventDefault: () => { preventedByHandler = true }
   })
-  tab.click()
 
   await waitFor(() => requests.length === 1)
   assert.equal(preventedByHandler, false)
@@ -284,6 +289,49 @@ test("selecting a badged row acknowledges it without delaying navigation", async
     app: "ComfyUI",
     signature: "a".repeat(64)
   })
+
+  dom.window.close()
+  parent.window.close()
+})
+
+test("programmatic tab clicks do not acknowledge a result", async () => {
+  const script = await fs.promises.readFile(
+    path.join(root, "server", "public", "app-vault-mode.js"), "utf8")
+  const signature = "e".repeat(64)
+  const parent = new JSDOM("", { url: "http://localhost/" })
+  const dom = new JSDOM(`<a id="save-space-tab" href="/vault/app/ComfyUI">
+    <span data-app-vault-result-badge></span>
+    <span data-app-vault-mode data-app="ComfyUI" data-mode="automatic"
+      data-ready="true" data-result-signature="${signature}">
+      <span data-app-vault-mode-label>Auto</span>
+    </span>
+  </a>`, {
+    runScripts: "outside-only",
+    url: "http://localhost/v/ComfyUI"
+  })
+  Object.defineProperty(dom.window, "parent", {
+    configurable: true,
+    value: parent.window
+  })
+  parent.window.postMessage = () => {}
+  const requests = []
+  dom.window.fetch = async (url, options = {}) => {
+    requests.push({ url, options })
+    return { ok: true, json: async () => ({}) }
+  }
+
+  dom.window.eval(script)
+  const tab = dom.window.document.getElementById("save-space-tab")
+  tab.addEventListener("click", (event) => event.preventDefault())
+  tab.click()
+
+  assert.equal(requests.length, 0)
+  assert.equal(tab.querySelector("[data-app-vault-result-badge]").hidden,
+    false)
+  assert.equal(dom.window.document.querySelector("[data-app-vault-mode]")
+    .dataset.resultSignature, signature)
+  assert.equal(dom.window.sessionStorage.getItem(
+    "pinokio:vault:auto-scan-focus:ComfyUI"), null)
 
   dom.window.close()
   parent.window.close()
@@ -336,8 +384,15 @@ test("a retained Disk Saver handoff targets the visible existing frame", async (
     json: async () => ({ acknowledged: true, app: "ComfyUI" })
   })
 
+  const tab = dom.window.document.getElementById("save-space-tab")
+  let clickHandler
+  const addEventListener = tab.addEventListener.bind(tab)
+  tab.addEventListener = (type, listener, options) => {
+    if (type === "click") clickHandler = listener
+    addEventListener(type, listener, options)
+  }
   dom.window.eval(script)
-  dom.window.document.getElementById("save-space-tab").click()
+  clickHandler({ isTrusted: true })
   await waitFor(() => visibleMessages.length === 1)
 
   assert.deepEqual(hiddenMessages, [])

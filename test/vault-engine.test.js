@@ -342,11 +342,15 @@ describe("Save Space engine", () => {
       mode: "automatic"
     }), { app: "demo", mode: "automatic" })
     const launchPath = path.join(home, "api", "demo", "start.js")
+    const modelPath = path.join(home, "api", "demo", "model.bin")
     vault.automaticScans.handleStarted(launchPath)
+    vault.automaticScans.recordChangedPath(modelPath)
     await vault.automaticScans.handleStopped(launchPath)
     assert.equal(vault.automaticScans.pendingStops.size, 0)
+    assert.equal(vault.automaticScans.changedPaths.has("demo"), false)
     assert.deepEqual(vault.automaticScans.snapshot().rows, [])
 
+    vault.automaticScans.changedPaths.set("demo", new Set([modelPath]))
     assert.equal((await vault.perform("scan", {
       candidate_size: 0
     })).started, true)
@@ -354,6 +358,9 @@ describe("Save Space engine", () => {
       !vault.scanPromise && !vault.scanCompletionPromise)
 
     assert.equal(await vault.globalScanReady(), true)
+    assert.equal(vault.automaticScans.changedPaths.has("demo"), false)
+    assert.equal(vault.automaticScans.active, null)
+    assert.equal(vault.automaticScans.entries.has("demo"), false)
     await vault.automaticScans.scanFinished({
       scopeId: null,
       result: { outcome: "cancelled" },

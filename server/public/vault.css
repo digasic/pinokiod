@@ -1678,6 +1678,40 @@ body.vault-page .vault-view-tabs {
 .vault-view-tabs .vault-nav-count {
   font-size: 10.5px;
 }
+.vault-view-tabs .vault-nav-row.attention {
+  background: color-mix(in srgb, var(--vault-warning) 9%, var(--task-panel));
+  color: var(--vault-warning);
+}
+.vault-view-tabs .vault-nav-row.attention:hover {
+  background: color-mix(in srgb, var(--vault-warning) 14%, var(--task-panel));
+}
+.vault-view-tabs .vault-nav-row.attention.selected {
+  border-bottom-color: var(--task-accent);
+}
+.vault-view-tabs .vault-nav-row.attention .vault-nav-name {
+  color: var(--vault-warning);
+  font-weight: 680;
+}
+.vault-view-tabs .vault-nav-row.attention .vault-nav-name::before {
+  width: 6px;
+  height: 6px;
+  display: inline-block;
+  margin-right: 6px;
+  border-radius: 50%;
+  background: var(--vault-warning);
+  content: "";
+  vertical-align: 1px;
+}
+.vault-view-tabs .vault-nav-row.attention .vault-nav-count {
+  min-width: 20px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--vault-warning) 72%, var(--task-panel));
+  color: #241300;
+  font-weight: 720;
+  line-height: 1.35;
+  text-align: center;
+}
 .vault-pane-action-note { color: var(--task-muted); font-size: 11.5px; white-space: nowrap; }
 .vault-toolbar {
   display: flex;
@@ -2099,7 +2133,11 @@ body.dark .vault-row-action .vault-text-button:hover:not(:disabled) {
 .vault-event-time { color: var(--task-muted); font-size: 10.5px; }
 .vault-unavailable { color: var(--task-muted); font-size: 11px; }
 @media (max-width: 1140px) {
-  .vault-overview { align-items: flex-start; flex-direction: column; }
+  .vault-overview {
+    min-height: auto;
+    align-items: flex-start;
+    flex-direction: column;
+  }
   .vault-overview-actions { width: 100%; justify-content: flex-start; }
   .vault-scan-coachmark { right: auto; left: 0; }
   .vault-metrics { width: 100%; }

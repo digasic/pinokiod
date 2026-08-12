@@ -2801,15 +2801,44 @@ class RegistryCore {
     let dev = Number(after.dev) || 0
     let size = Number(after.size) || 0
     let afterPath = typeof after.path === "string" ? after.path : ""
+    const possiblePeer = `(
+      EXISTS (
+        SELECT 1 FROM automatic_precheck_files peer
+        WHERE peer.app = candidate.app
+          AND peer.dev = candidate.dev
+          AND peer.size = candidate.size
+          AND pinokio_path_key(peer.path) !=
+            pinokio_path_key(candidate.path)
+      )
+      OR EXISTS (
+        SELECT 1 FROM files peer
+        WHERE peer.dev = candidate.dev
+          AND peer.size = candidate.size
+          AND peer.unavailable_reason IS NOT 'stale'
+          AND pinokio_path_key(peer.path) !=
+            pinokio_path_key(candidate.path)
+      )
+      OR EXISTS (
+        SELECT 1 FROM anchors peer
+        WHERE peer.verified_at IS NOT NULL
+          AND peer.dev = candidate.dev
+          AND peer.size = candidate.size
+          AND pinokio_path_key(peer.path) !=
+            pinokio_path_key(candidate.path)
+      )
+    )`
     if (!phase) {
       const group = this.database.prepare(`
-        SELECT dev, size
-        FROM automatic_precheck_files
-        WHERE app = @app AND (
-          @has_cursor = 0 OR dev > @dev OR (dev = @dev AND size > @size)
-        )
-        GROUP BY dev, size
-        ORDER BY dev, size
+        SELECT candidate.dev, candidate.size
+        FROM automatic_precheck_files candidate
+        WHERE candidate.app = @app
+          AND ${possiblePeer}
+          AND (
+            @has_cursor = 0 OR candidate.dev > @dev OR
+            (candidate.dev = @dev AND candidate.size > @size)
+          )
+        GROUP BY candidate.dev, candidate.size
+        ORDER BY candidate.dev, candidate.size
         LIMIT 1
       `).get({
         app,
@@ -2867,23 +2896,30 @@ class RegistryCore {
       rows = this.database.prepare(`
         SELECT
           'anchor' AS kind,
-          path,
-          size,
-          mtime,
-          ctime,
-          dev,
-          ino,
-          nlink,
-          mode,
-          uid,
-          gid,
-          hash
-        FROM anchors
-        WHERE dev = @dev
-          AND size = @size
-          AND path > @path
-          AND verified_at IS NOT NULL
-        ORDER BY path
+          anchor.path,
+          anchor.size,
+          anchor.mtime,
+          anchor.ctime,
+          anchor.dev,
+          anchor.ino,
+          anchor.nlink,
+          anchor.mode,
+          anchor.uid,
+          anchor.gid,
+          anchor.hash,
+          cached.hash AS cached_hash,
+          cached.size AS cached_size,
+          cached.mtime AS cached_mtime,
+          cached.ctime AS cached_ctime,
+          cached.dev AS cached_dev,
+          cached.ino AS cached_ino
+        FROM anchors anchor
+        LEFT JOIN hash_cache cached ON cached.path = anchor.path
+        WHERE anchor.dev = @dev
+          AND anchor.size = @size
+          AND anchor.path > @path
+          AND anchor.verified_at IS NOT NULL
+        ORDER BY anchor.path
         LIMIT @limit
       `).all({ dev, size, path: afterPath, limit: pageSize })
     } else {
@@ -2900,15 +2936,15 @@ class RegistryCore {
           peer.mode,
           peer.uid,
           peer.gid,
-          COALESCE(peer.hash, cached.hash) AS hash
+          peer.hash,
+          cached.hash AS cached_hash,
+          cached.size AS cached_size,
+          cached.mtime AS cached_mtime,
+          cached.ctime AS cached_ctime,
+          cached.dev AS cached_dev,
+          cached.ino AS cached_ino
         FROM files peer
-        LEFT JOIN hash_cache cached
-          ON cached.path = peer.path
-          AND cached.size = peer.size
-          AND cached.mtime = peer.mtime
-          AND cached.ctime = peer.ctime
-          AND cached.dev = peer.dev
-          AND cached.ino = peer.ino
+        LEFT JOIN hash_cache cached ON cached.path = peer.path
         WHERE peer.dev = @dev
           AND peer.size = @size
           AND peer.path > @path
@@ -2994,29 +3030,42 @@ class RegistryCore {
       hashes.set(canonicalPathKey(entry.path), entry.hash)
     }
     const rows = this.database.prepare(`
-      SELECT path, dev, size
+      SELECT path, dev, ino, size, mtime, ctime
       FROM automatic_precheck_files
       WHERE app = ?
-      ORDER BY pinokio_path_key(path), dev, size
+      ORDER BY pinokio_path_key(path), path, dev, ino, size, mtime, ctime
     `).iterate(app)
     const digest = crypto.createHash("sha256")
-    let files = 0
+    let proof = null
+    digest.update("automatic-precheck-snapshots\0")
     for (const row of rows) {
-      const hash = hashes.get(canonicalPathKey(row.path))
-      if (!hash) continue
-      digest.update(canonicalPathKey(row.path))
-      digest.update("\0")
-      digest.update(String(row.dev))
-      digest.update("\0")
-      digest.update(String(row.size))
-      digest.update("\0")
-      digest.update(hash)
-      digest.update("\n")
-      files += 1
+      const canonicalPath = canonicalPathKey(row.path)
+      const hash = hashes.get(canonicalPath)
+      if (!proof && hash) proof = { canonicalPath, row, hash }
+      for (const value of [
+        canonicalPath,
+        row.dev,
+        row.ino,
+        row.size,
+        row.mtime,
+        row.ctime
+      ]) {
+        digest.update(String(value))
+        digest.update("\0")
+      }
     }
+    if (!proof) return { signature: null, files: 0 }
+    digest.update("automatic-precheck-proof\0")
+    digest.update(proof.canonicalPath)
+    digest.update("\0")
+    digest.update(String(proof.row.dev))
+    digest.update("\0")
+    digest.update(String(proof.row.size))
+    digest.update("\0")
+    digest.update(proof.hash)
     return {
-      signature: files ? digest.digest("hex") : null,
-      files
+      signature: digest.digest("hex"),
+      files: 1
     }
   }
 

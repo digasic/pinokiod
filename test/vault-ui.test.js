@@ -547,7 +547,17 @@ describe("Save Space interface", () => {
     assert.match(vaultCss,
       /body\.vault-page \.vault-view-tabs\s*\{[^}]*padding:\s*0;/s)
     assert.match(vaultCss,
+      /@media \(max-width: 1140px\)[\s\S]*?\.vault-overview\s*\{[^}]*min-height:\s*auto;/s)
+    assert.match(vaultCss,
       /body\.dark\.vault-page\s*\{[^}]*--task-panel:\s*var\(--pinokio-sidebar-tabbar-bg\);/s)
+    assert.match(vaultCss,
+      /\.vault-view-tabs \.vault-nav-row\.attention\s*\{[^}]*background:/s)
+    assert.match(vaultCss,
+      /\.vault-view-tabs \.vault-nav-row\.attention \.vault-nav-name::before\s*\{[^}]*background:\s*var\(--vault-warning\);/s)
+    assert.match(vaultCss,
+      /\.vault-view-tabs \.vault-nav-row\.attention \.vault-nav-count\s*\{[^}]*background:/s)
+    assert.match(vaultCss,
+      /\.vault-view-tabs \.vault-nav-row\.attention\.selected\s*\{[^}]*border-bottom-color:\s*var\(--task-accent\);/s)
     assert.match(vaultCss,
       /\.vault-scan-control\s*>\s*\.vault-scan-action\s*\{[^}]*border-radius:\s*7px 0 0 7px;/s)
     assert.match(vaultCss,
@@ -2549,6 +2559,60 @@ describe("Save Space interface", () => {
       ".vault-setup-copy").textContent, /automatic/i)
 
     dom.window.close()
+  })
+
+  test("actionable tabs highlight nonzero cleanup opportunities", async () => {
+    const actionableStatus = fixture([
+      item({
+        path: "/pinokio/api/app/duplicate.bin",
+        relative_path: "duplicate.bin",
+        status: "duplicate",
+        shareable: true
+      }),
+      item({
+        path: "/pinokio/api/app/unused.bin",
+        relative_path: "unused.bin",
+        orphan: true
+      })
+    ], {
+      reclaimable: 4096
+    })
+    const { dom } = await makePage(actionableStatus)
+
+    for (const view of ["duplicates", "reclaimable"]) {
+      const tab = dom.window.document.querySelector(`[data-view="${view}"]`)
+      const count = tab.querySelector(".vault-nav-count")
+      assert.equal(count.textContent.trim(), "1")
+      assert.equal(tab.classList.contains("attention"), true)
+      assert.equal(count.classList.contains("attention"), true)
+    }
+    dom.window.close()
+
+    const { dom: emptyDom } = await makePage(fixture([item()]))
+
+    for (const view of ["duplicates", "reclaimable"]) {
+      const tab = emptyDom.window.document.querySelector(`[data-view="${view}"]`)
+      const count = tab.querySelector(".vault-nav-count")
+      assert.equal(count.textContent.trim(), "0")
+      assert.equal(tab.classList.contains("attention"), false)
+      assert.equal(count.classList.contains("attention"), false)
+    }
+    emptyDom.window.close()
+
+    const appStatus = fixture([item({
+      status: "duplicate",
+      shareable: true
+    })])
+    const { dom: appDom } = await makePage(appStatus, {
+      appMode: true,
+      scopeId: "app:app"
+    })
+
+    assert.equal(appDom.window.document.querySelector(
+      '[data-view="duplicates"]').classList.contains("attention"), true)
+    assert.equal(appDom.window.document.querySelector(
+      '[data-view="reclaimable"]'), null)
+    appDom.window.close()
   })
 
   test("app setup remains visible during global scan progress", async () => {

@@ -707,16 +707,20 @@ const eventLabels = {
 }
 const renderViews = () => {
   const counts = state.data.inventory.counts
+  const attentionViews = new Set(["duplicates", "reclaimable"])
   el("views-label").textContent = COPY.views
   const views = IS_APP_MODE
     ? ["all", "duplicates", "unavailable", "shared", "tracked", "activity"]
     : ["all", "duplicates", "unavailable", "shared", "tracked", "reclaimable", "activity"]
-  el("vault-views").innerHTML = views.map((view) => `
-    <button class="vault-nav-row ${state.view === view ? "selected" : ""}" type="button" data-view="${view}" ${state.view === view ? 'aria-current="page"' : ""}>
+  el("vault-views").innerHTML = views.map((view) => {
+    const needsAttention = attentionViews.has(view) && Number(counts[view]) > 0
+    return `
+    <button class="vault-nav-row ${state.view === view ? "selected" : ""} ${needsAttention ? "attention" : ""}" type="button" data-view="${view}" ${state.view === view ? 'aria-current="page"' : ""}>
       <i class="${viewIcon[view]}"></i>
       <span class="vault-nav-copy"><span class="vault-nav-name">${esc(viewLabel[view])}</span></span>
-      <span class="vault-nav-count ${view === "duplicates" && counts[view] ? "attention" : ""}">${counts[view]}</span>
-    </button>`).join("")
+      <span class="vault-nav-count ${needsAttention ? "attention" : ""}">${counts[view]}</span>
+    </button>`
+  }).join("")
 }
 
 const renderSourceNode = (source, depth, counts) => {

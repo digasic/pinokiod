@@ -7,7 +7,7 @@ const {
   ENTRY_BATCH_SIZE
 } = require("./constants")
 const { statMany } = require("./walker")
-const { sameSnapshot } = require("./snapshot")
+const { fileSnapshot, sameSnapshot } = require("./snapshot")
 const {
   cancelledError,
   isPathError
@@ -56,6 +56,7 @@ class AutomaticScans {
     this.lifecycleWork = new Set()
     this.stopSettleMs = STOP_SETTLE_MS
     this.drainQueued = false
+    this.drainRequested = false
     this.waitingFor = null
     this.listeners = new Set()
     this.appTransitions = new Map()
@@ -148,24 +149,59 @@ class AutomaticScans {
       })
       return
     }
-    for (const event of events || []) {
+    const watcherEvents = Array.isArray(events) ? events : []
+    if (!watcherEvents.some((event) => event && event.type === "delete")) {
+      for (const event of watcherEvents) {
+        if (event && ["create", "update"].includes(event.type)) {
+          this.recordChangedPath(event.path)
+        }
+      }
+      return
+    }
+    const batches = new Map()
+    for (let index = 0; index < watcherEvents.length; index++) {
+      const event = watcherEvents[index]
       if (!event || !["create", "update", "delete"].includes(event.type)) {
         continue
       }
-      this.recordChangedPath(event.path)
+      const target = this.changedPathTarget(
+        event.path, event.type === "delete")
+      if (!target) continue
+      let batch = batches.get(target.app)
+      if (!batch) {
+        batch = {
+          root: target.root,
+          updates: new Map(),
+          deletes: new Map()
+        }
+        batches.set(target.app, batch)
+      }
+      const key = pathKey(target.path)
+      if (event.type === "delete") batch.deletes.set(key, index)
+      else batch.updates.set(key, { index, path: target.path })
+    }
+    for (const [app, batch] of batches) {
+      this.applyChangedPathBatch(app, batch)
     }
   }
 
-  recordChangedPath(filePath) {
+  changedPathTarget(filePath, allowRoot = false) {
     if (this.disposed || !this.supported ||
         typeof filePath !== "string" || !filePath) {
-      return false
+      return null
     }
     const app = this.appForLaunchPath(filePath)
-    if (!app || !this.observedApps.has(app)) return false
-    const appRoot = path.resolve(this.vault.kernel.homedir, "api", app)
+    if (!app || !this.observedApps.has(app)) return null
+    const root = path.resolve(this.vault.kernel.homedir, "api", app)
     const resolved = path.resolve(filePath)
-    if (resolved === appRoot || !inside(appRoot, resolved)) return false
+    if ((!allowRoot && resolved === root) || !inside(root, resolved)) return null
+    return { app, root, path: resolved }
+  }
+
+  recordChangedPath(filePath) {
+    const target = this.changedPathTarget(filePath)
+    if (!target) return false
+    const { app, path: resolved } = target
     let paths = this.changedPaths.get(app)
     if (!paths) {
       paths = new Set()
@@ -175,6 +211,52 @@ class AutomaticScans {
     return true
   }
 
+  lastDeleteIndex(root, filePath, deletes) {
+    const rootKey = pathKey(root)
+    let current = path.resolve(filePath)
+    let latest = -1
+    while (true) {
+      const key = pathKey(current)
+      const index = deletes.get(key)
+      if (index !== undefined && index > latest) latest = index
+      if (key === rootKey) return latest
+      current = path.dirname(current)
+    }
+  }
+
+  applyChangedPathBatch(app, { root, updates, deletes }) {
+    const paths = this.changedPaths.get(app)
+    if (!deletes.size) {
+      const collected = paths || new Set()
+      for (const update of updates.values()) collected.add(update.path)
+      if (collected.size) this.changedPaths.set(app, collected)
+      return
+    }
+    const retained = new Set()
+    if (paths) {
+      for (const candidate of paths) {
+        const key = pathKey(candidate)
+        const update = updates.get(key)
+        if (this.lastDeleteIndex(root, candidate, deletes) >
+            (update ? update.index : -1) || retained.has(key)) {
+          paths.delete(candidate)
+        } else {
+          retained.add(key)
+        }
+      }
+    }
+    let collected = paths
+    for (const [key, update] of updates) {
+      if (update.index <= this.lastDeleteIndex(root, update.path, deletes) ||
+          retained.has(key)) continue
+      if (!collected) collected = new Set()
+      collected.add(update.path)
+      retained.add(key)
+    }
+    if (collected && collected.size) this.changedPaths.set(app, collected)
+    else this.changedPaths.delete(app)
+  }
+
   discardChangedPaths(app) {
     this.changedPaths.delete(app)
   }
@@ -182,14 +264,20 @@ class AutomaticScans {
   consumeChangedPaths(app, paths) {
     const collected = this.changedPaths.get(app)
     if (!collected) return
-    for (const filePath of paths || []) collected.delete(filePath)
-    if (!collected.size) this.changedPaths.delete(app)
+    for (const filePath of paths || []) {
+      collected.delete(path.resolve(filePath))
+    }
+    if (!collected.size) this.discardChangedPaths(app)
   }
 
   async candidateThreshold() {
-    const scan = this.vault.registry
-      ? await this.vault.registry.scanFor()
+    const cached = this.vault.lastScanCache &&
+      typeof this.vault.lastScanCache.get === "function"
+      ? this.vault.lastScanCache.get("")
       : null
+    const scan = cached || (this.vault.registry
+      ? await this.vault.registry.scanFor()
+      : null)
     const threshold = scan ? Number(scan.candidate_min_bytes) : NaN
     return Number.isFinite(threshold) && threshold >= 0
       ? threshold
@@ -726,24 +814,38 @@ class AutomaticScans {
   }
 
   schedule() {
-    if (this.disposed || this.drainQueued) return
+    if (this.disposed) return
+    if (this.drainQueued) {
+      this.drainRequested = true
+      return
+    }
     this.drainQueued = true
     queueMicrotask(() => {
-      this.drainQueued = false
-      const pending = this.drain()
+      const pending = (async () => {
+        do {
+          this.drainRequested = false
+          await this.drain()
+        } while (!this.disposed && this.drainRequested)
+      })()
       this.lifecycleWork.add(pending)
       pending.then(
-        () => this.lifecycleWork.delete(pending),
-        () => this.lifecycleWork.delete(pending)
+        () => {
+          this.lifecycleWork.delete(pending)
+          this.drainQueued = false
+          if (this.drainRequested) this.schedule()
+        },
+        (error) => {
+          this.lifecycleWork.delete(pending)
+          this.drainQueued = false
+          this.log("error", {
+            stage: "queue",
+            message: error && error.message ? error.message : String(error)
+          })
+          console.warn("Automatic Disk Saver check failed:",
+            error && error.message ? error.message : error)
+          if (this.drainRequested) this.schedule()
+        }
       )
-      pending.catch((error) => {
-        this.log("error", {
-          stage: "queue",
-          message: error && error.message ? error.message : String(error)
-        })
-        console.warn("Automatic Disk Saver check failed:",
-          error && error.message ? error.message : error)
-      })
     })
   }
 
@@ -792,44 +894,79 @@ class AutomaticScans {
     })
   }
 
-  async verifiedAutomaticHash(active, entry, memory, verifiedHashes, counts) {
+  async currentAutomaticEntry(active, entry, counts) {
     this.checkpoint(active)
     let current
     try {
       current = await fs.promises.lstat(entry.path)
     } catch (error) {
       if (!isPathError(error)) throw error
+      if (entry.kind === "changed" && isMissing(error)) {
+        counts.path_errors += 1
+        return null
+      }
       this.logVerificationSkip(active.app, entry, "unreadable", counts, error)
       return null
     }
     this.checkpoint(active)
     if (!current.isFile() || current.isSymbolicLink() ||
-        !sameSnapshot(entry, current)) {
+        current.dev !== entry.dev || current.size !== entry.size) {
       this.logVerificationSkip(
         active.app, entry, "snapshot-changed", counts)
       return null
     }
-    const key = this.automaticHashKey(entry)
-    const reusable = SHA256_RE.test(entry.hash || "")
-      ? entry.hash
-      : memory.get(key)
+    return {
+      stat: current,
+      entry: Object.assign({}, entry, fileSnapshot(current))
+    }
+  }
+
+  async verifiedAutomaticHash(
+    active, entry, memory, verifiedHashes, counts, prepared = null
+  ) {
+    const checked = prepared || await this.currentAutomaticEntry(
+      active, entry, counts)
+    if (!checked) return null
+    const current = checked.stat
+    const currentEntry = checked.entry
+    const key = this.automaticHashKey(currentEntry)
+    const cachedSnapshot = {
+      size: entry.cached_size,
+      mtime: entry.cached_mtime,
+      ctime: entry.cached_ctime,
+      dev: entry.cached_dev,
+      ino: entry.cached_ino
+    }
+    const reusable = memory.get(key) ||
+      (sameSnapshot(entry, current) && SHA256_RE.test(entry.hash || "")
+        ? entry.hash
+        : null) ||
+      (sameSnapshot(cachedSnapshot, current) &&
+        SHA256_RE.test(entry.cached_hash || "")
+        ? entry.cached_hash
+        : null)
     if (reusable) {
       counts.hash_reuses += 1
       memory.set(key, reusable)
-      verifiedHashes.set(pathKey(entry.path), Object.assign({}, entry, {
+      const verifiedEntry = Object.assign({}, currentEntry, {
         hash: reusable
-      }))
-      return reusable
+      })
+      verifiedHashes.set(pathKey(entry.path), verifiedEntry)
+      return verifiedEntry
     }
     let verified
     try {
-      verified = await this.vault.scanner.hashStable(entry, {
+      verified = await this.vault.scanner.hashStable(currentEntry, {
         signal: active.controller && active.controller.signal
       })
     } catch (error) {
       if (error && error.code === "EVAULTCANCELLED") throw error
       if (!isPathError(error)) throw error
       counts.hash_failures += 1
+      if (entry.kind === "changed" && isMissing(error)) {
+        counts.path_errors += 1
+        return null
+      }
       this.logVerificationSkip(active.app, entry, "hash-failed", counts, error)
       return null
     }
@@ -842,25 +979,36 @@ class AutomaticScans {
     counts.hashed += 1
     counts.hash_bytes += Math.max(0, Number(verified.result.size) || 0)
     memory.set(key, verified.result.hash)
-    verifiedHashes.set(pathKey(entry.path), Object.assign({}, entry, {
+    const verifiedEntry = Object.assign({}, currentEntry, {
       hash: verified.result.hash
-    }))
-    return verified.result.hash
+    })
+    verifiedHashes.set(pathKey(entry.path), verifiedEntry)
+    return verifiedEntry
   }
 
   async runPrecheck(active) {
     const app = active.app
     const root = path.resolve(this.vault.kernel.homedir, "api", app)
+    const startedAt = Date.now()
+    active.startedAt = startedAt
+    const markStage = (stage, entry = null) => {
+      active.stage = stage
+      active.stagePath = entry && entry.path ? entry.path : null
+      active.stageKind = entry && entry.kind ? entry.kind : null
+    }
+    markStage("app-root-check")
     if (!await this.appRootIsAvailable(app)) {
       const error = new Error("That app is no longer available.")
       error.code = "ENOENT"
       throw error
     }
-    const startedAt = Date.now()
     const counts = {
       files: 0,
       bytes: 0,
       candidates: 0,
+      registry_pages: 0,
+      candidate_checks: 0,
+      peer_checks: 0,
       path_errors: 0,
       hashed: 0,
       hash_bytes: 0,
@@ -868,11 +1016,11 @@ class AutomaticScans {
       hash_failures: 0,
       unstable_hashes: 0
     }
+    markStage("threshold-read")
     const threshold = await this.candidateThreshold()
     const paths = [...new Set(active.paths || [])].filter((filePath) =>
       typeof filePath === "string" && inside(root, filePath))
     const verifiedHashes = new Map()
-    await this.vault.registry.beginAutomaticPrecheck(app)
     this.log("check-started", {
       app,
       root,
@@ -880,6 +1028,8 @@ class AutomaticScans {
       changed_paths: paths.length,
       policy: "metadata-prefilter-sha256"
     })
+    markStage("staging-reset")
+    await this.vault.registry.beginAutomaticPrecheck(app)
     try {
       this.checkpoint(active)
       const metadataOptions = {
@@ -888,6 +1038,7 @@ class AutomaticScans {
         onError: (error, filePath) => {
           if (!isPathError(error)) return false
           counts.path_errors += 1
+          if (isMissing(error)) return true
           this.log("path-skipped", {
             app,
             path: filePath,
@@ -897,9 +1048,11 @@ class AutomaticScans {
           return true
         }
       }
+      markStage("changed-parent-metadata")
       const safePaths = await this.changedPathsWithSafeParents(
         paths, root, metadataOptions, () => this.checkpoint(active))
       this.checkpoint(active)
+      markStage("changed-path-metadata")
       const safeStats = await this.statChangedPaths(
         safePaths, metadataOptions, () => this.checkpoint(active))
       const statsByPath = new Map(safePaths.map((filePath, index) =>
@@ -926,107 +1079,164 @@ class AutomaticScans {
           gid: stat.gid
         })
       }
-      counts.candidates = candidates.length
       if (candidates.length) {
+        markStage("staging-write")
         await this.vault.registry.stageAutomaticPrecheckFiles(app, candidates)
       }
       this.checkpoint(active)
+      markStage("app-root-recheck")
       if (!await this.appRootIsAvailable(app)) {
         const error = new Error("That app is no longer available.")
         error.code = "ENOENT"
         throw error
       }
-      const verifiedMatches = []
+      this.log("verification-started", {
+        app,
+        files: counts.files,
+        bytes: counts.bytes,
+        threshold_candidates: candidates.length,
+        duration_ms: Date.now() - startedAt
+      })
+      let proof = null
       let group = null
+      const acceptProof = (candidate, peer, hash) => {
+        proof = { path: candidate.path, hash }
+        this.log("first-proof-exit", {
+          app,
+          candidate_path: candidate.path,
+          peer_path: peer.path,
+          peer_kind: peer.kind,
+          size: candidate.size,
+          duration_ms: Date.now() - startedAt,
+          registry_pages: counts.registry_pages,
+          candidate_checks: counts.candidate_checks,
+          peer_checks: counts.peer_checks,
+          hashed: counts.hashed,
+          hash_bytes: counts.hash_bytes,
+          hash_reuses: counts.hash_reuses
+        })
+      }
       const preparePeers = () => {
         if (!group || group.unmatched) return
         group.unmatched = new Map()
-        group.unmatchedIdentities = new Map()
         for (const [hash, value] of group.candidatesByHash) {
-          if (value.identities.size > 1) {
-            for (const candidate of value.candidates) {
-              group.matched.add(pathKey(candidate.path))
-            }
-          } else {
-            const identity = value.identities.values().next().value
-            group.unmatched.set(hash, {
-              identity,
-              candidates: value.candidates
-            })
-            group.unmatchedIdentities.set(
-              identity,
-              (group.unmatchedIdentities.get(identity) || 0) + 1)
-          }
+          group.unmatched.set(hash, {
+            identity: value.identities.values().next().value,
+            candidate: value.candidate
+          })
         }
       }
-      const finishGroup = () => {
-        if (!group) return
-        preparePeers()
-        for (const [hash, value] of group.candidatesByHash) {
-          for (const candidate of value.candidates) {
-            if (!group.matched.has(pathKey(candidate.path))) continue
-            verifiedMatches.push({ path: candidate.path, hash })
+      const hashCandidates = async (peerIdentity = null) => {
+        if (!group || group.candidatesHashed) return !!group
+        const identities = new Set(group.candidates.map((candidate) =>
+          this.automaticIdentityKey(candidate.entry)))
+        if (identities.size < 2 &&
+            (!peerIdentity || identities.has(peerIdentity))) {
+          return false
+        }
+        group.candidatesHashed = true
+        counts.candidates += group.candidates.length
+        for (const candidate of group.candidates) {
+          this.checkpoint(active)
+          markStage("candidate-hash", candidate.entry)
+          const verified = await this.verifiedAutomaticHash(
+            active,
+            candidate.entry,
+            group.memory,
+            verifiedHashes,
+            counts,
+            candidate
+          )
+          if (!verified) continue
+          const hash = verified.hash
+          let value = group.candidatesByHash.get(hash)
+          if (!value) {
+            value = { candidate: verified, identities: new Set() }
+            group.candidatesByHash.set(hash, value)
+          }
+          value.identities.add(this.automaticIdentityKey(verified))
+          if (value.identities.size > 1) {
+            acceptProof(value.candidate, verified, hash)
+            return true
           }
         }
+        preparePeers()
+        return true
+      }
+      const finishGroup = async () => {
+        if (!group) return false
+        await hashCandidates()
+        if (proof) return true
         group = null
+        return false
+      }
+      const complete = async () => {
+        this.checkpoint(active)
+        markStage("result-signature")
+        const result = await this.vault.registry.automaticPrecheckResult(
+          app, proof ? [proof] : [])
+        this.checkpoint(active)
+        return Object.assign({}, counts, {
+          signature: result.signature,
+          verified_files: Math.max(0, Number(result.files) || 0),
+          duration_ms: Date.now() - startedAt
+        })
       }
       let cursor = null
       do {
+        markStage("candidate-query")
+        counts.registry_pages += 1
         const page = await this.vault.registry.automaticPrecheckEntries(
           app, cursor, ENTRY_BATCH_SIZE)
         this.checkpoint(active)
         for (const entry of page.entries) {
           const key = `${entry.dev}\0${entry.size}`
           if (!group || group.key !== key) {
-            finishGroup()
+            if (await finishGroup()) return await complete()
             group = {
               key,
+              candidates: [],
+              candidatesHashed: false,
               candidatesByHash: new Map(),
-              matched: new Set(),
               unmatched: null,
-              unmatchedIdentities: null,
               memory: new Map()
             }
           }
           if (entry.kind === "changed") {
-            const candidate = entry
             this.checkpoint(active)
-            const hash = await this.verifiedAutomaticHash(
-              active, candidate, group.memory, verifiedHashes, counts)
-            if (!hash) continue
-            let value = group.candidatesByHash.get(hash)
-            if (!value) {
-              value = { candidates: [], identities: new Set() }
-              group.candidatesByHash.set(hash, value)
-            }
-            value.candidates.push(candidate)
-            value.identities.add(this.automaticIdentityKey(candidate))
+            markStage("candidate-metadata", entry)
+            counts.candidate_checks += 1
+            const candidate = await this.currentAutomaticEntry(
+              active, entry, counts)
+            if (candidate) group.candidates.push(candidate)
             continue
           }
-          preparePeers()
+          if (!group.candidatesHashed) await hashCandidates()
+          if (proof) return await complete()
+          if (group.candidatesHashed && !group.unmatched.size) continue
+          markStage("peer-metadata", entry)
+          counts.peer_checks += 1
+          const peer = await this.currentAutomaticEntry(active, entry, counts)
+          if (!peer) continue
+          const identity = this.automaticIdentityKey(peer.entry)
+          if (!await hashCandidates(identity)) continue
+          if (proof) return await complete()
           if (!group.unmatched.size) continue
+          if (![...group.unmatched.values()].some((wanted) =>
+            wanted.identity !== identity)) continue
           this.checkpoint(active)
-          const identity = this.automaticIdentityKey(entry)
-          if (group.unmatchedIdentities.size === 1 &&
-              group.unmatchedIdentities.has(identity)) continue
-          const hash = await this.verifiedAutomaticHash(
-            active, entry, group.memory, verifiedHashes, counts)
-          const wanted = hash && group.unmatched.get(hash)
+          markStage("peer-hash", entry)
+          const verified = await this.verifiedAutomaticHash(
+            active, entry, group.memory, verifiedHashes, counts, peer)
+          const wanted = verified && group.unmatched.get(verified.hash)
           if (!wanted || wanted.identity === identity) {
             continue
           }
-          for (const candidate of wanted.candidates) {
-            group.matched.add(pathKey(candidate.path))
-          }
-          group.unmatched.delete(hash)
-          const remaining = group.unmatchedIdentities.get(wanted.identity) - 1
-          if (remaining) {
-            group.unmatchedIdentities.set(wanted.identity, remaining)
-          } else {
-            group.unmatchedIdentities.delete(wanted.identity)
-          }
+          acceptProof(wanted.candidate, verified, verified.hash)
+          return await complete()
         }
         if (verifiedHashes.size >= ENTRY_BATCH_SIZE) {
+          markStage("hash-cache-write")
           await this.vault.registry.rememberHashCache(
             [...verifiedHashes.values()])
           verifiedHashes.clear()
@@ -1034,24 +1244,26 @@ class AutomaticScans {
         }
         cursor = page.next_cursor
       } while (cursor)
-      finishGroup()
-      this.checkpoint(active)
-      const result = await this.vault.registry.automaticPrecheckResult(
-        app, verifiedMatches)
-      this.checkpoint(active)
-      return Object.assign({}, counts, {
-        signature: result.signature,
-        verified_files: Math.max(0, Number(result.files) || 0),
-        duration_ms: Date.now() - startedAt
-      })
+      await finishGroup()
+      return await complete()
     } finally {
       try {
         if (verifiedHashes.size) {
-          await this.vault.registry.rememberHashCache(
-            [...verifiedHashes.values()])
+          try {
+            await this.vault.registry.rememberHashCache(
+              [...verifiedHashes.values()])
+          } catch (error) {
+            markStage("hash-cache-write")
+            throw error
+          }
         }
       } finally {
-        await this.vault.registry.abortAutomaticPrecheck(app)
+        try {
+          await this.vault.registry.abortAutomaticPrecheck(app)
+        } catch (error) {
+          markStage("staging-cleanup")
+          throw error
+        }
       }
     }
   }
@@ -1063,7 +1275,19 @@ class AutomaticScans {
       item.state === "checking")
     if (!entry) return
     await this.refreshGlobalScanReady()
-    if (this.disposed || !this.globalScanReady) return
+    if (this.disposed) return
+    if (!this.globalScanReady) {
+      if (this.entries.get(entry.app) === entry) {
+        this.restorePrevious(entry.app)
+        this.discardChangedPaths(entry.app)
+        this.log("check-skipped", {
+          app: entry.app,
+          reason: "global-scan-required"
+        })
+      }
+      this.schedule()
+      return
+    }
     if (this.manualDepth > 0 || this.currentBusyPromise() ||
         this.vault.fileActionProgress) {
       this.waitForBusyWork()
@@ -1143,10 +1367,22 @@ class AutomaticScans {
             ? (error.code === "EVAULTCANCELLED" ? "cancelled" : "failed")
             : "complete",
           cancel_reason: reason,
-          duration_ms: result && result.duration_ms,
+          duration_ms: result
+            ? result.duration_ms
+            : error && active.startedAt
+              ? Date.now() - active.startedAt
+              : undefined,
+          failure_stage: error && active.stage,
+          failure_path: error && (error.path || active.stagePath),
+          failure_kind: error && active.stageKind,
+          error_code: error && error.code,
+          error_syscall: error && error.syscall,
           files: result && result.files,
           bytes: result && result.bytes,
           candidates: result && result.candidates,
+          registry_pages: result && result.registry_pages,
+          candidate_checks: result && result.candidate_checks,
+          peer_checks: result && result.peer_checks,
           verified_files: result && result.verified_files,
           hashed: result && result.hashed,
           hash_bytes: result && result.hash_bytes,
