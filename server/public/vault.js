@@ -402,6 +402,7 @@ const PAGE_SIZE = 500
 const state = {
   data: null,
   candidateSize: defaultCandidateSize,
+  persistedCandidateSize: defaultCandidateSize,
   candidateSizeInitialized: false,
   view: "all",
   sourceId: SCOPE_ID,
@@ -545,6 +546,52 @@ const post = async (payload) => {
   }
   if (!result) throw new Error(COPY.action_request_failed.replace("{status}", response.status))
   return result
+}
+let candidateSizeSaveTail = Promise.resolve(true)
+let candidateSizeSaveGeneration = 0
+const saveCandidateSize = (size) => {
+  if (!candidateSizeOptions.includes(size)) return candidateSizeSaveTail
+  const generation = ++candidateSizeSaveGeneration
+  state.candidateSize = size
+  state.candidateSizeInitialized = true
+  renderCandidateSizeControl()
+  const save = candidateSizeSaveTail.then(async () => {
+    const result = await post({
+      action: "set_candidate_size",
+      scope_id: SCOPE_ID,
+      candidate_size: size
+    })
+    if (result.error) throw new Error(result.error)
+    state.persistedCandidateSize = size
+    return true
+  })
+  candidateSizeSaveTail = save.catch(async (error) => {
+    const isCurrent = () => generation === candidateSizeSaveGeneration
+    if (isCurrent() && candidateSize() === size) {
+      state.candidateSizeInitialized = false
+      const refreshed = await refresh(true)
+      if (!refreshed && isCurrent() && !state.candidateSizeInitialized) {
+        state.candidateSize = state.persistedCandidateSize
+        state.candidateSizeInitialized = true
+        renderCandidateSizeControl()
+      }
+    }
+    if (isCurrent()) {
+      state.feedback = {
+        error: true,
+        message: error && error.message ? error.message : String(error)
+      }
+      renderFeedback()
+    }
+    return false
+  })
+  const pending = candidateSizeSaveTail
+  pending.finally(() => {
+    if (candidateSizeSaveTail === pending) {
+      candidateSizeSaveTail = Promise.resolve(true)
+    }
+  })
+  return candidateSizeSaveTail
 }
 const openGlobalWorkspace = () => {
   window.parent.location.assign("/vault")
@@ -2846,10 +2893,13 @@ const settleFolderDiscoveryStart = () => {
 }
 const applyFullData = (data) => {
   if (!state.candidateSizeInitialized) {
-    const published = Number(data && data.global_candidate_min_bytes)
-    state.candidateSize = candidateSizeOptions.includes(published)
-      ? published
+    const saved = Number(data && data.candidate_min_bytes)
+    const fallback = Number(data && data.global_candidate_min_bytes)
+    const selected = candidateSizeOptions.includes(saved) ? saved : fallback
+    state.candidateSize = candidateSizeOptions.includes(selected)
+      ? selected
       : defaultCandidateSize
+    state.persistedCandidateSize = state.candidateSize
     state.candidateSizeInitialized = true
   }
   const scanning = scanActive(data.scan)
@@ -3228,10 +3278,16 @@ const startFolderDiscovery = async (folderPath) => {
   renderFolderDiscovery()
   try {
     resetFolderDiscoveryChoices()
+    if (!await candidateSizeSaveTail) {
+      state.folderDiscoveryStarting = false
+      state.folderDiscoveryChoosingRoot = true
+      renderFolderDiscovery()
+      focusFolderDiscoveryDialog()
+      return
+    }
     const result = await post({
       action: "find_folders",
-      path: folderPath,
-      candidate_size: candidateSize()
+      path: folderPath
     })
     if (result.error) throw new Error(result.error)
     if (!result.started && !result.already_running) {
@@ -3354,10 +3410,8 @@ document.addEventListener("click", async (event) => {
   if (target.hasAttribute("data-candidate-size")) {
     const size = Number(target.dataset.candidateSize)
     if (candidateSizeOptions.includes(size)) {
-      state.candidateSize = size
-      state.candidateSizeInitialized = true
       closeScanSizeMenu()
-      renderCandidateSizeControl()
+      await saveCandidateSize(size)
     }
     return
   }
@@ -3768,10 +3822,13 @@ document.addEventListener("click", async (event) => {
     state.scanPreviewOpen = false
     state.feedback = null
     try {
+      if (!await candidateSizeSaveTail) {
+        state.scanRequested = false
+        return
+      }
       const result = await post({
         action: "scan",
-        scope_id: SCOPE_ID,
-        candidate_size: candidateSize()
+        scope_id: SCOPE_ID
       })
       if (result.error) throw new Error(result.error)
       await refresh()
@@ -4227,11 +4284,9 @@ document.addEventListener("change", async (event) => {
   if (["vault-candidate-size", "vault-find-candidate-size"]
       .includes(event.target.id)) {
     const size = Number(event.target.value)
-    state.candidateSize = candidateSizeOptions.includes(size)
+    await saveCandidateSize(candidateSizeOptions.includes(size)
       ? size
-      : defaultCandidateSize
-    state.candidateSizeInitialized = true
-    renderCandidateSizeControl()
+      : defaultCandidateSize)
     return
   }
   if (event.target.id !== "vault-status-filter") return

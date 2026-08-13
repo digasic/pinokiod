@@ -1899,6 +1899,25 @@ class Vault {
         }
         return this.runMutation(() =>
           this.removeExternalSource(payload.source_id))
+      case "set_candidate_size": {
+        if (payload.scope_id != null &&
+            typeof payload.scope_id !== "string") {
+          return { error: "Choose a valid scan scope." }
+        }
+        const scopeId = typeof payload.scope_id === "string" && payload.scope_id
+          ? payload.scope_id
+          : null
+        if (scopeId) {
+          const source = this.scanSource(scopeId)
+          if (!source || source.kind !== "app") {
+            return { error: "That app is no longer available." }
+          }
+        }
+        return this.setCandidateSizeSetting(
+          scopeId,
+          payload.candidate_size
+        )
+      }
       case "scan": {
         const scanSource = payload.scope_id
           ? this.scanSource(payload.scope_id)
@@ -1913,22 +1932,21 @@ class Vault {
             code: "global_scan_required"
           }
         }
-        let threshold = this.sizeThreshold
-        if (payload.candidate_size != null) {
-          if (!CANDIDATE_SIZE_OPTIONS.includes(payload.candidate_size)) {
-            return { error: "Choose a valid minimum file size." }
-          }
-          threshold = payload.candidate_size
-        }
+        const settingScopeId = scanSource && scanSource.kind === "app"
+          ? scanSource.id
+          : null
+        const threshold = await this.candidateSizeSetting(settingScopeId)
         return this.startScan(payload.scope_id || null, threshold)
       }
       case "cancel_scan":
         return this.cancelScan()
-      case "find_folders":
+      case "find_folders": {
+        const threshold = await this.candidateSizeSetting(null)
         return this.startFolderDiscovery(
           payload.path,
-          payload.candidate_size
+          threshold
         )
+      }
       case "cancel_find_folders":
         return this.cancelFolderDiscovery()
       case "clear_find_folders":
@@ -3115,6 +3133,33 @@ class Vault {
     return scoped
   }
 
+  async candidateSizeSetting(scopeId = null) {
+    const setting = await this.registry.scanSetting(scopeId)
+    const minimum = setting && Number(setting.candidate_min_bytes)
+    if (CANDIDATE_SIZE_OPTIONS.includes(minimum)) return minimum
+    return SIZE_THRESHOLD
+  }
+
+  async setCandidateSizeSetting(scopeId = null, candidateMinBytes) {
+    if (!Number.isSafeInteger(candidateMinBytes) ||
+        !CANDIDATE_SIZE_OPTIONS.includes(candidateMinBytes)) {
+      return { error: "Choose a valid minimum file size." }
+    }
+    const setting = await this.registry.setScanSetting(
+      scopeId,
+      candidateMinBytes
+    )
+    return {
+      scope_id: scopeId || null,
+      candidate_min_bytes: setting.candidate_min_bytes,
+      updated_at: setting.updated_at
+    }
+  }
+
+  candidateSizeForApp(app) {
+    return this.candidateSizeSetting(sourceId("app", app))
+  }
+
   sourceCountMaps(summaryRows) {
     const counts = {
       all: {},
@@ -3391,13 +3436,10 @@ class Vault {
     const lastScan = await this.scanForScope(scopeId)
     const globalScan = scopeId ? await this.scanForScope(null) : lastScan
     const globalScanReady = this.globalScanIsReady(globalScan)
-    const publishedCandidateMinimum = globalScan
-      ? Number(globalScan.candidate_min_bytes)
-      : NaN
-    const globalCandidateMinimum = Number.isFinite(
-      publishedCandidateMinimum) && publishedCandidateMinimum >= 0
-      ? publishedCandidateMinimum
-      : SIZE_THRESHOLD
+    const candidateMinimum = await this.candidateSizeSetting(scopeId)
+    const globalCandidateMinimum = scopeId
+      ? await this.candidateSizeSetting(null)
+      : candidateMinimum
     const before = lastScan && Number.isFinite(lastScan.bytes_total)
       ? lastScan.bytes_total
       : 0
@@ -3435,6 +3477,7 @@ class Vault {
     const result = {
       enabled: true,
       global_scan_ready: globalScanReady,
+      candidate_min_bytes: candidateMinimum,
       global_candidate_min_bytes: globalCandidateMinimum,
       mode: this.mode,
       scan: this.scanStatus(),

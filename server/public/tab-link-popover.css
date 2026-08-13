@@ -220,6 +220,113 @@ body.dark .tab-link-popover .tab-link-popover-item:hover,
 body.dark .tab-link-popover .tab-link-popover-item:focus-visible {
   background: rgba(148, 163, 184, 0.12);
 }
+.tab-link-popover .tab-link-popover-item[aria-expanded="true"] {
+  background: rgba(15, 23, 42, 0.04);
+}
+body.dark .tab-link-popover .tab-link-popover-item[aria-expanded="true"] {
+  background: rgba(148, 163, 184, 0.08);
+}
+.tab-link-notification-settings {
+  margin: 0 14px 10px 40px;
+  border: 1px solid rgba(15, 23, 42, 0.1);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.025);
+  overflow: hidden;
+}
+body.dark .tab-link-notification-settings {
+  border-color: rgba(148, 163, 184, 0.18);
+  background: rgba(148, 163, 184, 0.045);
+}
+.tab-link-notification-setting-row {
+  min-height: 44px;
+  padding: 7px 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  box-sizing: border-box;
+  color: inherit;
+}
+.tab-link-notification-setting-row + .tab-link-notification-setting-row {
+  border-top: 1px solid rgba(15, 23, 42, 0.08);
+}
+body.dark .tab-link-notification-setting-row + .tab-link-notification-setting-row {
+  border-top-color: rgba(148, 163, 184, 0.14);
+}
+.tab-link-notification-setting-label {
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 500;
+  color: rgba(15, 23, 42, 0.76);
+}
+body.dark .tab-link-notification-setting-label {
+  color: rgba(226, 232, 240, 0.86);
+}
+.tab-link-notification-toggle-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.tab-link-notification-toggle-status {
+  min-width: 18px;
+  font-size: 11px;
+  text-align: right;
+  color: rgba(15, 23, 42, 0.56);
+}
+body.dark .tab-link-notification-toggle-status {
+  color: rgba(226, 232, 240, 0.62);
+}
+.tab-link-notification-switch {
+  position: relative;
+  width: 36px;
+  height: 26px;
+  padding: 4px;
+  appearance: none;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(100, 116, 139, 0.42);
+  cursor: pointer;
+  transition: background-color 140ms ease;
+}
+.tab-link-notification-switch[data-enabled="true"] {
+  background: var(--pinokio-focus-color, #2563eb);
+}
+.tab-link-notification-switch-thumb {
+  display: block;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #f8fafc;
+  box-shadow: 0 1px 2px rgba(15, 23, 42, 0.24);
+  transform: translateX(0);
+  transition: transform 140ms ease;
+}
+.tab-link-notification-switch[data-enabled="true"] .tab-link-notification-switch-thumb {
+  transform: translateX(10px);
+}
+.tab-link-notification-switch:focus-visible,
+.tab-link-notification-sound-select:focus-visible {
+  outline: 2px solid var(--pinokio-focus-color, #2563eb);
+  outline-offset: 2px;
+}
+.tab-link-notification-sound-select {
+  width: min(160px, 44vw);
+  min-height: 32px;
+  padding: 5px 28px 5px 9px;
+  border: 1px solid rgba(15, 23, 42, 0.14);
+  border-radius: 6px;
+  background: var(--pinokio-sidebar-tabbar-bg, #ffffff);
+  color: rgba(15, 23, 42, 0.82);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+body.dark .tab-link-notification-sound-select {
+  border-color: rgba(148, 163, 184, 0.22);
+  background: rgba(15, 23, 42, 0.42);
+  color: rgba(241, 245, 249, 0.9);
+  color-scheme: dark;
+}
 .tab-link-popover .tab-link-popover-item .label {
   font-size: 11px;
   font-weight: 600;
@@ -343,6 +450,27 @@ body.dark .tab-link-popover .tab-link-popover-footer:focus-visible {
   .tab-link-popover--modal .tab-link-popover-section {
     padding-right: 16px;
     padding-left: 16px;
+  }
+  .tab-link-notification-settings {
+    margin-right: 16px;
+    margin-left: 42px;
+  }
+  .tab-link-notification-setting-row {
+    padding-right: 8px;
+    padding-left: 8px;
+  }
+}
+@media (pointer: coarse) {
+  .tab-link-notification-switch {
+    width: 44px;
+    height: 30px;
+    padding: 4px;
+  }
+  .tab-link-notification-switch[data-enabled="true"] .tab-link-notification-switch-thumb {
+    transform: translateX(14px);
+  }
+  .tab-link-notification-sound-select {
+    min-height: 44px;
   }
 }
 .appcanvas > aside .menu-container .tab-link-popover-host {

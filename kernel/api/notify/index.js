@@ -6,7 +6,8 @@
       href: <link location to open>,
       target: <target for window.open()>,
       features: <windowFeatures>,
-      audio: <play audio if true>,
+      type: <notification type>,
+      silent: <disable the notification sound if true>,
     }
   }
 (*/

@@ -155,7 +155,6 @@ class Sweeper {
         : "complete"
       this.state.phase = "publishing"
       this.state.duration_ms = Date.now() - this.state.started
-      const metadata = this.scanMetadata(scopeId, outcome)
       const stores = anchorStores
         .filter((store) =>
           store.available && Number.isFinite(store.dev))
@@ -165,6 +164,12 @@ class Sweeper {
           can_link: store.mode !== "copy",
           root: store.root
         }))
+      const metadata = this.scanMetadata(scopeId, outcome)
+      if (!scopeId) {
+        metadata.linkable_devices = [...new Set(stores
+          .filter((store) => store.can_link)
+          .map((store) => store.dev))].sort((left, right) => left - right)
+      }
       const publication = await registry.publishScan(
         runId,
         this.publicationSourceIds(scopeId),

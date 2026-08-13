@@ -172,6 +172,8 @@ for (const method of [
   "removeAutomaticAppScanApp",
   "setAutomaticAppScanState",
   "scanFor",
+  "scanSetting",
+  "setScanSetting",
   "removeScan",
   "beginScan",
   "abortScan",

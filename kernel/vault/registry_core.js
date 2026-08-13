@@ -306,6 +306,13 @@ class RegistryCore {
       FROM automatic_app_scans
       WHERE state = 'paused';
 
+      CREATE TABLE IF NOT EXISTS minimum_size_settings (
+        scope_id TEXT PRIMARY KEY,
+        candidate_min_bytes INTEGER NOT NULL CHECK (
+          candidate_min_bytes >= 0
+        ),
+        updated_at INTEGER NOT NULL
+      );
     `)
     const automaticScanColumns = new Set(this.database.prepare(
       "PRAGMA table_info(automatic_app_scans)"
@@ -2670,6 +2677,38 @@ class RegistryCore {
     })
   }
 
+  scanSetting(scopeId = null) {
+    const row = this.database.prepare(`
+      SELECT candidate_min_bytes, updated_at
+      FROM minimum_size_settings
+      WHERE scope_id = ?
+    `).get(scopeId || "")
+    return row ? {
+      candidate_min_bytes: Number(row.candidate_min_bytes),
+      updated_at: Number(row.updated_at) || 0
+    } : null
+  }
+
+  setScanSetting(scopeId = null, candidateMinBytes) {
+    const minimum = candidateMinBytes
+    if (!Number.isSafeInteger(minimum) || minimum < 0) {
+      throw new Error("Invalid minimum file size setting.")
+    }
+    const updatedAt = Date.now()
+    this.database.prepare(`
+      INSERT INTO minimum_size_settings(
+        scope_id, candidate_min_bytes, updated_at
+      ) VALUES (?, ?, ?)
+      ON CONFLICT(scope_id) DO UPDATE SET
+        candidate_min_bytes = excluded.candidate_min_bytes,
+        updated_at = excluded.updated_at
+    `).run(scopeId || "", minimum, updatedAt)
+    return {
+      candidate_min_bytes: minimum,
+      updated_at: updatedAt
+    }
+  }
+
   automaticAppScanStates() {
     return this.database.prepare(`
       SELECT app, state, signature, updated_at
@@ -2807,6 +2846,9 @@ class RegistryCore {
         WHERE peer.app = candidate.app
           AND peer.dev = candidate.dev
           AND peer.size = candidate.size
+          AND (peer.mode & 4095) = (candidate.mode & 4095)
+          AND peer.uid = candidate.uid
+          AND peer.gid = candidate.gid
           AND pinokio_path_key(peer.path) !=
             pinokio_path_key(candidate.path)
       )
@@ -2814,7 +2856,10 @@ class RegistryCore {
         SELECT 1 FROM files peer
         WHERE peer.dev = candidate.dev
           AND peer.size = candidate.size
-          AND peer.unavailable_reason IS NOT 'stale'
+          AND peer.unavailable_reason IS NULL
+          AND (peer.mode & 4095) = (candidate.mode & 4095)
+          AND peer.uid = candidate.uid
+          AND peer.gid = candidate.gid
           AND pinokio_path_key(peer.path) !=
             pinokio_path_key(candidate.path)
       )
@@ -2823,6 +2868,9 @@ class RegistryCore {
         WHERE peer.verified_at IS NOT NULL
           AND peer.dev = candidate.dev
           AND peer.size = candidate.size
+          AND (peer.mode & 4095) = (candidate.mode & 4095)
+          AND peer.uid = candidate.uid
+          AND peer.gid = candidate.gid
           AND pinokio_path_key(peer.path) !=
             pinokio_path_key(candidate.path)
       )
@@ -2888,6 +2936,7 @@ class RegistryCore {
         WHERE candidate.app = @app
           AND candidate.dev = @dev
           AND candidate.size = @size
+          AND ${possiblePeer}
           AND candidate.path > @path
         ORDER BY candidate.path
         LIMIT @limit
@@ -2948,7 +2997,7 @@ class RegistryCore {
         WHERE peer.dev = @dev
           AND peer.size = @size
           AND peer.path > @path
-          AND peer.unavailable_reason IS NOT 'stale'
+          AND peer.unavailable_reason IS NULL
         ORDER BY peer.path
         LIMIT @limit
       `).all({ dev, size, path: afterPath, limit: pageSize })
@@ -3030,7 +3079,7 @@ class RegistryCore {
       hashes.set(canonicalPathKey(entry.path), entry.hash)
     }
     const rows = this.database.prepare(`
-      SELECT path, dev, ino, size, mtime, ctime
+      SELECT path, dev, ino, size, mtime, ctime, mode, uid, gid
       FROM automatic_precheck_files
       WHERE app = ?
       ORDER BY pinokio_path_key(path), path, dev, ino, size, mtime, ctime
@@ -3048,7 +3097,10 @@ class RegistryCore {
         row.ino,
         row.size,
         row.mtime,
-        row.ctime
+        row.ctime,
+        Number(row.mode) & 0o7777,
+        row.uid,
+        row.gid
       ]) {
         digest.update(String(value))
         digest.update("\0")
@@ -3061,6 +3113,12 @@ class RegistryCore {
     digest.update(String(proof.row.dev))
     digest.update("\0")
     digest.update(String(proof.row.size))
+    digest.update("\0")
+    digest.update(String(Number(proof.row.mode) & 0o7777))
+    digest.update("\0")
+    digest.update(String(proof.row.uid))
+    digest.update("\0")
+    digest.update(String(proof.row.gid))
     digest.update("\0")
     digest.update(proof.hash)
     return {

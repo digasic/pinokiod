@@ -276,17 +276,24 @@
       return;
     }
     const rect = anchor.getBoundingClientRect();
-    const scrollX = window.scrollX || window.pageXOffset || 0;
-    const scrollY = window.scrollY || window.pageYOffset || 0;
-    const top = rect.bottom + scrollY + 6;
-    let left = rect.left + scrollX;
+    const viewportPadding = 12;
+    const menuGap = 6;
     const menuWidth = menu.offsetWidth || 0;
-    const viewportRight = scrollX + window.innerWidth;
-    if (left + menuWidth > viewportRight - 12) {
-      left = Math.max(scrollX + 12, viewportRight - menuWidth - 12);
+    const menuHeight = menu.offsetHeight || 0;
+    let left = rect.left;
+    let top = rect.bottom + menuGap;
+    if (left + menuWidth > window.innerWidth - viewportPadding) {
+      left = Math.max(viewportPadding, window.innerWidth - menuWidth - viewportPadding);
     }
-    if (left < scrollX + 12) {
-      left = scrollX + 12;
+    if (left < viewportPadding) {
+      left = viewportPadding;
+    }
+    const topAbove = rect.top - menuHeight - menuGap;
+    if (top + menuHeight > window.innerHeight - viewportPadding && topAbove >= viewportPadding) {
+      top = topAbove;
+    } else {
+      top = Math.min(top, Math.max(viewportPadding, window.innerHeight - menuHeight - viewportPadding));
+      top = Math.max(viewportPadding, top);
     }
     menu.style.top = `${Math.round(top)}px`;
     menu.style.left = `${Math.round(left)}px`;
@@ -857,10 +864,13 @@
   color: var(--pinokio-focus-color, #4c9afe);
 }
 .pinokio-notify-popover {
-  position: absolute;
+  position: fixed;
   z-index: 2147482000;
   min-width: 220px;
   max-width: 280px;
+  max-height: calc(100dvh - 24px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   color: #f8fafc;
   background: rgba(15, 23, 42, 0.97);
   border-radius: 10px;
@@ -978,6 +988,133 @@ const syncToggleAppearance = (toggle, enabled) => {
         syncToggleAppearance(toggle, enabled);
       }
     });
+  };
+
+  const updateNotificationPreferenceForFrame = (frameName, enabled) => {
+    const state = getOrCreateState(frameName);
+    if (!state) {
+      return null;
+    }
+    const next = Boolean(enabled);
+    state.notifyEnabled = next;
+    setPreference(frameName, next);
+    syncInlineToggleStateForFrame(frameName);
+    return next;
+  };
+
+  const populateInlineSoundSelect = (select, options) => {
+    if (!(select instanceof HTMLSelectElement)) {
+      return;
+    }
+    const effectiveOptions = Array.isArray(options) && options.length > 0
+      ? options
+      : baseSoundOptions();
+    const selectedChoice = globalSoundPreference?.choice || SOUND_DEFAULT_CHOICE;
+    select.replaceChildren();
+    effectiveOptions.forEach((option) => {
+      if (!option || !option.value || !option.label) {
+        return;
+      }
+      const node = document.createElement('option');
+      node.value = option.value;
+      node.textContent = option.label;
+      node.selected = option.value === selectedChoice;
+      select.appendChild(node);
+    });
+    if (Array.from(select.options).some((option) => option.value === selectedChoice)) {
+      select.value = selectedChoice;
+    } else {
+      select.value = SOUND_DEFAULT_CHOICE;
+    }
+  };
+
+  const mountNotificationSettingsForLink = (link, container, callbacks = {}) => {
+    if (!(container instanceof HTMLElement)) {
+      return false;
+    }
+    const context = getNotificationMenuStateForLink(link);
+    if (!context.available || !context.frameName) {
+      return false;
+    }
+    const state = getOrCreateState(context.frameName);
+    if (!state) {
+      return false;
+    }
+
+    container.replaceChildren();
+
+    const toggleRow = document.createElement('div');
+    toggleRow.className = 'tab-link-notification-setting-row';
+    const toggleLabel = document.createElement('span');
+    toggleLabel.className = 'tab-link-notification-setting-label';
+    toggleLabel.textContent = 'Notifications for this tab';
+    const toggleControl = document.createElement('div');
+    toggleControl.className = 'tab-link-notification-toggle-control';
+    const toggleStatus = document.createElement('span');
+    toggleStatus.className = 'tab-link-notification-toggle-status';
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'tab-link-notification-switch';
+    toggle.setAttribute('role', 'switch');
+    toggle.setAttribute('aria-label', 'Notifications for this tab');
+    const toggleThumb = document.createElement('span');
+    toggleThumb.className = 'tab-link-notification-switch-thumb';
+    toggle.setAttribute('aria-describedby', `${container.id || 'tab-link-notification-settings'}-status`);
+    toggleStatus.id = `${container.id || 'tab-link-notification-settings'}-status`;
+    toggle.appendChild(toggleThumb);
+    toggleControl.append(toggleStatus, toggle);
+    toggleRow.append(toggleLabel, toggleControl);
+
+    const soundRow = document.createElement('label');
+    soundRow.className = 'tab-link-notification-setting-row';
+    const soundLabel = document.createElement('span');
+    soundLabel.className = 'tab-link-notification-setting-label';
+    soundLabel.textContent = 'Sound';
+    const soundSelect = document.createElement('select');
+    soundSelect.className = 'tab-link-notification-sound-select';
+    soundSelect.setAttribute('aria-label', 'Notification sound');
+    soundRow.append(soundLabel, soundSelect);
+
+    const syncToggle = (enabled) => {
+      toggle.setAttribute('aria-checked', enabled ? 'true' : 'false');
+      toggle.dataset.enabled = enabled ? 'true' : 'false';
+      toggleStatus.textContent = enabled ? 'On' : 'Off';
+    };
+
+    syncToggle(Boolean(state.notifyEnabled));
+    populateInlineSoundSelect(soundSelect, soundOptionsCache || baseSoundOptions());
+    container.append(toggleRow, soundRow);
+
+    toggle.addEventListener('click', () => {
+      const current = getOrCreateState(context.frameName);
+      if (!current) {
+        return;
+      }
+      const enabled = updateNotificationPreferenceForFrame(context.frameName, !current.notifyEnabled);
+      if (enabled === null) {
+        return;
+      }
+      syncToggle(enabled);
+      if (typeof callbacks.onEnabledChange === 'function') {
+        callbacks.onEnabledChange(enabled);
+      }
+    });
+
+    soundSelect.addEventListener('change', () => {
+      applySoundSelection(soundSelect.value);
+      if (typeof callbacks.onSoundChange === 'function') {
+        callbacks.onSoundChange(globalSoundPreference.choice);
+      }
+    });
+
+    loadSoundOptions().then((options) => {
+      if (!container.isConnected || !container.contains(soundSelect)) {
+        return;
+      }
+      populateInlineSoundSelect(soundSelect, options);
+    }).catch(() => {});
+
+    return true;
   };
 
   const getNotificationMenuStateForLink = (link) => {
@@ -1497,6 +1634,9 @@ const ensureTabAccessories = aggregateDebounce(() => {
     },
     openMenuForLink(link, anchor) {
       return openNotificationMenuForLink(link, anchor);
+    },
+    mountSettingsForLink(link, container, callbacks) {
+      return mountNotificationSettingsForLink(link, container, callbacks);
     },
   };
 })();

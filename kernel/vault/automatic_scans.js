@@ -1,7 +1,6 @@
 const fs = require("fs")
 const path = require("path")
 const {
-  SIZE_THRESHOLD,
   isCandidateFileSize,
   SHA256_RE,
   ENTRY_BATCH_SIZE
@@ -31,6 +30,12 @@ const pathKey = (value) => {
   const resolved = path.resolve(value)
   return process.platform === "win32" ? resolved.toLowerCase() : resolved
 }
+
+const metadataKey = (entry) => [
+  Number(entry.mode) & 0o7777,
+  Number(entry.uid),
+  Number(entry.gid)
+].join(":")
 
 class AutomaticScans {
   constructor(vault) {
@@ -270,7 +275,7 @@ class AutomaticScans {
     if (!collected.size) this.discardChangedPaths(app)
   }
 
-  async candidateThreshold() {
+  async candidatePolicy(app = null) {
     const cached = this.vault.lastScanCache &&
       typeof this.vault.lastScanCache.get === "function"
       ? this.vault.lastScanCache.get("")
@@ -278,10 +283,25 @@ class AutomaticScans {
     const scan = cached || (this.vault.registry
       ? await this.vault.registry.scanFor()
       : null)
-    const threshold = scan ? Number(scan.candidate_min_bytes) : NaN
-    return Number.isFinite(threshold) && threshold >= 0
-      ? threshold
-      : SIZE_THRESHOLD
+    const threshold = app
+      ? await this.vault.candidateSizeForApp(app)
+      : await this.vault.candidateSizeSetting(null)
+    const hasLinkableDevices = !!(
+      scan && Array.isArray(scan.linkable_devices))
+    return {
+      threshold,
+      linkability_known: hasLinkableDevices,
+      linkable_devices: new Set(hasLinkableDevices
+        ? scan.linkable_devices
+          .map((dev) => Number(dev))
+          .filter((dev) => Number.isFinite(dev))
+        : [])
+    }
+  }
+
+  async candidateThreshold(policy = null) {
+    const current = policy || await this.candidatePolicy()
+    return current.threshold
   }
 
   statChangedPaths(paths, options, onSettled = null) {
@@ -910,7 +930,8 @@ class AutomaticScans {
     }
     this.checkpoint(active)
     if (!current.isFile() || current.isSymbolicLink() ||
-        current.dev !== entry.dev || current.size !== entry.size) {
+        current.dev !== entry.dev || current.size !== entry.size ||
+        metadataKey(current) !== metadataKey(entry)) {
       this.logVerificationSkip(
         active.app, entry, "snapshot-changed", counts)
       return null
@@ -1016,8 +1037,10 @@ class AutomaticScans {
       hash_failures: 0,
       unstable_hashes: 0
     }
-    markStage("threshold-read")
-    const threshold = await this.candidateThreshold()
+    markStage("policy-read")
+    const policy = await this.candidatePolicy(app)
+    const threshold = await this.candidateThreshold(policy)
+    const linkableDevices = policy.linkable_devices
     const paths = [...new Set(active.paths || [])].filter((filePath) =>
       typeof filePath === "string" && inside(root, filePath))
     const verifiedHashes = new Map()
@@ -1025,8 +1048,10 @@ class AutomaticScans {
       app,
       root,
       threshold_bytes: threshold,
+      linkability_known: policy.linkability_known,
+      linkable_devices: [...linkableDevices],
       changed_paths: paths.length,
-      policy: "metadata-prefilter-sha256"
+      policy: "eligibility-metadata-prefilter-sha256"
     })
     markStage("staging-reset")
     await this.vault.registry.beginAutomaticPrecheck(app)
@@ -1065,7 +1090,9 @@ class AutomaticScans {
         if (!stat || !stat.isFile() || stat.isSymbolicLink()) continue
         counts.files += 1
         counts.bytes += Math.max(0, Number(stat.size) || 0)
-        if (!isCandidateFileSize(stat.size, threshold)) continue
+        if (!isCandidateFileSize(stat.size, threshold) ||
+            (policy.linkability_known &&
+              !linkableDevices.has(stat.dev))) continue
         candidates.push({
           path: paths[index],
           size: stat.size,
@@ -1119,8 +1146,8 @@ class AutomaticScans {
       const preparePeers = () => {
         if (!group || group.unmatched) return
         group.unmatched = new Map()
-        for (const [hash, value] of group.candidatesByHash) {
-          group.unmatched.set(hash, {
+        for (const [match, value] of group.candidatesByMatch) {
+          group.unmatched.set(match, {
             identity: value.identities.values().next().value,
             candidate: value.candidate
           })
@@ -1149,10 +1176,11 @@ class AutomaticScans {
           )
           if (!verified) continue
           const hash = verified.hash
-          let value = group.candidatesByHash.get(hash)
+          const match = `${hash}\0${metadataKey(verified)}`
+          let value = group.candidatesByMatch.get(match)
           if (!value) {
             value = { candidate: verified, identities: new Set() }
-            group.candidatesByHash.set(hash, value)
+            group.candidatesByMatch.set(match, value)
           }
           value.identities.add(this.automaticIdentityKey(verified))
           if (value.identities.size > 1) {
@@ -1197,7 +1225,7 @@ class AutomaticScans {
               key,
               candidates: [],
               candidatesHashed: false,
-              candidatesByHash: new Map(),
+              candidatesByMatch: new Map(),
               unmatched: null,
               memory: new Map()
             }
@@ -1222,13 +1250,17 @@ class AutomaticScans {
           if (!await hashCandidates(identity)) continue
           if (proof) return await complete()
           if (!group.unmatched.size) continue
+          const peerMetadata = metadataKey(peer.entry)
           if (![...group.unmatched.values()].some((wanted) =>
-            wanted.identity !== identity)) continue
+            wanted.identity !== identity &&
+            metadataKey(wanted.candidate) === peerMetadata)) continue
           this.checkpoint(active)
           markStage("peer-hash", entry)
           const verified = await this.verifiedAutomaticHash(
             active, entry, group.memory, verifiedHashes, counts, peer)
-          const wanted = verified && group.unmatched.get(verified.hash)
+          const match = verified &&
+            `${verified.hash}\0${metadataKey(verified)}`
+          const wanted = match && group.unmatched.get(match)
           if (!wanted || wanted.identity === identity) {
             continue
           }

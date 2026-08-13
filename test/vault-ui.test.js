@@ -414,7 +414,7 @@ const makePage = async (status, options = {}) => {
     const childManifest = parent
       ? folderDiscoveryChildren[parent]
       : null
-    const response = parent
+    const response = await (parent
       ? typeof childManifest === "function"
         ? childManifest(childPage)
         : childManifest || {
@@ -425,7 +425,7 @@ const makePage = async (status, options = {}) => {
             page_size: 500,
             pages: 1
           }
-      : typeof status === "function" ? status(url) : status
+      : typeof status === "function" ? status(url) : status)
     if (options.deferAutomaticStatus &&
         url === "/info/vault/automatic-scans") {
       await deferredAutomaticStatus
@@ -778,7 +778,7 @@ describe("Save Space interface", () => {
       request.action === "scan"))
     const scan = requests.find((request) => request.action === "scan")
     assert.equal(scan.scope_id, null)
-    assert.equal(scan.candidate_size, 100 * candidateBase ** 2)
+    assert.equal("candidate_size" in scan, false)
     await settle()
     dom.window.close()
   })
@@ -866,12 +866,13 @@ describe("Save Space interface", () => {
     dom.window.close()
   })
 
-  test("the scan minimum follows the latest global scan, not browser storage", async () => {
+  test("a scan relies on the saved scope setting, not browser storage", async () => {
     const candidateBase = process.platform === "win32" ? 1024 : 1000
-    const published = 50 * candidateBase ** 2
+    const saved = 50 * candidateBase ** 2
     const stored = 10 * candidateBase ** 2
     const { dom, requests } = await makePage(fixture([], {
-      global_candidate_min_bytes: published
+      candidate_min_bytes: saved,
+      global_candidate_min_bytes: 100 * candidateBase ** 2
     }), {
       storedCandidateSize: stored
     })
@@ -882,10 +883,36 @@ describe("Save Space interface", () => {
     document.getElementById("btn-scan").click()
     await waitFor(() => requests.some((request) =>
       request.action === "scan"))
-    assert.equal(requests.find((request) =>
-      request.action === "scan").candidate_size, published)
+    assert.equal("candidate_size" in requests.find((request) =>
+      request.action === "scan"), false)
 
     await settle()
+    dom.window.close()
+  })
+
+  test("an app displays and immediately saves its own minimum size", async () => {
+    const candidateBase = process.platform === "win32" ? 1024 : 1000
+    const appMinimum = candidateBase ** 2
+    const globalMinimum = 10 * candidateBase ** 2
+    const selected = 50 * candidateBase ** 2
+    const { dom, requests } = await makePage(fixture([], {
+      candidate_min_bytes: appMinimum,
+      global_candidate_min_bytes: globalMinimum
+    }), { appMode: true })
+    const document = dom.window.document
+    const selector = document.getElementById("vault-candidate-size")
+
+    assert.equal(selector.value, String(appMinimum))
+    selector.value = String(selected)
+    selector.dispatchEvent(new dom.window.Event("change", { bubbles: true }))
+    await waitFor(() => requests.some((request) =>
+      request.action === "set_candidate_size"))
+    const request = requests.find((entry) =>
+      entry.action === "set_candidate_size")
+    assert.equal(request.scope_id, "app:app")
+    assert.equal(request.candidate_size, selected)
+    assert.equal(selector.value, String(selected))
+
     dom.window.close()
   })
 
@@ -914,10 +941,84 @@ describe("Save Space interface", () => {
     document.getElementById("btn-scan").click()
     await waitFor(() => requests.some((request) =>
       request.action === "scan"))
-    assert.equal(requests.find((request) =>
-      request.action === "scan").candidate_size, selected)
+    const savedIndex = requests.findIndex((request) =>
+      request.action === "set_candidate_size")
+    const scanIndex = requests.findIndex((request) =>
+      request.action === "scan")
+    assert.ok(savedIndex >= 0 && savedIndex < scanIndex)
+    assert.equal("candidate_size" in requests[scanIndex], false)
 
     await settle()
+    dom.window.close()
+  })
+
+  test("a rejected minimum size save blocks a pending scan and restores the saved size", async () => {
+    const candidateBase = process.platform === "win32" ? 1024 : 1000
+    const saved = 50 * candidateBase ** 2
+    const selected = 10 * candidateBase ** 2
+    const { dom, requests } = await makePage(fixture([], {
+      candidate_min_bytes: saved,
+      global_candidate_min_bytes: saved
+    }), {
+      actionResults: {
+        set_candidate_size: { error: "Could not save minimum file size." }
+      }
+    })
+    const document = dom.window.document
+
+    document.querySelector(`[data-candidate-size="${selected}"]`).click()
+    document.getElementById("btn-scan").click()
+
+    await waitFor(() => /50 MB\+/.test(document.getElementById(
+      "vault-scan-size-label").textContent) &&
+      /could not save minimum file size/i.test(
+        document.getElementById("vault-feedback").textContent))
+    assert.equal(requests.some((request) => request.action === "scan"), false)
+
+    dom.window.close()
+  })
+
+  test("a stale minimum size failure does not replace a newer successful selection", async () => {
+    const candidateBase = process.platform === "win32" ? 1024 : 1000
+    const first = 10 * candidateBase ** 2
+    const second = 50 * candidateBase ** 2
+    const currentStatus = fixture([], {
+      candidate_min_bytes: 100 * candidateBase ** 2,
+      global_candidate_min_bytes: 100 * candidateBase ** 2
+    })
+    let statusCount = 0
+    let releaseRecovery
+    const recovery = new Promise((resolve) => { releaseRecovery = resolve })
+    let saveCount = 0
+    const actionResults = {}
+    Object.defineProperty(actionResults, "set_candidate_size", {
+      get() {
+        saveCount += 1
+        return saveCount === 1
+          ? { error: "Could not save minimum file size." }
+          : {}
+      }
+    })
+    const { dom, requests } = await makePage(async () => {
+      statusCount += 1
+      if (statusCount === 2) await recovery
+      return currentStatus
+    }, { actionResults })
+    const document = dom.window.document
+
+    document.querySelector(`[data-candidate-size="${first}"]`).click()
+    await waitFor(() => statusCount === 2)
+    document.querySelector(`[data-candidate-size="${second}"]`).click()
+    releaseRecovery()
+
+    await waitFor(() => requests.filter((request) =>
+      request.action === "set_candidate_size").length === 2)
+    await settle()
+    assert.match(document.getElementById("vault-scan-size-label").textContent,
+      /50 MB\+/)
+    assert.doesNotMatch(document.getElementById("vault-feedback").textContent,
+      /could not save minimum file size/i)
+
     dom.window.close()
   })
 
@@ -1090,12 +1191,46 @@ describe("Save Space interface", () => {
       request.action === "find_folders"))
     assert.equal(requests.find((entry) =>
       entry.action === "find_folders").path, "/Users/test")
-    assert.equal(requests.find((entry) =>
-      entry.action === "find_folders").candidate_size,
-      selectedThreshold)
+    const savedIndex = requests.findIndex((request) =>
+      request.action === "set_candidate_size")
+    const findIndex = requests.findIndex((request) =>
+      request.action === "find_folders")
+    assert.ok(savedIndex >= 0 && savedIndex < findIndex)
+    assert.equal("candidate_size" in requests[findIndex], false)
     assert.equal(pickerRequests.length, 0)
     await waitFor(() => document.getElementById(
       "vault-find-overlay").hidden)
+    dom.window.close()
+  })
+
+  test("a rejected minimum size save blocks pending folder discovery", async () => {
+    const candidateBase = process.platform === "win32" ? 1024 : 1000
+    const saved = 100 * candidateBase ** 2
+    const selected = 50 * candidateBase ** 2
+    const { dom, requests } = await makePage(fixture([item()], {
+      candidate_min_bytes: saved,
+      global_candidate_min_bytes: saved
+    }), {
+      actionResults: {
+        set_candidate_size: { error: "Could not save minimum file size." }
+      }
+    })
+    const document = dom.window.document
+
+    document.getElementById("btn-find-folders").click()
+    await waitFor(() => document.querySelector("[data-find-home-folder]"))
+    const selector = document.getElementById("vault-find-candidate-size")
+    selector.value = String(selected)
+    selector.dispatchEvent(new dom.window.Event("change", { bubbles: true }))
+    document.querySelector("[data-find-home-folder]").click()
+
+    await waitFor(() => document.getElementById(
+      "vault-find-candidate-size").value === String(saved) &&
+      /could not save minimum file size/i.test(
+        document.getElementById("vault-feedback").textContent))
+    assert.equal(requests.some((request) =>
+      request.action === "find_folders"), false)
+
     dom.window.close()
   })
 
@@ -1121,9 +1256,8 @@ describe("Save Space interface", () => {
     assert.equal(document.querySelector(
       ".vault-find-partial[role='alert']").textContent.trim(), message)
     assert.ok(document.querySelector("[data-find-home-folder]"))
-    assert.equal(requests.find((request) =>
-      request.action === "find_folders").candidate_size,
-      50 * candidateBase ** 2)
+    assert.equal("candidate_size" in requests.find((request) =>
+      request.action === "find_folders"), false)
     dom.window.close()
   })
 

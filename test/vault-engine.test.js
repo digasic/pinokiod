@@ -29,13 +29,18 @@ const makeOutside = async () => {
   return directory
 }
 
-const makeVault = async () => {
+const makeVault = async ({ candidateSize = CANDIDATE_SIZE_OPTIONS[0] } = {}) => {
   const home = await makeHome()
   const kernel = { homedir: home, platform: process.platform }
   const vault = new Vault(kernel)
   kernel.vault = vault
   await vault.init()
   vault.sizeThreshold = CANDIDATE_SIZE_OPTIONS[0]
+  if (candidateSize !== null) {
+    await vault.perform("set_candidate_size", {
+      candidate_size: candidateSize
+    })
+  }
   return { home, kernel, vault }
 }
 
@@ -175,20 +180,154 @@ describe("Save Space engine", () => {
     await close(vault)
   })
 
-  test("the published global scan minimum is reused by automatic checks", async () => {
-    const { vault } = await makeVault()
+  test("global and app minimum sizes persist and drive their own scans", async () => {
+    const { home, vault } = await makeVault()
+    const app = "minimum-size-app"
+    const appRoot = path.join(home, "api", app)
+    const appScope = `app:${app}`
+    const globalMinimum = CANDIDATE_SIZE_OPTIONS[2]
+    const appMinimum = CANDIDATE_SIZE_OPTIONS[1]
+    await fs.promises.mkdir(appRoot)
+    await vault.openWorkspace()
+
+    assert.equal((await vault.perform("set_candidate_size", {
+      candidate_size: globalMinimum
+    })).candidate_min_bytes, globalMinimum)
+    assert.equal((await vault.perform("set_candidate_size", {
+      scope_id: appScope,
+      candidate_size: appMinimum
+    })).candidate_min_bytes, appMinimum)
+    assert.equal((await vault.status()).candidate_min_bytes, globalMinimum)
+    assert.equal((await vault.status(appScope)).candidate_min_bytes, appMinimum)
+
+    const starts = []
+    vault.globalScanReady = async () => true
+    vault.startScan = (scopeId, threshold) => {
+      starts.push({ scope_id: scopeId, threshold })
+      return { started: true }
+    }
+    assert.deepEqual(await vault.perform("scan", {
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
+    }), { started: true })
+    assert.deepEqual(await vault.perform("scan", {
+      scope_id: appScope,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
+    }), { started: true })
+    assert.deepEqual(starts, [
+      { scope_id: null, threshold: globalMinimum },
+      { scope_id: appScope, threshold: appMinimum }
+    ])
+    let folderThreshold = null
+    vault.startFolderDiscovery = (folderPath, threshold) => {
+      folderThreshold = threshold
+      return { started: true }
+    }
+    assert.deepEqual(await vault.perform("find_folders", {
+      path: home,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[0]
+    }), { started: true })
+    assert.equal(folderThreshold, globalMinimum)
+    assert.equal((await vault.status()).candidate_min_bytes, globalMinimum)
+    assert.equal((await vault.status(appScope)).candidate_min_bytes, appMinimum)
+    assert.equal((await vault.automaticScans.candidatePolicy(app)).threshold,
+      appMinimum)
+
+    await close(vault)
+    const reopened = new Vault({ homedir: home, platform: process.platform })
+    await reopened.init()
+    assert.equal((await reopened.status()).candidate_min_bytes, globalMinimum)
+    assert.equal((await reopened.status(appScope)).candidate_min_bytes,
+      appMinimum)
+    await close(reopened)
+  })
+
+  test("reading a default minimum size does not persist it", async () => {
+    const { vault } = await makeVault({ candidateSize: null })
+
+    assert.equal(await vault.registry.scanSetting(), null)
+    assert.equal((await vault.status()).candidate_min_bytes, SIZE_THRESHOLD)
+    assert.equal(await vault.registry.scanSetting(), null)
+
+    await close(vault)
+  })
+
+  test("minimum size settings reject coerced values", async () => {
+    const { vault } = await makeVault({ candidateSize: null })
+
+    for (const candidateSize of [
+      null,
+      "",
+      String(CANDIDATE_SIZE_OPTIONS[1])
+    ]) {
+      assert.match((await vault.perform("set_candidate_size", {
+        candidate_size: candidateSize
+      })).error, /valid minimum file size/i)
+    }
+    assert.equal(await vault.registry.scanSetting(), null)
+
+    await close(vault)
+  })
+
+  test("minimum size settings reject malformed scopes", async () => {
+    const { vault } = await makeVault({ candidateSize: null })
+
+    const result = await vault.perform("set_candidate_size", {
+      scope_id: 123,
+      candidate_size: CANDIDATE_SIZE_OPTIONS[1]
+    })
+
+    assert.match(result.error, /valid scan scope/i)
+    assert.equal(await vault.registry.scanSetting(), null)
+
+    await close(vault)
+  })
+
+  test("scan history does not become a minimum size setting", async () => {
+    const home = await makeHome()
+    const vault = new Vault({ homedir: home, platform: process.platform })
+    await vault.init()
+    await vault.perform("set_candidate_size", {
+      candidate_size: CANDIDATE_SIZE_OPTIONS[2]
+    })
+    assert.equal((await vault.perform("scan")).started, true)
+    await waitForEngine(() => !vault.scanPromise &&
+      !vault.scanCompletionPromise)
+    await close(vault)
+
+    const database = new Database(path.join(home, "vault", "registry.sqlite3"))
+    database.exec("DROP TABLE minimum_size_settings")
+    database.close()
+
+    const reopened = new Vault({ homedir: home, platform: process.platform })
+    await reopened.init()
+    assert.equal((await reopened.status()).candidate_min_bytes,
+      SIZE_THRESHOLD)
+    assert.equal(await reopened.registry.scanSetting(), null)
+    await close(reopened)
+  })
+
+  test("the saved global minimum is reused by unscoped policy reads", async () => {
+    const { vault } = await makeVault({ candidateSize: null })
     const selected = CANDIDATE_SIZE_OPTIONS[2]
 
     assert.equal((await vault.status()).global_candidate_min_bytes,
       SIZE_THRESHOLD)
-    assert.deepEqual(await vault.perform("scan", {
+    await vault.perform("set_candidate_size", {
       candidate_size: selected
-    }), { started: true })
+    })
+    assert.deepEqual(await vault.perform("scan"), { started: true })
     await waitForEngine(() => !vault.scanPromise &&
       !vault.scanCompletionPromise)
 
     assert.equal((await vault.status()).global_candidate_min_bytes, selected)
     assert.equal(await vault.automaticScans.candidateThreshold(), selected)
+    const scan = await vault.registry.scanFor()
+    const expectedDevices = vault.anchorStores()
+      .filter((store) => store.available && Number.isFinite(store.dev) &&
+        store.mode !== "copy")
+      .map((store) => store.dev)
+      .sort((left, right) => left - right)
+    assert.deepEqual(scan.linkable_devices, expectedDevices)
 
     await close(vault)
   })
@@ -987,6 +1126,9 @@ describe("Save Space engine", () => {
       crypto.randomBytes(512))
     vault.sizeThreshold = 0
     await vault.sweeper.scan()
+    await vault.perform("set_candidate_size", {
+      candidate_size: selectedThreshold
+    })
 
     const stageDiscoveryFiles = vault.registry.stageFolderDiscoveryFiles
       .bind(vault.registry)
@@ -1032,18 +1174,22 @@ describe("Save Space engine", () => {
     await close(vault)
   })
 
-  test("Find folders requires an explicit supported threshold", async () => {
+  test("Find folders ignores request thresholds and uses the saved setting", async () => {
     const { vault } = await makeVault()
     const outside = await makeOutside()
+    const thresholds = []
+    vault.startFolderDiscovery = (folderPath, threshold) => {
+      thresholds.push(threshold)
+      return { started: true }
+    }
 
-    assert.match((await vault.perform("find_folders", {
-      path: outside
-    })).error, /valid minimum file size/i)
-    assert.match((await vault.perform("find_folders", {
+    assert.deepEqual(await vault.perform("find_folders", {
       path: outside,
       candidate_size: 123
-    })).error, /valid minimum file size/i)
-    assert.equal(vault.folderDiscoveryPromise, null)
+    }), { started: true })
+    assert.deepEqual(thresholds, [CANDIDATE_SIZE_OPTIONS[0]])
+    assert.equal((await vault.status()).candidate_min_bytes,
+      CANDIDATE_SIZE_OPTIONS[0])
     await close(vault)
   })
 

@@ -48,6 +48,13 @@ const makeVault = async (home, options = {}) => {
     : true
   vault.globalScanReady = async () => globalScanReady
   vault.automaticScans.globalScanReady = globalScanReady
+  if (globalScanReady) {
+    const homeStat = await fs.promises.stat(home)
+    vault.lastScanCache.set("", {
+      candidate_min_bytes: SIZE_THRESHOLD,
+      linkable_devices: [homeStat.dev]
+    })
+  }
   return vault
 }
 
@@ -1037,7 +1044,10 @@ describe("automatic app checks", () => {
       ["ino", 22],
       ["size", 201],
       ["mtime", 203],
-      ["ctime", 204]
+      ["ctime", 204],
+      ["mode", 0o640],
+      ["uid", 1],
+      ["gid", 1]
     ]) {
       assert.notEqual(
         signature([proof, Object.assign({}, unmatched, { [field]: value })]),
@@ -1158,6 +1168,104 @@ describe("automatic app checks", () => {
     assert.deepEqual(verifiedPaths.sort(), [first, second].sort())
     assert.deepEqual(vault.automaticScans.snapshot().rows, [])
     assert.equal(vault.automaticScans.changedPaths.has(app), false)
+    await close(vault)
+  })
+
+  test("metadata-incompatible copies do not publish a result", async (t) => {
+    if (process.platform === "win32") {
+      t.skip("POSIX permission metadata is required")
+      return
+    }
+    const home = await makeHome()
+    const app = "metadata-incompatible-app"
+    const appRoot = path.join(home, "api", app)
+    const first = path.join(appRoot, "first.bin")
+    const second = path.join(appRoot, "second.bin")
+    await fs.promises.mkdir(appRoot)
+    await fs.promises.writeFile(first, "same-content")
+    await fs.promises.writeFile(second, "same-content")
+    await fs.promises.chmod(first, 0o600)
+    await fs.promises.chmod(second, 0o644)
+    const vault = await makeVault(home)
+    vault.automaticScans.candidateThreshold = async () => 1
+    const hashedPaths = []
+    const originalHashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath, options) => {
+      hashedPaths.push(filePath)
+      return originalHashFile(filePath, options)
+    }
+
+    vault.automaticScans.queueApp(app, [first, second])
+    await waitFor(() => !vault.automaticScans.active &&
+      !vault.automaticScans.entries.has(app))
+
+    assert.deepEqual(hashedPaths, [])
+    assert.deepEqual(vault.automaticScans.snapshot().rows, [])
+    await close(vault)
+  })
+
+  test("devices without hardlink support do not publish a result", async () => {
+    const home = await makeHome()
+    const app = "copy-only-device-app"
+    const appRoot = path.join(home, "api", app)
+    const first = path.join(appRoot, "first.bin")
+    const second = path.join(appRoot, "second.bin")
+    await fs.promises.mkdir(appRoot)
+    await fs.promises.writeFile(first, "same-content")
+    await fs.promises.writeFile(second, "same-content")
+    const vault = await makeVault(home)
+    vault.automaticScans.candidateThreshold = async () => 1
+    vault.automaticScans.candidatePolicy = async () => ({
+      threshold: 1,
+      linkability_known: true,
+      linkable_devices: new Set()
+    })
+    const hashedPaths = []
+    const originalHashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath, options) => {
+      hashedPaths.push(filePath)
+      return originalHashFile(filePath, options)
+    }
+
+    vault.automaticScans.queueApp(app, [first, second])
+    await waitFor(() => !vault.automaticScans.active &&
+      !vault.automaticScans.entries.has(app))
+
+    assert.deepEqual(hashedPaths, [])
+    assert.deepEqual(vault.automaticScans.snapshot().rows, [])
+    await close(vault)
+  })
+
+  test("legacy global scans without linkability metadata preserve automatic checks", async () => {
+    const home = await makeHome()
+    const app = "legacy-global-scan-app"
+    const appRoot = path.join(home, "api", app)
+    const first = path.join(appRoot, "first.bin")
+    const second = path.join(appRoot, "second.bin")
+    await fs.promises.mkdir(appRoot)
+    await fs.promises.writeFile(first, "same-content")
+    await fs.promises.writeFile(second, "same-content")
+    const vault = await makeVault(home)
+    vault.lastScanCache.set("", { candidate_min_bytes: 1 })
+    await vault.registry.setScanSetting(`app:${app}`, 0)
+    const hashedPaths = []
+    const originalHashFile = vault.hashFile.bind(vault)
+    vault.hashFile = async (filePath, options) => {
+      hashedPaths.push(filePath)
+      return originalHashFile(filePath, options)
+    }
+
+    vault.automaticScans.queueApp(app, [first, second])
+    await waitFor(() => {
+      const row = vault.automaticScans.entries.get(app)
+      return !vault.automaticScans.active && row && row.state === "result"
+    })
+
+    assert.deepEqual(hashedPaths.sort(), [first, second].sort())
+    assert.deepEqual(vault.automaticScans.snapshot().rows.map((row) => ({
+      app: row.app,
+      state: row.state
+    })), [{ app, state: "result" }])
     await close(vault)
   })
 
@@ -2113,7 +2221,7 @@ describe("automatic app checks", () => {
     await close(vault)
   })
 
-  test("peer verification rejects changed type, device, and size", async (t) => {
+  test("peer verification rejects changed eligibility metadata", async (t) => {
     const home = await makeHome()
     const automatic = makeAutomatic({
       enabled: true,
@@ -2141,6 +2249,18 @@ describe("automatic app checks", () => {
       {
         name: "size",
         stat: { file: true, link: false, dev: 1, size: 5 }
+      },
+      {
+        name: "permissions",
+        stat: { file: true, link: false, dev: 1, size: 4, mode: 1 }
+      },
+      {
+        name: "owner",
+        stat: { file: true, link: false, dev: 1, size: 4, uid: 1 }
+      },
+      {
+        name: "group",
+        stat: { file: true, link: false, dev: 1, size: 4, gid: 1 }
       }
     ]
     const currentStats = new Map(cases.map(({ name, stat }) => [
@@ -2154,9 +2274,9 @@ describe("automatic app checks", () => {
         mtimeMs: 1,
         ctimeMs: 1,
         nlink: 1,
-        mode: 0,
-        uid: 0,
-        gid: 0
+        mode: stat.mode || 0,
+        uid: stat.uid || 0,
+        gid: stat.gid || 0
       }
     ]))
     const lstat = fs.promises.lstat
@@ -2172,7 +2292,10 @@ describe("automatic app checks", () => {
         size: 4,
         ino: 1,
         mtime: 1,
-        ctime: 1
+        ctime: 1,
+        mode: 0,
+        uid: 0,
+        gid: 0
       }, counts), null)
     }
 
@@ -3426,7 +3549,11 @@ describe("automatic app checks", () => {
       candidate("hardlink-a.bin", 108, 7),
       candidate("hardlink-b.bin", 108, 7),
       candidate("file-peer.bin", 109, 8),
-      candidate("anchor-peer.bin", 110, 9)
+      candidate("anchor-peer.bin", 110, 9),
+      candidate("unavailable-peer.bin", 111, 10),
+      Object.assign(candidate("metadata-mismatch.bin", 108, 11), {
+        mode: 1
+      })
     ]
     const file = (filePath, size, dev, ino, unavailableReason = null) => ({
       path: filePath,
@@ -3454,6 +3581,13 @@ describe("automatic app checks", () => {
       path.join(home, "stale-peer.bin"), 106, 1, 23, "stale"))
     await registry.upsertFile(file(
       path.join(home, "valid-file-peer.bin"), 109, 1, 24))
+    const unavailableWithinEligibleGroup = path.join(
+      home, "unavailable-within-eligible-group.bin")
+    await registry.upsertFile(file(
+      unavailableWithinEligibleGroup, 109, 1, 25, "metadata"))
+    await registry.upsertFile(file(
+      path.join(home, "unavailable-file-peer.bin"), 111, 1, 26,
+      "metadata"))
 
     for (const [name, size, verifiedAt] of [
       ["unverified", 107, null],
@@ -3497,6 +3631,9 @@ describe("automatic app checks", () => {
             WHERE peer.app = candidate.app
               AND peer.dev = candidate.dev
               AND peer.size = candidate.size
+              AND (peer.mode & 4095) = (candidate.mode & 4095)
+              AND peer.uid = candidate.uid
+              AND peer.gid = candidate.gid
               AND pinokio_path_key(peer.path) !=
                 pinokio_path_key(candidate.path)
           )
@@ -3504,7 +3641,10 @@ describe("automatic app checks", () => {
             SELECT 1 FROM files peer
             WHERE peer.dev = candidate.dev
               AND peer.size = candidate.size
-              AND peer.unavailable_reason IS NOT 'stale'
+              AND peer.unavailable_reason IS NULL
+              AND (peer.mode & 4095) = (candidate.mode & 4095)
+              AND peer.uid = candidate.uid
+              AND peer.gid = candidate.gid
               AND pinokio_path_key(peer.path) !=
                 pinokio_path_key(candidate.path)
           )
@@ -3513,6 +3653,9 @@ describe("automatic app checks", () => {
             WHERE peer.verified_at IS NOT NULL
               AND peer.dev = candidate.dev
               AND peer.size = candidate.size
+              AND (peer.mode & 4095) = (candidate.mode & 4095)
+              AND peer.uid = candidate.uid
+              AND peer.gid = candidate.gid
               AND pinokio_path_key(peer.path) !=
                 pinokio_path_key(candidate.path)
           )
@@ -3525,9 +3668,11 @@ describe("automatic app checks", () => {
     assert.match(plan, /files_size_device_path_idx/)
     assert.match(plan, /anchors_size_device_path_idx/)
     const changed = []
+    const returnedPaths = []
     let cursor = null
     do {
       const page = registry.automaticPrecheckEntries(app, cursor, 2)
+      returnedPaths.push(...page.entries.map((entry) => entry.path))
       changed.push(...page.entries
         .filter((entry) => entry.kind === "changed")
         .map((entry) => entry.path))
@@ -3540,6 +3685,7 @@ describe("automatic app checks", () => {
       entries[8].path,
       entries[9].path
     ].sort())
+    assert.equal(returnedPaths.includes(unavailableWithinEligibleGroup), false)
     registry.close()
   })
 

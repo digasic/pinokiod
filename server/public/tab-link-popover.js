@@ -266,10 +266,39 @@
         if (action === "notifications") {
           const activeLink = tabLinkActiveLink
           const notifier = typeof window !== "undefined" ? window.PinokioIdleNotifier : null
-          const anchor = activeLink ? (activeLink.querySelector(`.${TAB_LINK_TRIGGER_CLASS}`) || activeLink) : null
-          hideTabLinkPopover({ immediate: true })
-          if (notifier && typeof notifier.openMenuForLink === "function") {
-            notifier.openMenuForLink(activeLink, anchor)
+          const existingPanel = item.nextElementSibling
+          if (existingPanel && existingPanel.classList.contains("tab-link-notification-settings")) {
+            existingPanel.remove()
+            item.setAttribute("aria-expanded", "false")
+            item.removeAttribute("aria-controls")
+            return
+          }
+          if (notifier && typeof notifier.mountSettingsForLink === "function") {
+            const panel = document.createElement("div")
+            panel.className = "tab-link-notification-settings"
+            panel.id = `${TAB_LINK_POPOVER_ID}-notification-settings`
+            panel.setAttribute("role", "group")
+            panel.setAttribute("aria-label", "Desktop notification settings")
+            item.insertAdjacentElement("afterend", panel)
+            const value = item.querySelector(".value")
+            const icon = item.querySelector(".tab-link-popover-action-icon i")
+            const mounted = notifier.mountSettingsForLink(activeLink, panel, {
+              onEnabledChange(enabled) {
+                if (value) {
+                  value.textContent = enabled ? "Enabled for this tab" : "Disabled for this tab"
+                }
+                if (icon) {
+                  icon.classList.toggle("fa-bell", enabled)
+                  icon.classList.toggle("fa-bell-slash", !enabled)
+                }
+              }
+            })
+            if (mounted) {
+              item.setAttribute("aria-controls", panel.id)
+              item.setAttribute("aria-expanded", "true")
+            } else {
+              panel.remove()
+            }
           }
           return
         }
@@ -1897,6 +1926,9 @@
       item.className = "tab-link-popover-item tab-link-popover-item--action"
       if (actionItem.action) {
         item.setAttribute("data-action", actionItem.action)
+      }
+      if (actionItem.action === "notifications") {
+        item.setAttribute("aria-expanded", "false")
       }
       if (actionItem.url) {
         item.setAttribute("data-url", actionItem.url)
