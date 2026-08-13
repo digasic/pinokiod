@@ -1263,6 +1263,13 @@ class Shell {
           if (cuda_script) {
             conda_activation.push(`CALL "${cuda_script}" > "${cuda_log}" 2>&1`)
           }
+          // The conda-forge VS activation script prepends Library\lib before
+          // calling vcvars, but vcvars rebuilds LIB and drops that entry.
+          // Restore both the active Conda environment and managed CUDA import
+          // libraries after all compiler activation scripts have completed.
+          // CALL's second expansion is required because these commands are
+          // joined on one cmd.exe line and must read LIB after vcvars updates it.
+          conda_activation.push(`CALL set "LIB=%%CONDA_PREFIX%%\\Library\\lib;%%CUDA_HOME%%\\lib;%%LIB%%"`)
         } catch (e) {
           console.log('vc vars setup', e)
         }

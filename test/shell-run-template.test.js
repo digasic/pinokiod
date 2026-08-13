@@ -174,6 +174,47 @@ test('Shell.activate keeps managed Python downloads automatic on every platform'
   }
 })
 
+test('Shell.activate restores Conda and CUDA library paths after Windows compiler activation', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pinokio-shell-windows-lib-'))
+  t.after(() => fs.rm(root, { recursive: true, force: true }))
+  const activateRoot = path.join(root, 'bin', 'miniforge', 'etc', 'conda', 'activate.d', 'pinokio')
+  const compilerScript = path.join(activateRoot, 'vs2019_compiler_vars.bat')
+  const cudaScript = path.join(activateRoot, '~cuda-nvcc_activate.bat')
+  await fs.mkdir(activateRoot, { recursive: true })
+  await fs.writeFile(compilerScript, '@echo off\n')
+  await fs.writeFile(cudaScript, '@echo off\n')
+
+  const kernel = createKernel(root)
+  kernel.bin = {
+    activationCommands: () => [],
+    path: (...parts) => path.join(root, 'bin', ...parts),
+    vs_path_env: {},
+  }
+  const shell = createShell(kernel)
+  shell.platform = 'win32'
+  shell.shell = 'cmd.exe'
+  shell.env = {}
+
+  const params = await shell.activate({
+    build: true,
+    path: root,
+    message: ['uv pip install cupy'],
+  })
+
+  const activation = params.message[0]
+  const compilerIndex = activation.indexOf(`CALL "${compilerScript}"`)
+  const cudaIndex = activation.indexOf(`CALL "${cudaScript}"`)
+  const libraryCommand = 'CALL set "LIB=%%CONDA_PREFIX%%\\Library\\lib;%%CUDA_HOME%%\\lib;%%LIB%%"'
+  const libraryIndex = activation.indexOf(libraryCommand)
+
+  assert.notEqual(compilerIndex, -1)
+  assert.notEqual(cudaIndex, -1)
+  assert.notEqual(libraryIndex, -1)
+  assert.ok(compilerIndex < cudaIndex)
+  assert.ok(cudaIndex < libraryIndex)
+  assert.equal(params.message[1], 'uv pip install cupy')
+})
+
 test('Shell.init_env defaults the uv HTTP timeout without overriding apps', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'pinokio-shell-uv-timeout-'))
   await fs.mkdir(path.join(root, 'api'), { recursive: true })
