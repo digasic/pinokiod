@@ -1870,8 +1870,10 @@ class Server {
       }
       return ""
     }
+    const launcherPath = this.kernel.path("api", name)
+    const launcherDisplayPath = this.formatLogsDisplayPath(launcherPath)
     const launcherRemote = this.kernel.api && typeof this.kernel.api.parentGitURI === "function"
-      ? (this.kernel.api.parentGitURI(this.kernel.path("api", name)) || "")
+      ? (this.kernel.api.parentGitURI(launcherPath) || "")
       : ""
     const launcherRemoteUrl = buildGitRemoteWebUrl(launcherRemote)
 
@@ -1926,7 +1928,8 @@ class Server {
       dev_link,
 //      repos,
       current_urls,
-      path: this.kernel.path("api", name),
+      path: launcherPath,
+      launcher_path_display: launcherDisplayPath,
       log_path: this.kernel.path("api", name, "logs"),
       plugin_menu: null,
       portal: this.portal,

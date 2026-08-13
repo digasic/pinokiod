@@ -998,9 +998,12 @@ test("app identity popover exposes launcher metadata and remote browser link", a
   assert.ok(helperIndex > existingCommunityGitConfigIndex)
   assert.ok(helperIndex < launcherRemoteIndex)
   assert.ok(renderPropIndex > launcherRemoteIndex)
-  assert.match(server, /kernel\.api\.parentGitURI\(this\.kernel\.path\("api", name\)\)/)
+  assert.match(server, /const launcherPath = this\.kernel\.path\("api", name\)/)
+  assert.match(server, /const launcherDisplayPath = this\.formatLogsDisplayPath\(launcherPath\)/)
+  assert.match(server, /kernel\.api\.parentGitURI\(launcherPath\)/)
   assert.match(server, /launcherRemoteUrl = buildGitRemoteWebUrl\(launcherRemote\)/)
   assert.match(server, /launcher_remote_url: launcherRemoteUrl/)
+  assert.match(server, /launcher_path_display: launcherDisplayPath/)
   assert.match(server, /const buildGitRemoteWebUrl = \(value\) =>/)
   assert.match(server, /return `https:\/\/\$\{sshUrlMatch\[1\]\}\/\$\{sshUrlMatch\[2\]\}`/)
   assert.match(server, /return `https:\/\/\$\{scpMatch\[1\]\}\/\$\{scpMatch\[2\]\}`/)
@@ -1011,8 +1014,17 @@ test("app identity popover exposes launcher metadata and remote browser link", a
   assert.match(appView, /class="app-header-info-popover-icon" src="<%=config\.icon \|\| '\/pinokio-black\.png'%>"/)
   assert.match(appView, /const appInfoRemoteUrl = typeof launcher_remote_url === "string" \? launcher_remote_url : ""/)
   assert.ok(appView.includes('const appInfoRemoteDisplayUrl = appInfoRemoteUrl.replace(/^https?:\\/\\//i, "")'))
+  assert.match(appView, /const appInfoFolderPath = typeof path === "string" \? path : ""/)
+  assert.match(appView, /const appInfoFolderDisplayPath = typeof launcher_path_display === "string"/)
+  assert.match(appView, /data-app-info-copy-path="<%=appInfoFolderPath%>"/)
+  assert.match(appView, /data-filepath="<%=appInfoFolderPath%>" data-app-info-reveal-path/)
+  assert.match(appView, /fa-regular fa-folder/)
+  assert.match(appView, /fa-brands fa-github/)
+  assert.match(appView, /app-header-info-popover-row-label">App folder</)
+  assert.match(appView, /app-header-info-popover-row-label">Source</)
   assert.match(appView, /href="<%=appInfoRemoteUrl%>" title="<%=appInfoRemoteUrl%>" rel="noopener noreferrer" data-app-info-external-link/)
-  assert.match(appView, /<span><%=appInfoRemoteDisplayUrl%><\/span>/)
+  assert.match(appView, /app-header-info-popover-row-value"><%=appInfoRemoteDisplayUrl%><\/span>/)
+  assert.match(appView, /grid-template-columns: 26px minmax\(0, 1fr\) auto/)
   assert.match(appView, /text-overflow: ellipsis/)
   assert.match(appView, /white-space: nowrap/)
   assert.match(appView, /window\.open\(href, "_blank"\)/)
@@ -1046,7 +1058,7 @@ test("app identity popover exposes launcher metadata and remote browser link", a
   assert.match(appView, /\.mobile-bottom-nav \.resource-usage-popover \{[\s\S]*bottom: calc\(100% \+ 9px\);/)
   assert.doesNotMatch(appView, /Open launcher remote/)
   assert.doesNotMatch(appView, /fetch\("\/go"/)
-  assert.doesNotMatch(appView, /app-header-info-popover-link"[^>]*features="browser"/)
+  assert.doesNotMatch(appView, /data-app-info-external-link[^>]*features="browser"/)
   assert.doesNotMatch(appView, /appInfoGitHistoryUrl|hydrateAppInfoGithubUrl|buildAppInfoGithubUrl|launcher_github_url|Open launcher on GitHub|No GitHub remote detected/)
 
   const start = appView.indexOf('<script>\n(() => {\n  const appInfoRoots = Array.from(document.querySelectorAll("[data-app-info-root]"))')
@@ -1059,7 +1071,9 @@ test("app identity popover exposes launcher metadata and remote browser link", a
       <div data-app-info-root>
         <button type="button" data-app-header-info-trigger aria-expanded="false">Demo</button>
         <div class="hidden" data-app-header-info-popover>
-          <a class="app-header-info-popover-link" href="https://gitlab.com/octocat/demo" title="https://gitlab.com/octocat/demo" data-app-info-external-link>gitlab.com/octocat/demo</a>
+          <button type="button" data-app-info-copy-path="/tmp/demo"><i class="fa-regular fa-copy"></i></button>
+          <button type="button" data-filepath="/tmp/demo" data-app-info-reveal-path>Reveal</button>
+          <a class="app-header-info-popover-row app-header-info-popover-row--link" href="https://gitlab.com/octocat/demo" title="https://gitlab.com/octocat/demo" data-app-info-external-link>gitlab.com/octocat/demo</a>
         </div>
       </div>
       <iframe></iframe>
@@ -1069,6 +1083,13 @@ test("app identity popover exposes launcher metadata and remote browser link", a
     pretendToBeVisual: true
   })
   const openedUrls = []
+  const copiedPaths = []
+  Object.defineProperty(dom.window.navigator, "clipboard", {
+    configurable: true,
+    value: {
+      writeText: async (value) => copiedPaths.push(value)
+    }
+  })
   dom.window.open = (url, target, features) => {
     openedUrls.push({ url, target, features })
   }
@@ -1080,13 +1101,24 @@ test("app identity popover exposes launcher metadata and remote browser link", a
 
   assert.equal(popover.classList.contains("hidden"), true)
   assert.equal(trigger.getAttribute("aria-expanded"), "false")
-  const remoteLink = dom.window.document.querySelector(".app-header-info-popover-link")
+  const remoteLink = dom.window.document.querySelector(".app-header-info-popover-row--link")
   assert.ok(remoteLink)
   assert.equal(remoteLink.getAttribute("href"), "https://gitlab.com/octocat/demo")
   assert.equal(remoteLink.getAttribute("title"), "https://gitlab.com/octocat/demo")
   assert.equal(remoteLink.hasAttribute("target"), false)
   assert.equal(remoteLink.hasAttribute("features"), false)
   assert.equal(remoteLink.textContent.trim(), "gitlab.com/octocat/demo")
+
+  click()
+  const copyButton = dom.window.document.querySelector("[data-app-info-copy-path]")
+  copyButton.dispatchEvent(new dom.window.MouseEvent("click", { bubbles: true, cancelable: true }))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(copiedPaths, ["/tmp/demo"])
+  assert.equal(copyButton.classList.contains("is-copied"), true)
+  assert.equal(copyButton.getAttribute("aria-label"), "App folder copied")
+  assert.equal(popover.classList.contains("hidden"), false)
+  dom.window.document.querySelector("[data-app-info-reveal-path]").click()
+  assert.equal(popover.classList.contains("hidden"), true)
 
   click()
   assert.equal(popover.classList.contains("hidden"), false)
