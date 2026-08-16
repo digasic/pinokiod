@@ -617,11 +617,11 @@ describe("Save Space interface", () => {
     const globalChart = globalDocument.querySelector(".vault-storage-chart")
 
     assert.match(globalHeadline.textContent, /saved by deduplicating/)
-    assert.match(globalChart.getAttribute("aria-label"), /Still used:/)
+    assert.match(globalChart.getAttribute("aria-label"), /In use:/)
     assert.match(globalChart.getAttribute("aria-label"), /Saved:/)
     assert.match(globalChart.getAttribute("aria-label"), /Can save:/)
     assert.match(globalDocument.querySelector(
-      ".vault-storage-key.occupied").textContent, /Still used/)
+      ".vault-storage-key.occupied").textContent, /In use/)
     assert.match(globalDocument.querySelector(
       ".vault-storage-key.optimized").textContent, /Saved/)
     assert.match(globalDocument.querySelector(

@@ -90,7 +90,7 @@ const COPY = {
   manual_description: "Scan only when requested",
   storage_saved_headline: "{size} saved by deduplicating",
   storage_unique_headline: "{size} unique to this app",
-  storage_still_used: "Still used",
+  storage_still_used: "In use",
   storage_saved: "Saved",
   storage_unique: "Unique",
   storage_shared: "Shared",
