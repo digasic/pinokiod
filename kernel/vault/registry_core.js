@@ -3227,7 +3227,7 @@ class RegistryCore {
   beginScan(scopeId = null) {
     // The scan schema is reset for every run, so a compact integer is enough.
     // Repeating a UUID in tens of millions of temporary rows and indexes turns
-    // an All files scan into many gigabytes of avoidable I/O.
+    // a low-threshold scan into many gigabytes of avoidable I/O.
     const id = 1
     this.scanSizes.clear()
     this.scanInodes.clear()

@@ -1,11 +1,13 @@
 const CANDIDATE_SIZE_BASE = process.platform === "win32" ? 1024 : 1000
 const SIZE_THRESHOLD = 100 * CANDIDATE_SIZE_BASE ** 2
-const CANDIDATE_SIZE_OPTIONS = [0]
-  .concat([1, 10, 50, 100, 500].map((value) => value * CANDIDATE_SIZE_BASE ** 2))
+const CANDIDATE_SIZE_OPTIONS = [10, 50, 100, 500]
+  .map((value) => value * CANDIDATE_SIZE_BASE ** 2)
   .concat(CANDIDATE_SIZE_BASE ** 3)
+const MINIMUM_CANDIDATE_SIZE = CANDIDATE_SIZE_OPTIONS[0]
 const isCandidateFileSize = (size, threshold) => size > 0 && size >= threshold
 
 module.exports = {
+  MINIMUM_CANDIDATE_SIZE,
   SIZE_THRESHOLD,
   CANDIDATE_SIZE_OPTIONS,
   isCandidateFileSize,

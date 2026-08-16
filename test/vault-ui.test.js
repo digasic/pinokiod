@@ -520,8 +520,9 @@ describe("Save Space interface", () => {
     assert.doesNotMatch(combined,
       /Keep separate|Kept separate|Review again|review_again/)
     assert.doesNotMatch(combined, /\bundo\b/i)
-    assert.match(combined, /const candidateSizeOptions = \[0\]/)
-    assert.match(combined, /\[1, 10, 50, 100, 500\]/)
+    assert.match(combined,
+      /const candidateSizeOptions = \[10, 50, 100, 500\]/)
+    assert.doesNotMatch(combined, /const candidateSizeOptions = \[0\]/)
     assert.match(combined, /The rest of the scan completed\./)
     assert.doesNotMatch(combined, /Previous completed results were kept\./)
     assert.match(combined, /Scan completed with exclusions/)
@@ -747,9 +748,9 @@ describe("Save Space interface", () => {
     assert.match(document.getElementById("btn-scan").textContent,
       /Scan again/)
     assert.equal(requests.some((request) => request.action === "scan"), false)
-    document.querySelector('[data-candidate-size="0"]').click()
-    assert.match(document.getElementById("vault-scan-size-label").textContent,
-      /All files/)
+    assert.equal(document.querySelector('[data-candidate-size="0"]'), null)
+    assert.equal(document.querySelector(
+      `[data-candidate-size="${candidateBase ** 2}"]`), null)
     assert.equal(requests.some((request) => request.action === "scan"), false)
     document.querySelector(`[data-candidate-size="${100 * candidateBase ** 2}"]`).click()
     assert.ok(document.querySelector('.vault-all-locations[data-source=""]'))
@@ -892,8 +893,8 @@ describe("Save Space interface", () => {
 
   test("an app displays and immediately saves its own minimum size", async () => {
     const candidateBase = process.platform === "win32" ? 1024 : 1000
-    const appMinimum = candidateBase ** 2
-    const globalMinimum = 10 * candidateBase ** 2
+    const appMinimum = 10 * candidateBase ** 2
+    const globalMinimum = 100 * candidateBase ** 2
     const selected = 50 * candidateBase ** 2
     const { dom, requests } = await makePage(fixture([], {
       candidate_min_bytes: appMinimum,

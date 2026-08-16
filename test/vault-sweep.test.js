@@ -6,6 +6,7 @@ const os = require("node:os")
 const path = require("node:path")
 const Vault = require("../kernel/vault")
 const RegistryCore = require("../kernel/vault/registry_core")
+const { MINIMUM_CANDIDATE_SIZE } = require("../kernel/vault/constants")
 const { statMany } = require("../kernel/vault/walker")
 
 const homes = []
@@ -17,6 +18,12 @@ const sha256 = (contents) => crypto.createHash("sha256")
 const write = async (filePath, contents) => {
   await fs.promises.mkdir(path.dirname(filePath), { recursive: true })
   await fs.promises.writeFile(filePath, contents)
+  return filePath
+}
+
+const writeCandidate = async (filePath, contents) => {
+  await write(filePath, contents)
+  await fs.promises.truncate(filePath, MINIMUM_CANDIDATE_SIZE)
   return filePath
 }
 
@@ -455,7 +462,7 @@ describe("Save Space scans", () => {
     assert.equal((await vault.registry.getFile(linked)).status, "linked")
   })
 
-  test("All files excludes empty files and retains more than one page", async () => {
+  test("a low-threshold scan excludes empty files and retains more than one page", async () => {
     const { home, vault } = await makeVault(0)
     const root = path.join(home, "api", "many")
     const paths = []
@@ -490,7 +497,7 @@ describe("Save Space scans", () => {
       .concat(secondPage.items.map((item) => item.path))).size, paths.length)
   })
 
-  test("All files sends only matching size groups to hash work", async () => {
+  test("a low-threshold scan sends only matching size groups to hash work", async () => {
     const { home, vault } = await makeVault(0)
     const root = path.join(home, "api", "windows")
     for (let index = 1; index <= 300; index++) {
@@ -676,9 +683,10 @@ describe("Save Space scans", () => {
   test("an anchor sharing a scanned inode is not counted as a second read", async () => {
     const { home, vault } = await makeVault()
     const contents = crypto.randomBytes(4096)
-    const first = await write(
+    const first = await writeCandidate(
       path.join(home, "api", "one", "model.bin"), contents)
-    await write(path.join(home, "api", "two", "model.bin"), contents)
+    await writeCandidate(
+      path.join(home, "api", "two", "model.bin"), contents)
     await vault.sweeper.scan()
     const duplicate = [...await vault.registry.files({
       statuses: ["duplicate"]
@@ -703,10 +711,11 @@ describe("Save Space scans", () => {
     assert.equal(reads, 1)
     assert.equal(vault.sweeper.state.hash_work_files, 1)
     assert.equal(vault.sweeper.state.hash_files_completed, 1)
-    assert.equal(vault.sweeper.state.hash_work_bytes, contents.length)
+    assert.equal(vault.sweeper.state.hash_work_bytes,
+      MINIMUM_CANDIDATE_SIZE)
     assert.equal(
       vault.sweeper.state.hash_bytes_completed,
-      contents.length
+      MINIMUM_CANDIDATE_SIZE
     )
     assert.equal((await vault.registry.getFile(first)).hash, duplicate.hash)
   })
@@ -1375,8 +1384,10 @@ describe("Save Space scans", () => {
   test("an anchor fallback does not change the discovered hash workload", async () => {
     const { home, vault } = await makeVault()
     const contents = crypto.randomBytes(4096)
-    await write(path.join(home, "api", "one", "model.bin"), contents)
-    await write(path.join(home, "api", "two", "model.bin"), contents)
+    await writeCandidate(
+      path.join(home, "api", "one", "model.bin"), contents)
+    await writeCandidate(
+      path.join(home, "api", "two", "model.bin"), contents)
     await vault.sweeper.scan()
     const duplicate = [...await vault.registry.files({
       statuses: ["duplicate"]
@@ -1429,7 +1440,7 @@ describe("Save Space scans", () => {
       const progress = vault.scanStatus()
       assert.equal(progress.hash_work_files, 1)
       assert.equal(progress.hash_files_completed, 0)
-      assert.equal(progress.hash_work_bytes, contents.length)
+      assert.equal(progress.hash_work_bytes, MINIMUM_CANDIDATE_SIZE)
       assert.equal(progress.hash_bytes_completed, 0)
     } finally {
       releaseAnchor()
@@ -1445,10 +1456,11 @@ describe("Save Space scans", () => {
     assert.equal(result.outcome, "completed_with_exclusions")
     assert.equal(vault.sweeper.state.hash_work_files, 1)
     assert.equal(vault.sweeper.state.hash_files_completed, 1)
-    assert.equal(vault.sweeper.state.hash_work_bytes, contents.length)
+    assert.equal(vault.sweeper.state.hash_work_bytes,
+      MINIMUM_CANDIDATE_SIZE)
     assert.equal(
       vault.sweeper.state.hash_bytes_completed,
-      contents.length
+      MINIMUM_CANDIDATE_SIZE
     )
   })
 
@@ -1602,12 +1614,15 @@ describe("Save Space scans", () => {
   test("a missing database is rebuilt by a normal scan, including managed links below the threshold", async () => {
     const { home, vault, store } = await makeVault()
     const contents = crypto.randomBytes(4096)
-    await write(path.join(home, "api", "one", "model.bin"), contents)
-    await write(path.join(home, "api", "two", "model.bin"), contents)
+    await writeCandidate(
+      path.join(home, "api", "one", "model.bin"), contents)
+    await writeCandidate(
+      path.join(home, "api", "two", "model.bin"), contents)
     await vault.sweeper.scan()
     const duplicate = [...await vault.registry.files({
       statuses: ["duplicate"]
     })][0]
+    const hash = duplicate.hash
     await vault.perform("deduplicate", { path: duplicate.path })
     const managedPath = duplicate.path
 
@@ -1619,7 +1634,7 @@ describe("Save Space scans", () => {
       store
     })
     await replacement.init()
-    replacement.sizeThreshold = contents.length * 2
+    replacement.sizeThreshold = MINIMUM_CANDIDATE_SIZE * 2
     vaults.push(replacement)
     assert.equal(await replacement.registry.countFiles(), 0)
 
@@ -1628,21 +1643,23 @@ describe("Save Space scans", () => {
     const rebuilt = await replacement.registry.getFile(managedPath)
     assert.ok(rebuilt)
     assert.equal(rebuilt.status, "linked")
-    assert.equal(rebuilt.hash, sha256(contents))
+    assert.equal(rebuilt.hash, hash)
   })
 
   test("managed links remain tracked below the threshold if their anchor was removed externally", async () => {
     const { home, vault } = await makeVault()
     const contents = crypto.randomBytes(4096)
-    await write(path.join(home, "api", "one", "model.bin"), contents)
-    await write(path.join(home, "api", "two", "model.bin"), contents)
+    await writeCandidate(
+      path.join(home, "api", "one", "model.bin"), contents)
+    await writeCandidate(
+      path.join(home, "api", "two", "model.bin"), contents)
     await vault.sweeper.scan()
     const duplicate = [...await vault.registry.files({
       statuses: ["duplicate"]
     })][0]
     await vault.perform("deduplicate", { path: duplicate.path })
     await fs.promises.unlink(vault.storePathFor(duplicate.hash))
-    vault.sizeThreshold = contents.length * 2
+    vault.sizeThreshold = MINIMUM_CANDIDATE_SIZE * 2
 
     await vault.sweeper.scan()
 
@@ -1744,11 +1761,11 @@ describe("Save Space scans", () => {
     }
     const { home, vault } = await makeVault()
     const contents = crypto.randomBytes(4096)
-    const incompatible = await write(
+    const incompatible = await writeCandidate(
       path.join(home, "api", "a", "model.bin"), contents)
-    const compatibleOne = await write(
+    const compatibleOne = await writeCandidate(
       path.join(home, "api", "b", "model.bin"), contents)
-    const compatibleTwo = await write(
+    const compatibleTwo = await writeCandidate(
       path.join(home, "api", "c", "model.bin"), contents)
     await fs.promises.chmod(incompatible, 0o600)
     await fs.promises.chmod(compatibleOne, 0o644)

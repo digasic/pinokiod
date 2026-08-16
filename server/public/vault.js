@@ -192,6 +192,7 @@ const COPY = {
   hardlinks_unavailable: "This disk does not support shared files",
   anchor_conflict: "The stored matching copy could not be verified",
   permission_denied: "Disk Saver cannot modify this file or its folder",
+  below_minimum_size: "This file is below the 10 MB safety minimum",
   cannot_share_safely: "This file cannot safely share storage",
   changed_since_scan: "Some files changed since the scan. Scan again before deduplicating them.",
   deduplicate_locked: "Stop the app before deduplicating this file.",
@@ -394,8 +395,8 @@ const candidateSizeBase = document.body.dataset.platform === "win32" ? 1024 : 10
 const AUTOMATIC_SUPPORTED = document.body.dataset.platform === "darwin" ||
   document.body.dataset.platform === "win32"
 const defaultCandidateSize = 100 * candidateSizeBase ** 2
-const candidateSizeOptions = [0]
-  .concat([1, 10, 50, 100, 500].map((value) => value * candidateSizeBase ** 2))
+const candidateSizeOptions = [10, 50, 100, 500]
+  .map((value) => value * candidateSizeBase ** 2)
   .concat(candidateSizeBase ** 3)
 const PAGE_SIZE = 500
 
@@ -494,7 +495,7 @@ const candidateSize = () => {
   return candidateSizeOptions.includes(value) ? value : defaultCandidateSize
 }
 const candidateSizeLabel = (size = candidateSize()) => {
-  return size === 0 ? COPY.all : `${fmt(size)}+`
+  return `${fmt(size)}+`
 }
 const renderCandidateSizeControl = () => {
   const size = candidateSize()
@@ -1657,7 +1658,8 @@ const unavailableLabel = (item) => ({
   hardlinks: COPY.hardlinks_unavailable,
   different_disk: COPY.different_disk,
   anchor_conflict: COPY.anchor_conflict,
-  permission_denied: COPY.permission_denied
+  permission_denied: COPY.permission_denied,
+  below_minimum_size: COPY.below_minimum_size
 }[item.unavailable_reason] || COPY.cannot_share_safely)
 const statusMarkup = (item) => {
   if (item.status === "unavailable") {

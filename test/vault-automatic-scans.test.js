@@ -1247,7 +1247,7 @@ describe("automatic app checks", () => {
     await fs.promises.writeFile(second, "same-content")
     const vault = await makeVault(home)
     vault.lastScanCache.set("", { candidate_min_bytes: 1 })
-    await vault.registry.setScanSetting(`app:${app}`, 0)
+    vault.automaticScans.candidateThreshold = async () => 1
     const hashedPaths = []
     const originalHashFile = vault.hashFile.bind(vault)
     vault.hashFile = async (filePath, options) => {

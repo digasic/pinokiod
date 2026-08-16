@@ -9,8 +9,11 @@ const Vault = require("../kernel/vault")
 const Registry = require("../kernel/vault/registry")
 const {
   CANDIDATE_SIZE_OPTIONS,
+  MINIMUM_CANDIDATE_SIZE,
   SIZE_THRESHOLD
 } = require("../kernel/vault/constants")
+
+const candidateBase = process.platform === "win32" ? 1024 : 1000
 
 const homes = []
 
@@ -35,7 +38,7 @@ const makeVault = async ({ candidateSize = CANDIDATE_SIZE_OPTIONS[0] } = {}) => 
   const vault = new Vault(kernel)
   kernel.vault = vault
   await vault.init()
-  vault.sizeThreshold = CANDIDATE_SIZE_OPTIONS[0]
+  vault.sizeThreshold = 1
   if (candidateSize !== null) {
     await vault.perform("set_candidate_size", {
       candidate_size: candidateSize
@@ -50,13 +53,29 @@ const write = async (filePath, contents) => {
   return filePath
 }
 
+const writeCandidate = async (
+  filePath,
+  contents,
+  size = MINIMUM_CANDIDATE_SIZE
+) => {
+  await write(filePath, contents)
+  await fs.promises.truncate(filePath, size)
+  return filePath
+}
+
+const assertCandidateContents = async (filePath, contents, size) => {
+  const expected = Buffer.alloc(size)
+  contents.copy(expected)
+  assert.deepEqual(await fs.promises.readFile(filePath), expected)
+}
+
 const duplicatePair = async (home, name = "model.bin") => {
   const contents = crypto.randomBytes(4096)
-  const first = await write(
+  const first = await writeCandidate(
     path.join(home, "api", "first", name), contents)
-  const second = await write(
+  const second = await writeCandidate(
     path.join(home, "api", "second", name), contents)
-  return { contents, first, second }
+  return { contents, first, second, size: MINIMUM_CANDIDATE_SIZE }
 }
 
 const close = async (vault) => {
@@ -264,6 +283,33 @@ describe("Save Space engine", () => {
       })).error, /valid minimum file size/i)
     }
     assert.equal(await vault.registry.scanSetting(), null)
+
+    await close(vault)
+  })
+
+  test("minimum size settings reject values below 10 MB", async () => {
+    const { vault } = await makeVault({ candidateSize: null })
+
+    for (const candidateSize of [0, candidateBase ** 2]) {
+      assert.match((await vault.perform("set_candidate_size", {
+        candidate_size: candidateSize
+      })).error, /valid minimum file size/i)
+    }
+    assert.equal(CANDIDATE_SIZE_OPTIONS[0],
+      MINIMUM_CANDIDATE_SIZE)
+    assert.deepEqual(CANDIDATE_SIZE_OPTIONS, [
+      10, 50, 100, 500, 1000
+    ].map((value) => value * candidateBase ** 2))
+    assert.equal(await vault.registry.scanSetting(), null)
+
+    await close(vault)
+  })
+
+  test("legacy minimum size settings fall back to 100 MB", async () => {
+    const { vault } = await makeVault({ candidateSize: null })
+    await vault.registry.setScanSetting(null, candidateBase ** 2)
+
+    assert.equal((await vault.status()).candidate_min_bytes, SIZE_THRESHOLD)
 
     await close(vault)
   })
@@ -677,11 +723,11 @@ describe("Save Space engine", () => {
     const { home, vault } = await makeVault()
     const outside = await makeOutside()
     const contents = crypto.randomBytes(4096)
-    const pinokioFile = await write(
+    const pinokioFile = await writeCandidate(
       path.join(home, "api", "app", "model.bin"), contents)
-    const direct = await write(
+    const direct = await writeCandidate(
       path.join(outside, "other-app", "model.bin"), contents)
-    const nested = await write(
+    const nested = await writeCandidate(
       path.join(outside, "other-app", "models", "model.bin"),
       contents
     )
@@ -721,11 +767,11 @@ describe("Save Space engine", () => {
     assert.equal(discovery.phase, "complete", discovery.error)
     assert.equal(discovery.result_count, 1)
     assert.equal(discovery.result_files, 2)
-    assert.equal(discovery.result_bytes, contents.length * 2)
+    assert.equal(discovery.result_bytes, MINIMUM_CANDIDATE_SIZE * 2)
     assert.equal(discovery.candidates_known, true)
     assert.equal(discovery.processed, discovery.candidates)
     assert.equal(discovery.verified_files, 2)
-    assert.equal(discovery.verified_bytes, contents.length * 2)
+    assert.equal(discovery.verified_bytes, MINIMUM_CANDIDATE_SIZE * 2)
     const results = await vault.folderDiscoveryResults()
     assert.equal(results.total, 1)
     assert.equal(results.root.folder,
@@ -733,7 +779,7 @@ describe("Save Space engine", () => {
     assert.equal(results.items[0].folder,
       path.join(await fs.promises.realpath(outside), "other-app"))
     assert.equal(results.items[0].file_count, 2)
-    assert.equal(results.items[0].bytes, contents.length * 2)
+    assert.equal(results.items[0].bytes, MINIMUM_CANDIDATE_SIZE * 2)
     assert.equal(results.items[0].eligible_file_count, 2)
     const recommendations = await vault.registry
       .folderDiscoveryRecommendations(vault.folderFinder.runId)
@@ -772,20 +818,20 @@ describe("Save Space engine", () => {
     const first = crypto.randomBytes(4096)
     const second = crypto.randomBytes(6144)
     const unrelated = crypto.randomBytes(7168)
-    await write(path.join(home, "api", "first", "model.bin"), first)
-    await write(path.join(home, "api", "second", "model.bin"), second)
-    const unrelatedPath = await write(
+    await writeCandidate(path.join(home, "api", "first", "model.bin"), first)
+    await writeCandidate(path.join(home, "api", "second", "model.bin"), second)
+    const unrelatedPath = await writeCandidate(
       path.join(home, "api", "unrelated-a", "model.bin"), unrelated)
-    await write(
+    await writeCandidate(
       path.join(home, "api", "unrelated-b", "model.bin"), unrelated)
     const comfy = path.join(outside, ".comfycraft")
     const release = path.join(outside, "pinokio_2026_0627")
-    await write(path.join(comfy, "kits", "ace", "model.bin"), first)
-    await write(path.join(comfy, "kits", "hello", "model.bin"), second)
+    await writeCandidate(path.join(comfy, "kits", "ace", "model.bin"), first)
+    await writeCandidate(path.join(comfy, "kits", "hello", "model.bin"), second)
     await write(path.join(comfy, "logs", "history.bin"),
       crypto.randomBytes(2048))
-    await write(path.join(release, "api", "first", "model.bin"), first)
-    await write(path.join(release, "api", "second", "model.bin"), second)
+    await writeCandidate(path.join(release, "api", "first", "model.bin"), first)
+    await writeCandidate(path.join(release, "api", "second", "model.bin"), second)
 
     await vault.sweeper.scan()
     const unrelatedHash = (await vault.registry.getFile(unrelatedPath)).hash
@@ -823,7 +869,7 @@ describe("Save Space engine", () => {
     const kitChildren = await vault.folderDiscoveryChildren(
       comfyChildren.items[0].folder)
     assert.equal(kitChildren.items.length, 2)
-    assert.equal(comfyResult.eligible_file_count, 3)
+    assert.equal(comfyResult.eligible_file_count, 2)
     assert.equal(comfyResult.file_count, 2)
 
     const selected = [
@@ -889,9 +935,9 @@ describe("Save Space engine", () => {
     const contents = crypto.randomBytes(8192)
     await write(path.join(home, "api", "baseline", "unique.bin"),
       crypto.randomBytes(contents.length))
-    const first = await write(
+    const first = await writeCandidate(
       path.join(outside, "first-app", "model.bin"), contents)
-    const second = await write(
+    const second = await writeCandidate(
       path.join(outside, "second-app", "model.bin"), contents)
 
     await vault.sweeper.scan()
@@ -904,7 +950,7 @@ describe("Save Space engine", () => {
     const discovery = vault.folderDiscoveryStatus()
     const results = await vault.folderDiscoveryResults()
     assert.equal(discovery.result_files, 2)
-    assert.equal(discovery.result_bytes, contents.length * 2)
+    assert.equal(discovery.result_bytes, MINIMUM_CANDIDATE_SIZE * 2)
     assert.equal(results.selection.selected_count, 0)
     await vault.perform("update_folder_discovery_selection", {
       root: discovery.root,
@@ -915,7 +961,7 @@ describe("Save Space engine", () => {
     const staged = (await vault.folderDiscoveryResults()).selection
     assert.equal(staged.selected_count, 1)
     assert.equal(staged.selected_files, 2)
-    assert.equal(staged.potential_savings, contents.length)
+    assert.equal(staged.potential_savings, MINIMUM_CANDIDATE_SIZE)
 
     vault.hashFile = async () => {
       throw new Error("Adding staged results must not hash files again.")
@@ -936,8 +982,9 @@ describe("Save Space engine", () => {
     assert.equal(secondRow.status, "duplicate")
     const status = await vault.status()
     assert.equal(status.bytes_without_sharing, contents.length)
-    assert.equal(status.logical_bytes, contents.length * 3)
-    assert.equal(status.pending_bytes, contents.length)
+    assert.equal(status.logical_bytes,
+      MINIMUM_CANDIDATE_SIZE * 2 + contents.length)
+    assert.equal(status.pending_bytes, MINIMUM_CANDIDATE_SIZE)
     await close(vault)
   })
 
@@ -957,7 +1004,8 @@ describe("Save Space engine", () => {
     await vault.sweeper.scan()
     assert.equal((await vault.registry.files()).length, 0)
 
-    await write(path.join(outside, "models", "model.bin"), pair.contents)
+    await writeCandidate(
+      path.join(outside, "models", "model.bin"), pair.contents, pair.size)
     assert.equal((await vault.perform("find_folders", {
       path: outside,
       candidate_size: CANDIDATE_SIZE_OPTIONS[0]
@@ -967,7 +1015,7 @@ describe("Save Space engine", () => {
     const discovery = vault.folderDiscoveryStatus()
     assert.equal(discovery.phase, "complete", discovery.error)
     assert.equal(discovery.result_files, 1)
-    assert.equal(discovery.result_bytes, pair.contents.length)
+    assert.equal(discovery.result_bytes, pair.size)
     const results = await vault.folderDiscoveryResults()
     assert.equal(results.total, 1)
     assert.equal(results.selection.selected_count, 0)
@@ -979,7 +1027,7 @@ describe("Save Space engine", () => {
     })
     const selected = (await vault.folderDiscoveryResults()).selection
     assert.equal(selected.selected_files, 1)
-    assert.equal(selected.potential_savings, pair.contents.length)
+    assert.equal(selected.potential_savings, pair.size)
     await close(vault)
   })
 
@@ -987,8 +1035,8 @@ describe("Save Space engine", () => {
     const { home, vault } = await makeVault()
     const outside = await makeOutside()
     const contents = crypto.randomBytes(4096)
-    await write(path.join(home, "api", "app", "model.bin"), contents)
-    const outsideFile = await write(
+    await writeCandidate(path.join(home, "api", "app", "model.bin"), contents)
+    const outsideFile = await writeCandidate(
       path.join(outside, "models", "model.bin"), contents)
     const canonicalOutsideFile = await fs.promises.realpath(outsideFile)
     await vault.sweeper.scan()
@@ -1037,18 +1085,45 @@ describe("Save Space engine", () => {
     const { home, vault } = await makeVault()
     const outside = await makeOutside()
     const contents = crypto.randomBytes(64)
-    await write(path.join(home, "api", "context", "model.bin"), contents)
+    await writeCandidate(
+      path.join(home, "api", "context", "model.bin"), contents)
     for (let index = 0; index < 501; index++) {
-      await write(path.join(
+      await writeCandidate(path.join(
         outside,
         `app-${String(index).padStart(3, "0")}`,
         "models",
         "model.bin"
       ), contents)
     }
-    await write(path.join(outside, "unrelated.bin"),
-      crypto.randomBytes(contents.length * 1000))
     await vault.sweeper.scan()
+    const resultHash = crypto.createHash("sha256")
+      .update(contents)
+      .update(Buffer.alloc(MINIMUM_CANDIDATE_SIZE - contents.length))
+      .digest("hex")
+    vault.hashFile = async (filePath) => ({
+      hash: resultHash,
+      size: (await fs.promises.stat(filePath)).size
+    })
+    const prepareResults = vault.registry.prepareFolderDiscoveryResults
+      .bind(vault.registry)
+    vault.registry.prepareFolderDiscoveryResults = async (runId, root) => {
+      const stat = await fs.promises.stat(root)
+      // Force recommendations below the root without creating a huge file.
+      const staged = await vault.registry.stageFolderDiscoveryFiles(runId, [{
+        path: path.join(root, "unrelated.bin"),
+        size: MINIMUM_CANDIDATE_SIZE * 1000,
+        mtime: stat.mtimeMs,
+        ctime: stat.ctimeMs,
+        dev: stat.dev,
+        ino: 0,
+        nlink: 1,
+        mode: stat.mode,
+        uid: stat.uid,
+        gid: stat.gid
+      }])
+      assert.equal(staged.changes, 1)
+      return prepareResults(runId, root)
+    }
     assert.equal((await vault.perform("find_folders", {
       path: outside,
       candidate_size: CANDIDATE_SIZE_OPTIONS[0]
@@ -1084,13 +1159,24 @@ describe("Save Space engine", () => {
       const outside = await makeOutside()
       const first = crypto.randomBytes(1000)
       const second = crypto.randomBytes(1000)
-      await write(path.join(home, "api", "first", "model.bin"), first)
-      await write(path.join(home, "api", "second", "model.bin"), second)
-      await write(path.join(outside, "group", "a", "model.bin"), first)
-      await write(path.join(outside, "group", "b", "model.bin"), second)
+      await writeCandidate(
+        path.join(home, "api", "first", "model.bin"), first)
+      await writeCandidate(
+        path.join(home, "api", "second", "model.bin"), second)
+      await writeCandidate(
+        path.join(outside, "group", "a", "model.bin"), first)
+      await writeCandidate(
+        path.join(outside, "group", "b", "model.bin"), second)
       for (let index = 0; index < extraSizes.length; index++) {
-        await write(path.join(outside, "group", `extra-${index}.bin`),
-          crypto.randomBytes(extraSizes[index]))
+        const size = Math.max(
+          MINIMUM_CANDIDATE_SIZE,
+          MINIMUM_CANDIDATE_SIZE * extraSizes[index] / 1000
+        )
+        await writeCandidate(
+          path.join(outside, "group", `extra-${index}.bin`),
+          crypto.randomBytes(extraSizes[index]),
+          size
+        )
       }
       await vault.sweeper.scan()
       await vault.perform("find_folders", {
@@ -1249,13 +1335,15 @@ describe("Save Space engine", () => {
     const contents = crypto.randomBytes(4096)
     const stale = []
     for (let index = 0; index < 32; index++) {
-      stale.push(await write(
+      stale.push(await writeCandidate(
         path.join(home, "api", "app", `a${String(index).padStart(2, "0")}.bin`),
         contents
       ))
     }
-    await write(path.join(home, "api", "app", "z-valid.bin"), contents)
-    await write(path.join(outside, "models", "model.bin"), contents)
+    await writeCandidate(
+      path.join(home, "api", "app", "z-valid.bin"), contents)
+    await writeCandidate(
+      path.join(outside, "models", "model.bin"), contents)
     await vault.sweeper.scan()
 
     for (let index = 0; index < stale.length; index++) {
@@ -1338,8 +1426,10 @@ describe("Save Space engine", () => {
     const { home, vault } = await makeVault()
     const outside = await makeOutside()
     const contents = crypto.randomBytes(4096)
-    await write(path.join(home, "api", "app", "model.bin"), contents)
-    await write(path.join(outside, "models", "model.bin"), contents)
+    await writeCandidate(
+      path.join(home, "api", "app", "model.bin"), contents)
+    await writeCandidate(
+      path.join(outside, "models", "model.bin"), contents)
     await vault.sweeper.scan()
     const publishedFiles = await vault.registry.countFiles()
     vault.hashFile = async () => {
@@ -1387,7 +1477,7 @@ describe("Save Space engine", () => {
       store: kernel.store
     })
     await replacement.init()
-    replacement.sizeThreshold = pair.contents.length * 2
+    replacement.sizeThreshold = pair.size * 2
 
     assert.deepEqual(replacement.configuredLocations(), [])
     assert.equal(await replacement.globalScanReady(), false)
@@ -1399,6 +1489,33 @@ describe("Save Space engine", () => {
       "linked"
     )
     await close(replacement)
+  })
+
+  test("deduplication refuses legacy scan results below 10 MB", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    const pair = {
+      first: await write(path.join(home, "api", "first", "small.bin"),
+        contents),
+      second: await write(path.join(home, "api", "second", "small.bin"),
+        contents)
+    }
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    const result = await vault.perform("deduplicate", {
+      path: duplicate.path
+    })
+
+    assert.equal(result.status, "unavailable")
+    assert.equal(result.unavailable_reason, "below_minimum_size")
+    const [first, second] = await Promise.all([
+      fs.promises.stat(pair.first),
+      fs.promises.stat(pair.second)
+    ])
+    assert.notEqual(first.ino, second.ino)
+    await close(vault)
   })
 
   test("explicit deduplication creates the first anchor and changes one path atomically", async () => {
@@ -1418,7 +1535,7 @@ describe("Save Space engine", () => {
       path: duplicate.path
     })
     assert.equal(result.status, "converted")
-    assert.equal(result.bytes_saved, pair.contents.length)
+    assert.equal(result.bytes_saved, pair.size)
 
     const firstStat = await fs.promises.stat(pair.first)
     const secondStat = await fs.promises.stat(pair.second)
@@ -1691,7 +1808,7 @@ describe("Save Space engine", () => {
       unavailable_reason: "hardlinks"
     })
     assert.equal((await fs.promises.stat(duplicate.path)).ino, before.ino)
-    assert.deepEqual(await fs.promises.readFile(duplicate.path), pair.contents)
+    await assertCandidateContents(duplicate.path, pair.contents, pair.size)
     const rows = await vault.registry.files({ hash: duplicate.hash })
     assert.equal(rows.every((row) =>
       row.status === "unavailable" &&
@@ -1739,7 +1856,7 @@ describe("Save Space engine", () => {
     assert.equal(row.status, "unavailable")
     assert.equal(row.unavailable_reason, "permission_denied")
     assert.equal((await fs.promises.stat(duplicate.path)).ino, before.ino)
-    assert.deepEqual(await fs.promises.readFile(duplicate.path), pair.contents)
+    await assertCandidateContents(duplicate.path, pair.contents, pair.size)
     const status = await vault.status(null, { view: "duplicates" })
     const unavailable = await vault.status(null, { view: "unavailable" })
     assert.equal(status.inventory.counts.duplicates, 0)
@@ -1903,7 +2020,7 @@ describe("Save Space engine", () => {
     assert.equal(row.status, "unavailable")
     assert.equal(row.unavailable_reason, "metadata")
     assert.equal((await fs.promises.stat(duplicate.path)).ino, before.ino)
-    assert.deepEqual(await fs.promises.readFile(duplicate.path), pair.contents)
+    await assertCandidateContents(duplicate.path, pair.contents, pair.size)
     await close(vault)
   })
 
@@ -1950,7 +2067,7 @@ describe("Save Space engine", () => {
     assert.equal(row.status, "unavailable")
     assert.equal(row.unavailable_reason, "different_disk")
     assert.equal((await fs.promises.stat(duplicate.path)).ino, before.ino)
-    assert.deepEqual(await fs.promises.readFile(duplicate.path), pair.contents)
+    await assertCandidateContents(duplicate.path, pair.contents, pair.size)
     await close(vault)
   })
 
@@ -1990,7 +2107,7 @@ describe("Save Space engine", () => {
     assert.equal(fs.existsSync(
       `${duplicate.path}.pinokio-dedup-tmp`), false)
     assert.equal((await fs.promises.stat(duplicate.path)).ino, before.ino)
-    assert.deepEqual(await fs.promises.readFile(duplicate.path), pair.contents)
+    await assertCandidateContents(duplicate.path, pair.contents, pair.size)
     await close(vault)
   })
 
@@ -2009,7 +2126,8 @@ describe("Save Space engine", () => {
     )
     const anchor = vault.storePathFor(duplicate.hash)
     await fs.promises.unlink(anchor)
-    await fs.promises.writeFile(anchor, crypto.randomBytes(pair.contents.length))
+    await writeCandidate(anchor, crypto.randomBytes(pair.contents.length),
+      pair.size)
     const before = await fs.promises.stat(duplicate.path)
 
     const result = await vault.perform("deduplicate", {
@@ -2018,10 +2136,7 @@ describe("Save Space engine", () => {
 
     assert.equal(result.status, "stale")
     assert.equal((await fs.promises.stat(duplicate.path)).ino, before.ino)
-    assert.deepEqual(
-      await fs.promises.readFile(duplicate.path),
-      pair.contents
-    )
+    await assertCandidateContents(duplicate.path, pair.contents, pair.size)
     await close(vault)
   })
 
@@ -2098,7 +2213,7 @@ describe("Save Space engine", () => {
     assert.equal(matching.inventory.current.separate_count, 2)
     assert.equal(
       matching.inventory.current.separate_bytes,
-      firstPair.contents.length * 2
+      firstPair.size * 2
     )
 
     const result = await vault.perform("separate_all", {
@@ -2161,11 +2276,11 @@ describe("Save Space engine", () => {
     await vault.sweeper.scan()
     let status = await vault.status()
 
-    assert.equal(status.bytes_without_sharing, pair.contents.length * 2)
-    assert.equal(status.logical_bytes, pair.contents.length * 2)
+    assert.equal(status.bytes_without_sharing, pair.size * 2)
+    assert.equal(status.logical_bytes, pair.size * 2)
     assert.equal(status.saved_by_sharing, 0)
-    assert.equal(status.bytes_on_disk, pair.contents.length * 2)
-    assert.equal(status.pending_bytes, pair.contents.length)
+    assert.equal(status.bytes_on_disk, pair.size * 2)
+    assert.equal(status.pending_bytes, pair.size)
     assert.equal(Object.hasOwn(status, "shared_logical_bytes"), false)
     let appStatus = await vault.status("app:first")
     assert.equal(appStatus.shared_logical_bytes, 0)
@@ -2175,21 +2290,21 @@ describe("Save Space engine", () => {
     })][0]
     await vault.perform("deduplicate", { path: duplicate.path })
     status = await vault.status()
-    assert.equal(status.saved_by_sharing, pair.contents.length)
-    assert.equal(status.logical_bytes, pair.contents.length * 2)
-    assert.equal(status.bytes_on_disk, pair.contents.length)
+    assert.equal(status.saved_by_sharing, pair.size)
+    assert.equal(status.logical_bytes, pair.size * 2)
+    assert.equal(status.bytes_on_disk, pair.size)
     assert.equal(status.pending_bytes, 0)
     appStatus = await vault.status("app:first", {
       view: "duplicates",
       query: "does-not-match"
     })
-    assert.equal(appStatus.shared_logical_bytes, pair.contents.length)
+    assert.equal(appStatus.shared_logical_bytes, pair.size)
 
     await vault.perform("separate_files", { paths: [duplicate.path] })
     status = await vault.status()
     assert.equal(status.saved_by_sharing, 0)
-    assert.equal(status.bytes_on_disk, pair.contents.length * 2)
-    assert.equal(status.pending_bytes, pair.contents.length)
+    assert.equal(status.bytes_on_disk, pair.size * 2)
+    assert.equal(status.pending_bytes, pair.size)
     await close(vault)
   })
 
@@ -2254,7 +2369,7 @@ describe("Save Space engine", () => {
     })).status, "detached")
     assert.notEqual((await fs.promises.stat(duplicate.path)).ino, linked.ino)
     assert.equal((await vault.registry.getFile(duplicate.path)).status, "duplicate")
-    assert.deepEqual(await fs.promises.readFile(duplicate.path), pair.contents)
+    await assertCandidateContents(duplicate.path, pair.contents, pair.size)
     assert.equal((await vault.perform("review_again", {
       path: duplicate.path
     })).error, "unknown action")

@@ -11,6 +11,7 @@ const AutomaticScans = require("./automatic_scans")
 const { fileSnapshot, sameSnapshot, sameContentState } = require("./snapshot")
 const { cancelledError } = require("./operation_errors")
 const {
+  MINIMUM_CANDIDATE_SIZE,
   SIZE_THRESHOLD,
   CANDIDATE_SIZE_OPTIONS,
   TMP_SUFFIX,
@@ -2416,6 +2417,9 @@ class Vault {
         status: "unavailable",
         unavailable_reason: unavailableReason
       }
+    }
+    if (targetStat.size < MINIMUM_CANDIDATE_SIZE) {
+      return markUnavailable("below_minimum_size")
     }
     const prepared = await this.ensureAnchorForHash(target.hash, targetStat)
     if (prepared.status !== "ready") {
