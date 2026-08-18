@@ -206,6 +206,7 @@ for (const method of [
   "appsForHashes",
   "reclaimableBatch",
   "duplicateGroupChildren",
+  "fileLocationChildren",
   "duplicateGroupSelection",
   "duplicateGroupPageSelection",
   "statusSnapshot",

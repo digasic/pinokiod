@@ -15883,6 +15883,17 @@ class Server {
           req.query.folder_discovery_child_page))
         return
       }
+      const locationsPath = req.query &&
+        typeof req.query.locations_path === "string"
+        ? req.query.locations_path
+        : null
+      if (locationsPath) {
+        res.json(await vault.fileLocations(scopeId, locationsPath, {
+          cursor: req.query && req.query.cursor,
+          page_size: req.query && req.query.page_size
+        }))
+        return
+      }
       const groupHash = req.query &&
         typeof req.query.group_hash === "string"
         ? req.query.group_hash

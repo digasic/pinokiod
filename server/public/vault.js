@@ -5,14 +5,14 @@ const COPY = {
   duplicates: "Duplicates",
   cannot_deduplicate: "Cannot deduplicate",
   shared: "Deduplicated",
-  reclaimable: "Unused files",
+  reclaimable: "Trash",
   activity: "Activity",
   all_description: "Every scanned file and its current deduplication status.",
   duplicates_description: "Identical files waiting to be deduplicated.",
   unavailable_description: "Identical files that cannot share storage.",
   shared_description: "Files currently sharing disk storage through hardlinks.",
   tracked_description: "Files with no duplicate action required.",
-  reclaimable_description: "Private links no longer used by any linked file.",
+  reclaimable_description: "Spare copies no file is using.",
   activity_description: "A history of changes made by Disk Saver.",
   add_external_folder: "Add external folder",
   find_folders: "Find more savings",
@@ -236,16 +236,15 @@ const COPY = {
   selected_copy: "Selected",
   loading_copies: "Loading copies…",
   show_more_copies: "Show {count} more copies",
+  loading_locations: "Loading locations…",
+  show_more_locations: "Show {count} more locations",
   making_separate: "Making file separate",
   make_separate: "Make separate",
   try_again: "Try again",
-  reclaim: "Clean up",
-  reclaim_all: "Clean up all",
-  cleanup_ready: "{size} ready to clean up",
-  cleanup_ready_detail: "{count} left after their linked files were deleted.",
-  review_cleanup: "Review cleanup",
-  private_link: "private link",
-  private_links: "private links",
+  reclaim: "Delete",
+  reclaim_all: "Empty Trash",
+  cleanup_ready: "{size} in the Trash",
+  review_cleanup: "Open Trash",
   make_file_separate: "Make file separate",
   make_files_separate: "Make {count} files separate",
   making_separate_selected: "Making files separate",
@@ -260,7 +259,6 @@ const COPY = {
   select_for_separation: "Select to make separate",
   select_all_on_page: "Select all on this page",
   identical_contents_at: "Identical contents at",
-  locations_shown: "{shown} of {total} locations shown",
   no_files: "No files found",
   no_files_hint: "Run a scan to find files that can be deduplicated. Scanning never links files together or replaces them.",
   scan_waiting: "Waiting for scan results",
@@ -273,21 +271,20 @@ const COPY = {
   no_shared_hint: "Deduplicated files will appear here after you review duplicates.",
   no_tracked: "No files with no action needed",
   no_tracked_hint: "Files without a duplicate action will appear here after a scan.",
-  no_reclaimable: "No cleanup needed",
-  no_reclaimable_hint: "Private links with no remaining linked files will appear here.",
+  no_reclaimable: "Trash is empty",
+  no_reclaimable_hint: "Spare copies Pinokio no longer needs appear here.",
   no_activity: "No activity yet",
   no_activity_hint: "Changes made by Disk Saver will appear here.",
   view_all: "View all files",
   tracked_note: "Only files {size} and larger appear here. Files keep their current locations.",
   tracked_note_all: "All non-empty files appear here. Files keep their current locations.",
   duplicate_note: "Only files waiting for review are shown.",
-  reclaimable_note: "These private links have no remaining linked files. Cleaning them up frees disk space.",
   activity_note: "Recent changes made by Disk Saver.",
   converted: "Deduplicated",
   separated: "Separated",
   reclaimed: "Cleaned up",
   event_convert: "Deduplicated",
-  event_reclaim: "Cleaned up unused link",
+  event_reclaim: "Emptied from Trash",
   event_detach: "Separated",
   event_change: "File state changed"
 }
@@ -328,6 +325,14 @@ const folderDiscoveryChildrenUrl = (folder, page = 0) => {
     folder_discovery_parent: folder,
     folder_discovery_child_page: String(Math.max(0, Number(page) || 0))
   })
+  return `/info/dedup?${query.toString()}`
+}
+const fileLocationsUrl = (filePath, options = {}) => {
+  const query = new URLSearchParams()
+  if (SCOPE_ID) query.set("scope_id", SCOPE_ID)
+  query.set("locations_path", filePath)
+  if (options.cursor) query.set("cursor", options.cursor)
+  query.set("page_size", String(DUPLICATE_CHILD_PAGE_SIZE))
   return `/info/dedup?${query.toString()}`
 }
 const duplicateGroupUrl = (hash, options = {}) => {
@@ -416,6 +421,8 @@ const state = {
   expandedFiles: new Set(),
   expandedDuplicateGroups: new Set(),
   duplicateGroupChildren: new Map(),
+  fileLocations: new Map(),
+  locationsScanTs: undefined,
   duplicateGroupGeneration: 0,
   selectedDuplicateFiles: new Map(),
   selectedSeparateFiles: new Set(),
@@ -454,11 +461,19 @@ const state = {
   pageCursors: [""]
 }
 
+// Expanded location lists describe one grouping of one file. Anything that
+// can change that grouping closes them instead of leaving stale paths open.
+const closeFileLocations = () => {
+  state.expandedFiles.clear()
+  state.fileLocations.clear()
+}
+
 const resetPage = () => {
   state.page = 0
   state.pageCursors = [""]
   state.expandedDuplicateGroups.clear()
   state.duplicateGroupChildren.clear()
+  closeFileLocations()
   state.duplicateGroupGeneration += 1
 }
 
@@ -1696,15 +1711,22 @@ const sharingControl = (item) => {
 }
 
 const fileDetail = (item) => {
-  if (!state.expandedFiles.has(item.path) || !item.locations || item.locations.length < 2) return ""
-  const total = Math.max(item.locations.length, Number(item.location_count) || 0)
-  const label = total > item.locations.length
-    ? COPY.locations_shown
-      .replace("{shown}", item.locations.length)
-      .replace("{total}", total)
-    : `${COPY.identical_contents_at} ${countLabel(total, COPY.location, COPY.locations_lower)}`
-  return `<div class="vault-detail"><div class="vault-detail-label">${esc(label)}</div>${item.locations.map((location) => `
-    <div class="vault-location-detail"><i class="fa-regular fa-file"></i><span>${esc(externalLocation(location) || [location.source_label, location.relative_path].filter(Boolean).join(" / "))}</span>${revealButton(location.path, location.source_id, basename(location.relative_path))}</div>`).join("")}</div>`
+  if (!state.expandedFiles.has(item.path)) return ""
+  const locations = state.fileLocations.get(item.path)
+  if (!locations || (locations.loading && !locations.loaded)) {
+    return `<div class="vault-detail"><div class="vault-detail-label"><i class="fa-solid fa-circle-notch fa-spin"></i> ${esc(COPY.loading_locations)}</div></div>`
+  }
+  if (locations.error) {
+    return `<div class="vault-detail"><div class="vault-detail-label error">${esc(locations.error)}</div></div>`
+  }
+  const total = Math.max(locations.items.length, Number(locations.total) || 0)
+  const label = `${COPY.identical_contents_at} ${countLabel(total, COPY.location, COPY.locations_lower)}`
+  const remaining = Math.max(0, total - locations.items.length)
+  const more = locations.nextCursor
+    ? `<div class="vault-location-detail"><button class="vault-text-button" type="button" data-more-file-locations="${attr(item.path)}" ${locations.loading ? "disabled" : ""}>${esc(COPY.show_more_locations.replace("{count}", Math.min(remaining, DUPLICATE_CHILD_PAGE_SIZE)))}</button></div>`
+    : ""
+  return `<div class="vault-detail"><div class="vault-detail-label">${esc(label)}</div>${locations.items.map((location) => `
+    <div class="vault-location-detail"><i class="fa-regular fa-file"></i><span>${esc(externalLocation(location) || [location.source_label, location.relative_path].filter(Boolean).join(" / "))}</span>${revealButton(location.path, location.source_id, basename(location.relative_path))}</div>`).join("")}${more}</div>`
 }
 const separateCheckbox = (item) => item.status === "shared"
   ? `<input class="vault-row-checkbox" type="checkbox" data-select-separate="${attr(item.path)}" aria-label="${attr(`${COPY.select_for_separation}: ${basename(item.relative_path)}`)}" ${state.separateAllMatching || state.selectedSeparateFiles.has(item.path) ? "checked" : ""} />`
@@ -1721,7 +1743,7 @@ const rowSelectionCheckbox = (item) =>
 const renderFileRow = (item, depth = 0, showMatch = false) => {
   const directoryPath = dirname(item.relative_path)
   const match = item.match
-  const expandable = item.locations && item.locations.length > 1
+  const expandable = Number(item.location_count) > 1
   const rowTail = showMatch
     ? `<span>${match ? `<span class="vault-match-path">${esc(match.path)}</span>` : "—"}</span>
       <span class="vault-space">${esc(spaceMarkup(item))}</span>
@@ -1826,7 +1848,7 @@ const flatLocation = (item) => externalLocation(item) ||
 const renderFlatFiles = (items) => [...items]
   .sort((a, b) => compareRows(a, b, flatLocation))
   .map((item) => {
-    const expandable = item.locations && item.locations.length > 1
+    const expandable = Number(item.location_count) > 1
     return `<div class="vault-file-row">
       <div class="vault-name-cell">
         ${separateCheckbox(item)}
@@ -2230,7 +2252,7 @@ const paneFooterText = () => {
     return `${count}${order ? ` · ${order}` : ""}`
   }
   if (state.view === "duplicates") return COPY.duplicate_note
-  if (state.view === "reclaimable") return COPY.reclaimable_note
+  if (state.view === "reclaimable") return ""
   if (state.view === "activity") return COPY.activity_note
   const minimumSize = state.data.last_scan &&
     Number.isFinite(state.data.last_scan.candidate_min_bytes)
@@ -2754,12 +2776,8 @@ const renderCleanupNotice = () => {
   }
   const bytes = Number(state.data.reclaimable) || 0
   const title = COPY.cleanup_ready.replace("{size}", fmt(bytes))
-  const detail = COPY.cleanup_ready_detail.replace(
-    "{count}",
-    countLabel(unusedCount, COPY.private_link, COPY.private_links)
-  )
   notice.className = "vault-cleanup-notice show"
-  notice.innerHTML = `<i class="fa-solid fa-broom" aria-hidden="true"></i><strong>${esc(title)}</strong><span class="vault-cleanup-notice-detail">${esc(detail)}</span><button class="vault-button" id="btn-review-cleanup" type="button">${esc(COPY.review_cleanup)}<i class="fa-solid fa-chevron-right" aria-hidden="true"></i></button>`
+  notice.innerHTML = `<i class="fa-regular fa-trash-can" aria-hidden="true"></i><strong>${esc(title)}</strong><button class="vault-button" id="btn-review-cleanup" type="button">${esc(COPY.review_cleanup)}<i class="fa-solid fa-chevron-right" aria-hidden="true"></i></button>`
 }
 
 const clearPanel = (id, className) => {
@@ -2846,9 +2864,9 @@ const fetchJson = async (url) => {
   if (!response.ok) throw new Error(COPY.status_request_failed.replace("{status}", response.status))
   return response.json()
 }
-const loadDuplicateGroupChildren = async (hash, append = false) => {
+const loadPagedChildren = async (cache, key, buildUrl, append) => {
   const generation = state.duplicateGroupGeneration
-  const current = state.duplicateGroupChildren.get(hash) || {
+  const current = cache.get(key) || {
     items: [],
     total: 0,
     nextCursor: null,
@@ -2859,12 +2877,11 @@ const loadDuplicateGroupChildren = async (hash, append = false) => {
   if (current.loading) return
   current.loading = true
   current.error = null
-  state.duplicateGroupChildren.set(hash, current)
+  cache.set(key, current)
   render()
   try {
-    const result = await fetchJson(duplicateGroupUrl(hash, {
-      cursor: append ? current.nextCursor : null
-    }))
+    const result = await fetchJson(
+      buildUrl(append ? current.nextCursor : null))
     if (generation !== state.duplicateGroupGeneration) return
     const items = Array.isArray(result.items) ? result.items : []
     current.items = append ? current.items.concat(items) : items
@@ -2883,6 +2900,12 @@ const loadDuplicateGroupChildren = async (hash, append = false) => {
     }
   }
 }
+const loadDuplicateGroupChildren = (hash, append = false) =>
+  loadPagedChildren(state.duplicateGroupChildren, hash, (cursor) =>
+    duplicateGroupUrl(hash, { cursor }), append)
+const loadFileLocations = (filePath, append = false) =>
+  loadPagedChildren(state.fileLocations, filePath, (cursor) =>
+    fileLocationsUrl(filePath, { cursor }), append)
 const duplicateGroupSelectionPaths = async (hash) =>
   fetchJson(duplicateGroupUrl(hash, { select: true }))
 const duplicateGroupPageSelectionItems = async () =>
@@ -2919,6 +2942,11 @@ const applyFullData = (data) => {
     reviewedScan() !== String(data.last_scan.ts) &&
     (shareableDuplicateCount > 0 || data.last_scan.partial)
   settleFolderDiscoveryStart()
+  const publishedScan = data.last_scan ? data.last_scan.ts : null
+  if (publishedScan !== state.locationsScanTs) {
+    state.locationsScanTs = publishedScan
+    closeFileLocations()
+  }
   state.data = data
   const fileAction = serverFileAction(data.file_action)
   if (fileAction) state.actionProgress = fileAction
@@ -3034,6 +3062,7 @@ const runAction = async (payload, success) => {
   } catch (error) {
     state.feedback = { error: true, message: error && error.message ? error.message : String(error) }
   }
+  closeFileLocations()
   await refresh(true)
 }
 
@@ -3741,11 +3770,21 @@ document.addEventListener("click", async (event) => {
       target.dataset.moreDuplicateGroup,
       true
     )
+  } else if (target.dataset.moreFileLocations) {
+    await loadFileLocations(target.dataset.moreFileLocations, true)
   } else if (target.dataset.expandFile) {
     const file = target.dataset.expandFile
-    if (state.expandedFiles.has(file)) state.expandedFiles.delete(file)
-    else state.expandedFiles.add(file)
-    render()
+    if (state.expandedFiles.has(file)) {
+      state.expandedFiles.delete(file)
+      render()
+    } else {
+      state.expandedFiles.add(file)
+      render()
+      const loaded = state.fileLocations.get(file)
+      if (!loaded || (!loaded.loaded && !loaded.loading)) {
+        await loadFileLocations(file)
+      }
+    }
   } else if (target.dataset.removeSource) {
     const source = sourceById(target.dataset.removeSource)
     if (!source) return

@@ -784,6 +784,110 @@ describe("Save Space interface", () => {
     dom.window.close()
   })
 
+  test("expanding a file loads its real locations instead of row samples", async () => {
+    const duplicate = item({
+      path: "/pinokio/api/app/models/duplicate.bin",
+      relative_path: "models/duplicate.bin",
+      status: "duplicate",
+      shareable: true,
+      location_count: 3,
+      locations: [{
+        path: "/pinokio/api/app/models/duplicate.bin",
+        source_id: "app:app",
+        source_label: "app",
+        relative_path: "models/duplicate.bin"
+      }, {
+        path: "/pinokio/api/app/models/sample.bin",
+        source_id: "app:app",
+        source_label: "app",
+        relative_path: "models/sample.bin"
+      }]
+    })
+    const base = fixture([duplicate])
+    base.inventory.source_counts.duplicates["app:app"] = 1
+    base.inventory.shareable_by_source["app:app"] = 1
+    const response = (url) => {
+      const parsed = new URL(url, "http://localhost")
+      if (parsed.searchParams.get("locations_path")) {
+        return {
+          path: parsed.searchParams.get("locations_path"),
+          items: ["first", "second", "third"].map((name) => ({
+            path: `/pinokio/api/app/models/${name}.bin`,
+            source_id: "app:app",
+            source_label: "app",
+            relative_path: `models/${name}.bin`
+          })),
+          total: 3,
+          next_cursor: null
+        }
+      }
+      const result = JSON.parse(JSON.stringify(base))
+      result.items = [duplicate]
+      return result
+    }
+    const { dom, getRequests } = await makePage(response)
+    const document = dom.window.document
+
+    document.querySelector('[data-view="duplicates"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+    const disclosure = document.querySelector(
+      '[data-expand-file="/pinokio/api/app/models/duplicate.bin"]')
+    assert.ok(disclosure)
+    disclosure.click()
+
+    await waitFor(() => getRequests.some((url) =>
+      new URL(url, "http://localhost").searchParams
+        .get("locations_path") === "/pinokio/api/app/models/duplicate.bin"))
+    await waitFor(() => document.querySelector(".vault-detail") &&
+      document.querySelector(".vault-detail").textContent.includes("third.bin"))
+    const detail = document.querySelector(".vault-detail")
+    assert.match(detail.textContent, /Identical contents at 3 locations/)
+    assert.match(detail.textContent, /first\.bin/)
+    assert.doesNotMatch(detail.textContent, /sample\.bin/)
+    assert.doesNotMatch(detail.textContent, /of 3 locations shown/)
+    await settle()
+    dom.window.close()
+  })
+
+  test("leftover storage is presented as a Trash the user can empty", async () => {
+    const blob = {
+      store_id: "home",
+      hash: "b".repeat(64),
+      size: 11500000,
+      nlink: 1,
+      orphan: 1
+    }
+    const base = fixture([])
+    base.inventory.counts.reclaimable = 1
+    base.reclaimable = blob.size
+    base.enabled = true
+    const response = (url) => {
+      const view = new URL(url, "http://localhost")
+        .searchParams.get("view") || "all"
+      const result = JSON.parse(JSON.stringify(base))
+      result.inventory.view = view
+      result.items = view === "reclaimable" ? [blob] : []
+      return result
+    }
+    const { dom } = await makePage(response)
+    const document = dom.window.document
+
+    assert.match(document.querySelector("#vault-views").textContent, /Trash/)
+    document.querySelector('[data-view="reclaimable"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="reclaimable"].selected'))
+    await waitFor(() => document.querySelector("[data-reclaim]"))
+
+    const body = document.body.textContent
+    assert.match(body, /Empty Trash/)
+    assert.doesNotMatch(body, /private link/i)
+    assert.doesNotMatch(body, /ready to clean up/i)
+    assert.doesNotMatch(body, /their linked files were deleted/i)
+    await settle()
+    dom.window.close()
+  })
+
   test("Cannot deduplicate is separate from actionable duplicates", async () => {
     const duplicate = item({
       path: "/pinokio/api/app/models/duplicate.bin",

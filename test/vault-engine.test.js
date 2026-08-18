@@ -2447,6 +2447,159 @@ describe("Save Space engine", () => {
     await close(vault)
   })
 
+  test("Make separate frees the anchor once nothing links to it", async () => {
+    const { home, vault } = await makeVault()
+    const pair = await duplicatePair(home)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    await vault.perform("deduplicate", { path: duplicate.path })
+    const hash = duplicate.hash
+    const storePath = vault.storePathFor(hash)
+    const linked = [...await vault.registry.files({ statuses: ["linked"] })]
+    assert.equal(linked.length, 2)
+
+    assert.equal((await vault.perform("detach", {
+      path: linked[0].path
+    })).status, "detached")
+    assert.equal(fs.existsSync(storePath), true)
+    assert.equal((await fs.promises.stat(storePath)).nlink, 2)
+    assert.equal((await vault.registry.anchorsForHash(hash)).length, 1)
+
+    assert.equal((await vault.perform("detach", {
+      path: linked[1].path
+    })).status, "detached")
+    assert.equal(fs.existsSync(storePath), false)
+    assert.equal((await vault.registry.anchorsForHash(hash)).length, 0)
+
+    for (const entry of linked) {
+      await assertCandidateContents(entry.path, pair.contents, pair.size)
+    }
+    const activity = await vault.status(null, {
+      view: "activity",
+      page_size: 500
+    })
+    assert.equal(activity.items.some((item) => item.kind === "reclaim"), true)
+    await close(vault)
+  })
+
+  test("freeing the anchor leaves the registry ready to deduplicate again", async () => {
+    const { home, vault } = await makeVault()
+    await duplicatePair(home)
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    await vault.perform("deduplicate", { path: duplicate.path })
+    for (const row of [...await vault.registry.files({
+      statuses: ["linked"]
+    })]) {
+      assert.equal((await vault.perform("detach", {
+        path: row.path
+      })).status, "detached")
+    }
+
+    const rows = [...await vault.registry.files({})]
+    assert.equal(rows.filter((row) => row.status === "reference").length, 1)
+    assert.equal(rows.filter((row) => row.status === "duplicate").length, 1)
+    const target = rows.find((row) => row.status === "duplicate")
+    assert.equal((await vault.perform("deduplicate", {
+      path: target.path
+    })).status, "converted")
+    await close(vault)
+  })
+
+  test("bulk Make separate frees only the anchors nothing links to", async () => {
+    const { home, vault } = await makeVault()
+    await duplicatePair(home, "kept.bin")
+    const trio = crypto.randomBytes(4096)
+    for (const name of ["one", "two", "three"]) {
+      await writeCandidate(path.join(home, "api", name, "freed.bin"), trio)
+    }
+    await vault.sweeper.scan()
+    const result = await vault.perform("deduplicate_files", {
+      paths: [...await vault.registry.files({
+        statuses: ["duplicate"]
+      })].map((item) => item.path)
+    })
+    assert.equal(result.converted, 3)
+
+    const linked = [...await vault.registry.files({ statuses: ["linked"] })]
+    const freedHash = linked.find((item) =>
+      path.basename(item.path) === "freed.bin").hash
+    const keptHash = linked.find((item) =>
+      path.basename(item.path) === "kept.bin").hash
+    const freedStore = vault.storePathFor(freedHash)
+    const keptStore = vault.storePathFor(keptHash)
+
+    const separated = await vault.perform("separate_files", {
+      paths: linked
+        .filter((item) => path.basename(item.path) === "freed.bin")
+        .map((item) => item.path)
+        .concat(linked.find((item) =>
+          path.basename(item.path) === "kept.bin").path)
+    })
+    assert.equal(separated.separated, 4)
+
+    assert.equal(fs.existsSync(freedStore), false)
+    assert.equal((await vault.registry.anchorsForHash(freedHash)).length, 0)
+    assert.equal(fs.existsSync(keptStore), true)
+    assert.equal((await vault.registry.anchorsForHash(keptHash)).length, 1)
+    await close(vault)
+  })
+
+  test("Expanding a file lists every location for its own identity", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    for (const name of ["one", "two", "three"]) {
+      await writeCandidate(path.join(home, "api", name, "shared.bin"), contents)
+    }
+    await vault.sweeper.scan()
+    const duplicate = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+
+    const byHash = await vault.fileLocations(null, duplicate.path)
+    assert.equal(byHash.total, 3)
+    assert.equal(byHash.items.length, 3)
+    assert.equal(byHash.items.some((entry) =>
+      entry.path === duplicate.path), true)
+
+    await vault.perform("deduplicate", { path: duplicate.path })
+    const byInode = await vault.fileLocations(null, duplicate.path)
+    assert.equal(byInode.total, 2)
+    assert.equal(byInode.items.length, 2)
+    const untouched = [...await vault.registry.files({
+      statuses: ["duplicate"]
+    })][0]
+    assert.equal(byInode.items.some((entry) =>
+      entry.path === untouched.path), false)
+    await close(vault)
+  })
+
+  test("an app workspace lists every location but acts only on its own", async () => {
+    const { home, vault } = await makeVault()
+    const contents = crypto.randomBytes(4096)
+    for (const app of ["one", "two", "three"]) {
+      await writeCandidate(path.join(home, "api", app, "shared.bin"), contents)
+    }
+    await vault.sweeper.scan()
+
+    const scope = "app:two"
+    const status = await vault.status(scope, { view: "all", page_size: 100 })
+    assert.equal(status.items.length, 1)
+    const row = status.items[0]
+    assert.equal(row.location_count, 3)
+
+    const locations = await vault.fileLocations(scope, row.path)
+    assert.equal(locations.total, 3)
+    assert.equal(locations.items.length, 3)
+    assert.equal(new Set(locations.items.map((item) =>
+      item.source_id)).size, 3)
+    await close(vault)
+  })
+
   test("invalid scoped actions cannot expand into a global mutation", async () => {
     const { home, vault } = await makeVault()
     await duplicatePair(home)

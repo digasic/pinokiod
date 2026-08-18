@@ -5633,6 +5633,77 @@ class RegistryCore {
     }
   }
 
+  fileLocationChildren(options = {}) {
+    const externalSourceIds = [...new Set(
+      (options.externalSourceIds || []).filter(Boolean))]
+    const pageSize = Math.max(
+      1, Math.min(500, Number(options.pageSize) || 100))
+    const inode = Number.isFinite(options.dev) && Number.isFinite(options.ino)
+    const identity = inode
+      ? `${options.dev}:${options.ino}`
+      : String(options.hash || "")
+    const authorized = this.duplicateGroupFilter(
+      [],
+      "",
+      true,
+      "child",
+      inode ? ["linked"] : [],
+      externalSourceIds
+    )
+    const identityWhere = inode
+      ? "child.dev = ? AND child.ino = ?"
+      : "child.hash = ?"
+    const identityValues = inode
+      ? [options.dev, options.ino]
+      : [options.hash]
+    const decoded = this.decodeCursor(options.cursor)
+    const cursorWhere = []
+    const cursorValues = []
+    if (decoded &&
+        decoded.sort === "file-locations" &&
+        decoded.identity === identity &&
+        typeof decoded.path === "string") {
+      cursorWhere.push("child.path > ?")
+      cursorValues.push(decoded.path)
+    }
+    const rows = this.database.prepare(`
+      SELECT child.*
+      FROM files child
+      WHERE ${identityWhere}
+        AND ${authorized.where.join(" AND ")}
+        ${cursorWhere.length
+          ? `AND ${cursorWhere.join(" AND ")}`
+          : ""}
+      ORDER BY child.path
+      LIMIT ?
+    `).all(
+      ...identityValues,
+      ...authorized.values,
+      ...cursorValues,
+      pageSize + 1
+    )
+    const hasMore = rows.length > pageSize
+    if (hasMore) rows.pop()
+    const last = rows[rows.length - 1]
+    const total = Number(this.database.prepare(`
+      SELECT COUNT(*) AS count
+      FROM files child
+      WHERE ${identityWhere}
+        AND ${authorized.where.join(" AND ")}
+    `).get(...identityValues, ...authorized.values).count) || 0
+    return {
+      rows,
+      total,
+      nextCursor: hasMore && last
+        ? this.encodeCursor({
+            sort: "file-locations",
+            identity,
+            path: last.path
+          })
+        : null
+    }
+  }
+
   duplicateGroupSelection(options = {}) {
     const sourceIds = [...new Set(
       (options.sourceIds || []).filter(Boolean))]

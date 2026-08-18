@@ -2854,6 +2854,9 @@ class Vault {
     ))
     await this.refreshInodeSnapshots(entry.hash, entry.dev, entry.ino)
     if (options.reclassify !== false) {
+      // Free before reclassifying: classification must see the final state,
+      // or it records a reference against an anchor about to be deleted.
+      await this.freeUnusedAnchors([entry.hash])
       await this.reclassifyHashes([entry.hash])
     }
     if (options.changedHashes) options.changedHashes.add(entry.hash)
@@ -2915,6 +2918,7 @@ class Vault {
       }
     }
     if (affectedHashes.size) {
+      await this.freeUnusedAnchors(affectedHashes)
       await this.reclassifyHashes(affectedHashes)
     }
     const event = {
@@ -2998,6 +3002,7 @@ class Vault {
         }
       }
       if (affectedHashes.size) {
+        await this.freeUnusedAnchors(affectedHashes)
         await this.reclassifyHashes(affectedHashes)
       }
       if (changedHashes instanceof FileActionChanges) {
@@ -3072,6 +3077,27 @@ class Vault {
       bytes: stat.size
     })) result.activity_warning = true
     return result
+  }
+
+  // Separating the last path to shared content leaves an anchor nothing
+  // references. Freeing it here keeps that cleanup out of the user's hands.
+  // reclaim() revalidates and refuses while any path still links, so a
+  // partial separation frees nothing and a failure is never fatal.
+  async freeUnusedAnchors(hashes) {
+    for (const hash of hashes) {
+      let anchors = []
+      try {
+        anchors = await this.registry.anchorsForHash(hash)
+      } catch (error) {
+        continue
+      }
+      for (const anchor of anchors) {
+        if (anchor.nlink !== 1) continue
+        try {
+          await this.reclaim(hash, anchor.store_id)
+        } catch (error) {}
+      }
+    }
   }
 
   async reclaimAll() {
@@ -3325,6 +3351,45 @@ class Vault {
     return {
       hash,
       items: this.publicDuplicateChildItems(result.rows),
+      total: Number(result.total) || 0,
+      next_cursor: result.nextCursor || null
+    }
+  }
+
+  async fileLocations(scopeId, filePath, options = {}) {
+    if (typeof filePath !== "string" || !filePath) {
+      throw new TypeError("Invalid vault file path.")
+    }
+    const target = path.resolve(filePath)
+    const entry = await this.registry.getFile(target)
+    const sourceIds = this.scopeSourceIds(scopeId)
+    if (!entry ||
+        (scopeId && !sourceIds.includes(entry.source_id))) {
+      return { path: target, items: [], total: 0, next_cursor: null }
+    }
+    const cursor = typeof options.cursor === "string"
+      ? options.cursor.slice(0, 2048)
+      : ""
+    const pageSize = boundedInteger(
+      options.page_size, 100, 1, STATUS_PAGE_SIZE)
+    const identity = entry.status === "linked"
+      ? { dev: entry.dev, ino: entry.ino }
+      : { hash: entry.hash }
+    if (!identity.hash && !Number.isFinite(identity.dev)) {
+      return { path: target, items: [], total: 0, next_cursor: null }
+    }
+    // Every authorized location is listed whatever the scope. A scope decides
+    // what can be selected and acted on, not what the user is told exists.
+    const result = await this.registry.fileLocationChildren(Object.assign({
+      externalSourceIds: this.configuredExternalSourceIds(),
+      cursor,
+      pageSize
+    }, identity))
+    return {
+      path: target,
+      items: (result.rows || []).map((row) => Object.assign({
+        path: row.path
+      }, this.locationForPath(row.path, row.source_id))),
       total: Number(result.total) || 0,
       next_cursor: result.nextCursor || null
     }
