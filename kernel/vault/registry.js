@@ -210,6 +210,8 @@ for (const method of [
   "duplicateGroupSelection",
   "duplicateGroupPageSelection",
   "statusSnapshot",
+  "treeLevel",
+  "treeLocationRows",
   "clearFiles"
 ]) {
   Registry.prototype[method] = function (...args) {

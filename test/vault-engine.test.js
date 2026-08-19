@@ -375,6 +375,106 @@ describe("Save Space engine", () => {
     await close(reopened)
   })
 
+  test("the folder tree resolves a group of locations to its members", async () => {
+    const { home, vault } = await makeVault()
+    await writeCandidate(
+      path.join(home, "api", "alpha", "models", "one.bin"),
+      crypto.randomBytes(4096))
+    await writeCandidate(
+      path.join(home, "api", "beta", "models", "two.bin"),
+      crypto.randomBytes(4096))
+    await vault.openWorkspace()
+    assert.equal((await vault.perform("scan")).started, true)
+    await waitForEngine(() => !vault.scanPromise &&
+      !vault.scanCompletionPromise)
+
+    // "Apps" owns no files itself; it stands for the apps beneath it.
+    const group = await vault.treeEntries(null, { location_id: "apps" })
+    assert.deepEqual(group.items.map((entry) => entry.kind), ["location", "location"])
+    assert.deepEqual(
+      group.items.map((entry) => entry.location_id).sort(),
+      ["app:alpha", "app:beta"])
+    assert.ok(group.items.every((entry) => entry.size > 0))
+
+    // One location resolves to its own contents instead of a list of one.
+    const single = await vault.treeEntries(null, { location_id: "app:alpha" })
+    assert.deepEqual(single.items.map((entry) => entry.label), ["models"])
+    assert.equal(single.items[0].kind, "directory")
+    await close(vault)
+  })
+
+  test("a scoped folder tree cannot be pointed at another location", async () => {
+    const { home, vault } = await makeVault()
+    await writeCandidate(
+      path.join(home, "api", "mine", "models", "mine.bin"),
+      crypto.randomBytes(4096))
+    await writeCandidate(
+      path.join(home, "api", "theirs", "models", "theirs.bin"),
+      crypto.randomBytes(4096))
+    await vault.openWorkspace()
+    assert.equal((await vault.perform("scan")).started, true)
+    await waitForEngine(() => !vault.scanPromise &&
+      !vault.scanCompletionPromise)
+
+    const escaped = await vault.treeEntries("app:mine", {
+      location_id: "app:theirs"
+    })
+    // Naming another location from a scoped page must not read it.
+    assert.notEqual(escaped.source_id, "app:theirs")
+    const paths = JSON.stringify(escaped.items)
+    assert.ok(!paths.includes("theirs"))
+    await close(vault)
+  })
+
+  test("a folder level pages folders and files as one order", async () => {
+    const { home, vault } = await makeVault()
+    const root = path.join(home, "api", "paged")
+    // Two folders and two loose files, with sizes that interleave.
+    await writeCandidate(path.join(root, "big", "a.bin"),
+      crypto.randomBytes(4096), MINIMUM_CANDIDATE_SIZE * 4)
+    await writeCandidate(path.join(root, "small", "b.bin"),
+      crypto.randomBytes(4096), MINIMUM_CANDIDATE_SIZE)
+    await writeCandidate(path.join(root, "middle.bin"),
+      crypto.randomBytes(4096), MINIMUM_CANDIDATE_SIZE * 2)
+    await writeCandidate(path.join(root, "tiny.bin"),
+      crypto.randomBytes(4096), MINIMUM_CANDIDATE_SIZE)
+    await vault.openWorkspace()
+    assert.equal((await vault.perform("scan")).started, true)
+    await waitForEngine(() => !vault.scanPromise &&
+      !vault.scanCompletionPromise)
+
+    const whole = await vault.treeEntries(null, {
+      location_id: "app:paged",
+      size_sort: "desc"
+    })
+    const order = whole.items.map((entry) => entry.label ||
+      entry.relative_path)
+    // A loose file sorts by its size, not below every folder.
+    assert.equal(order[0], "big")
+    assert.ok(order.indexOf("middle.bin") < order.indexOf("small"))
+
+    // The same order survives being read one row at a time.
+    const paged = []
+    let cursor = null
+    let offset = 0
+    for (let guard = 0; guard < 20; guard += 1) {
+      const page = await vault.treeEntries(null, {
+        location_id: "app:paged",
+        size_sort: "desc",
+        page_size: 1,
+        cursor,
+        directory_offset: offset
+      })
+      paged.push(...page.items.map((entry) => entry.label ||
+        entry.relative_path))
+      if (!page.has_next || !page.items.length) break
+      cursor = page.next_cursor
+      offset = page.next_directory_offset
+    }
+    assert.deepEqual(paged, order)
+    await close(vault)
+  })
+
   test("the saved global minimum is reused by unscoped policy reads", async () => {
     const { vault } = await makeVault({ candidateSize: null })
     const selected = CANDIDATE_SIZE_OPTIONS[2]

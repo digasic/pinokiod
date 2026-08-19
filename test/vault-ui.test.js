@@ -126,6 +126,20 @@ const fixture = (items = [], overrides = {}) => {
   }, overrides)
 }
 
+// Folder rows load and open on demand, so tests that assert on files inside
+// them open the tree first.
+const openTree = async (document, waitFor) => {
+  for (let guard = 0; guard < 24; guard += 1) {
+    const closed = [...document.querySelectorAll("[data-toggle-path]")]
+      .filter((button) => button.getAttribute("aria-expanded") === "false")
+    if (!closed.length) return
+    for (const button of closed) button.click()
+    await waitFor(() => [...document.querySelectorAll("[data-toggle-path]")]
+      .filter((button) =>
+        button.getAttribute("aria-expanded") === "false").length < closed.length ||
+      !document.querySelector(".fa-circle-notch"))
+  }
+}
 const waitFor = async (condition) => {
   for (let attempt = 0; attempt < 100; attempt++) {
     if (condition()) return
@@ -160,8 +174,8 @@ const makePage = async (status, options = {}) => {
       runScripts: "outside-only",
       url: appMode
         ? "http://localhost/vault/app/app"
-        : `http://localhost/vault${options.focusGroup
-          ? `?group=${options.focusGroup}`
+        : `http://localhost/vault${options.reveal
+          ? `?reveal=${encodeURIComponent(options.reveal)}&location=${encodeURIComponent(options.revealLocation || "app:app")}`
           : ""}`
     }
   )
@@ -409,6 +423,86 @@ const makePage = async (status, options = {}) => {
     if (initialStatusPending && parsed.pathname === "/info/dedup") {
       initialStatusPending = false
       await deferredInitialStatus
+    }
+    const treeParent = parsed.searchParams.get("tree_parent")
+    if (treeParent !== null) {
+      const base = await (typeof status === "function" ? status(url) : status)
+      const all = base.items || []
+      const locationId = parsed.searchParams.get("location_id")
+      const tally = (bucket, entry) => {
+        bucket.size += Number(entry.size) || 0
+        bucket.file_count += 1
+        if (entry.status === "duplicate") bucket.duplicate_count += 1
+        if (entry.status === "shared") bucket.linked_count += 1
+        if (entry.status === "unavailable") bucket.unavailable_count += 1
+        return bucket
+      }
+      const empty = () => ({
+        size: 0,
+        file_count: 0,
+        duplicate_count: 0,
+        unavailable_count: 0,
+        linked_count: 0
+      })
+      if (!locationId) {
+        const bySource = new Map()
+        for (const entry of all) {
+          bySource.set(entry.source_id,
+            tally(bySource.get(entry.source_id) || empty(), entry))
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            enabled: true,
+            parent: "",
+            items: [...bySource].map(([id, totals]) => Object.assign({
+              kind: "location",
+              name: id,
+              label: ((base.sources || []).find((source) =>
+                source.id === id) || {}).label || id,
+              relative_path: "",
+              location_id: id,
+              source_id: id
+            }, totals))
+          })
+        }
+      }
+      const prefix = treeParent ? `${treeParent}/` : ""
+      const directories = new Map()
+      const files = []
+      for (const entry of all) {
+        if (entry.source_id !== locationId) continue
+        const relative = String(entry.relative_path || "")
+        if (prefix && !relative.startsWith(prefix)) continue
+        const rest = relative.slice(prefix.length)
+        const cut = rest.indexOf("/")
+        if (cut < 0) {
+          files.push(Object.assign({ kind: "file" }, entry))
+          continue
+        }
+        const name = rest.slice(0, cut)
+        directories.set(name,
+          tally(directories.get(name) || empty(), entry))
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          enabled: true,
+          parent: treeParent,
+          items: [
+            ...[...directories].map(([name, totals]) => Object.assign({
+              kind: "directory",
+              name,
+              label: name,
+              relative_path: `${prefix}${name}`,
+              source_id: locationId
+            }, totals)),
+            ...files
+          ]
+        })
+      }
     }
     const parent = parsed.searchParams.get("folder_discovery_parent")
     const childPage = Number(
@@ -862,6 +956,76 @@ describe("Save Space interface", () => {
     dom.window.close()
   })
 
+  test("a copy elsewhere links only when it can be pointed at", async () => {
+    const duplicate = item({
+      path: "/pinokio/api/app/models/duplicate.bin",
+      relative_path: "models/duplicate.bin",
+      status: "duplicate",
+      shareable: true,
+      location_count: 3
+    })
+    const base = fixture([duplicate])
+    base.inventory.source_counts.duplicates["app:app"] = 1
+    base.inventory.shareable_by_source["app:app"] = 1
+    const response = (url) => {
+      const parsed = new URL(url, "http://localhost")
+      if (parsed.searchParams.get("locations_path")) {
+        return {
+          path: parsed.searchParams.get("locations_path"),
+          items: [{
+            path: "/pinokio/api/app/models/duplicate.bin",
+            status: "duplicate",
+            source_id: "app:app",
+            source_label: "app",
+            relative_path: "models/duplicate.bin"
+          }, {
+            path: "/pinokio/api/other/models/duplicate.bin",
+            status: "duplicate",
+            source_id: "app:other",
+            source_kind: "app",
+            source_label: "other",
+            relative_path: "models/duplicate.bin"
+          }, {
+            path: "/elsewhere/duplicate.bin",
+            status: "duplicate",
+            source_id: "app:nameless",
+            source_kind: "app",
+            source_label: "nameless",
+            relative_path: ""
+          }],
+          total: 3,
+          next_cursor: null
+        }
+      }
+      const result = JSON.parse(JSON.stringify(base))
+      result.items = [duplicate]
+      return result
+    }
+    const { dom } = await makePage(response, { appMode: true })
+    const document = dom.window.document
+
+    document.querySelector('[data-view="duplicates"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+    await openTree(document, waitFor)
+    await waitFor(() => document.querySelector(
+      '[data-expand-file="/pinokio/api/app/models/duplicate.bin"]'))
+    document.querySelector(
+      '[data-expand-file="/pinokio/api/app/models/duplicate.bin"]').click()
+    await waitFor(() => document.querySelector(".vault-location-path"))
+
+    const links = [...document.querySelectorAll(".vault-location-link")]
+    // The copy in another app is addressable, so it is a link that carries the
+    // path to reveal. The copy with no path is text, not a link to nowhere.
+    assert.equal(links.length, 1)
+    assert.equal(links[0].dataset.openPath, "models/duplicate.bin")
+    assert.equal(links[0].dataset.openSource, "app:other")
+    const detail = document.querySelector(".vault-detail")
+    assert.match(detail.textContent, /nameless/)
+    await settle()
+    dom.window.close()
+  })
+
   test("leftover storage is presented as a Trash the user can empty", async () => {
     const blob = {
       store_id: "home",
@@ -900,8 +1064,8 @@ describe("Save Space interface", () => {
     dom.window.close()
   })
 
-  test("a scoped page hands one content group to the global page", async () => {
-    const hash = "c".repeat(64)
+  test("a link from another location opens the tree on that file", async () => {
+    const hash = "a".repeat(64)
     const duplicate = item({
       path: "/pinokio/api/app/models/duplicate.bin",
       relative_path: "models/duplicate.bin",
@@ -913,27 +1077,22 @@ describe("Save Space interface", () => {
     const base = fixture([duplicate])
     base.inventory.source_counts.duplicates["app:app"] = 1
     base.inventory.shareable_by_source["app:app"] = 1
-    const response = (url) => {
-      const parsed = new URL(url, "http://localhost")
-      if (parsed.searchParams.get("group_hash")) {
-        return { hash, items: [], total: 3, next_cursor: null }
-      }
-      const result = JSON.parse(JSON.stringify(base))
-      result.inventory.view = parsed.searchParams.get("view") || "all"
-      result.items = [duplicate]
-      return result
-    }
-    const { dom, getRequests } = await makePage(response, {
-      focusGroup: hash
+    const { dom } = await makePage(base, {
+      reveal: "models/duplicate.bin",
+      revealLocation: "app:app"
     })
     const document = dom.window.document
 
+    // The link lands on the ordinary folder view, not a filtered duplicate list.
+    assert.ok(document.querySelector('[data-display-mode="folders"].selected'))
     await waitFor(() => document.querySelector(
-      '[data-view="duplicates"].selected'))
-    assert.ok(document.querySelector('[data-display-mode="files"].selected'))
-    await waitFor(() => getRequests.some((url) =>
-      new URL(url, "http://localhost").searchParams
-        .get("group_hash") === hash))
+      '[data-reveal-row="models/duplicate.bin"]'))
+    const row = document.querySelector('[data-reveal-row="models/duplicate.bin"]')
+    await waitFor(() => row.classList.contains("vault-row-focus"))
+    // Every folder on the way down was opened to get there.
+    assert.ok([...document.querySelectorAll("[data-toggle-path]")]
+      .some((button) => button.dataset.togglePath === "models" &&
+        button.getAttribute("aria-expanded") === "true"))
     await settle()
     dom.window.close()
   })
@@ -992,6 +1151,9 @@ describe("Save Space interface", () => {
     document.querySelector('[data-view="duplicates"]').click()
     await waitFor(() => document.querySelector(
       '[data-view="duplicates"].selected'))
+    await openTree(document, waitFor)
+    await waitFor(() => /duplicate\.bin/.test(
+      document.querySelector(".vault-table").textContent))
     assert.match(document.querySelector(".vault-table").textContent,
       /duplicate\.bin/)
     assert.doesNotMatch(document.querySelector(".vault-table").textContent,
@@ -1004,6 +1166,9 @@ describe("Save Space interface", () => {
     document.querySelector('[data-view="unavailable"]').click()
     await waitFor(() => document.querySelector(
       '[data-view="unavailable"].selected'))
+    await openTree(document, waitFor)
+    await waitFor(() => /blocked\.bin/.test(
+      document.querySelector(".vault-table").textContent))
     const table = document.querySelector(".vault-table")
     assert.match(table.textContent, /blocked\.bin/)
     assert.match(table.textContent,
@@ -1244,6 +1409,9 @@ describe("Save Space interface", () => {
     filter.dispatchEvent(new dom.window.Event("change", { bubbles: true }))
     await waitFor(() => document.querySelector(
       "[data-deduplicate-scope]") === null)
+    await openTree(document, waitFor)
+    await waitFor(() => /blocked\.bin/.test(
+      document.querySelector(".vault-table").textContent))
     assert.match(document.querySelector(".vault-table").textContent,
       /blocked\.bin/)
     assert.doesNotMatch(document.querySelector(".vault-table").textContent,
@@ -3254,6 +3422,11 @@ describe("Save Space interface", () => {
       fixture([managed, ordinaryHardlink, unique]))
     const document = dom.window.document
 
+    // Selecting "everything on the page" belongs to the flat file list; the
+    // folder tree loads a level at a time and has no page to select.
+    document.querySelector('[data-display-mode="files"]').click()
+    await waitFor(() => document.querySelector(
+      "[data-select-separate-page]"))
     const checkboxes = document.querySelectorAll("[data-select-separate]")
     assert.equal(checkboxes.length, 2)
     const selectPage = document.querySelector(
@@ -3310,6 +3483,8 @@ describe("Save Space interface", () => {
     const { dom, requests, confirmations } = await makePage(status)
     const document = dom.window.document
 
+    document.querySelector('[data-display-mode="files"]').click()
+    await waitFor(() => document.querySelector("[data-select-separate-page]"))
     document.querySelector("[data-select-separate-page]").click()
     const selectAll = document.querySelector("[data-select-separate-all]")
     assert.ok(selectAll)
@@ -3337,6 +3512,7 @@ describe("Save Space interface", () => {
         location_id: null,
         view: "all",
         status_filter: "all",
+        display_mode: "files",
         query: ""
       }
     )

@@ -150,6 +150,15 @@ const sameFileMetadata = (left, right) => {
 }
 
 const sourceId = (kind, name) => `${kind}:${encodeURIComponent(name)}`
+const commonDirectory = (left, right) => {
+  let index = 0
+  while (index < left.length &&
+    index < right.length &&
+    left[index] === right[index]) index += 1
+  const shared = left.slice(0, index)
+  const cut = shared.lastIndexOf("/")
+  return cut < 0 ? "" : shared.slice(0, cut)
+}
 const boundedInteger = (value, fallback, minimum, maximum) => {
   const parsed = Number(value)
   if (!Number.isSafeInteger(parsed)) return fallback
@@ -1227,6 +1236,19 @@ class Vault {
     }
   }
 
+  sourceLabelChain(source) {
+    if (!source) return ""
+    const parts = [source.label]
+    const seen = new Set([source.id])
+    let current = source
+    while (current && current.parent_id && !seen.has(current.parent_id)) {
+      seen.add(current.parent_id)
+      current = this._sourcesById.get(current.parent_id)
+      if (current) parts.unshift(current.label)
+    }
+    return parts.join(" / ")
+  }
+
   sourceIsWithinScope(source, scopeId) {
     if (!scopeId) return true
     const seen = new Set()
@@ -2025,7 +2047,10 @@ class Vault {
         const selection = this.separateSelection(payload)
         if (selection.error) return { error: selection.error }
         const total = await this.registry.matchingFileSummary(
-          "linked", selection.sourceIds, selection.query)
+          "linked",
+          selection.sourceIds,
+          selection.query,
+          selection.nameOnly)
         if (!total.count) {
           return { error: "No matching deduplicated files remain." }
         }
@@ -2586,7 +2611,10 @@ class Vault {
     }
     return {
       sourceIds,
-      query: String(payload.query || "").slice(0, 500).trim()
+      query: String(payload.query || "").slice(0, 500).trim(),
+      // Separating "all matching" has to mean the rows the search listed, so
+      // it repeats the filter the view was using.
+      nameOnly: payload.display_mode === "files"
     }
   }
 
@@ -2954,7 +2982,8 @@ class Vault {
         selection.sourceIds,
         cursor,
         100,
-        selection.query
+        selection.query,
+        selection.nameOnly
       )
       if (!rows.length) break
       const affectedHashes = new Set()
@@ -3303,6 +3332,181 @@ class Vault {
     }, this.locationForPath(row.path, row.source_id)))
   }
 
+  // One level of the folder tree. Subfolders come back with the totals for
+  // everything inside them, which is what makes sorting a level by size mean
+  // anything; files sitting directly in the folder come back as normal rows.
+  async treeEntries(scopeId, options = {}) {
+    if (!this.enabled || !this.registry) return { enabled: false }
+    const locationId = typeof options.location_id === "string" &&
+      options.location_id
+      ? options.location_id
+      : null
+    const view = STATUS_VIEWS.has(options.view) ? options.view : "all"
+    const statusFilter = STATUS_FILTERS.has(options.status_filter)
+      ? options.status_filter
+      : "all"
+    const query = String(options.query || "").slice(0, 500).trim()
+    const sizeSort = options.size_sort === "asc" || options.size_sort === "desc"
+      ? options.size_sort
+      : null
+    const nameSort = options.name_sort === "desc" ? "desc" : "asc"
+    // The authorised set, not the requested id: a scoped page must not be able
+    // to read another location by naming it, and a rail entry standing for a
+    // group of locations -- Pinokio, Apps -- owns no files of its own, so it
+    // resolves to its descendants rather than to an empty tree.
+    const sourceIds = this.scopeSourceIds(scopeId, locationId)
+    const source = sourceIds.length === 1
+      ? this._sourcesById.get(sourceIds[0])
+      : null
+    // A group of locations, or none chosen at all, is a tree of locations.
+    if (!source || !source.root) {
+      const rows = await this.registry.treeLocationRows({
+        sourceIds,
+        unrestricted: !scopeId && !locationId,
+        externalSourceIds: this.configuredExternalSourceIds(),
+        view,
+        statusFilter,
+        query,
+        nameOnly: false
+      })
+      const items = rows
+        .map((row) => {
+          const entry = this._sourcesById.get(row.source_id)
+          if (!entry) return null
+          return {
+            kind: "location",
+            name: entry.label,
+            label: this.sourceLabelChain(entry),
+            relative_path: "",
+            location_id: entry.id,
+            source_id: entry.id,
+            size: Number(row.bytes) || 0,
+            file_count: Number(row.file_count) || 0,
+            duplicate_count: Number(row.duplicate_count) || 0,
+            unavailable_count: Number(row.unavailable_count) || 0,
+            linked_count: Number(row.linked_count) || 0
+          }
+        })
+        .filter(Boolean)
+      items.sort((left, right) => {
+        if (sizeSort === "asc" && left.size !== right.size) return left.size - right.size
+        if (sizeSort === "desc" && left.size !== right.size) return right.size - left.size
+        const order = left.label.localeCompare(right.label)
+        return nameSort === "desc" ? -order : order
+      })
+      return {
+        enabled: true,
+        parent: "",
+        source_id: null,
+        items,
+        has_next: false,
+        next_cursor: null
+      }
+    }
+    const parent = String(options.parent || "")
+      .replace(/^[\\/]+/, "")
+      .replace(/[\\/]+$/, "")
+      .slice(0, 4096)
+    const root = source.root.replace(/[\\/]+$/, "")
+    const separator = root.includes("\\") && !root.includes("/") ? "\\" : "/"
+    const prefix = parent
+      ? `${root}${separator}${parent.split("/").join(separator)}${separator}`
+      : `${root}${separator}`
+    const pageSize = boundedInteger(
+      options.page_size, STATUS_PAGE_SIZE, 1, STATUS_PAGE_SIZE)
+    const directoryOffset = boundedInteger(
+      options.directory_offset, 0, 0, Number.MAX_SAFE_INTEGER)
+    const level = await this.registry.treeLevel({
+      sourceId: source.id,
+      prefix,
+      view,
+      statusFilter,
+      query,
+      nameOnly: false,
+      sizeSort,
+      nameSort,
+      cursor: typeof options.cursor === "string"
+        ? options.cursor.slice(0, 2048)
+        : "",
+      pageSize,
+      // One extra of each so the merge can tell whether a side has more.
+      directoryLimit: pageSize + 1,
+      directoryOffset,
+      externalSourceIds: this.configuredExternalSourceIds()
+    })
+    const directories = (level.directories || []).map((row) => {
+      // A run of folders holding nothing but one another reads as one row.
+      // The shared prefix of the first and last path underneath is exactly
+      // that run, because the two are the extremes of a sorted list.
+      const shared = commonDirectory(row.lo || "", row.hi || "")
+      const label = shared && shared.startsWith(`${row.name}/`)
+        ? shared
+        : row.name
+      return {
+        kind: "directory",
+        name: row.name,
+        label,
+        relative_path: parent ? `${parent}/${label}` : label,
+        source_id: source.id,
+        size: Number(row.bytes) || 0,
+        file_count: Number(row.file_count) || 0,
+        duplicate_count: Number(row.duplicate_count) || 0,
+        unavailable_count: Number(row.unavailable_count) || 0,
+        linked_count: Number(row.linked_count) || 0
+      }
+    })
+    const files = this.publicFileItems(level.files)
+      .map((item) => Object.assign({ kind: "file" }, item))
+    const fileCursors = (level.files && level.files.rowCursors) || []
+    // Both sides arrive sorted the same way, so walking them together gives the
+    // page its true order. Sorting by size interleaves folders and files: the
+    // question on screen is "what is biggest", and a large loose file buried
+    // under small folders is the wrong answer to it. Sorting by name keeps the
+    // familiar folders-first grouping.
+    const ahead = (left, right) => {
+      if (sizeSort) {
+        if (left.size !== right.size) {
+          return sizeSort === "asc"
+            ? left.size < right.size
+            : left.size > right.size
+        }
+      } else if ((left.kind === "directory") !== (right.kind === "directory")) {
+        return left.kind === "directory"
+      }
+      const order = String(left.label || left.relative_path || "")
+        .localeCompare(String(right.label || right.relative_path || ""))
+      return nameSort === "desc" ? order > 0 : order < 0
+    }
+    const items = []
+    let directoryIndex = 0
+    let fileIndex = 0
+    while (items.length < pageSize &&
+      (directoryIndex < directories.length || fileIndex < files.length)) {
+      const directory = directories[directoryIndex]
+      const file = files[fileIndex]
+      if (directory && (!file || ahead(directory, file))) {
+        items.push(directory)
+        directoryIndex += 1
+      } else if (file) {
+        items.push(file)
+        fileIndex += 1
+      } else break
+    }
+    return {
+      enabled: true,
+      parent,
+      source_id: source.id,
+      items,
+      has_next: directoryIndex < directories.length ||
+        fileIndex < files.length ||
+        !!(level.files && level.files.nextCursor),
+      next_directory_offset: directoryOffset + directoryIndex,
+      next_cursor: fileIndex > 0
+        ? fileCursors[fileIndex - 1] || null
+        : (typeof options.cursor === "string" ? options.cursor : null)
+    }
+  }
+
   async duplicateGroupChildren(scopeId, hash, options = {}) {
     if (typeof hash !== "string" || !SHA256_RE.test(hash)) {
       throw new TypeError("Invalid vault content identifier.")
@@ -3326,7 +3530,9 @@ class Vault {
       cursor,
       pageSize,
       unrestricted: !scopeId,
-      activeUnrestricted: !scopeId && !locationId
+      activeUnrestricted: !scopeId && !locationId,
+      // Content groups are only ever listed by the flat file view.
+      nameOnly: true
     })
     return {
       hash,
@@ -3389,7 +3595,8 @@ class Vault {
       sourceIds: this.scopeSourceIds(scopeId, locationId),
       externalSourceIds: this.configuredExternalSourceIds(),
       query: String(options.query || "").slice(0, 500).trim(),
-      unrestricted: !scopeId && !locationId
+      unrestricted: !scopeId && !locationId,
+      nameOnly: true
     })
     return {
       hash,
@@ -3416,7 +3623,8 @@ class Vault {
         options.page_size, STATUS_PAGE_SIZE, 1, STATUS_PAGE_SIZE),
       sizeSort: options.size_sort || "desc",
       unrestricted: !scopeId && !locationId,
-      authorizedUnrestricted: !scopeId
+      authorizedUnrestricted: !scopeId,
+      nameOnly: true
     })
     return {
       items: result.items || [],
@@ -3429,6 +3637,9 @@ class Vault {
     const view = STATUS_VIEWS.has(options.view) ? options.view : "all"
     const groupDuplicates =
       view === "duplicates" && options.display_mode === "files"
+    // The flat list shows a file name where the tree shows a folder path, so
+    // the search has to match what is on screen. See queryClause().
+    const filesMode = options.display_mode === "files"
     const statusFilter = STATUS_FILTERS.has(options.status_filter)
       ? options.status_filter
       : "all"
@@ -3464,6 +3675,8 @@ class Vault {
         ? options.size_sort || "desc"
         : options.size_sort,
       groupDuplicates,
+      nameOnly: filesMode,
+      nameSort: options.name_sort === "desc" ? "desc" : "asc",
       cursor
     })
     let items

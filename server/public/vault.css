@@ -1881,6 +1881,7 @@ body.vault-page .vault-view-tabs {
 }
 .vault-name-header {
   display: inline-flex;
+  align-self: stretch;
   align-items: center;
   gap: 8px;
 }
@@ -1930,7 +1931,19 @@ body.vault-page .vault-view-tabs {
 .vault-group-meta { margin: 2px 0 0 23px; color: var(--task-muted); font-size: 10px; }
 .vault-group-action { grid-column: 5; justify-self: end; }
 .vault-group-action .vault-button { min-height: 28px; padding: 4px 9px; }
-.vault-name-cell { display: flex; min-width: 0; align-items: center; gap: 8px; }
+/* The row a Disk Saver link pointed at, so arriving on a long list lands the
+   eye on the file the link was about. */
+.vault-row-focus {
+  background: color-mix(in srgb, var(--task-accent) 16%, transparent);
+  box-shadow: inset 2px 0 0 var(--task-accent);
+}
+.vault-name-cell {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+  padding-left: calc(var(--vault-indent, 0) * 18px);
+}
 .vault-row-checkbox {
   width: 15px;
   height: 15px;
@@ -1943,8 +1956,6 @@ body.vault-page .vault-view-tabs {
   height: 15px;
   flex: 0 0 15px;
 }
-.vault-name-cell.indent-1 { padding-left: 18px; }
-.vault-name-cell.indent-2 { padding-left: 36px; }
 .vault-name-icon { width: 16px; flex: 0 0 16px; color: var(--task-muted); text-align: center; }
 .vault-disclosure {
   width: 16px;
@@ -2064,7 +2075,9 @@ body.dark .vault-row-action .vault-text-button:hover:not(:disabled) {
   background: color-mix(in srgb, var(--task-text) 11%, var(--task-panel));
 }
 .vault-detail {
-  padding: 8px var(--vault-inline) 9px 56px;
+  /* Lines up under the file it belongs to, however deep the tree row sits. */
+  padding: 8px var(--vault-inline) 9px
+    calc(56px + var(--vault-indent, 0) * 18px);
   border-bottom: 1px solid var(--task-border);
   background: color-mix(in srgb, var(--task-soft) 48%, transparent);
 }

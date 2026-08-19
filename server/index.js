@@ -1833,13 +1833,10 @@ class Server {
     const dev_initial_tab = type === "browse" && req.query && req.query.pinokio_dev_tab === "files"
       ? "files"
       : "plugins"
-    // Disk Saver hands one content group to another app: the page opens with
-    // its Disk Saver tab selected and that group already expanded.
-    const vault_initial_group = req.query &&
-      typeof req.query.vault_group === "string" &&
-      /^[a-f0-9]{64}$/i.test(req.query.vault_group)
-      ? req.query.vault_group.toLowerCase()
-      : null
+    const vault_initial_reveal = req.query &&
+      typeof req.query.vault_reveal === "string"
+      ? req.query.vault_reveal.slice(0, 4096)
+      : ""
 
     const registryEnabled = await this.isRegistryEnabled().catch(() => false)
     let community_url = ""
@@ -1963,7 +1960,7 @@ class Server {
       tabs: savedTabs,
       editor_tab: editor_tab,
       dev_initial_tab,
-      vault_initial_group,
+      vault_initial_reveal,
       config,
       protection_enabled: protectionPreference ? protectionPreference.protection_enabled !== false : false,
       autolaunch_app: autolaunchAppState,
@@ -15902,6 +15899,21 @@ class Server {
         }))
         return
       }
+      if (req.query && typeof req.query.tree_parent === "string") {
+        res.json(await vault.treeEntries(scopeId, {
+          location_id: req.query.location_id,
+          parent: req.query.tree_parent,
+          view: req.query.view,
+          status_filter: req.query.status_filter,
+          query: req.query.q,
+          size_sort: req.query.size_sort,
+          name_sort: req.query.name_sort,
+          cursor: req.query.cursor,
+          directory_offset: req.query.directory_offset,
+          page_size: req.query.page_size
+        }))
+        return
+      }
       const groupHash = req.query &&
         typeof req.query.group_hash === "string"
         ? req.query.group_hash
@@ -15936,6 +15948,7 @@ class Server {
         query: req.query && req.query.q,
         status_filter: req.query && req.query.status_filter,
         size_sort: req.query && req.query.size_sort,
+        name_sort: req.query && req.query.name_sort,
         display_mode: req.query && req.query.display_mode,
         folder_discovery_page:
           req.query && req.query.folder_discovery_page,

@@ -16,6 +16,16 @@ const canonicalPathKey = (value) => {
   return path.win32.resolve(filePath).toLowerCase()
 }
 
+// The search box matches whole paths, which is right when the tree shows
+// folders: a folder name is a thing you meant to search for. In the flat file
+// list only the file name is on screen, so a path match there returns rows the
+// user cannot see a reason for. This narrows the match to the last segment.
+const pathNameKey = (value) => {
+  const filePath = String(value || "")
+  const cut = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"))
+  return (cut < 0 ? filePath : filePath.slice(cut + 1)).toLowerCase()
+}
+
 const unsafePath = (filePath) => {
   const error = new Error(`Storage index path is not safe: ${filePath}`)
   error.code = "EVAULTPATH"
@@ -65,6 +75,11 @@ class RegistryCore {
         "pinokio_path_key",
         { deterministic: true },
         canonicalPathKey
+      )
+      this.database.function(
+        "pinokio_path_name",
+        { deterministic: true },
+        pathNameKey
       )
       this.database.pragma("journal_mode = DELETE")
       this.database.pragma("synchronous = NORMAL")
@@ -4858,7 +4873,7 @@ class RegistryCore {
     return Number(row.count) || 0
   }
 
-  matchingFileSummary(status, sourceIds = [], query = "") {
+  matchingFileSummary(status, sourceIds = [], query = "", nameOnly = false) {
     const ids = [...new Set(sourceIds.filter(Boolean))]
     if (!ids.length) return { count: 0, bytes: 0 }
     if (!query) {
@@ -4875,18 +4890,15 @@ class RegistryCore {
         bytes: Number(row.bytes) || 0
       }
     }
-    const values = [status, ...ids]
-    values.push(`%${String(query).toLowerCase()
-      .replace(/\\/g, "\\\\")
-      .replace(/%/g, "\\%")
-      .replace(/_/g, "\\_")}%`)
+    const clause = this.queryClause("path", query, nameOnly)
+    const values = [status, ...ids, ...clause.values]
     const row = this.database.prepare(`
       SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS bytes
       FROM files
       WHERE status = ?
         AND source_id IN (${placeholders(ids)})
         AND unavailable_reason IS NOT 'stale'
-        AND LOWER(path) LIKE ? ESCAPE '\\'
+        AND ${clause.sql}
     `).get(...values)
     return {
       count: Number(row.count) || 0,
@@ -4899,18 +4911,17 @@ class RegistryCore {
     sourceIds = [],
     cursor = "",
     limit = 100,
-    query = ""
+    query = "",
+    nameOnly = false
   ) {
     const ids = [...new Set(sourceIds.filter(Boolean))]
     if (!ids.length) return []
     const values = [status, cursor, ...ids]
     let search = ""
     if (query) {
-      search = "AND LOWER(path) LIKE ? ESCAPE '\\'"
-      values.push(`%${String(query).toLowerCase()
-        .replace(/\\/g, "\\\\")
-        .replace(/%/g, "\\%")
-        .replace(/_/g, "\\_")}%`)
+      const clause = this.queryClause("path", query, nameOnly)
+      search = `AND ${clause.sql}`
+      values.push(...clause.values)
     }
     return this.database.prepare(`
       SELECT path FROM files
@@ -5036,13 +5047,33 @@ class RegistryCore {
     return Buffer.from(JSON.stringify(value)).toString("base64url")
   }
 
+  // The path match stays in front as a cheap prefilter, so the basename
+  // function only runs on rows that could match at all.
+  queryClause(column, query, nameOnly) {
+    const escaped = `%${String(query).toLowerCase()
+      .replace(/\\/g, "\\\\")
+      .replace(/%/g, "\\%")
+      .replace(/_/g, "\\_")}%`
+    return nameOnly
+      ? {
+        sql: `LOWER(${column}) LIKE ? ESCAPE '\\' ` +
+          `AND pinokio_path_name(${column}) LIKE ? ESCAPE '\\'`,
+        values: [escaped, escaped]
+      }
+      : {
+        sql: `LOWER(${column}) LIKE ? ESCAPE '\\'`,
+        values: [escaped]
+      }
+  }
+
   fileFilter(
     view,
     statusFilter,
     sourceIds,
     query,
     unrestricted = false,
-    externalSourceIds = []
+    externalSourceIds = [],
+    nameOnly = false
   ) {
     const where = ["unavailable_reason IS NOT 'stale'"]
     const values = []
@@ -5075,11 +5106,9 @@ class RegistryCore {
       where.push("0")
     }
     if (query) {
-      where.push("LOWER(path) LIKE ? ESCAPE '\\'")
-      values.push(`%${String(query).toLowerCase()
-        .replace(/\\/g, "\\\\")
-        .replace(/%/g, "\\%")
-        .replace(/_/g, "\\_")}%`)
+      const clause = this.queryClause("path", query, nameOnly)
+      where.push(clause.sql)
+      values.push(...clause.values)
     }
     return { where, values }
   }
@@ -5090,7 +5119,8 @@ class RegistryCore {
     unrestricted,
     alias,
     statuses = ["duplicate"],
-    externalSourceIds = []
+    externalSourceIds = [],
+    nameOnly = false
   ) {
     const column = (name) => `${alias}.${name}`
     const where = [`${column("unavailable_reason")} IS NOT 'stale'`]
@@ -5114,11 +5144,9 @@ class RegistryCore {
       }
     }
     if (query) {
-      where.push(`LOWER(${column("path")}) LIKE ? ESCAPE '\\'`)
-      values.push(`%${String(query).toLowerCase()
-        .replace(/\\/g, "\\\\")
-        .replace(/%/g, "\\%")
-        .replace(/_/g, "\\_")}%`)
+      const clause = this.queryClause(column("path"), query, nameOnly)
+      where.push(clause.sql)
+      values.push(...clause.values)
     }
     return { where, values }
   }
@@ -5134,7 +5162,7 @@ class RegistryCore {
       Buffer.from(left.path),
       Buffer.from(right.path)
     )
-    return sort === "desc" ? -pathOrder : pathOrder
+    return sort === "desc" || sort === "path_desc" ? -pathOrder : pathOrder
   }
 
   fileStreamRows(options) {
@@ -5145,7 +5173,9 @@ class RegistryCore {
       sort,
       cursor,
       limit,
-      externalSourceIds
+      externalSourceIds,
+      nameOnly,
+      parentPrefix
     } = options
     const where = ["unavailable_reason IS NOT 'stale'"]
     const values = []
@@ -5162,11 +5192,18 @@ class RegistryCore {
       values.push(status)
     }
     if (query) {
-      where.push("LOWER(path) LIKE ? ESCAPE '\\'")
-      values.push(`%${String(query).toLowerCase()
-        .replace(/\\/g, "\\\\")
-        .replace(/%/g, "\\%")
-        .replace(/_/g, "\\_")}%`)
+      const clause = this.queryClause("path", query, nameOnly)
+      where.push(clause.sql)
+      values.push(...clause.values)
+    }
+    // Files sitting directly in one folder: inside the prefix, with no further
+    // separator after it.
+    if (parentPrefix) {
+      const [low, high] = this.prefixRange(parentPrefix)
+      where.push("path >= ? AND path < ?")
+      values.push(low, high)
+      where.push("instr(replace(substr(path, ?), '\\', '/'), '/') = 0")
+      values.push(String(parentPrefix).length + 1)
     }
     if (cursor && typeof cursor.path === "string") {
       if (sort === "asc" && Number.isFinite(cursor.size)) {
@@ -5175,6 +5212,9 @@ class RegistryCore {
       } else if (sort === "desc" && Number.isFinite(cursor.size)) {
         where.push("(size < ? OR (size = ? AND path < ?))")
         values.push(cursor.size, cursor.size, cursor.path)
+      } else if (sort === "path_desc") {
+        where.push("path < ?")
+        values.push(cursor.path)
       } else if (sort === "path") {
         where.push("path > ?")
         values.push(cursor.path)
@@ -5184,7 +5224,9 @@ class RegistryCore {
       ? "size ASC, path ASC"
       : sort === "desc"
         ? "size DESC, path DESC"
-        : "path ASC"
+        : sort === "path_desc"
+          ? "path DESC"
+          : "path ASC"
     return this.database.prepare(`
       SELECT * FROM files
       ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
@@ -5202,7 +5244,9 @@ class RegistryCore {
       sort,
       cursor,
       pageSize,
-      externalSourceIds
+      externalSourceIds,
+      nameOnly,
+      parentPrefix
     } = options
     const sources = unrestricted
       ? [null]
@@ -5236,7 +5280,9 @@ class RegistryCore {
         sort,
         cursor: stream.cursor,
         limit,
-        externalSourceIds
+        externalSourceIds,
+        nameOnly,
+        parentPrefix
       })
       stream.rows.push(...rows)
       if (rows.length < limit) stream.exhausted = true
@@ -5287,6 +5333,208 @@ class RegistryCore {
     }[statusFilter] || []
   }
 
+  // A LIKE carrying an ESCAPE clause cannot use an index, so a subtree written
+  // that way scans the whole location. The same set expressed as a range over
+  // the path is served by the primary key: every path under the prefix sorts
+  // at or after it and before the prefix with its last character stepped once.
+  prefixRange(prefix) {
+    const low = String(prefix)
+    const last = low.charCodeAt(low.length - 1)
+    return [
+      low,
+      `${low.slice(0, -1)}${String.fromCharCode(last + 1)}`
+    ]
+  }
+
+  // Immediate subdirectories of one folder, each carrying the totals for
+  // everything beneath it. The tree used to add these up in the browser from
+  // whichever page of files had loaded, so every folder size was a sample.
+  treeDirectoryRows(options) {
+    const {
+      sourceId,
+      prefix,
+      statuses,
+      query,
+      nameOnly,
+      sizeSort,
+      nameSort,
+      limit,
+      offset
+    } = options
+    const [low, high] = this.prefixRange(prefix)
+    const where = [
+      "source_id = ?",
+      "unavailable_reason IS NOT 'stale'",
+      "path >= ? AND path < ?"
+    ]
+    const values = [sourceId, low, high]
+    if (statuses && statuses.length) {
+      where.push(`status IN (${placeholders(statuses)})`)
+      values.push(...statuses)
+    }
+    if (query) {
+      const clause = this.queryClause("path", query, nameOnly)
+      where.push(clause.sql)
+      values.push(...clause.values)
+    }
+    const order = sizeSort === "asc"
+      ? "bytes ASC, name ASC"
+      : sizeSort === "desc"
+        ? "bytes DESC, name ASC"
+        : nameSort === "desc" ? "name DESC" : "name ASC"
+    return this.database.prepare(`
+      WITH scoped AS (
+        SELECT replace(substr(path, ?), '\', '/') AS rel, size, status
+        FROM files
+        WHERE ${where.join(" AND ")}
+      )
+      SELECT
+        substr(rel, 1, instr(rel, '/') - 1) AS name,
+        COUNT(*) AS file_count,
+        SUM(size) AS bytes,
+        SUM(CASE WHEN status = 'duplicate' THEN 1 ELSE 0 END)
+          AS duplicate_count,
+        SUM(CASE WHEN status = 'unavailable' THEN 1 ELSE 0 END)
+          AS unavailable_count,
+        SUM(CASE WHEN status = 'linked' THEN 1 ELSE 0 END)
+          AS linked_count,
+        MIN(rel) AS lo,
+        MAX(rel) AS hi
+      FROM scoped
+      WHERE instr(rel, '/') > 0
+      GROUP BY name
+      ORDER BY ${order}
+      LIMIT ? OFFSET ?
+    `).all(
+      String(prefix).length + 1,
+      ...values,
+      limit,
+      Math.max(0, Number(offset) || 0)
+    )
+  }
+
+  // The top of the global tree: one row per location with its real total.
+  // Without a search this reads the maintained per-source rollup; a search has
+  // to count the matching rows, which is why it costs more.
+  treeLocationRows(options) {
+    const {
+      sourceIds,
+      unrestricted,
+      externalSourceIds,
+      view,
+      statusFilter,
+      query,
+      nameOnly
+    } = options
+    const statuses = this.statusesForView(view, statusFilter)
+    if (!unrestricted && !sourceIds.length) return []
+    if (!query) {
+      const rows = this.summaryRows(
+        sourceIds, unrestricted, externalSourceIds)
+      const totals = new Map()
+      for (const row of rows) {
+        if (statuses && statuses.length &&
+          !statuses.includes(row.status)) continue
+        const current = totals.get(row.source_id) || {
+          source_id: row.source_id,
+          file_count: 0,
+          bytes: 0,
+          duplicate_count: 0,
+          unavailable_count: 0,
+          linked_count: 0
+        }
+        current.file_count += Number(row.file_count) || 0
+        current.bytes += Number(row.bytes) || 0
+        if (row.status === "duplicate") {
+          current.duplicate_count += Number(row.file_count) || 0
+        } else if (row.status === "unavailable") {
+          current.unavailable_count += Number(row.file_count) || 0
+        } else if (row.status === "linked") {
+          current.linked_count += Number(row.file_count) || 0
+        }
+        totals.set(row.source_id, current)
+      }
+      return [...totals.values()].filter((row) => row.file_count > 0)
+    }
+    const where = ["unavailable_reason IS NOT 'stale'"]
+    const values = []
+    if (unrestricted) {
+      const external = this.externalSourceFilter(null, externalSourceIds)
+      where.push(external.where)
+      values.push(...external.values)
+    } else {
+      where.push(`source_id IN (${placeholders(sourceIds)})`)
+      values.push(...sourceIds)
+    }
+    if (statuses && statuses.length) {
+      where.push(`status IN (${placeholders(statuses)})`)
+      values.push(...statuses)
+    }
+    const clause = this.queryClause("path", query, nameOnly)
+    where.push(clause.sql)
+    values.push(...clause.values)
+    return this.database.prepare(`
+      SELECT source_id,
+        COUNT(*) AS file_count,
+        SUM(size) AS bytes,
+        SUM(CASE WHEN status = 'duplicate' THEN 1 ELSE 0 END)
+          AS duplicate_count,
+        SUM(CASE WHEN status = 'unavailable' THEN 1 ELSE 0 END)
+          AS unavailable_count,
+        SUM(CASE WHEN status = 'linked' THEN 1 ELSE 0 END)
+          AS linked_count
+      FROM files
+      WHERE ${where.join(" AND ")}
+      GROUP BY source_id
+    `).all(...values)
+  }
+
+  // One level of the folder tree: its subfolders with real totals, and the
+  // files sitting directly in it.
+  treeLevel(options) {
+    const {
+      sourceId,
+      prefix,
+      view,
+      statusFilter,
+      query,
+      nameOnly,
+      sizeSort,
+      nameSort,
+      cursor,
+      pageSize,
+      externalSourceIds,
+      directoryLimit
+    } = options
+    return {
+      directories: this.treeDirectoryRows({
+        sourceId,
+        prefix,
+        statuses: this.statusesForView(view, statusFilter),
+        query,
+        nameOnly,
+        sizeSort,
+        nameSort,
+        limit: Math.max(1, Number(directoryLimit) || 2000),
+        offset: options.directoryOffset
+      }),
+      files: this.filePage({
+        view,
+        statusFilter,
+        sourceIds: [sourceId],
+        query,
+        pageSize,
+        sizeSort,
+        nameSort,
+        cursor,
+        unrestricted: false,
+        externalSourceIds,
+        nameOnly,
+        parentPrefix: prefix
+      })
+    }
+  }
+
   filePage(options) {
     const {
       view,
@@ -5295,13 +5543,17 @@ class RegistryCore {
       query,
       pageSize,
       sizeSort,
+      nameSort,
       cursor,
       unrestricted,
-      externalSourceIds
+      externalSourceIds,
+      nameOnly,
+      parentPrefix
     } = options
+    // Size and name sorting are one server-side order, so only one can win.
     const sort = sizeSort === "asc" || sizeSort === "desc"
       ? sizeSort
-      : "path"
+      : nameSort === "desc" ? "path_desc" : "path"
     const rows = this.boundedFileRows({
       sourceIds,
       unrestricted,
@@ -5310,7 +5562,9 @@ class RegistryCore {
       sort,
       cursor,
       pageSize,
-      externalSourceIds
+      externalSourceIds,
+      nameOnly,
+      parentPrefix
     })
     const hasMore = rows.length > pageSize
     if (hasMore) rows.pop()
@@ -5323,6 +5577,11 @@ class RegistryCore {
       })
       : null
 
+    const rowCursors = rows.map((row) => this.encodeCursor({
+      sort,
+      size: row.size,
+      path: row.path
+    }))
     const hashes = [...new Set(rows
       .filter((row) => row.status !== "linked")
       .map((row) => row.hash)
@@ -5445,7 +5704,7 @@ class RegistryCore {
         ...inodeCountExternal.values
       )
       : []
-    return { rows, hashSiblings, inodeSiblings, nextCursor }
+    return { rows, rowCursors, hashSiblings, inodeSiblings, nextCursor }
   }
 
   duplicateGroupPage(options = {}) {
@@ -5464,7 +5723,8 @@ class RegistryCore {
       !!options.unrestricted,
       "candidate",
       ["duplicate"],
-      externalSourceIds
+      externalSourceIds,
+      !!options.nameOnly
     )
     active.where.push("candidate.hash IS NOT NULL")
     const authorized = this.duplicateGroupFilter(
@@ -5579,7 +5839,8 @@ class RegistryCore {
       !!options.activeUnrestricted,
       "child",
       ["duplicate"],
-      externalSourceIds
+      externalSourceIds,
+      !!options.nameOnly
     )
     const decoded = this.decodeCursor(options.cursor)
     const cursorWhere = []
@@ -5715,7 +5976,8 @@ class RegistryCore {
       !!options.unrestricted,
       "candidate",
       ["duplicate"],
-      externalSourceIds
+      externalSourceIds,
+      !!options.nameOnly
     )
     const rows = this.database.prepare(`
       SELECT candidate.path
@@ -5747,7 +6009,8 @@ class RegistryCore {
       !!options.unrestricted,
       "candidate",
       ["duplicate"],
-      externalSourceIds
+      externalSourceIds,
+      !!options.nameOnly
     )
     const rows = this.database.prepare(`
       SELECT candidate.path, candidate.hash, candidate.size
@@ -5883,6 +6146,7 @@ class RegistryCore {
     const view = options.view || "all"
     const statusFilter = options.statusFilter || "all"
     const query = String(options.query || "")
+    const nameOnly = !!options.nameOnly
     const pageSize = Math.max(1, Math.min(500, Number(options.pageSize) || 500))
     const scopeRows = this.summaryRows(
       scopeSourceIds, !!options.scopeUnrestricted, externalSourceIds)
@@ -5964,7 +6228,8 @@ class RegistryCore {
           locationSourceIds,
           query,
           !!options.locationUnrestricted,
-          externalSourceIds
+          externalSourceIds,
+          nameOnly
         )
         const row = this.database.prepare(`
           SELECT
@@ -6015,7 +6280,8 @@ class RegistryCore {
           cursor: options.cursor,
           unrestricted: !!options.locationUnrestricted,
           authorizedUnrestricted: !!options.scopeUnrestricted,
-          externalSourceIds
+          externalSourceIds,
+          nameOnly
         })
         pageTotal = page.total
       } else {
@@ -6026,9 +6292,11 @@ class RegistryCore {
           query,
           pageSize,
           sizeSort: options.sizeSort,
+          nameSort: options.nameSort,
           cursor: options.cursor,
           unrestricted: !!options.locationUnrestricted,
-          externalSourceIds
+          externalSourceIds,
+          nameOnly
         })
       }
     }

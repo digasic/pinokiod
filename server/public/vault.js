@@ -168,11 +168,16 @@ const COPY = {
   size: "Size",
   sort_largest: "Sort by size, largest first",
   sort_smallest: "Sort by size, smallest first",
+  show_more: "Show more",
+  sort_a_z: "Sort by name, A to Z",
+  sort_z_a: "Sort by name, Z to A",
   folders: "Folders",
   files_mode: "Files",
   display_mode: "Display mode",
   sorted_largest: "sorted largest first",
   sorted_smallest: "sorted smallest first",
+  sorted_a_z: "sorted A to Z",
+  sorted_z_a: "sorted Z to A",
   previous: "Previous",
   next: "Next",
   file_pages: "File pages",
@@ -298,15 +303,19 @@ const COPY = {
 }
 
 const SCOPE_ID = document.body.dataset.vaultScope || null
-const FOCUS_GROUP = (() => {
-  const value = new URLSearchParams(window.location.search).get("group")
-  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value.toLowerCase())
-    ? value.toLowerCase()
-    : null
+// A link from another location reveals the file where it lives: the same
+// folder view the user was already reading, opened down to that file.
+const REVEAL = (() => {
+  const params = new URLSearchParams(window.location.search)
+  const relative = String(params.get("reveal") || "").slice(0, 4096)
+  if (!relative) return null
+  return {
+    relative,
+    locationId: String(params.get("location") || "").slice(0, 200) || null
+  }
 })()
 // A scoped page hands one content group off to the global page, which opens
 // on it once its first page of duplicate results arrives.
-let focusGroupPending = !!FOCUS_GROUP
 const IS_APP_MODE = document.body.dataset.vaultMode === "app" && !!SCOPE_ID
 const APP_NAME = IS_APP_MODE ? document.body.dataset.vaultApp || "" : ""
 const HOME_PATH = document.body.dataset.vaultHome || ""
@@ -323,7 +332,10 @@ const statusUrl = (progress = false) => {
     if (state.query) query.set("q", state.query)
     if (state.statusFilter !== "all") query.set("status_filter", state.statusFilter)
     if (state.sizeSort) query.set("size_sort", state.sizeSort)
-    if (state.view === "duplicates" && state.displayMode === "files") {
+    if (state.nameSort === "desc") query.set("name_sort", "desc")
+    // The server groups duplicates only for this view, but every view needs to
+    // know the mode: the flat list matches the search against file names.
+    if (state.displayMode === "files" && supportsDisplayMode()) {
       query.set("display_mode", "files")
     }
     query.set("page", String(state.page))
@@ -342,6 +354,21 @@ const folderDiscoveryChildrenUrl = (folder, page = 0) => {
     folder_discovery_parent: folder,
     folder_discovery_child_page: String(Math.max(0, Number(page) || 0))
   })
+  return `/info/dedup?${query.toString()}`
+}
+const treeLevelUrl = (locationId, parent, cursor = null, directoryOffset = 0) => {
+  const query = new URLSearchParams()
+  if (SCOPE_ID) query.set("scope_id", SCOPE_ID)
+  query.set("tree_parent", parent)
+  if (locationId) query.set("location_id", locationId)
+  query.set("view", state.view)
+  if (state.statusFilter !== "all") query.set("status_filter", state.statusFilter)
+  if (state.query) query.set("q", state.query)
+  if (state.sizeSort) query.set("size_sort", state.sizeSort)
+  if (state.nameSort === "desc") query.set("name_sort", "desc")
+  if (cursor) query.set("cursor", cursor)
+  if (directoryOffset) query.set("directory_offset", String(directoryOffset))
+  query.set("page_size", String(PAGE_SIZE))
   return `/info/dedup?${query.toString()}`
 }
 const fileLocationsUrl = (filePath, options = {}) => {
@@ -427,20 +454,27 @@ const state = {
   candidateSize: defaultCandidateSize,
   persistedCandidateSize: defaultCandidateSize,
   candidateSizeInitialized: false,
-  view: FOCUS_GROUP ? "duplicates" : "all",
-  sourceId: SCOPE_ID,
+  view: "all",
+  sourceId: REVEAL && REVEAL.locationId ? REVEAL.locationId : SCOPE_ID,
   query: "",
   statusFilter: "all",
-  displayMode: FOCUS_GROUP ? "files" : "folders",
-  sizeSort: FOCUS_GROUP ? "desc" : null,
+  displayMode: "folders",
+  sizeSort: null,
+  nameSort: "asc",
   collapsedSources: new Set(),
-  collapsedDirs: new Set(),
+  // One entry per folder that has been opened, keyed by its path inside the
+  // location. Folders start closed, so only what the user opens is fetched.
+  treeLevels: new Map(),
+  expandedDirs: new Set(),
+  treeGeneration: 0,
   expandedFiles: new Set(),
   expandedDuplicateGroups: new Set(),
   duplicateGroupChildren: new Map(),
   fileLocations: new Map(),
   locationsScanTs: undefined,
   duplicateGroupGeneration: 0,
+  revealPending: !!REVEAL,
+  revealPath: REVEAL ? REVEAL.relative : "",
   selectedDuplicateFiles: new Map(),
   selectedSeparateFiles: new Set(),
   separateAllMatching: false,
@@ -492,6 +526,9 @@ const resetPage = () => {
   state.duplicateGroupChildren.clear()
   closeFileLocations()
   state.duplicateGroupGeneration += 1
+  // Sort order, search and view all change what a folder level contains, so
+  // anything already fetched is stale.
+  resetTreeLevels()
 }
 
 const clearSeparateSelection = () => {
@@ -664,15 +701,20 @@ const openGlobalWorkspace = () => {
 // Locations that are not apps have no such page and open the global workspace.
 // The label and kind travel with the row: an app workspace cannot look up
 // sources belonging to other apps.
-const openContentGroup = async (group, kind, label) => {
+// Opens the copy where it lives: the same folder view the user was reading,
+// in the location that holds it, opened down to the file and marked. Falling
+// back to the content group covers a row that arrived without a path.
+const openFileLocation = async (relative, sourceId, kind, label) => {
   const accepted = await confirmLeave(
     COPY.open_location_confirm.replace(
       "{location}", label || COPY.unknown_location),
     COPY.open_location_accept)
   if (!accepted) return
+  // An app's workspace only exists inside that app's page, so a copy in an app
+  // opens there with its Disk Saver tab selected. Anything else opens global.
   const target = kind === "app" && label
-    ? `/pinokio/browser/${encodeURIComponent(label)}?vault_group=${encodeURIComponent(group)}`
-    : `/vault?group=${encodeURIComponent(group)}`
+    ? `/pinokio/browser/${encodeURIComponent(label)}?vault_reveal=${encodeURIComponent(relative)}`
+    : `/vault?reveal=${encodeURIComponent(relative)}&location=${encodeURIComponent(sourceId)}`
   window.parent.location.assign(target)
 }
 const applyAutomaticScanSnapshot = (snapshot) => {
@@ -795,9 +837,9 @@ const externalLocation = (item) => {
   const separator = base.includes("\\") && !base.includes("/") ? "\\" : "/"
   return `${base}${separator}${separator === "\\" ? relative.replace(/\//g, "\\") : relative}`
 }
-const buildItems = () => {
-  return state.data && Array.isArray(state.data.items) ? state.data.items : []
-}
+const buildItems = () => state.data && Array.isArray(state.data.items)
+  ? state.data.items
+  : []
 
 const viewIcon = {
   all: "fa-regular fa-file-lines",
@@ -1764,14 +1806,14 @@ const sharingControl = (item) => {
   return `<span class="vault-status-cell">${statusMarkup(item)}${control}</span>`
 }
 
-const fileDetail = (item) => {
+const fileDetail = (item, depth = 0) => {
   if (!state.expandedFiles.has(item.path)) return ""
   const locations = state.fileLocations.get(item.path)
   if (!locations || (locations.loading && !locations.loaded)) {
-    return `<div class="vault-detail"><div class="vault-detail-label"><i class="fa-solid fa-circle-notch fa-spin"></i> ${esc(COPY.loading_locations)}</div></div>`
+    return `<div class="vault-detail"${indentStyle(depth)}><div class="vault-detail-label"><i class="fa-solid fa-circle-notch fa-spin"></i> ${esc(COPY.loading_locations)}</div></div>`
   }
   if (locations.error) {
-    return `<div class="vault-detail"><div class="vault-detail-label error">${esc(locations.error)}</div></div>`
+    return `<div class="vault-detail"${indentStyle(depth)}><div class="vault-detail-label error">${esc(locations.error)}</div></div>`
   }
   const total = Math.max(locations.items.length, Number(locations.total) || 0)
   // Copies are byte-identical, so the size is stated once for the group.
@@ -1794,9 +1836,12 @@ const fileDetail = (item) => {
           : location.status === "unavailable"
             ? COPY.cannot_be_deduplicated
             : COPY.not_deduplicated_yet
-    const outside = SCOPE_ID && item.hash && location.source_id !== SCOPE_ID
+    // Only a copy that can be pointed at is a link.
+    const outside = SCOPE_ID &&
+      location.source_id !== SCOPE_ID &&
+      location.relative_path
     const text = outside
-      ? `<button class="vault-location-link" type="button" data-open-group="${attr(item.hash)}" data-open-kind="${attr(location.source_kind || "")}" data-open-label="${attr(location.source_label || "")}" title="${attr(COPY.open_in_disk_saver)}">${esc(where)}</button>`
+      ? `<button class="vault-location-link" type="button" data-open-path="${attr(location.relative_path)}" data-open-source="${attr(location.source_id || "")}" data-open-kind="${attr(location.source_kind || "")}" data-open-label="${attr(location.source_label || "")}" title="${attr(COPY.open_in_disk_saver)}">${esc(where)}</button>`
       : esc(where)
     // Rows keep identical slots whether or not a reveal button exists, so the
     // notes form a column and every row is the same height.
@@ -1804,7 +1849,7 @@ const fileDetail = (item) => {
       location.path, location.source_id, basename(location.relative_path))
     return `<div class="vault-location-detail"><i class="fa-regular fa-file"></i><span class="vault-location-path" title="${attr(where)}">${text}</span><span class="vault-location-note">${esc(note)}</span>${reveal || `<span class="vault-location-reveal-placeholder"></span>`}</div>`
   }).join("")
-  return `<div class="vault-detail"><div class="vault-detail-label">${esc(label)}</div>${body}${more}</div>`
+  return `<div class="vault-detail"${indentStyle(depth)}><div class="vault-detail-label">${esc(label)}</div>${body}${more}</div>`
 }
 const separateCheckbox = (item) => item.status === "shared"
   ? `<input class="vault-row-checkbox" type="checkbox" data-select-separate="${attr(item.path)}" aria-label="${attr(`${COPY.select_for_separation}: ${basename(item.relative_path)}`)}" ${state.separateAllMatching || state.selectedSeparateFiles.has(item.path) ? "checked" : ""} />`
@@ -1818,6 +1863,19 @@ const duplicateCheckbox = (item) =>
 const rowSelectionCheckbox = (item) =>
   duplicateCheckbox(item) || separateCheckbox(item)
 
+// Folder rows carry no checkbox, so they reserve its width instead and every
+// name in the tree starts on the same column.
+const checkboxPlaceholder =
+  '<span class="vault-row-checkbox-placeholder"></span>'
+// Tree rows indent one step per level. The cap only stops a pathological tree
+// from pushing the name off the row: it sits past the depth real app trees
+// reach, so in practice every row indents by its own level. Names truncate
+// rather than reflow, so an over-deep row degrades quietly.
+const MAX_INDENT_DEPTH = 12
+const indentStyle = (depth) => depth > 0
+  ? ` style="--vault-indent:${Math.min(depth, MAX_INDENT_DEPTH)}"`
+  : ""
+
 const renderFileRow = (item, depth = 0, showMatch = false) => {
   const directoryPath = dirname(item.relative_path)
   const match = item.match
@@ -1827,9 +1885,9 @@ const renderFileRow = (item, depth = 0, showMatch = false) => {
       <span class="vault-space">${esc(spaceMarkup(item))}</span>
       <span class="vault-row-action"></span>`
     : sharingControl(item)
-  return `<div class="vault-file-row">
-    <div class="vault-name-cell indent-${Math.min(depth, 2)}">
-      ${rowSelectionCheckbox(item)}
+  return `<div class="vault-file-row"${item.relative_path ? ` data-reveal-row="${attr(item.relative_path)}"` : ""}>
+    <div class="vault-name-cell"${indentStyle(depth)}>
+      ${rowSelectionCheckbox(item) || checkboxPlaceholder}
       ${expandable ? `<button class="vault-disclosure" type="button" data-expand-file="${attr(item.path)}" aria-label="${state.expandedFiles.has(item.path) ? COPY.collapse : COPY.expand}" aria-expanded="${state.expandedFiles.has(item.path)}"><i class="fa-solid fa-chevron-${state.expandedFiles.has(item.path) ? "down" : "right"}"></i></button>` : `<span class="vault-disclosure"></span>`}
       <i class="fa-regular fa-file vault-name-icon"></i>
       <span class="vault-name-copy"><span class="vault-file-name">${esc(basename(item.relative_path))}</span>${directoryPath && depth === 0 ? `<span class="vault-file-path">${esc(directoryPath)}</span>` : ""}</span>
@@ -1837,74 +1895,188 @@ const renderFileRow = (item, depth = 0, showMatch = false) => {
     </div>
     <span class="vault-size">${item.size ? fmt(item.size) : "—"}</span>
     ${rowTail}
-  </div>${fileDetail(item)}`
+  </div>${fileDetail(item, depth)}`
 }
 
 const sizeOf = (item) => Math.max(0, Number(item && item.size) || 0)
 const compareRows = (left, right, nameOf) => {
-  const byName = () => nameOf(left).localeCompare(nameOf(right))
+  const direction = state.nameSort === "desc" ? -1 : 1
+  const byName = () =>
+    direction * nameOf(left).localeCompare(nameOf(right))
   if (!state.sizeSort) return byName()
   const sizeDifference = sizeOf(left) - sizeOf(right)
   return (state.sizeSort === "asc" ? sizeDifference : -sizeDifference) || byName()
 }
-const makeTree = (items) => {
-  const root = { dirs: new Map(), files: [] }
-  for (const item of items) {
-    const parts = String(item.relative_path || basename(item.path)).split("/").filter(Boolean)
-    const fileName = parts.pop() || basename(item.path)
-    item._treeName = fileName
-    let node = root
-    for (const part of parts) {
-      if (!node.dirs.has(part)) node.dirs.set(part, { name: part, dirs: new Map(), files: [] })
-      node = node.dirs.get(part)
+const levelKey = (locationId, parent) => `${locationId || ""}\u0000${parent}`
+const treeLevel = (locationId, parent) =>
+  state.treeLevels.get(levelKey(locationId, parent)) || null
+// A new view, location, search or order gives the tree a different shape, so
+// nothing about the old one survives.
+const resetTreeLevels = () => {
+  state.treeLevels.clear()
+  state.expandedDirs.clear()
+  state.treeGeneration += 1
+}
+// A scan or a file action only changes what the rows say. Dropping the fetched
+// levels picks that up; keeping the open folders leaves the user where they
+// were instead of collapsing the tree under them after every action.
+const invalidateTreeLevels = () => {
+  state.treeLevels.clear()
+  state.treeGeneration += 1
+}
+const loadTreeLevel = async (locationId, parent, append = false) => {
+  const key = levelKey(locationId, parent)
+  const existing = state.treeLevels.get(key)
+  if (existing && existing.loading) return
+  // A level continues from two places at once: how far down the folder list it
+  // got, and which file it stopped on.
+  // Whatever the level is showing now was asked for under this generation. A
+  // reply from an older one describes a search, filter or order that is gone.
+  const generation = state.treeGeneration
+  const cursor = append && existing ? existing.nextCursor : null
+  const directoryOffset = append && existing
+    ? existing.nextDirectoryOffset || 0
+    : 0
+  state.treeLevels.set(key, {
+    items: existing && append ? existing.items : [],
+    loading: true,
+    loaded: !!(existing && append),
+    error: null,
+    hasNext: existing ? existing.hasNext : false,
+    nextCursor: existing ? existing.nextCursor : null,
+    nextDirectoryOffset: existing ? existing.nextDirectoryOffset : 0
+  })
+  render()
+  try {
+    const data = await fetchJson(
+      treeLevelUrl(locationId, parent, cursor, directoryOffset))
+    if (generation !== state.treeGeneration) return
+    // A scope holding one location has nothing to choose between, so it opens
+    // rather than making the user click through a list of one.
+    const only = (data.items || []).length === 1 &&
+      (data.items || [])[0].kind === "location"
+      ? data.items[0]
+      : null
+    if (only) {
+      const childKey = levelKey(only.location_id, "")
+      state.expandedDirs.add(childKey)
+      if (!state.treeLevels.has(childKey)) {
+        loadTreeLevel(only.location_id, "")
+      }
     }
-    node.files.push(item)
+    const previous = state.treeLevels.get(key)
+    state.treeLevels.set(key, {
+      items: append && previous
+        ? [...previous.items, ...(data.items || [])]
+        : (data.items || []),
+      loading: false,
+      loaded: true,
+      error: null,
+      hasNext: !!data.has_next,
+      nextCursor: data.next_cursor || null,
+      nextDirectoryOffset: Number(data.next_directory_offset) || 0
+    })
+  } catch (error) {
+    if (generation !== state.treeGeneration) return
+    state.treeLevels.set(key, {
+      items: [],
+      loading: false,
+      loaded: true,
+      error: error && error.message ? error.message : String(error),
+      hasNext: false,
+      nextCursor: null,
+      nextDirectoryOffset: 0
+    })
   }
-  const setTreeSize = (node) => {
-    node.size = node.files.reduce((sum, item) => sum + sizeOf(item), 0)
-    for (const child of node.dirs.values()) node.size += setTreeSize(child)
-    return node.size
-  }
-  setTreeSize(root)
-  return root
+  render()
 }
-const nodeItems = (node) => [...node.files, ...[...node.dirs.values()].flatMap((child) => nodeItems(child))]
-const renderTreeNode = (node, prefix, depth) => {
-  let current = node
-  const labels = [node.name]
-  while (current.files.length === 0 && current.dirs.size === 1) {
-    current = [...current.dirs.values()][0]
-    labels.push(current.name)
+// Opens each folder on the way down to the revealed file. Collapsed runs like
+// "lib / python3.10 / site-packages" are one entry, so the walk matches on the
+// entry's own path rather than stepping one segment at a time.
+const walkToReveal = async () => {
+  if (!state.revealPending) return
+  const target = state.revealPath
+  const locationId = state.sourceId
+  let parent = ""
+  for (let guard = 0; guard < 64; guard += 1) {
+    let level = treeLevel(locationId, parent)
+    if (!level || !level.loaded) {
+      await loadTreeLevel(locationId, parent)
+      level = treeLevel(locationId, parent)
+    }
+    if (!level || level.error) break
+    const match = () => level.items.find((entry) => entry.kind === "directory" &&
+      target.startsWith(`${entry.relative_path}/`))
+    let next = match()
+    // The folder on the way down can sit past the first page of a busy level,
+    // so keep asking for more of that level until it appears or runs out.
+    while (!next && level.hasNext) {
+      await loadTreeLevel(locationId, parent, true)
+      const grown = treeLevel(locationId, parent)
+      if (!grown || grown.error || grown.items.length === level.items.length) break
+      level = grown
+      next = match()
+    }
+    if (!next) break
+    state.expandedDirs.add(levelKey(locationId, next.relative_path))
+    parent = next.relative_path
   }
-  const key = [...prefix, ...labels].join("/")
-  const collapsed = state.collapsedDirs.has(key)
-  const items = nodeItems(current)
-  const duplicateCount = items.filter((item) => item.status === "duplicate").length
-  const unavailableCount = items.filter((item) => item.status === "unavailable").length
-  const shared = items.filter((item) => item.status === "shared").length
-  const summary = duplicateCount
-    ? countLabel(duplicateCount, COPY.duplicate.toLowerCase(), COPY.duplicates.toLowerCase())
-    : unavailableCount
-      ? COPY.cannot_deduplicate
-      : shared
-        ? COPY.shared
-        : COPY.tracked
-  let html = `<div class="vault-file-row directory">
-    <div class="vault-name-cell indent-${Math.min(depth, 2)}"><button class="vault-disclosure" type="button" data-toggle-dir="${attr(key)}" aria-label="${collapsed ? COPY.expand : COPY.collapse}" aria-expanded="${!collapsed}"><i class="fa-solid fa-chevron-${collapsed ? "right" : "down"}"></i></button><i class="fa-regular fa-folder vault-name-icon"></i><span class="vault-file-name">${esc(labels.join(" / "))}</span></div>
-    <span class="vault-size">${fmt(current.size)}</span><span>${esc(summary)}</span>
-  </div>`
-  if (!collapsed) {
-    html += [...current.files].sort((a, b) => compareRows(a, b, (item) => item._treeName)).map((item) => renderFileRow(item, depth + 1)).join("")
-    html += [...current.dirs.values()].sort((a, b) => compareRows(a, b, (node) => node.name)).map((child) => renderTreeNode(child, [...prefix, ...labels], depth + 1)).join("")
+  state.revealPending = false
+  render()
+  const row = document.querySelector(
+    `[data-reveal-row="${String(target).replace(/["\\]/g, "\\$&")}"]`)
+  if (!row) return
+  row.classList.add("vault-row-focus")
+  if (typeof row.scrollIntoView === "function") {
+    row.scrollIntoView({ block: "center" })
   }
-  return html
 }
-const renderTree = (items) => {
-  const tree = makeTree(items)
-  return [...tree.files].sort((a, b) => compareRows(a, b, (item) => item._treeName)).map((item) => renderFileRow(item)).join("") +
-    [...tree.dirs.values()].sort((a, b) => compareRows(a, b, (node) => node.name)).map((node) => renderTreeNode(node, [], 0)).join("")
+const treeSummary = (entry) => entry.duplicate_count
+  ? countLabel(entry.duplicate_count, COPY.duplicate.toLowerCase(), COPY.duplicates.toLowerCase())
+  : entry.unavailable_count
+    ? COPY.cannot_deduplicate
+    : entry.linked_count
+      ? COPY.shared
+      : COPY.tracked
+const renderTreeBranch = (entry, locationId, parent, depth, icon) => {
+  const key = levelKey(locationId, parent)
+  const expanded = state.expandedDirs.has(key)
+  const label = String(entry.label || entry.name).split("/").join(" / ")
+  return `<div class="vault-file-row directory">
+    <div class="vault-name-cell"${indentStyle(depth)}>${checkboxPlaceholder}<button class="vault-disclosure" type="button" data-toggle-location="${attr(locationId || "")}" data-toggle-path="${attr(parent)}" aria-label="${expanded ? COPY.collapse : COPY.expand}" aria-expanded="${expanded}"><i class="fa-solid fa-chevron-${expanded ? "down" : "right"}"></i></button><i class="fa-regular ${icon} vault-name-icon"></i><span class="vault-file-name">${esc(label)}</span></div>
+    <span class="vault-size">${fmt(entry.size)}</span><span>${esc(treeSummary(entry))}</span>
+  </div>${expanded ? renderTreeLevel(locationId, parent, depth + 1) : ""}`
 }
-
+const treePlaceholderRow = (depth, inner) =>
+  `<div class="vault-file-row"><div class="vault-name-cell"${indentStyle(depth)}>${checkboxPlaceholder}<span class="vault-disclosure"></span>${inner}</div></div>`
+const renderTreeLevel = (locationId, parent, depth) => {
+  const level = treeLevel(locationId, parent)
+  // Rendering a level the client does not hold is what asks for it, so the
+  // root and any folder left open across a refresh both fill themselves in.
+  if (!level) loadTreeLevel(locationId, parent)
+  if (!level || (!level.loaded && level.loading)) {
+    return treePlaceholderRow(depth, `<i class="fa-solid fa-circle-notch fa-spin vault-name-icon"></i><span class="vault-file-name">${esc(COPY.loading_locations)}</span>`)
+  }
+  if (level.error) {
+    return treePlaceholderRow(depth, `<span class="vault-file-name error">${esc(level.error)}</span>`)
+  }
+  if (!level.items.length) return emptyState(state.view)
+  const rows = level.items.map((entry) => {
+    if (entry.kind === "location") {
+      return renderTreeBranch(
+        entry, entry.location_id, "", depth, "fa-folder-open")
+    }
+    if (entry.kind === "directory") {
+      return renderTreeBranch(
+        entry, locationId, entry.relative_path, depth, "fa-folder")
+    }
+    return renderFileRow(entry, depth)
+  }).join("")
+  const more = level.hasNext
+    ? treePlaceholderRow(depth, `<button class="vault-text-button" type="button" data-more-location="${attr(locationId || "")}" data-more-path="${attr(parent)}" ${level.loading ? "disabled" : ""}>${esc(COPY.show_more)}</button>`)
+    : ""
+  return rows + more
+}
 const groupTitle = (source) => {
   if (!source) return COPY.unknown_location
   const parts = [source.label]
@@ -1929,7 +2101,7 @@ const renderFlatFiles = (items) => [...items]
     const expandable = Number(item.location_count) > 1
     return `<div class="vault-file-row">
       <div class="vault-name-cell">
-        ${separateCheckbox(item)}
+        ${separateCheckbox(item) || checkboxPlaceholder}
         ${expandable ? `<button class="vault-disclosure" type="button" data-expand-file="${attr(item.path)}" aria-label="${state.expandedFiles.has(item.path) ? COPY.collapse : COPY.expand}" aria-expanded="${state.expandedFiles.has(item.path)}"><i class="fa-solid fa-chevron-${state.expandedFiles.has(item.path) ? "down" : "right"}"></i></button>` : `<span class="vault-disclosure"></span>`}
         <i class="fa-regular fa-file vault-name-icon"></i>
         <span class="vault-file-name">${esc(basename(item.relative_path))}</span>
@@ -2029,28 +2201,6 @@ const renderDuplicateGroups = (items) => {
   }).join("")
 }
 
-const renderInventoryGroups = (items) => {
-  const groups = new Map()
-  for (const item of items) {
-    const key = item.source_id || "unknown"
-    if (!groups.has(key)) groups.set(key, [])
-    groups.get(key).push(item)
-  }
-  return [...groups.entries()].sort(sourceSort).map(([sourceId, group]) => {
-    const source = sourceById(sourceId)
-    const duplicates = group.filter((item) => item.status === "duplicate")
-    const unavailable = group.filter((item) => item.status === "unavailable").length
-    const saveable = duplicates.filter((item) => item.shareable).reduce((sum, item) => sum + item.size, 0)
-    const shared = group.filter((item) => item.status === "shared").length
-    const meta = [countLabel(group.length)]
-    if (duplicates.length) meta.push(countLabel(duplicates.length, COPY.duplicate.toLowerCase(), COPY.duplicates.toLowerCase()))
-    else if (unavailable) meta.push(`${unavailable} ${COPY.cannot_deduplicate.toLowerCase()}`)
-    else if (shared) meta.push(`${shared} ${COPY.shared.toLowerCase()}`)
-    if (saveable) meta.push(`${fmt(saveable)} ${COPY.can_save_suffix}`)
-    const action = batchAction(source)
-    return `<div class="vault-group-row"><div class="vault-group-main"><div class="vault-group-title"><i class="fa-regular fa-folder"></i><span>${esc(groupTitle(source))}</span></div><div class="vault-group-meta">${esc(meta.join(" · "))}</div></div>${action ? `<div class="vault-group-action">${action}</div>` : ""}</div>${renderTree(group)}`
-  }).join("")
-}
 
 const emptyState = (view) => {
   const scanning = scanMatchesContext(state.data && state.data.scan)
@@ -2222,11 +2372,22 @@ const renderTable = (items) => {
     headers = [COPY.name, COPY.location_column, COPY.size, COPY.status]
     body = items.length ? renderFlatFiles(items) : emptyState(state.view)
   } else {
-    body = items.length ? (state.sourceId ? renderTree(items) : renderInventoryGroups(items)) : emptyState(state.view)
+    body = renderTreeLevel(state.sourceId, "", 0)
   }
-  const sortableSize = tableClass === "flat" || state.view === "duplicates" || state.view === "reclaimable"
+  const sortableSize = tableClass === "flat" ||
+    tableClass === "inventory" ||
+    state.view === "duplicates" ||
+    state.view === "reclaimable"
   const sizeSortLabel = state.sizeSort === "desc" ? COPY.sort_smallest : COPY.sort_largest
   const sizeSortIcon = state.sizeSort === "desc" ? "fa-arrow-down-wide-short" : state.sizeSort === "asc" ? "fa-arrow-up-short-wide" : "fa-sort"
+  // Only where the page order is the name order: the duplicate, reclaimable
+  // and activity lists are paged by something else, so reordering their rows
+  // would only reorder the page the user happens to be on.
+  const sortableName = tableClass === "flat" || tableClass === "inventory"
+  const nameSortLabel = state.nameSort === "desc" ? COPY.sort_a_z : COPY.sort_z_a
+  const nameSortIcon = state.nameSort === "desc"
+    ? "fa-arrow-down-z-a"
+    : "fa-arrow-down-a-z"
   const separatePagePaths = selectablePagePaths(items)
   const duplicatePagePaths = state.view === "duplicates"
     ? selectableDuplicatePagePaths(items)
@@ -2246,7 +2407,12 @@ const renderTable = (items) => {
     : 0
   let pageSelectionAttribute = ""
   let allPageSelected = false
-  if (groupedEligible) {
+  const lazyTree = tableClass === "inventory"
+  if (lazyTree) {
+    // The rows on screen come from the folder levels, not the status page, so
+    // a "select everything here" box would reach rows the user cannot see.
+    pageSelectionAttribute = ""
+  } else if (groupedEligible) {
     pageSelectionAttribute = "data-select-duplicate-group-page"
     allPageSelected = groupedSelected === groupedEligible
   } else if (duplicatePagePaths.length) {
@@ -2258,8 +2424,21 @@ const renderTable = (items) => {
     allPageSelected = separatePagePaths.every((filePath) =>
       state.selectedSeparateFiles.has(filePath))
   }
-  const headerMarkup = headers.map((header, index) => index === 0 && pageSelectionAttribute
-    ? `<span class="vault-name-header"><input class="vault-row-checkbox" type="checkbox" ${pageSelectionAttribute} aria-label="${attr(COPY.select_all_on_page)}" title="${attr(COPY.select_all_on_page)}" ${allPageSelected ? "checked" : ""} /><span>${esc(header)}</span></span>`
+  const nameSortButton = `<button class="vault-sort-button ${state.sizeSort ? "" : "active"}" type="button" data-sort-name aria-label="${attr(nameSortLabel)}">${esc(COPY.name)}<i class="fa-solid ${nameSortIcon}" aria-hidden="true"></i></button>`
+  const nameHeader = (header) => {
+    const inner = sortableName ? nameSortButton : `<span>${esc(header)}</span>`
+    const sorted = !sortableName || state.sizeSort
+      ? "none"
+      : state.nameSort === "desc" ? "descending" : "ascending"
+    if (pageSelectionAttribute) {
+      return `<span class="vault-name-header" role="columnheader" aria-sort="${sorted}"><input class="vault-row-checkbox" type="checkbox" ${pageSelectionAttribute} aria-label="${attr(COPY.select_all_on_page)}" title="${attr(COPY.select_all_on_page)}" ${allPageSelected ? "checked" : ""} />${inner}</span>`
+    }
+    return sortableName
+      ? `<span class="vault-sort-column" role="columnheader" aria-sort="${sorted}">${inner}</span>`
+      : `<span>${esc(header)}</span>`
+  }
+  const headerMarkup = headers.map((header, index) => index === 0
+    ? nameHeader(header)
     : (header === COPY.size || header === COPY.size_each) && sortableSize
       ? `<span class="vault-sort-column" role="columnheader" aria-sort="${state.sizeSort === "desc" ? "descending" : state.sizeSort === "asc" ? "ascending" : "none"}"><button class="vault-sort-button ${state.sizeSort ? "active" : ""}" type="button" data-sort-size aria-label="${attr(sizeSortLabel)}">${esc(header)}<i class="fa-solid ${sizeSortIcon}" aria-hidden="true"></i></button></span>`
       : `<span>${esc(header)}</span>`).join("")
@@ -2290,6 +2469,18 @@ const orderedItems = (items) => {
 const pagedItems = (items) => {
   const inventory = state.data.inventory
   state.page = Number(inventory.page) || 0
+  if (state.displayMode !== "files") {
+    return {
+      items,
+      start: 0,
+      end: items.length,
+      total: items.length,
+      pages: 1,
+      hasPrevious: false,
+      hasNext: false,
+      nextCursor: null
+    }
+  }
   return {
     items: orderedItems(items),
     start: Number(inventory.start) || 0,
@@ -2326,7 +2517,9 @@ const paneFooterText = () => {
       : countLabel(itemCount)
     const order = state.sizeSort === "desc"
       ? COPY.sorted_largest
-      : state.sizeSort === "asc" ? COPY.sorted_smallest : ""
+      : state.sizeSort === "asc"
+        ? COPY.sorted_smallest
+        : state.nameSort === "desc" ? COPY.sorted_z_a : COPY.sorted_a_z
     return `${count}${order ? ` · ${order}` : ""}`
   }
   if (state.view === "duplicates") return COPY.duplicate_note
@@ -2915,6 +3108,13 @@ const render = () => {
       }
     }
   }
+  if (state.revealPending && !state.revealWalking) {
+    const root = treeLevel(state.sourceId, "")
+    if (root && root.loaded) {
+      state.revealWalking = true
+      walkToReveal().finally(() => { state.revealWalking = false })
+    }
+  }
   renderViews()
   renderExternalPrompt()
   renderFolderDiscovery()
@@ -3020,16 +3220,11 @@ const applyFullData = (data) => {
     reviewedScan() !== String(data.last_scan.ts) &&
     (shareableDuplicateCount > 0 || data.last_scan.partial)
   settleFolderDiscoveryStart()
-  if (focusGroupPending &&
-      data.inventory && data.inventory.view === "duplicates") {
-    focusGroupPending = false
-    state.expandedDuplicateGroups.add(FOCUS_GROUP)
-    loadDuplicateGroupChildren(FOCUS_GROUP)
-  }
   const publishedScan = data.last_scan ? data.last_scan.ts : null
   if (publishedScan !== state.locationsScanTs) {
     state.locationsScanTs = publishedScan
     closeFileLocations()
+    invalidateTreeLevels()
   }
   state.data = data
   const fileAction = serverFileAction(data.file_action)
@@ -3147,6 +3342,9 @@ const runAction = async (payload, success) => {
     state.feedback = { error: true, message: error && error.message ? error.message : String(error) }
   }
   closeFileLocations()
+  // A file action changes what the rows say without publishing a scan, so the
+  // fetched levels have to go even though the scan timestamp has not moved.
+  invalidateTreeLevels()
   await refresh(true)
 }
 
@@ -3484,9 +3682,10 @@ const closeScanSizeMenu = () => {
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("button")
   if (!target) return
-  if (target.dataset.openGroup) {
-    await openContentGroup(
-      target.dataset.openGroup,
+  if (target.dataset.openPath) {
+    await openFileLocation(
+      target.dataset.openPath,
+      target.dataset.openSource,
       target.dataset.openKind,
       target.dataset.openLabel)
     return
@@ -3805,10 +4004,39 @@ document.addEventListener("click", async (event) => {
     state.sizeSort = state.sizeSort === "desc" ? "asc" : "desc"
     resetPage()
     await refresh(true)
+  } else if (target.dataset.togglePath !== undefined) {
+    const locationId = target.dataset.toggleLocation || null
+    const parent = target.dataset.togglePath
+    const key = levelKey(locationId, parent)
+    if (state.expandedDirs.has(key)) {
+      state.expandedDirs.delete(key)
+      render()
+    } else {
+      state.expandedDirs.add(key)
+      if (!treeLevel(locationId, parent)) {
+        await loadTreeLevel(locationId, parent)
+      } else render()
+    }
+    return
+  } else if (target.dataset.morePath !== undefined) {
+    await loadTreeLevel(
+      target.dataset.moreLocation || null, target.dataset.morePath, true)
+    return
+  } else if (target.hasAttribute("data-sort-name")) {
+    clearFileSelections()
+    // Size ordering wins over name ordering server-side, so sorting by name
+    // has to drop it rather than sit underneath it doing nothing visible.
+    state.nameSort = !state.sizeSort && state.nameSort === "asc"
+      ? "desc"
+      : "asc"
+    state.sizeSort = null
+    resetPage()
+    await refresh(true)
   } else if (target.dataset.displayMode) {
     clearFileSelections()
     state.displayMode = target.dataset.displayMode === "files" ? "files" : "folders"
     state.sizeSort = state.displayMode === "files" ? "desc" : null
+    state.nameSort = "asc"
     resetPage()
     await refresh(true)
   } else if (target.dataset.view || target.id === "btn-review-cleanup") {
@@ -3819,6 +4047,7 @@ document.addEventListener("click", async (event) => {
     state.statusFilter = "all"
     state.displayMode = state.view === "shared" ? "files" : "folders"
     state.sizeSort = state.view === "shared" ? "desc" : null
+    state.nameSort = "asc"
     if (state.view === "duplicates") {
       markScanReviewed()
       state.scanResult = null
@@ -3838,11 +4067,6 @@ document.addEventListener("click", async (event) => {
     if (state.collapsedSources.has(id)) state.collapsedSources.delete(id)
     else state.collapsedSources.add(id)
     renderLocations()
-  } else if (target.dataset.toggleDir) {
-    const key = target.dataset.toggleDir
-    if (state.collapsedDirs.has(key)) state.collapsedDirs.delete(key)
-    else state.collapsedDirs.add(key)
-    render()
   } else if (target.dataset.expandDuplicateGroup) {
     const hash = target.dataset.expandDuplicateGroup
     if (state.expandedDuplicateGroups.has(hash)) {
@@ -4109,6 +4333,7 @@ document.addEventListener("click", async (event) => {
             location_id: state.sourceId,
             view: state.view,
             status_filter: state.statusFilter,
+            display_mode: state.displayMode,
             query: state.query
           }
         : { action: "separate_files", paths }
