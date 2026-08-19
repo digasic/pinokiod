@@ -1647,16 +1647,20 @@ body[data-vault-mode="global"] .vault-explorer {
 }
 .vault-text-button:hover { color: var(--task-text); }
 .vault-text-button:disabled { cursor: progress; opacity: .55; }
+/* The list is the only part that grows and scrolls; every other row keeps its
+   own height. Laying this out as fixed grid rows tied the footer's position to
+   how many children happened to be in flow, and a status row appearing or a
+   mode declaring a different count pushed the footer out of the pane, where no
+   amount of scrolling could reach it. */
 .vault-pane {
-  display: grid;
+  display: flex;
   min-width: 0;
   min-height: 0;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  flex-direction: column;
   overflow: hidden;
 }
-body[data-vault-mode="global"] .vault-pane {
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
-}
+.vault-pane > * { flex: 0 0 auto; }
+.vault-pane > .vault-table-wrap { min-height: 0; flex: 1 1 auto; }
 body.vault-page .vault-view-tabs {
   display: block;
   min-width: 0;
@@ -2192,6 +2196,10 @@ body.dark .vault-row-action .vault-text-button:hover:not(:disabled) {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  /* Now that it holds its own place at the bottom, it needs an edge: a short
+     list leaves empty space above it, and without a rule it reads as a stray
+     line of text rather than the foot of the table. */
+  border-top: 1px solid var(--task-border);
   padding: 9px var(--vault-inline) 11px;
   color: var(--task-muted);
   font-size: 10.5px;
