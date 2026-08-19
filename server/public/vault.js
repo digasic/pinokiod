@@ -168,7 +168,7 @@ const COPY = {
   size: "Size",
   sort_largest: "Sort by size, largest first",
   sort_smallest: "Sort by size, smallest first",
-  show_more: "Show more",
+  page_number: "Page {page}",
   sort_a_z: "Sort by name, A to Z",
   sort_z_a: "Sort by name, Z to A",
   folders: "Folders",
@@ -332,7 +332,7 @@ const statusUrl = (progress = false) => {
     if (state.query) query.set("q", state.query)
     if (state.statusFilter !== "all") query.set("status_filter", state.statusFilter)
     if (state.sizeSort) query.set("size_sort", state.sizeSort)
-    if (state.nameSort === "desc") query.set("name_sort", "desc")
+    if (state.nameSort) query.set("name_sort", state.nameSort)
     // The server groups duplicates only for this view, but every view needs to
     // know the mode: the flat list matches the search against file names.
     if (state.displayMode === "files" && supportsDisplayMode()) {
@@ -365,7 +365,7 @@ const treeLevelUrl = (locationId, parent, cursor = null, directoryOffset = 0) =>
   if (state.statusFilter !== "all") query.set("status_filter", state.statusFilter)
   if (state.query) query.set("q", state.query)
   if (state.sizeSort) query.set("size_sort", state.sizeSort)
-  if (state.nameSort === "desc") query.set("name_sort", "desc")
+  if (state.nameSort) query.set("name_sort", state.nameSort)
   if (cursor) query.set("cursor", cursor)
   if (directoryOffset) query.set("directory_offset", String(directoryOffset))
   query.set("page_size", String(PAGE_SIZE))
@@ -460,7 +460,7 @@ const state = {
   statusFilter: "all",
   displayMode: "folders",
   sizeSort: null,
-  nameSort: "asc",
+  nameSort: null,
   collapsedSources: new Set(),
   // One entry per folder that has been opened, keyed by its path inside the
   // location. Folders start closed, so only what the user opens is fetched.
@@ -1924,32 +1924,34 @@ const invalidateTreeLevels = () => {
   state.treeLevels.clear()
   state.treeGeneration += 1
 }
-const loadTreeLevel = async (locationId, parent, append = false) => {
+// A level is a list, so it pages like one. Each page's starting position is
+// kept so Previous can return to it, the same way the flat file list keeps its
+// cursors.
+const loadTreeLevel = async (locationId, parent, page = 0) => {
   const key = levelKey(locationId, parent)
   const existing = state.treeLevels.get(key)
   if (existing && existing.loading) return
-  // A level continues from two places at once: how far down the folder list it
-  // got, and which file it stopped on.
   // Whatever the level is showing now was asked for under this generation. A
   // reply from an older one describes a search, filter or order that is gone.
   const generation = state.treeGeneration
-  const cursor = append && existing ? existing.nextCursor : null
-  const directoryOffset = append && existing
-    ? existing.nextDirectoryOffset || 0
-    : 0
+  const positions = existing && existing.positions
+    ? existing.positions
+    : [{ cursor: null, directoryOffset: 0 }]
+  const wanted = Math.max(0, Math.min(page, positions.length - 1))
+  const from = positions[wanted]
   state.treeLevels.set(key, {
-    items: existing && append ? existing.items : [],
+    items: existing ? existing.items : [],
     loading: true,
-    loaded: !!(existing && append),
+    loaded: !!existing,
     error: null,
-    hasNext: existing ? existing.hasNext : false,
-    nextCursor: existing ? existing.nextCursor : null,
-    nextDirectoryOffset: existing ? existing.nextDirectoryOffset : 0
+    page: wanted,
+    positions,
+    hasNext: existing ? existing.hasNext : false
   })
   render()
   try {
-    const data = await fetchJson(
-      treeLevelUrl(locationId, parent, cursor, directoryOffset))
+    const data = await fetchJson(treeLevelUrl(
+      locationId, parent, from.cursor, from.directoryOffset))
     if (generation !== state.treeGeneration) return
     // A scope holding one location has nothing to choose between, so it opens
     // rather than making the user click through a list of one.
@@ -1960,21 +1962,23 @@ const loadTreeLevel = async (locationId, parent, append = false) => {
     if (only) {
       const childKey = levelKey(only.location_id, "")
       state.expandedDirs.add(childKey)
-      if (!state.treeLevels.has(childKey)) {
-        loadTreeLevel(only.location_id, "")
-      }
+      if (!state.treeLevels.has(childKey)) loadTreeLevel(only.location_id, "")
     }
-    const previous = state.treeLevels.get(key)
+    const next = positions.slice(0, wanted + 1)
+    if (data.has_next) {
+      next.push({
+        cursor: data.next_cursor || null,
+        directoryOffset: Number(data.next_directory_offset) || 0
+      })
+    }
     state.treeLevels.set(key, {
-      items: append && previous
-        ? [...previous.items, ...(data.items || [])]
-        : (data.items || []),
+      items: data.items || [],
       loading: false,
       loaded: true,
       error: null,
-      hasNext: !!data.has_next,
-      nextCursor: data.next_cursor || null,
-      nextDirectoryOffset: Number(data.next_directory_offset) || 0
+      page: wanted,
+      positions: next,
+      hasNext: !!data.has_next
     })
   } catch (error) {
     if (generation !== state.treeGeneration) return
@@ -1983,9 +1987,9 @@ const loadTreeLevel = async (locationId, parent, append = false) => {
       loading: false,
       loaded: true,
       error: error && error.message ? error.message : String(error),
-      hasNext: false,
-      nextCursor: null,
-      nextDirectoryOffset: 0
+      page: 0,
+      positions: [{ cursor: null, directoryOffset: 0 }],
+      hasNext: false
     })
   }
   render()
@@ -2011,10 +2015,10 @@ const walkToReveal = async () => {
     // The folder on the way down can sit past the first page of a busy level,
     // so keep asking for more of that level until it appears or runs out.
     while (!next && level.hasNext) {
-      await loadTreeLevel(locationId, parent, true)
-      const grown = treeLevel(locationId, parent)
-      if (!grown || grown.error || grown.items.length === level.items.length) break
-      level = grown
+      await loadTreeLevel(locationId, parent, (Number(level.page) || 0) + 1)
+      const turned = treeLevel(locationId, parent)
+      if (!turned || turned.error || turned.page === level.page) break
+      level = turned
       next = match()
     }
     if (!next) break
@@ -2072,10 +2076,11 @@ const renderTreeLevel = (locationId, parent, depth) => {
     }
     return renderFileRow(entry, depth)
   }).join("")
-  const more = level.hasNext
-    ? treePlaceholderRow(depth, `<button class="vault-text-button" type="button" data-more-location="${attr(locationId || "")}" data-more-path="${attr(parent)}" ${level.loading ? "disabled" : ""}>${esc(COPY.show_more)}</button>`)
+  const page = Number(level.page) || 0
+  const paging = level.hasNext || page > 0
+    ? treePlaceholderRow(depth, `<span class="vault-pagination" role="navigation" aria-label="${attr(COPY.file_pages)}"><button class="vault-text-button" type="button" data-tree-page="previous" data-page-location="${attr(locationId || "")}" data-page-path="${attr(parent)}" ${page > 0 && !level.loading ? "" : "disabled"}>${esc(COPY.previous)}</button><span class="vault-page-range">${esc(COPY.page_number.replace("{page}", page + 1))}</span><button class="vault-text-button" type="button" data-tree-page="next" data-page-location="${attr(locationId || "")}" data-page-path="${attr(parent)}" ${level.hasNext && !level.loading ? "" : "disabled"}>${esc(COPY.next)}</button></span>`)
     : ""
-  return rows + more
+  return rows + paging
 }
 const groupTitle = (source) => {
   if (!source) return COPY.unknown_location
@@ -2093,10 +2098,13 @@ const sourceSort = (a, b) => {
   const rank = (source) => source && source.kind === "external" ? 1 : source ? 0 : 2
   return rank(first) - rank(second) || groupTitle(first).localeCompare(groupTitle(second))
 }
+// The flat list is ordered by the name its Name column shows, matching the
+// order the server paged in; the location is only the tie-break.
+const flatName = (item) => basename(item.relative_path)
 const flatLocation = (item) => externalLocation(item) ||
   [groupTitle(sourceById(item.source_id)), item.relative_path].filter(Boolean).join(" / ")
 const renderFlatFiles = (items) => [...items]
-  .sort((a, b) => compareRows(a, b, flatLocation))
+  .sort((a, b) => compareRows(a, b, flatName))
   .map((item) => {
     const expandable = Number(item.location_count) > 1
     return `<div class="vault-file-row">
@@ -2387,10 +2395,10 @@ const renderTable = (items) => {
   const sortableName = tableClass === "flat" ||
     tableClass === "inventory" ||
     tableClass === "matches"
-  const nameSortLabel = state.nameSort === "desc" ? COPY.sort_a_z : COPY.sort_z_a
+  const nameSortLabel = state.nameSort === "asc" ? COPY.sort_z_a : COPY.sort_a_z
   const nameSortIcon = state.nameSort === "desc"
     ? "fa-arrow-down-z-a"
-    : "fa-arrow-down-a-z"
+    : state.nameSort === "asc" ? "fa-arrow-down-a-z" : "fa-sort"
   const separatePagePaths = selectablePagePaths(items)
   const duplicatePagePaths = state.view === "duplicates"
     ? selectableDuplicatePagePaths(items)
@@ -2427,10 +2435,10 @@ const renderTable = (items) => {
     allPageSelected = separatePagePaths.every((filePath) =>
       state.selectedSeparateFiles.has(filePath))
   }
-  const nameSortButton = `<button class="vault-sort-button ${state.sizeSort ? "" : "active"}" type="button" data-sort-name aria-label="${attr(nameSortLabel)}">${esc(COPY.name)}<i class="fa-solid ${nameSortIcon}" aria-hidden="true"></i></button>`
+  const nameSortButton = `<button class="vault-sort-button ${state.nameSort ? "active" : ""}" type="button" data-sort-name aria-label="${attr(nameSortLabel)}">${esc(COPY.name)}<i class="fa-solid ${nameSortIcon}" aria-hidden="true"></i></button>`
   const nameHeader = (header) => {
     const inner = sortableName ? nameSortButton : `<span>${esc(header)}</span>`
-    const sorted = !sortableName || state.sizeSort
+    const sorted = !sortableName || !state.nameSort
       ? "none"
       : state.nameSort === "desc" ? "descending" : "ascending"
     if (pageSelectionAttribute) {
@@ -2461,7 +2469,7 @@ const orderedItems = (items) => {
       (blob) => blob.hash))
   }
   if (state.displayMode === "files" && supportsDisplayMode()) {
-    return [...items].sort((a, b) => compareRows(a, b, flatLocation))
+    return [...items].sort((a, b) => compareRows(a, b, flatName))
   }
   return [...items].sort((a, b) => {
     const sourceOrder = state.sourceId ? 0 : sourceSort([a.source_id], [b.source_id])
@@ -2522,7 +2530,9 @@ const paneFooterText = () => {
       ? COPY.sorted_largest
       : state.sizeSort === "asc"
         ? COPY.sorted_smallest
-        : state.nameSort === "desc" ? COPY.sorted_z_a : COPY.sorted_a_z
+        : state.nameSort === "desc"
+          ? COPY.sorted_z_a
+          : state.nameSort === "asc" ? COPY.sorted_a_z : ""
     return `${count}${order ? ` · ${order}` : ""}`
   }
   if (state.view === "duplicates") return COPY.duplicate_note
@@ -4021,17 +4031,23 @@ document.addEventListener("click", async (event) => {
       } else render()
     }
     return
-  } else if (target.dataset.morePath !== undefined) {
-    await loadTreeLevel(
-      target.dataset.moreLocation || null, target.dataset.morePath, true)
+  } else if (target.dataset.treePage) {
+    const locationId = target.dataset.pageLocation || null
+    const parent = target.dataset.pagePath
+    const level = treeLevel(locationId, parent)
+    const page = (Number(level && level.page) || 0) +
+      (target.dataset.treePage === "next" ? 1 : -1)
+    if (page < 0) return
+    await loadTreeLevel(locationId, parent, page)
+    // Only the root level owns the top of the table; paging a folder deeper in
+    // should leave the reader where they were looking.
+    if (!parent && !locationId) el("vault-table-wrap").scrollTop = 0
     return
   } else if (target.hasAttribute("data-sort-name")) {
     clearFileSelections()
     // Size ordering wins over name ordering server-side, so sorting by name
     // has to drop it rather than sit underneath it doing nothing visible.
-    state.nameSort = !state.sizeSort && state.nameSort === "asc"
-      ? "desc"
-      : "asc"
+    state.nameSort = state.nameSort === "asc" ? "desc" : "asc"
     state.sizeSort = null
     resetPage()
     await refresh(true)
@@ -4039,7 +4055,7 @@ document.addEventListener("click", async (event) => {
     clearFileSelections()
     state.displayMode = target.dataset.displayMode === "files" ? "files" : "folders"
     state.sizeSort = state.displayMode === "files" ? "desc" : null
-    state.nameSort = "asc"
+    state.nameSort = null
     resetPage()
     await refresh(true)
   } else if (target.dataset.view || target.id === "btn-review-cleanup") {
@@ -4050,7 +4066,7 @@ document.addEventListener("click", async (event) => {
     state.statusFilter = "all"
     state.displayMode = state.view === "shared" ? "files" : "folders"
     state.sizeSort = state.view === "shared" ? "desc" : null
-    state.nameSort = "asc"
+    state.nameSort = null
     if (state.view === "duplicates") {
       markScanReviewed()
       state.scanResult = null

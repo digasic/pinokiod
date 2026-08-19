@@ -5045,6 +5045,15 @@ class RegistryCore {
     }
   }
 
+  // A cursor carries only what its order resumes from.
+  cursorFor(sort, row) {
+    const cursor = { sort, size: row.size, path: row.path }
+    if (sort === "name" || sort === "name_desc") {
+      cursor.name = pathNameKey(row.path)
+    }
+    return cursor
+  }
+
   encodeCursor(value) {
     return Buffer.from(JSON.stringify(value)).toString("base64url")
   }
@@ -5160,11 +5169,18 @@ class RegistryCore {
     if (sort === "desc" && left.size !== right.size) {
       return left.size > right.size ? -1 : 1
     }
+    if (sort === "name" || sort === "name_desc") {
+      const nameOrder = Buffer.compare(
+        Buffer.from(pathNameKey(left.path)),
+        Buffer.from(pathNameKey(right.path))
+      )
+      if (nameOrder) return sort === "name_desc" ? -nameOrder : nameOrder
+    }
     const pathOrder = Buffer.compare(
       Buffer.from(left.path),
       Buffer.from(right.path)
     )
-    return sort === "desc" || sort === "path_desc" ? -pathOrder : pathOrder
+    return sort === "desc" ? -pathOrder : pathOrder
   }
 
   fileStreamRows(options) {
@@ -5215,21 +5231,33 @@ class RegistryCore {
       } else if (sort === "desc" && Number.isFinite(cursor.size)) {
         where.push("(size < ? OR (size = ? AND path < ?))")
         values.push(cursor.size, cursor.size, cursor.path)
-      } else if (sort === "path_desc") {
-        where.push("path < ?")
-        values.push(cursor.path)
+      } else if (sort === "name_desc" && typeof cursor.name === "string") {
+        where.push(
+          "(pinokio_path_name(path) < ? OR " +
+          "(pinokio_path_name(path) = ? AND path < ?))")
+        values.push(cursor.name, cursor.name, cursor.path)
+      } else if (sort === "name" && typeof cursor.name === "string") {
+        where.push(
+          "(pinokio_path_name(path) > ? OR " +
+          "(pinokio_path_name(path) = ? AND path > ?))")
+        values.push(cursor.name, cursor.name, cursor.path)
       } else if (sort === "path") {
         where.push("path > ?")
         values.push(cursor.path)
       }
     }
+    // Ordering by name means the name the row shows. It costs a scan, because
+    // no index covers a derived value, so it is only asked for when the user
+    // sorts by the Name column.
     const order = sort === "asc"
       ? "size ASC, path ASC"
       : sort === "desc"
         ? "size DESC, path DESC"
-        : sort === "path_desc"
-          ? "path DESC"
-          : "path ASC"
+        : sort === "name"
+          ? "pinokio_path_name(path) ASC, path ASC"
+          : sort === "name_desc"
+            ? "pinokio_path_name(path) DESC, path DESC"
+            : "path ASC"
     return this.database.prepare(`
       SELECT * FROM files
       ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
@@ -5293,14 +5321,14 @@ class RegistryCore {
       if (rows.length < limit) stream.exhausted = true
       const last = rows[rows.length - 1]
       if (last) {
-        stream.cursor = {
-          sort,
-          size: last.size,
-          path: last.path
-        }
+        stream.cursor = this.cursorFor(sort, last)
       }
     }
-    for (const stream of streams) refill(stream, 1)
+    // One stream needs no merging, so it is filled in a single query. Several
+    // are probed a row at a time because most will not contribute much.
+    for (const stream of streams) {
+      refill(stream, streams.length === 1 ? pageSize + 1 : 1)
+    }
     const result = []
     while (result.length < pageSize + 1) {
       let selected = null
@@ -5316,7 +5344,10 @@ class RegistryCore {
       if (!selected) break
       result.push(selected.rows.shift())
       if (!selected.rows.length && !selected.exhausted) {
-        refill(selected, 16)
+        // Ask for what the page still needs. Refilling a fixed handful meant
+        // dozens of queries per page, which is invisible while an index serves
+        // them and ruinous for an order that has to scan.
+        refill(selected, Math.max(16, pageSize + 1 - result.length))
       }
     }
     return result
@@ -5565,9 +5596,13 @@ class RegistryCore {
       parentSeparator
     } = options
     // Size and name sorting are one server-side order, so only one can win.
+    // Name order is only ever asked for, never the default: it costs a scan,
+    // and the natural order of an inventory is its path order.
     const sort = sizeSort === "asc" || sizeSort === "desc"
       ? sizeSort
-      : nameSort === "desc" ? "path_desc" : "path"
+      : nameSort === "asc"
+        ? "name"
+        : nameSort === "desc" ? "name_desc" : "path"
     const rows = this.boundedFileRows({
       sourceIds,
       unrestricted,
@@ -5585,18 +5620,11 @@ class RegistryCore {
     if (hasMore) rows.pop()
     const last = rows[rows.length - 1]
     const nextCursor = hasMore && last
-      ? this.encodeCursor({
-        sort,
-        size: last.size,
-        path: last.path
-      })
+      ? this.encodeCursor(this.cursorFor(sort, last))
       : null
 
-    const rowCursors = rows.map((row) => this.encodeCursor({
-      sort,
-      size: row.size,
-      path: row.path
-    }))
+    const rowCursors = rows.map((row) =>
+      this.encodeCursor(this.cursorFor(sort, row)))
     const hashes = [...new Set(rows
       .filter((row) => row.status !== "linked")
       .map((row) => row.hash)

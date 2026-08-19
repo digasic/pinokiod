@@ -3349,7 +3349,10 @@ class Vault {
     const sizeSort = options.size_sort === "asc" || options.size_sort === "desc"
       ? options.size_sort
       : null
-    const nameSort = options.name_sort === "desc" ? "desc" : "asc"
+    const nameSort = options.name_sort === "asc" ||
+      options.name_sort === "desc"
+      ? options.name_sort
+      : null
     // The authorised set, not the requested id: a scoped page must not be able
     // to read another location by naming it, and a rail entry standing for a
     // group of locations -- Pinokio, Apps -- owns no files of its own, so it
@@ -3683,7 +3686,9 @@ class Vault {
         : options.size_sort,
       groupDuplicates,
       nameOnly: filesMode,
-      nameSort: options.name_sort === "desc" ? "desc" : "asc",
+      nameSort: options.name_sort === "asc" || options.name_sort === "desc"
+        ? options.name_sort
+        : null,
       cursor
     })
     let items

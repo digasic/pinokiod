@@ -485,22 +485,32 @@ const makePage = async (status, options = {}) => {
         directories.set(name,
           tally(directories.get(name) || empty(), entry))
       }
+      const merged = [
+        ...[...directories].map(([name, totals]) => Object.assign({
+          kind: "directory",
+          name,
+          label: name,
+          relative_path: `${prefix}${name}`,
+          source_id: locationId
+        }, totals)),
+        ...files
+      ]
+      // Honour the page size the client asks for, so a level that does not fit
+      // one page exercises the same continuation the server drives.
+      const limit = Math.max(1,
+        Number(parsed.searchParams.get("page_size")) || 500)
+      const from = Math.max(0,
+        Number(parsed.searchParams.get("directory_offset")) || 0)
+      const page = merged.slice(from, from + limit)
       return {
         ok: true,
         status: 200,
         json: async () => ({
           enabled: true,
           parent: treeParent,
-          items: [
-            ...[...directories].map(([name, totals]) => Object.assign({
-              kind: "directory",
-              name,
-              label: name,
-              relative_path: `${prefix}${name}`,
-              source_id: locationId
-            }, totals)),
-            ...files
-          ]
+          items: page,
+          has_next: from + page.length < merged.length,
+          next_directory_offset: from + page.length
         })
       }
     }
@@ -952,6 +962,55 @@ describe("Save Space interface", () => {
       "the copy that stays",
       "already deduplicated"
     ])
+    await settle()
+    dom.window.close()
+  })
+
+  test("a folder level pages like the file list, one page at a time", async () => {
+    // More files in one folder than a page holds.
+    const many = Array.from({ length: 1200 }, (unused, index) => item({
+      path: `/pinokio/api/app/models/file-${String(index).padStart(4, "0")}.bin`,
+      relative_path: `models/file-${String(index).padStart(4, "0")}.bin`,
+      status: "tracked"
+    }))
+    const { dom, getRequests } = await makePage(fixture(many))
+    const document = dom.window.document
+
+    await openTree(document, waitFor)
+    const rowsNow = () => document.querySelectorAll(
+      "#vault-table-wrap .vault-file-row").length
+    // Wait for the folder's own level, not just the rows above it.
+    await waitFor(() => rowsNow() > 100)
+    const first = rowsNow()
+    // The level stops well short of the 1200 files it contains.
+    assert.ok(first < 1200, `expected a bounded level, rendered ${first}`)
+    // Every level request carries a page size; none asks for everything.
+    const sizes = getRequests
+      .map((url) => new URL(url, "http://localhost"))
+      .filter((url) => url.searchParams.get("tree_parent") !== null)
+      .map((url) => Number(url.searchParams.get("page_size")))
+    assert.ok(sizes.length > 0)
+    assert.ok(sizes.every((size) => size > 0 && size <= 500))
+
+    // The rest is a page away, and the level pages both ways.
+    const next = document.querySelector('[data-tree-page="next"]')
+    assert.ok(next, "expected the level to offer a next page")
+    assert.equal(document.querySelector('[data-tree-page="previous"]').disabled,
+      true)
+    // Read the first file on the page, not the folder rows above it.
+    const firstFile = () => [...document.querySelectorAll(
+      "#vault-table-wrap .vault-file-name")]
+      .map((node) => node.textContent)
+      .find((text) => /^file-\d+\.bin$/.test(text))
+    const opening = firstFile()
+    assert.ok(opening)
+    next.click()
+    await waitFor(() => firstFile() && firstFile() !== opening)
+    assert.match(document.querySelector(".vault-page-range").textContent,
+      /Page 2/)
+    // And back again lands on the page it came from.
+    document.querySelector('[data-tree-page="previous"]').click()
+    await waitFor(() => firstFile() === opening)
     await settle()
     dom.window.close()
   })
