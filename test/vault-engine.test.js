@@ -375,6 +375,57 @@ describe("Save Space engine", () => {
     await close(reopened)
   })
 
+  test("the folder tree reads Windows paths", async () => {
+    // Backslash separators cannot be exercised through the filesystem on a
+    // POSIX runner, so this drives the registry with Windows-shaped rows. It
+    // guards the separator, which used to be written into the SQL text where
+    // JavaScript and SQLite escaped it differently and neither matched.
+    const home = await makeHome()
+    const RegistryCore = require("../kernel/vault/registry_core")
+    const core = new RegistryCore(home)
+    await core.load()
+    const root = "C:\\Users\\x\\pinokio\\api\\demo"
+    const insert = core.database.prepare(`INSERT INTO files
+      (path, hash, size, mtime, ctime, dev, ino, mode, uid, gid,
+       source_id, app, status, updated_at)
+      VALUES (?, ?, ?, 0, 0, 1, ?, 0, 0, 0, 'app:demo', 'demo',
+        'reference', 0)`);
+    [
+      [`${root}\\app\\models\\big.bin`, 4000],
+      [`${root}\\app\\models\\small.bin`, 10],
+      [`${root}\\cache\\only\\deep\\x.bin`, 50],
+      [`${root}\\loose.bin`, 700]
+    ].forEach(([filePath, size], index) =>
+      insert.run(filePath, `h${index}`, size, index + 1))
+
+    const directories = core.treeDirectoryRows({
+      sourceId: "app:demo",
+      prefix: `${root}\\`,
+      separator: "\\",
+      statuses: [],
+      query: "",
+      nameOnly: false,
+      sizeSort: "desc",
+      limit: 50,
+      offset: 0
+    })
+    assert.deepEqual(directories.map((row) => row.name), ["app", "cache"])
+    assert.equal(directories[0].bytes, 4010)
+    // The collapse reads these, so they have to carry the whole subpath.
+    assert.equal(directories[1].lo, "cache\\only\\deep\\x.bin")
+
+    const files = core.fileStreamRows({
+      sourceId: "app:demo",
+      query: "",
+      sort: "path",
+      limit: 50,
+      parentPrefix: `${root}\\`,
+      parentSeparator: "\\"
+    })
+    assert.deepEqual(files.map((row) => row.path), [`${root}\\loose.bin`])
+    core.database.close()
+  })
+
   test("the folder tree resolves a group of locations to its members", async () => {
     const { home, vault } = await makeVault()
     await writeCandidate(

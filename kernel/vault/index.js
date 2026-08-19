@@ -3408,7 +3408,10 @@ class Vault {
       .replace(/[\\/]+$/, "")
       .slice(0, 4096)
     const root = source.root.replace(/[\\/]+$/, "")
-    const separator = root.includes("\\") && !root.includes("/") ? "\\" : "/"
+    // Every source root is produced by path.resolve, so it is already native
+    // and the platform separator is the right one -- no need to infer it from
+    // the string, which a directory named with a backslash would fool.
+    const separator = path.sep
     const prefix = parent
       ? `${root}${separator}${parent.split("/").join(separator)}${separator}`
       : `${root}${separator}`
@@ -3419,6 +3422,7 @@ class Vault {
     const level = await this.registry.treeLevel({
       sourceId: source.id,
       prefix,
+      separator,
       view,
       statusFilter,
       query,
@@ -3438,7 +3442,10 @@ class Vault {
       // A run of folders holding nothing but one another reads as one row.
       // The shared prefix of the first and last path underneath is exactly
       // that run, because the two are the extremes of a sorted list.
-      const shared = commonDirectory(row.lo || "", row.hi || "")
+      const native = (value) => separator === "/"
+        ? String(value || "")
+        : String(value || "").split(separator).join("/")
+      const shared = commonDirectory(native(row.lo), native(row.hi))
       const label = shared && shared.startsWith(`${row.name}/`)
         ? shared
         : row.name

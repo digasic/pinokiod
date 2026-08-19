@@ -22,7 +22,9 @@ const canonicalPathKey = (value) => {
 // user cannot see a reason for. This narrows the match to the last segment.
 const pathNameKey = (value) => {
   const filePath = String(value || "")
-  const cut = Math.max(filePath.lastIndexOf("/"), filePath.lastIndexOf("\\"))
+  // Only the platform's own separator: registry paths are always native, and
+  // on POSIX a backslash is an ordinary character in a file name.
+  const cut = filePath.lastIndexOf(path.sep)
   return (cut < 0 ? filePath : filePath.slice(cut + 1)).toLowerCase()
 }
 
@@ -5175,7 +5177,8 @@ class RegistryCore {
       limit,
       externalSourceIds,
       nameOnly,
-      parentPrefix
+      parentPrefix,
+      parentSeparator
     } = options
     const where = ["unavailable_reason IS NOT 'stale'"]
     const values = []
@@ -5202,8 +5205,8 @@ class RegistryCore {
       const [low, high] = this.prefixRange(parentPrefix)
       where.push("path >= ? AND path < ?")
       values.push(low, high)
-      where.push("instr(replace(substr(path, ?), '\\', '/'), '/') = 0")
-      values.push(String(parentPrefix).length + 1)
+      where.push("instr(substr(path, ?), ?) = 0")
+      values.push(String(parentPrefix).length + 1, parentSeparator)
     }
     if (cursor && typeof cursor.path === "string") {
       if (sort === "asc" && Number.isFinite(cursor.size)) {
@@ -5246,7 +5249,8 @@ class RegistryCore {
       pageSize,
       externalSourceIds,
       nameOnly,
-      parentPrefix
+      parentPrefix,
+      parentSeparator
     } = options
     const sources = unrestricted
       ? [null]
@@ -5282,7 +5286,8 @@ class RegistryCore {
         limit,
         externalSourceIds,
         nameOnly,
-        parentPrefix
+        parentPrefix,
+        parentSeparator
       })
       stream.rows.push(...rows)
       if (rows.length < limit) stream.exhausted = true
@@ -5356,6 +5361,7 @@ class RegistryCore {
       statuses,
       query,
       nameOnly,
+      separator,
       sizeSort,
       nameSort,
       limit,
@@ -5382,14 +5388,16 @@ class RegistryCore {
       : sizeSort === "desc"
         ? "bytes DESC, name ASC"
         : nameSort === "desc" ? "name DESC" : "name ASC"
+    // Values bind in the order the placeholders appear: the CTE's substr, then
+    // its WHERE, then the two separators in the outer select and filter.
     return this.database.prepare(`
       WITH scoped AS (
-        SELECT replace(substr(path, ?), '\', '/') AS rel, size, status
+        SELECT substr(path, ?) AS rel, size, status
         FROM files
         WHERE ${where.join(" AND ")}
       )
       SELECT
-        substr(rel, 1, instr(rel, '/') - 1) AS name,
+        substr(rel, 1, instr(rel, ?) - 1) AS name,
         COUNT(*) AS file_count,
         SUM(size) AS bytes,
         SUM(CASE WHEN status = 'duplicate' THEN 1 ELSE 0 END)
@@ -5401,13 +5409,15 @@ class RegistryCore {
         MIN(rel) AS lo,
         MAX(rel) AS hi
       FROM scoped
-      WHERE instr(rel, '/') > 0
+      WHERE instr(rel, ?) > 0
       GROUP BY name
       ORDER BY ${order}
       LIMIT ? OFFSET ?
     `).all(
       String(prefix).length + 1,
       ...values,
+      separator,
+      separator,
       limit,
       Math.max(0, Number(offset) || 0)
     )
@@ -5495,6 +5505,7 @@ class RegistryCore {
     const {
       sourceId,
       prefix,
+      separator,
       view,
       statusFilter,
       query,
@@ -5510,6 +5521,7 @@ class RegistryCore {
       directories: this.treeDirectoryRows({
         sourceId,
         prefix,
+        separator,
         statuses: this.statusesForView(view, statusFilter),
         query,
         nameOnly,
@@ -5530,7 +5542,8 @@ class RegistryCore {
         unrestricted: false,
         externalSourceIds,
         nameOnly,
-        parentPrefix: prefix
+        parentPrefix: prefix,
+        parentSeparator: separator
       })
     }
   }
@@ -5548,7 +5561,8 @@ class RegistryCore {
       unrestricted,
       externalSourceIds,
       nameOnly,
-      parentPrefix
+      parentPrefix,
+      parentSeparator
     } = options
     // Size and name sorting are one server-side order, so only one can win.
     const sort = sizeSort === "asc" || sizeSort === "desc"
@@ -5564,7 +5578,8 @@ class RegistryCore {
       pageSize,
       externalSourceIds,
       nameOnly,
-      parentPrefix
+      parentPrefix,
+      parentSeparator
     })
     const hasMore = rows.length > pageSize
     if (hasMore) rows.pop()
