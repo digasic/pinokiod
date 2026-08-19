@@ -2380,10 +2380,13 @@ const renderTable = (items) => {
     state.view === "reclaimable"
   const sizeSortLabel = state.sizeSort === "desc" ? COPY.sort_smallest : COPY.sort_largest
   const sizeSortIcon = state.sizeSort === "desc" ? "fa-arrow-down-wide-short" : state.sizeSort === "asc" ? "fa-arrow-up-short-wide" : "fa-sort"
-  // Only where the page order is the name order: the duplicate, reclaimable
-  // and activity lists are paged by something else, so reordering their rows
-  // would only reorder the page the user happens to be on.
-  const sortableName = tableClass === "flat" || tableClass === "inventory"
+  // Every table whose rows are paths, which is every one whose Name column
+  // holds a name. Content groups are labelled with a sample path rather than an
+  // identity, Trash rows are labelled with a hash, and Activity is a log kept in
+  // time order, so none of the three has a name to sort by.
+  const sortableName = tableClass === "flat" ||
+    tableClass === "inventory" ||
+    tableClass === "matches"
   const nameSortLabel = state.nameSort === "desc" ? COPY.sort_a_z : COPY.sort_z_a
   const nameSortIcon = state.nameSort === "desc"
     ? "fa-arrow-down-z-a"

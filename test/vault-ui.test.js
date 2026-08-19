@@ -956,6 +956,53 @@ describe("Save Space interface", () => {
     dom.window.close()
   })
 
+  test("name sorting is offered wherever the Name column holds a name", async () => {
+    const duplicate = item({
+      path: "/pinokio/api/app/models/duplicate.bin",
+      relative_path: "models/duplicate.bin",
+      status: "duplicate",
+      shareable: true,
+      location_count: 2
+    })
+    const base = fixture([duplicate])
+    base.inventory.source_counts.duplicates["app:app"] = 1
+    base.inventory.shareable_by_source["app:app"] = 1
+    const { dom } = await makePage(base)
+    const document = dom.window.document
+    const controls = () => ({
+      name: !!document.querySelector("[data-sort-name]"),
+      size: !!document.querySelector("[data-sort-size]")
+    })
+
+    // Rows are paths here, in either display mode.
+    assert.deepEqual(controls(), { name: true, size: true })
+    document.querySelector('[data-display-mode="files"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-display-mode="files"].selected'))
+    assert.deepEqual(controls(), { name: true, size: true })
+
+    document.querySelector('[data-view="duplicates"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+    // Duplicates in Folders is an ordinary tree of paths.
+    assert.deepEqual(controls(), { name: true, size: true })
+
+    document.querySelector('[data-display-mode="files"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-display-mode="files"].selected'))
+    // Content groups are labelled with a sample path, not an identity, so
+    // ordering them by name would order them by an arbitrary member.
+    assert.deepEqual(controls(), { name: false, size: true })
+
+    document.querySelector('[data-view="activity"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="activity"].selected'))
+    // A log is kept in time order.
+    assert.deepEqual(controls(), { name: false, size: false })
+    await settle()
+    dom.window.close()
+  })
+
   test("a copy elsewhere links only when it can be pointed at", async () => {
     const duplicate = item({
       path: "/pinokio/api/app/models/duplicate.bin",
