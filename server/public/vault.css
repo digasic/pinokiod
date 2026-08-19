@@ -964,6 +964,32 @@ body[data-vault-mode="global"] .vault-explorer {
   outline: 2px solid color-mix(in srgb, var(--task-accent) 55%, transparent);
   outline-offset: 1px;
 }
+.vault-confirm-overlay {
+  position: fixed;
+  z-index: 140;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--task-text) 34%, transparent);
+}
+.vault-confirm-overlay[hidden] { display: none; }
+.vault-confirm-dialog {
+  width: min(420px, 100%);
+  padding: 18px 20px 16px;
+  border: 1px solid var(--task-border-strong);
+  border-radius: 10px;
+  background: var(--task-panel);
+  box-shadow: 0 22px 70px color-mix(in srgb, var(--task-text) 24%, transparent);
+}
+.vault-confirm-message {
+  margin: 0 0 16px;
+  color: var(--task-text);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.vault-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
+
 .vault-find-overlay {
   position: fixed;
   z-index: 120;
@@ -2043,9 +2069,40 @@ body.dark .vault-row-action .vault-text-button:hover:not(:disabled) {
   background: color-mix(in srgb, var(--task-soft) 48%, transparent);
 }
 .vault-detail-label { margin-bottom: 5px; color: var(--task-muted); font-size: 10px; font-weight: 650; }
-.vault-location-detail { display: flex; align-items: center; gap: 7px; padding: 2px 0; color: var(--task-text); font-size: 10.5px; }
+.vault-location-detail { display: flex; align-items: center; gap: 7px; min-height: 26px; color: var(--task-text); font-size: 10.5px; }
 .vault-location-detail i { color: var(--task-muted); }
 .vault-location-detail > span { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.vault-location-detail > .vault-location-path {
+  min-width: 0;
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.vault-location-detail > .vault-location-note {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding-left: 12px;
+  color: var(--task-muted);
+  white-space: nowrap;
+}
+.vault-location-detail > .vault-location-reveal-placeholder { flex: 0 0 26px; }
+.vault-location-link {
+  appearance: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--task-accent);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.vault-location-link:hover { text-decoration: underline; }
+.vault-location-link i { color: inherit; font-size: 9px; margin-left: 5px; }
 .vault-duplicate-content-group {
   min-height: 52px;
   background: color-mix(in srgb, var(--task-soft) 28%, transparent);

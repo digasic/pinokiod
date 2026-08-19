@@ -1833,6 +1833,13 @@ class Server {
     const dev_initial_tab = type === "browse" && req.query && req.query.pinokio_dev_tab === "files"
       ? "files"
       : "plugins"
+    // Disk Saver hands one content group to another app: the page opens with
+    // its Disk Saver tab selected and that group already expanded.
+    const vault_initial_group = req.query &&
+      typeof req.query.vault_group === "string" &&
+      /^[a-f0-9]{64}$/i.test(req.query.vault_group)
+      ? req.query.vault_group.toLowerCase()
+      : null
 
     const registryEnabled = await this.isRegistryEnabled().catch(() => false)
     let community_url = ""
@@ -1956,6 +1963,7 @@ class Server {
       tabs: savedTabs,
       editor_tab: editor_tab,
       dev_initial_tab,
+      vault_initial_group,
       config,
       protection_enabled: protectionPreference ? protectionPreference.protection_enabled !== false : false,
       autolaunch_app: autolaunchAppState,

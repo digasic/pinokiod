@@ -237,6 +237,9 @@ const COPY = {
   loading_copies: "Loading copies…",
   show_more_copies: "Show {count} more copies",
   loading_locations: "Loading locations…",
+  open_in_disk_saver: "Open this file in Disk Saver",
+  open_location_confirm: "Open Disk Saver to review {location}?",
+  open_location_accept: "Open",
   show_more_locations: "Show {count} more locations",
   making_separate: "Making file separate",
   make_separate: "Make separate",
@@ -258,7 +261,12 @@ const COPY = {
   separation_cancelled: "Separation cancelled after {count}.",
   select_for_separation: "Select to make separate",
   select_all_on_page: "Select all on this page",
-  identical_contents_at: "Identical contents at",
+  stored_times: "Stored {count} times · {size} each",
+  this_file: "this file",
+  copy_that_stays: "the copy that stays",
+  already_deduplicated: "already deduplicated",
+  not_deduplicated_yet: "not deduplicated yet",
+  cannot_be_deduplicated: "cannot be deduplicated",
   no_files: "No files found",
   no_files_hint: "Run a scan to find files that can be deduplicated. Scanning never links files together or replaces them.",
   scan_waiting: "Waiting for scan results",
@@ -290,6 +298,15 @@ const COPY = {
 }
 
 const SCOPE_ID = document.body.dataset.vaultScope || null
+const FOCUS_GROUP = (() => {
+  const value = new URLSearchParams(window.location.search).get("group")
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value.toLowerCase())
+    ? value.toLowerCase()
+    : null
+})()
+// A scoped page hands one content group off to the global page, which opens
+// on it once its first page of duplicate results arrives.
+let focusGroupPending = !!FOCUS_GROUP
 const IS_APP_MODE = document.body.dataset.vaultMode === "app" && !!SCOPE_ID
 const APP_NAME = IS_APP_MODE ? document.body.dataset.vaultApp || "" : ""
 const HOME_PATH = document.body.dataset.vaultHome || ""
@@ -410,12 +427,12 @@ const state = {
   candidateSize: defaultCandidateSize,
   persistedCandidateSize: defaultCandidateSize,
   candidateSizeInitialized: false,
-  view: "all",
+  view: FOCUS_GROUP ? "duplicates" : "all",
   sourceId: SCOPE_ID,
   query: "",
   statusFilter: "all",
-  displayMode: "folders",
-  sizeSort: null,
+  displayMode: FOCUS_GROUP ? "files" : "folders",
+  sizeSort: FOCUS_GROUP ? "desc" : null,
   collapsedSources: new Set(),
   collapsedDirs: new Set(),
   expandedFiles: new Set(),
@@ -609,8 +626,54 @@ const saveCandidateSize = (size) => {
   })
   return candidateSizeSaveTail
 }
+// Small confirm dialog in the workspace's own visual language, so leaving the
+// page never happens through a native browser prompt.
+const confirmLeave = (message, confirmLabel) => new Promise((resolve) => {
+  const overlay = document.createElement("div")
+  overlay.className = "vault-confirm-overlay"
+  overlay.innerHTML = `<section class="vault-confirm-dialog" role="dialog" aria-modal="true"><p class="vault-confirm-message"></p><div class="vault-confirm-actions"><button class="vault-button" type="button" data-confirm-cancel>${esc(COPY.cancel)}</button><button class="vault-button primary" type="button" data-confirm-accept>${esc(confirmLabel)}</button></div></section>`
+  overlay.querySelector(".vault-confirm-message").textContent = message
+  const settle = (value) => {
+    document.removeEventListener("keydown", onKey, true)
+    overlay.remove()
+    resolve(value)
+  }
+  const onKey = (event) => {
+    if (event.key !== "Escape") return
+    event.preventDefault()
+    event.stopPropagation()
+    settle(false)
+  }
+  overlay.addEventListener("click", (event) => {
+    if (event.target === overlay) settle(false)
+    if (event.target.closest("[data-confirm-cancel]")) settle(false)
+    if (event.target.closest("[data-confirm-accept]")) settle(true)
+  })
+  document.addEventListener("keydown", onKey, true)
+  document.body.appendChild(overlay)
+  const accept = overlay.querySelector("[data-confirm-accept]")
+  if (accept) accept.focus()
+})
+
 const openGlobalWorkspace = () => {
   window.parent.location.assign("/vault")
+}
+// A copy in another app opens that app's page with its Disk Saver tab selected
+// and the group expanded, because an app's workspace only exists inside that
+// page; opening the workspace URL directly strands the user with no navigation.
+// Locations that are not apps have no such page and open the global workspace.
+// The label and kind travel with the row: an app workspace cannot look up
+// sources belonging to other apps.
+const openContentGroup = async (group, kind, label) => {
+  const accepted = await confirmLeave(
+    COPY.open_location_confirm.replace(
+      "{location}", label || COPY.unknown_location),
+    COPY.open_location_accept)
+  if (!accepted) return
+  const target = kind === "app" && label
+    ? `/pinokio/browser/${encodeURIComponent(label)}?vault_group=${encodeURIComponent(group)}`
+    : `/vault?group=${encodeURIComponent(group)}`
+  window.parent.location.assign(target)
 }
 const applyAutomaticScanSnapshot = (snapshot) => {
   if (!IS_APP_MODE || !AUTOMATIC_SUPPORTED) return
@@ -703,24 +766,15 @@ const onAutomaticScanMessage = (event) => {
 }
 const sourceById = (id) => (state.data.sources || []).find((source) => source.id === id)
 const sourceChildren = (id) => (state.data.sources || []).filter((source) => source.parent_id === id)
-const sourceIsWithinScope = (sourceId) => {
-  if (!SCOPE_ID) return true
-  const seen = new Set()
-  let source = sourceById(sourceId)
-  while (source && !seen.has(source.id)) {
-    if (source.id === SCOPE_ID) return true
-    seen.add(source.id)
-    source = sourceById(source.parent_id)
-  }
-  return false
-}
 const revealLabel = document.body.dataset.platform === "darwin"
   ? COPY.show_in_finder
   : document.body.dataset.platform === "win32"
     ? COPY.show_in_file_explorer
     : COPY.open_containing_folder
+// Revealing changes nothing, so it is offered for every tracked path, not
+// only the ones the current scope can act on.
 const revealButton = (filePath, sourceId, name) => {
-  if (!filePath || !sourceIsWithinScope(sourceId)) return ""
+  if (!filePath) return ""
   const label = `${revealLabel}: ${name || basename(filePath)}`
   return `<button class="vault-reveal-button" type="button" data-reveal-file="${attr(filePath)}" aria-label="${attr(label)}" title="${attr(revealLabel)}"><i class="fa-regular fa-folder-open" aria-hidden="true"></i></button>`
 }
@@ -1720,13 +1774,37 @@ const fileDetail = (item) => {
     return `<div class="vault-detail"><div class="vault-detail-label error">${esc(locations.error)}</div></div>`
   }
   const total = Math.max(locations.items.length, Number(locations.total) || 0)
-  const label = `${COPY.identical_contents_at} ${countLabel(total, COPY.location, COPY.locations_lower)}`
+  // Copies are byte-identical, so the size is stated once for the group.
+  const label = COPY.stored_times
+    .replace("{count}", total)
+    .replace("{size}", fmt(item.size))
   const remaining = Math.max(0, total - locations.items.length)
   const more = locations.nextCursor
     ? `<div class="vault-location-detail"><button class="vault-text-button" type="button" data-more-file-locations="${attr(item.path)}" ${locations.loading ? "disabled" : ""}>${esc(COPY.show_more_locations.replace("{count}", Math.min(remaining, DUPLICATE_CHILD_PAGE_SIZE)))}</button></div>`
     : ""
-  return `<div class="vault-detail"><div class="vault-detail-label">${esc(label)}</div>${locations.items.map((location) => `
-    <div class="vault-location-detail"><i class="fa-regular fa-file"></i><span>${esc(externalLocation(location) || [location.source_label, location.relative_path].filter(Boolean).join(" / "))}</span>${revealButton(location.path, location.source_id, basename(location.relative_path))}</div>`).join("")}${more}</div>`
+  const body = locations.items.map((location) => {
+    const where = externalLocation(location) ||
+      [location.source_label, location.relative_path].filter(Boolean).join(" / ")
+    const note = location.path === item.path
+      ? COPY.this_file
+      : location.status === "tracked"
+        ? COPY.copy_that_stays
+        : location.status === "shared"
+          ? COPY.already_deduplicated
+          : location.status === "unavailable"
+            ? COPY.cannot_be_deduplicated
+            : COPY.not_deduplicated_yet
+    const outside = SCOPE_ID && item.hash && location.source_id !== SCOPE_ID
+    const text = outside
+      ? `<button class="vault-location-link" type="button" data-open-group="${attr(item.hash)}" data-open-kind="${attr(location.source_kind || "")}" data-open-label="${attr(location.source_label || "")}" title="${attr(COPY.open_in_disk_saver)}">${esc(where)}</button>`
+      : esc(where)
+    // Rows keep identical slots whether or not a reveal button exists, so the
+    // notes form a column and every row is the same height.
+    const reveal = revealButton(
+      location.path, location.source_id, basename(location.relative_path))
+    return `<div class="vault-location-detail"><i class="fa-regular fa-file"></i><span class="vault-location-path" title="${attr(where)}">${text}</span><span class="vault-location-note">${esc(note)}</span>${reveal || `<span class="vault-location-reveal-placeholder"></span>`}</div>`
+  }).join("")
+  return `<div class="vault-detail"><div class="vault-detail-label">${esc(label)}</div>${body}${more}</div>`
 }
 const separateCheckbox = (item) => item.status === "shared"
   ? `<input class="vault-row-checkbox" type="checkbox" data-select-separate="${attr(item.path)}" aria-label="${attr(`${COPY.select_for_separation}: ${basename(item.relative_path)}`)}" ${state.separateAllMatching || state.selectedSeparateFiles.has(item.path) ? "checked" : ""} />`
@@ -2942,6 +3020,12 @@ const applyFullData = (data) => {
     reviewedScan() !== String(data.last_scan.ts) &&
     (shareableDuplicateCount > 0 || data.last_scan.partial)
   settleFolderDiscoveryStart()
+  if (focusGroupPending &&
+      data.inventory && data.inventory.view === "duplicates") {
+    focusGroupPending = false
+    state.expandedDuplicateGroups.add(FOCUS_GROUP)
+    loadDuplicateGroupChildren(FOCUS_GROUP)
+  }
   const publishedScan = data.last_scan ? data.last_scan.ts : null
   if (publishedScan !== state.locationsScanTs) {
     state.locationsScanTs = publishedScan
@@ -3400,6 +3484,13 @@ const closeScanSizeMenu = () => {
 document.addEventListener("click", async (event) => {
   const target = event.target.closest("button")
   if (!target) return
+  if (target.dataset.openGroup) {
+    await openContentGroup(
+      target.dataset.openGroup,
+      target.dataset.openKind,
+      target.dataset.openLabel)
+    return
+  }
   if (target.hasAttribute("data-dismiss-automatic-scan-coachmark")) {
     dismissAutomaticScanCoachmark(true)
     return

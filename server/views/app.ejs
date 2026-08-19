@@ -8694,7 +8694,7 @@ body.dark .pinokio-custom-terminal-header {
         <% const vaultAutomaticSupported = typeof vault_automatic_supported === 'undefined' || vault_automatic_supported === true %>
         <% const vaultAutomaticResultSignature = vaultAutomaticSupported && typeof vault_automatic_result_signature === 'string' ? vault_automatic_result_signature : '' %>
         <% const vaultSidebarLabel = !vaultGlobalScanReady ? 'Disk Saver — Set up required' : vaultAutomaticSupported ? `Disk Saver — ${vaultAutomaticMode === 'automatic' ? 'Automatic' : 'Manual'} checking${vaultAutomaticResultSignature ? ' — Duplicate files found' : ''}` : 'Disk Saver' %>
-        <a id='save-space-tab' data-mode="refresh" target="app-vault" href="/vault/app/<%=encodeURIComponent(name)%>" class="btn header-item frame-link<%=vaultAutomaticResultSignature ? ' app-vault-result-attention' : ''%>" data-index="vault" data-static="retain" data-tab-link-popover="false" aria-label="<%=vaultSidebarLabel%>">
+        <a id='save-space-tab' data-mode="refresh" target="app-vault" href="/vault/app/<%=encodeURIComponent(name)%><%=typeof vault_initial_group === 'string' && vault_initial_group ? `?group=${vault_initial_group}` : ''%>" class="btn header-item frame-link<%=vaultAutomaticResultSignature ? ' app-vault-result-attention' : ''%>" data-index="vault" data-static="retain" data-tab-link-popover="false" aria-label="<%=vaultSidebarLabel%>">
           <div class='tab'>
             <i class="fa-solid fa-hard-drive menu-action-leading-icon"></i>
             <div class='display'>Disk Saver</div>
@@ -9181,6 +9181,14 @@ body.dark .pinokio-custom-terminal-header {
     const devTabUrl = new URL(window.location.href)
     devTabUrl.searchParams.delete("pinokio_dev_tab")
     window.history.replaceState(window.history.state, "", `${devTabUrl.pathname}${devTabUrl.search}${devTabUrl.hash}`)
+  } catch (_) {}
+  <% } %>
+  <% if (typeof vault_initial_group === 'string' && vault_initial_group) { %>
+  global_selector = "#save-space-tab.frame-link"
+  try {
+    const vaultTabUrl = new URL(window.location.href)
+    vaultTabUrl.searchParams.delete("vault_group")
+    window.history.replaceState(window.history.state, "", `${vaultTabUrl.pathname}${vaultTabUrl.search}${vaultTabUrl.hash}`)
   } catch (_) {}
   <% } %>
   let pendingSelectionRetry = null

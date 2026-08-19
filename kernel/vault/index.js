@@ -1,8 +1,8 @@
 const fs = require("fs")
 const path = require("path")
 const crypto = require("crypto")
-const { execFile } = require("child_process")
 const { Worker } = require("worker_threads")
+const Util = require("../util")
 const Registry = require("./registry")
 const Scanner = require("./scanner")
 const Sweeper = require("./sweeper")
@@ -44,6 +44,12 @@ const AUTOMATIC_ACTIONS = new Set([
 ])
 const PERMISSION_DENIED_CODES = new Set(["EACCES", "EPERM"])
 const BUSY_CODES = new Set(["EBUSY"])
+const PUBLIC_FILE_STATUS = {
+  reference: "tracked",
+  duplicate: "duplicate",
+  unavailable: "unavailable",
+  linked: "shared"
+}
 const hardlinkUnavailableCode = (code) =>
   HARDLINK_UNSUPPORTED_CODES.has(code) || PERMISSION_DENIED_CODES.has(code)
 const replacementLockedCode = (code) =>
@@ -182,32 +188,11 @@ class FileActionChanges {
   }
 }
 
-const revealInFileManager = (filePath, platform = process.platform) =>
-  new Promise((resolve, reject) => {
-    const command = platform === "darwin"
-      ? "open"
-      : platform === "win32"
-        ? "explorer.exe"
-        : "xdg-open"
-    const args = platform === "darwin"
-      ? ["-R", filePath]
-      : platform === "win32"
-        ? [`/select,${filePath}`]
-        : [path.dirname(filePath)]
-    execFile(command, args, {
-      timeout: 10000,
-      windowsHide: true
-    }, (error) => error ? reject(error) : resolve())
-  })
-
 class Vault {
   constructor(kernel) {
     this.kernel = kernel
     this.fileManagerLauncher = (filePath) =>
-      revealInFileManager(
-        filePath,
-        this.kernel.platform || process.platform
-      )
+      Util.openfs(filePath, { action: "view" }, this.kernel)
     this.enabled = false
     this.initialized = false
     this.mode = null
@@ -1359,8 +1344,10 @@ class Vault {
     if (!entry || entry.unavailable_reason === "stale") {
       return { error: "This file is no longer tracked. Scan again to refresh this view." }
     }
+    // Opening a file manager mutates nothing, so it is allowed for any tracked
+    // path regardless of the scope the request came from.
     const source = this.sourceForPath(entry.path, entry.source_id)
-    if (!source || !this.sourceIsWithinScope(source, scopeId)) {
+    if (!source) {
       return { error: "This file is outside the current location." }
     }
     if (!await this.canonicalPathIsWithinSource(entry.path, source)) {
@@ -1373,7 +1360,10 @@ class Vault {
     try {
       await this.fileManagerLauncher(entry.path)
     } catch (error) {
-      return { error: "The file manager could not open this file." }
+      // Naming the underlying failure is what makes a report actionable; the
+      // generic sentence hid whether the spawn, the binary, or the path failed.
+      const detail = error && error.message ? ` (${error.message})` : ""
+      return { error: `The file manager could not open this file.${detail}` }
     }
     return { revealed: true }
   }
@@ -3253,12 +3243,7 @@ class Vault {
           dev: match.dev,
           ino: match.ino
         }, this.locationForPath(match.path, match.source_id)))
-      const publicStatus = {
-        reference: "tracked",
-        duplicate: "duplicate",
-        unavailable: "unavailable",
-        linked: "shared"
-      }[row.status]
+      const publicStatus = PUBLIC_FILE_STATUS[row.status]
       const result = Object.assign({
         path: row.path,
         hash: row.hash,
@@ -3305,18 +3290,13 @@ class Vault {
   }
 
   publicDuplicateChildItems(rows) {
-    const publicStatus = {
-      reference: "tracked",
-      duplicate: "duplicate",
-      linked: "shared"
-    }
     return (rows || []).map((row) => Object.assign({
       kind: "duplicate_path",
       path: row.path,
       hash: row.hash,
       size: Number(row.size) || 0,
       app: row.app || null,
-      status: publicStatus[row.status],
+      status: PUBLIC_FILE_STATUS[row.status],
       registry_status: row.status,
       shareable: row.status === "duplicate",
       selectable: !!row.selectable
@@ -3388,7 +3368,8 @@ class Vault {
     return {
       path: target,
       items: (result.rows || []).map((row) => Object.assign({
-        path: row.path
+        path: row.path,
+        status: PUBLIC_FILE_STATUS[row.status] || null
       }, this.locationForPath(row.path, row.source_id))),
       total: Number(result.total) || 0,
       next_cursor: result.nextCursor || null

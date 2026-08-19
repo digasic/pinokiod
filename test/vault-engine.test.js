@@ -5,6 +5,7 @@ const fs = require("node:fs")
 const os = require("node:os")
 const path = require("node:path")
 const Database = require("better-sqlite3")
+const Util = require("../kernel/util")
 const Vault = require("../kernel/vault")
 const Registry = require("../kernel/vault/registry")
 const {
@@ -102,6 +103,28 @@ describe("Save Space engine", () => {
         recursive: true,
         force: true
       }).catch(() => {})
+    }
+  })
+
+  test("file reveals reuse the shared file explorer launcher", async () => {
+    const kernel = { homedir: os.tmpdir(), platform: process.platform }
+    const vault = new Vault(kernel)
+    const originalOpenfs = Util.openfs
+    const calls = []
+    Util.openfs = (...args) => {
+      calls.push(args)
+    }
+
+    try {
+      const filePath = path.join(os.tmpdir(), "model with spaces.bin")
+      await vault.fileManagerLauncher(filePath)
+      assert.deepEqual(calls, [[
+        filePath,
+        { action: "view" },
+        kernel
+      ]])
+    } finally {
+      Util.openfs = originalOpenfs
     }
   })
 
@@ -1553,7 +1576,7 @@ describe("Save Space engine", () => {
     await close(vault)
   })
 
-  test("revealing a file is scoped to a current registered path", async () => {
+  test("revealing works for any tracked path, whatever the scope", async () => {
     const { home, vault } = await makeVault()
     const pair = await duplicatePair(home, 'model "quoted".bin')
     await vault.sweeper.scan()
@@ -1571,19 +1594,18 @@ describe("Save Space engine", () => {
     }), { revealed: true })
     assert.deepEqual(launched, [pair.first])
 
-    const outside = await vault.perform("reveal", {
+    assert.notEqual(first.source_id, second.source_id)
+    assert.deepEqual(await vault.perform("reveal", {
       scope_id: first.source_id,
       path: pair.second
-    })
-    assert.match(outside.error, /outside the current location/i)
-    assert.notEqual(first.source_id, second.source_id)
-    assert.deepEqual(launched, [pair.first])
+    }), { revealed: true })
+    assert.deepEqual(launched, [pair.first, pair.second])
 
     const untracked = await vault.perform("reveal", {
       path: path.join(home, "api", "first", "missing.bin")
     })
     assert.match(untracked.error, /no longer tracked/i)
-    assert.deepEqual(launched, [pair.first])
+    assert.deepEqual(launched, [pair.first, pair.second])
 
     await close(vault)
   })

@@ -160,7 +160,9 @@ const makePage = async (status, options = {}) => {
       runScripts: "outside-only",
       url: appMode
         ? "http://localhost/vault/app/app"
-        : "http://localhost/vault"
+        : `http://localhost/vault${options.focusGroup
+          ? `?group=${options.focusGroup}`
+          : ""}`
     }
   )
   const requests = []
@@ -811,8 +813,13 @@ describe("Save Space interface", () => {
       if (parsed.searchParams.get("locations_path")) {
         return {
           path: parsed.searchParams.get("locations_path"),
-          items: ["first", "second", "third"].map((name) => ({
+          items: [
+            ["duplicate", "duplicate"],
+            ["first", "tracked"],
+            ["third", "shared"]
+          ].map(([name, status]) => ({
             path: `/pinokio/api/app/models/${name}.bin`,
+            status,
             source_id: "app:app",
             source_label: "app",
             relative_path: `models/${name}.bin`
@@ -839,13 +846,18 @@ describe("Save Space interface", () => {
     await waitFor(() => getRequests.some((url) =>
       new URL(url, "http://localhost").searchParams
         .get("locations_path") === "/pinokio/api/app/models/duplicate.bin"))
-    await waitFor(() => document.querySelector(".vault-detail") &&
-      document.querySelector(".vault-detail").textContent.includes("third.bin"))
+    await waitFor(() => document.querySelector(".vault-location-path"))
     const detail = document.querySelector(".vault-detail")
-    assert.match(detail.textContent, /Identical contents at 3 locations/)
-    assert.match(detail.textContent, /first\.bin/)
+    assert.match(detail.textContent, /Stored 3 times · 4\.1 KB each/)
     assert.doesNotMatch(detail.textContent, /sample\.bin/)
     assert.doesNotMatch(detail.textContent, /of 3 locations shown/)
+    const notes = [...detail.querySelectorAll(".vault-location-note")]
+      .map((node) => node.textContent)
+    assert.deepEqual(notes, [
+      "this file",
+      "the copy that stays",
+      "already deduplicated"
+    ])
     await settle()
     dom.window.close()
   })
@@ -884,6 +896,44 @@ describe("Save Space interface", () => {
     assert.doesNotMatch(body, /private link/i)
     assert.doesNotMatch(body, /ready to clean up/i)
     assert.doesNotMatch(body, /their linked files were deleted/i)
+    await settle()
+    dom.window.close()
+  })
+
+  test("a scoped page hands one content group to the global page", async () => {
+    const hash = "c".repeat(64)
+    const duplicate = item({
+      path: "/pinokio/api/app/models/duplicate.bin",
+      relative_path: "models/duplicate.bin",
+      status: "duplicate",
+      shareable: true,
+      hash,
+      location_count: 3
+    })
+    const base = fixture([duplicate])
+    base.inventory.source_counts.duplicates["app:app"] = 1
+    base.inventory.shareable_by_source["app:app"] = 1
+    const response = (url) => {
+      const parsed = new URL(url, "http://localhost")
+      if (parsed.searchParams.get("group_hash")) {
+        return { hash, items: [], total: 3, next_cursor: null }
+      }
+      const result = JSON.parse(JSON.stringify(base))
+      result.inventory.view = parsed.searchParams.get("view") || "all"
+      result.items = [duplicate]
+      return result
+    }
+    const { dom, getRequests } = await makePage(response, {
+      focusGroup: hash
+    })
+    const document = dom.window.document
+
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+    assert.ok(document.querySelector('[data-display-mode="files"].selected'))
+    await waitFor(() => getRequests.some((url) =>
+      new URL(url, "http://localhost").searchParams
+        .get("group_hash") === hash))
     await settle()
     dom.window.close()
   })
