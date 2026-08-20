@@ -5414,12 +5414,18 @@ class RegistryCore {
       where.push(clause.sql)
       values.push(...clause.values)
     }
+    // Folded so a capitalised folder does not lead every lowercase one, and
+    // broken by the raw name so the order is total: this level pages by offset,
+    // and two names differing only in case would otherwise tie and let a page
+    // boundary repeat or skip a row.
     const folded = "pinokio_path_name(name)"
     const order = sizeSort === "asc"
-      ? `bytes ASC, ${folded} ASC`
+      ? `bytes ASC, ${folded} ASC, name ASC`
       : sizeSort === "desc"
-        ? `bytes DESC, ${folded} ASC`
-        : nameSort === "desc" ? `${folded} DESC` : `${folded} ASC`
+        ? `bytes DESC, ${folded} ASC, name ASC`
+        : nameSort === "desc"
+          ? `${folded} DESC, name DESC`
+          : `${folded} ASC, name ASC`
     // Values bind in the order the placeholders appear: the CTE's substr, then
     // its WHERE, then the two separators in the outer select and filter.
     return this.database.prepare(`
