@@ -2098,13 +2098,14 @@ const sourceSort = (a, b) => {
   const rank = (source) => source && source.kind === "external" ? 1 : source ? 0 : 2
   return rank(first) - rank(second) || groupTitle(first).localeCompare(groupTitle(second))
 }
-// The flat list is ordered by the name its Name column shows, matching the
-// order the server paged in; the location is only the tie-break.
-const flatName = (item) => basename(item.relative_path)
+// The name a row shows in its Name column. Every list orders by this, so the
+// order matches the column the user clicked; the path below it is context, not
+// the sort key.
+const rowName = (item) => basename(item.relative_path || item.path)
 const flatLocation = (item) => externalLocation(item) ||
   [groupTitle(sourceById(item.source_id)), item.relative_path].filter(Boolean).join(" / ")
 const renderFlatFiles = (items) => [...items]
-  .sort((a, b) => compareRows(a, b, flatName))
+  .sort((a, b) => compareRows(a, b, rowName))
   .map((item) => {
     const expandable = Number(item.location_count) > 1
     return `<div class="vault-file-row">
@@ -2205,7 +2206,7 @@ const renderDuplicateGroups = (items) => {
     const action = source && source.shareable && allShareable
       ? `<button class="vault-button" type="button" data-deduplicate-scope="${attr(sourceId)}">${esc(COPY.deduplicate)} ${countLabel(allShareable)}</button>`
       : `<span class="vault-unavailable">${esc(COPY.sharing_unavailable)}</span>`
-    return `<div class="vault-group-row"><div class="vault-group-main"><div class="vault-group-title"><i class="fa-regular fa-folder"></i><span>${esc(groupTitle(source))}</span></div><div class="vault-group-meta">${countLabel(group.length, COPY.duplicate.toLowerCase(), COPY.duplicates.toLowerCase())} · ${bytes ? fmt(bytes) : COPY.unavailable}</div></div><div class="vault-group-action">${action}</div></div>${[...group].sort((a, b) => compareRows(a, b, (item) => item.relative_path)).map((item) => renderFileRow(item, 0, true)).join("")}`
+    return `<div class="vault-group-row"><div class="vault-group-main"><div class="vault-group-title"><i class="fa-regular fa-folder"></i><span>${esc(groupTitle(source))}</span></div><div class="vault-group-meta">${countLabel(group.length, COPY.duplicate.toLowerCase(), COPY.duplicates.toLowerCase())} · ${bytes ? fmt(bytes) : COPY.unavailable}</div></div><div class="vault-group-action">${action}</div></div>${[...group].sort((a, b) => compareRows(a, b, rowName)).map((item) => renderFileRow(item, 0, true)).join("")}`
   }).join("")
 }
 
@@ -2226,8 +2227,10 @@ const emptyState = (view) => {
   return `<div class="vault-empty"><div class="vault-empty-inner"><i class="${content[2]}"></i><h3>${esc(content[0])}</h3><p>${esc(content[1])}</p>${view === "duplicates" ? `<button class="vault-button" type="button" data-view="all">${esc(COPY.view_all)}</button>` : ""}</div></div>`
 }
 
-const renderReclaimable = (blobs) => {
-  if (!blobs.length) return emptyState("reclaimable")
+const renderReclaimable = (rows) => {
+  if (!rows.length) return emptyState("reclaimable")
+  const blobs = [...rows]
+    .sort((left, right) => compareRows(left, right, (blob) => blob.hash))
   return blobs.map((blob) => `<div class="vault-file-row"><div class="vault-name-cell"><span class="vault-disclosure"></span><i class="fa-regular fa-file vault-name-icon"></i><span class="vault-name-copy"><span class="vault-file-name">${esc(`${blob.hash.slice(0, 12)}…`)}</span></span></div><span class="vault-size">${fmt(blob.size)}</span><span class="vault-space">${fmt(blob.size)}</span><span class="vault-row-action"><button class="vault-text-button" type="button" data-reclaim="${attr(blob.hash)}" data-reclaim-store="${attr(blob.store_id)}">${esc(COPY.reclaim)}</button></span></div>`).join("")
 }
 
@@ -2461,22 +2464,6 @@ const renderTable = (items) => {
   syncDuplicateGroupPageSelectionCheckbox()
 }
 
-const orderedItems = (items) => {
-  if (state.view === "activity") return items
-  if (items.some((item) => item.kind === "duplicate_group")) return items
-  if (state.view === "reclaimable") {
-    return [...items].sort((a, b) => compareRows(a, b,
-      (blob) => blob.hash))
-  }
-  if (state.displayMode === "files" && supportsDisplayMode()) {
-    return [...items].sort((a, b) => compareRows(a, b, flatName))
-  }
-  return [...items].sort((a, b) => {
-    const sourceOrder = state.sourceId ? 0 : sourceSort([a.source_id], [b.source_id])
-    return sourceOrder || compareRows(a, b, (item) => item.relative_path || item.path)
-  })
-}
-
 const pagedItems = (items) => {
   const inventory = state.data.inventory
   state.page = Number(inventory.page) || 0
@@ -2493,7 +2480,7 @@ const pagedItems = (items) => {
     }
   }
   return {
-    items: orderedItems(items),
+    items,
     start: Number(inventory.start) || 0,
     end: Number(inventory.end) || 0,
     total: Number(inventory.total) || 0,

@@ -1015,6 +1015,43 @@ describe("Save Space interface", () => {
     dom.window.close()
   })
 
+  test("Duplicates in Folders orders by name, not by the path below it", async () => {
+    // Names and paths disagree on purpose: ordering by path gives decord,
+    // numpy.libs, torch, triton -- which is what the screen used to show.
+    const files = [
+      ["zebra.dll", "app/decord/zebra.dll"],
+      ["mango.dll", "app/numpy.libs/mango.dll"],
+      ["apple.dll", "app/torch/lib/apple.dll"]
+    ].map(([name, relative]) => item({
+      path: `/pinokio/api/app/${relative}`,
+      relative_path: relative,
+      status: "duplicate",
+      shareable: true,
+      location_count: 2
+    }))
+    const base = fixture(files)
+    base.inventory.source_counts.duplicates["app:app"] = files.length
+    base.inventory.shareable_by_source["app:app"] = files.length
+    const { dom } = await makePage(base)
+    const document = dom.window.document
+
+    document.querySelector('[data-view="duplicates"]').click()
+    await waitFor(() => document.querySelector(
+      '[data-view="duplicates"].selected'))
+    const names = () => [...document.querySelectorAll(
+      "#vault-table-wrap .vault-file-name")].map((node) => node.textContent)
+
+    document.querySelector("[data-sort-name]").click()
+    await waitFor(() => names()[0] === "apple.dll")
+    assert.deepEqual(names(), ["apple.dll", "mango.dll", "zebra.dll"])
+
+    document.querySelector("[data-sort-name]").click()
+    await waitFor(() => names()[0] === "zebra.dll")
+    assert.deepEqual(names(), ["zebra.dll", "mango.dll", "apple.dll"])
+    await settle()
+    dom.window.close()
+  })
+
   test("name sorting is offered wherever the Name column holds a name", async () => {
     const duplicate = item({
       path: "/pinokio/api/app/models/duplicate.bin",

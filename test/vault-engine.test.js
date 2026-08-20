@@ -394,7 +394,9 @@ describe("Save Space engine", () => {
       [`${root}\\app\\models\\big.bin`, 4000],
       [`${root}\\app\\models\\small.bin`, 10],
       [`${root}\\cache\\only\\deep\\x.bin`, 50],
-      [`${root}\\loose.bin`, 700]
+      [`${root}\\loose.bin`, 700],
+      [`${root}\\Zebra\\z.bin`, 5],
+      [`${root}\\apple\\a.bin`, 5]
     ].forEach(([filePath, size], index) =>
       insert.run(filePath, `h${index}`, size, index + 1))
 
@@ -409,7 +411,24 @@ describe("Save Space engine", () => {
       limit: 50,
       offset: 0
     })
-    assert.deepEqual(directories.map((row) => row.name), ["app", "cache"])
+    assert.deepEqual(directories.map((row) => row.name).slice(0, 2),
+      ["app", "cache"])
+    // Folder names fold case the same way file names do, so a capitalised
+    // folder does not jump ahead of every lowercase one.
+    const cased = core.treeDirectoryRows({
+      sourceId: "app:demo",
+      prefix: `${root}\\`,
+      separator: "\\",
+      statuses: [],
+      query: "",
+      nameOnly: false,
+      sizeSort: null,
+      nameSort: "asc",
+      limit: 50,
+      offset: 0
+    })
+    assert.deepEqual(cased.map((row) => row.name),
+      ["app", "apple", "cache", "Zebra"])
     assert.equal(directories[0].bytes, 4010)
     // The collapse reads these, so they have to carry the whole subpath.
     assert.equal(directories[1].lo, "cache\\only\\deep\\x.bin")

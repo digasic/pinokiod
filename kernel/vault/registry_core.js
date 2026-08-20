@@ -5414,11 +5414,12 @@ class RegistryCore {
       where.push(clause.sql)
       values.push(...clause.values)
     }
+    const folded = "pinokio_path_name(name)"
     const order = sizeSort === "asc"
-      ? "bytes ASC, name ASC"
+      ? `bytes ASC, ${folded} ASC`
       : sizeSort === "desc"
-        ? "bytes DESC, name ASC"
-        : nameSort === "desc" ? "name DESC" : "name ASC"
+        ? `bytes DESC, ${folded} ASC`
+        : nameSort === "desc" ? `${folded} DESC` : `${folded} ASC`
     // Values bind in the order the placeholders appear: the CTE's substr, then
     // its WHERE, then the two separators in the outer select and filter.
     return this.database.prepare(`
