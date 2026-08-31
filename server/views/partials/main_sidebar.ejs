@@ -9,7 +9,8 @@
 <aside class="main-sidebar" id="main-sidebar" aria-label="Primary navigation">
   <nav class="main-sidebar-nav" aria-label="Pinokio navigation">
     <div class='main-sidebar-section main-sidebar-section-actions' aria-label="Actions">
-      <a class='tab main-sidebar-action <%= sidebarSelected === 'explore' ? 'selected' : '' %>' id='explore' href="/home?mode=explore"><i class="fa-solid fa-globe main-sidebar-action-icon"></i><div class='caption'>Explore</div></a>
+      <a class='tab main-sidebar-action <%= sidebarSelected === 'home' ? 'selected' : '' %>' id='home' href="/home"<% if (sidebarSelected === 'home') { %> aria-current="page"<% } %>><i class="fa-solid fa-layer-group main-sidebar-action-icon"></i><div class='caption'>My Apps</div></a>
+      <a class='tab main-sidebar-action <%= sidebarSelected === 'explore' ? 'selected' : '' %>' id='explore' href="/home?mode=explore"<% if (sidebarSelected === 'explore') { %> aria-current="page"<% } %>><i class="fa-solid fa-globe main-sidebar-action-icon"></i><div class='caption'>Explore</div></a>
       <details class="universal-create-menu">
         <summary class="tab main-sidebar-action" aria-label="Create options"><i class="fa-solid fa-plus main-sidebar-action-icon"></i><div class='caption'>Create</div></summary>
         <div class="universal-create-dropdown">

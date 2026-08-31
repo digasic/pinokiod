@@ -5,6 +5,18 @@ const test = require('node:test')
 
 const sidebarFile = path.resolve(__dirname, '..', 'server', 'views', 'partials', 'main_sidebar.ejs')
 
+test('main sidebar exposes My Apps before Explore', async () => {
+  const source = await fs.readFile(sidebarFile, 'utf8')
+
+  const myAppsIndex = source.indexOf("<div class='caption'>My Apps</div>")
+  const exploreIndex = source.indexOf("<div class='caption'>Explore</div>")
+
+  assert.notEqual(myAppsIndex, -1)
+  assert.notEqual(exploreIndex, -1)
+  assert.ok(myAppsIndex < exploreIndex)
+  assert.match(source, /sidebarSelected === 'home'[\s\S]*id='home' href="\/home"[\s\S]*aria-current="page"[\s\S]*fa-layer-group[\s\S]*>My Apps</)
+})
+
 test('main sidebar moves Home Server under Configure', async () => {
   const source = await fs.readFile(sidebarFile, 'utf8')
 
