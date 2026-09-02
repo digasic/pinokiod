@@ -2,6 +2,7 @@ const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
 const MiniSearch = require('minisearch')
+const NestedLayout = require('../../kernel/nested_layout')
 
 const APP_SEARCH_CACHE_TTL_MS = 15000
 const APP_SEARCH_MAX_FILE_BYTES = 1024 * 1024
@@ -265,6 +266,7 @@ class AppSearchService {
     for (const app of apps) {
       const appRoot = this.kernel.path('api', app.name)
       const candidates = await this.collectAppSearchCandidates(appRoot)
+      await NestedLayout.addSearchCandidates(this, appRoot, candidates)
       const fingerprint = this.computeAppSearchFingerprint(app, candidates)
       const previous = previousPerApp.get(app.name)
       let appDocs

@@ -3861,7 +3861,7 @@ class Server {
                   config.shortcuts = config.shortcuts(this.kernel, this.kernel.info)
                 }
               }
-              await this.renderShortcuts(uri, item.name, config, pathComponents)
+              await this.renderShortcuts(uri, item.name, config, pathComponents, await Util.NestedLayout.relativeRoot(this.kernel, this.kernel.path("api", item.name)))
               items[i].shortcuts = config.shortcuts
             }
           }
@@ -4369,14 +4369,14 @@ class Server {
 
     }
   }
-  async renderShortcuts(uri, name, config, pathComponents) {
+  async renderShortcuts(uri, name, config, pathComponents, launcher_root = "") {
     if (config.shortcuts) {
       for(let i=0; i<config.shortcuts.length; i++) {
         let shortcut = config.shortcuts[i]
         if (shortcut.action) {
           if (shortcut.action.method === "stop") {
             if (shortcut.action.uri) {
-              let absolute = path.resolve(__dirname, ...pathComponents, shortcut.action.uri)
+              let absolute = path.resolve(__dirname, launcher_root, ...pathComponents, shortcut.action.uri)
               let seed = path.resolve(__dirname)
               let p = absolute.replace(seed, "")
               let link = p.split(/[\/\\]/).filter((x) => { return x }).join("/")
@@ -4584,6 +4584,7 @@ class Server {
 //      }].concat(config.menu)
 
       let launcher_root = req.launcher_root || ""
+      let nested_root = await Util.NestedLayout.menuRoot(this.kernel, path.resolve(uri, name), launcher_root)
 
       for(let i=0; i<config.menu.length; i++) {
         let menuitem = config.menu[i]
@@ -4640,7 +4641,7 @@ class Server {
               }
             } else {
               config.menu[i].run = rendered.run
-              config.menu[i].cwd = path.resolve(this.kernel.homedir, "api", launcher_root, name)
+              config.menu[i].cwd = nested_root ? path.resolve(this.kernel.homedir, "api", name, nested_root) : path.resolve(this.kernel.homedir, "api", launcher_root, name)
               if (launcher_root) {
                 config.menu[i].href = "/api/" + name + "/" + launcher_root
               } else {
@@ -4749,7 +4750,7 @@ class Server {
         if (menuitem.action) {
           if (menuitem.action.method === "stop") {
             if (menuitem.action.uri) {
-              let absolute = path.resolve(__dirname, ...pathComponents, menuitem.action.uri)
+              let absolute = path.resolve(__dirname, nested_root, ...pathComponents, menuitem.action.uri)
               let seed = path.resolve(__dirname)
               let p = absolute.replace(seed, "")
               let link = p.split(/[\/\\]/).filter((x) => { return x }).join("/")
@@ -4773,7 +4774,7 @@ class Server {
         // check on/off: if on/off exists => assume that it's a script
         // 1. check if the script is running
         if (menuitem.when) {
-          let scriptPath = path.resolve(uri, name, menuitem.when)
+          let scriptPath = path.resolve(uri, name, nested_root, menuitem.when)
           let filepath = scriptPath.replace(/\?.+/, "")
           let check = this.kernel.status(filepath)
           if (check) {
@@ -5227,7 +5228,7 @@ class Server {
       if (!workspaceStats.isDirectory()) {
         throw new Error('Workspace path is not a directory')
       }
-      const candidate = path.resolve(workspacePath, 'logs')
+      const candidate = path.resolve(await this.kernel.api.launcher_path(workspacePath), 'logs')
       await fs.promises.mkdir(candidate, { recursive: true })
       return {
         logsRoot: candidate,
@@ -14677,7 +14678,7 @@ class Server {
 //      }
 //    }))
     this.app.post("/env", ex(async (req, res) => {
-      let fullpath = path.resolve(this.kernel.homedir, req.body.filepath, "ENVIRONMENT")
+      let fullpath = path.resolve(await this.kernel.api.launcher_path(path.resolve(this.kernel.homedir, req.body.filepath)), "ENVIRONMENT")
       let updated = req.body.vals
       let hosts = req.body.hosts
       await Util.update_env(fullpath, updated)
@@ -14830,7 +14831,7 @@ class Server {
       //})
     }))
     this.app.get("/pre/api/:name", ex(async (req, res) => {
-      let launcher = await this.kernel.api.launcher(req.params.name)
+      let launcher = await Util.NestedLayout.preLauncher(this.kernel, await this.kernel.api.launcher(req.params.name))
       let config = launcher.script
       if (config && Array.isArray(config.pre)) {
         const items = config.pre.filter((item) => item && typeof item === "object")
@@ -14888,7 +14889,7 @@ class Server {
       }
     }))
     this.app.get("/share/:name", ex(async (req, res) => {
-      let filepath = path.resolve(this.kernel.homedir, "api", req.params.name, "ENVIRONMENT")
+      let filepath = path.resolve(await this.kernel.api.launcher_path(req.params.name), "ENVIRONMENT")
       //let filepath = path.resolve(this.kernel.homedir, req.params[0])
       const config = await Util.parse_env(filepath)
       const keys = [
@@ -15640,10 +15641,11 @@ class Server {
           files.push(filename)
         }
       }
+      files = await Util.NestedLayout.addAiFiles(this.kernel, this.kernel.path("api", req.params.name), filenames, files, this.exists.bind(this))
 
       let items = files.map((item) => {
         return {
-          text: item,
+          text: path.basename(item),
           href: `/_api/${req.params.name}/${item}`
         }
       })

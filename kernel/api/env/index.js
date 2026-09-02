@@ -15,7 +15,7 @@ class Env {
       }
     */
     // write to current app folder's ENVIRONMENT
-    let api_path = Util.api_path(req.parent.path, kernel)
+    let api_path = await kernel.api.launcher_path(Util.api_path(req.parent.path, kernel))
     let env_path = path.resolve(api_path, "ENVIRONMENT")
     await Util.update_env(env_path, req.params)
   }
@@ -35,7 +35,7 @@ class Env {
         }
       }
     */
-    let api_path = Util.api_path(req.parent.path, kernel)
+    let api_path = await kernel.api.launcher_path(Util.api_path(req.parent.path, kernel))
     let env_path = path.resolve(api_path, "ENVIRONMENT")
     let env = await Environment.get2(req.parent.path, kernel)
     // does the key exist?

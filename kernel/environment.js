@@ -660,7 +660,7 @@ const get = async (homedir, kernel) => {
   for(let key in current_env) {
     let val = current_env[key]
     if (val.startsWith("./")) {
-      let full_path = path.resolve(homedir, val)
+      let full_path = await Util.NestedLayout.environmentPath(kernel, homedir, val, got_root)
       current_env[key] = full_path
     }
     if (val.trim() === "") {
@@ -1013,6 +1013,7 @@ const init = async (options, kernel) => {
       await fs.promises.appendFile(excludePath, appendContent)
     }
   }
+  await Util.NestedLayout.ensureGitExclude(root, relpath, kernel)
   return {
     relpath,
     root_path: root,

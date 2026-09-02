@@ -3,6 +3,7 @@ const path = require('path')
 const crypto = require('crypto')
 const { AsyncLocalStorage } = require('async_hooks')
 const Environment = require('./environment')
+const NestedLayout = require('./nested_layout')
 
 class AppLogSessions {
   constructor({ kernel, now = () => new Date().toISOString(), randomHex = () => crypto.randomBytes(3).toString('hex') }) {
@@ -90,7 +91,7 @@ class AppLogSessions {
     return {
       appRoot,
       scriptPath: absolute,
-      script: this.toPosix(parts.slice(1).join(path.sep))
+      script: this.toPosix(await NestedLayout.sessionScript(this, apiRoot, appRoot, absolute, parts.slice(1).join(path.sep)))
     }
   }
 

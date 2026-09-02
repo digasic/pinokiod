@@ -412,8 +412,7 @@ class AppRegistryService {
 
     const runtime = this.collectAppRuntime(appRoot)
     runtime.external_ready_urls = this.buildExternalReadyUrls(runtime.ready_url, options.source || null)
-    const installScript = await this.firstExistingScript(appRoot, ['install.js', 'install.json'])
-    const startScript = await this.firstExistingScript(appRoot, ['start.js', 'start.json'])
+    const { installScript, startScript } = await Util.NestedLayout.appScripts(this, appRoot)
     let defaultTarget = null
     try {
       defaultTarget = await this.kernel.api.get_default(appRoot)

@@ -131,7 +131,7 @@ class Api {
     if (formData.icon_dirty) {
       // 
       // write icon file
-      let icon_path = this.kernel.path("api", formData.new_path, formData.icon_path)
+      let icon_path = path.resolve(launcher_path, formData.icon_path)
       await fs.promises.writeFile(icon_path, formData.avatar)
       meta.icon = formData.icon_path
       dirty = true
@@ -232,7 +232,7 @@ class Api {
       meta.ui = `/p/${api_name}`
       meta.browse = `/p/${api_name}/dev`
     } else {
-      meta.icon = meta.icon ? `/asset/api/${api_name}/${meta.icon}` : "/pinokio-black.png"
+      Util.NestedLayout.setMetaIcon(meta, api_name, api_root_path, relpath, isWithinApiRoot)
       meta.link = `/p/${api_name}/${relpath}/dev#n1`
       meta.web_path = `/api/${api_name}/${relpath}`
       meta.ui = `/p/${api_name}/${relpath}`
@@ -1791,6 +1791,7 @@ class Api {
     })
   }
   async get_default(repo_path) {
+    repo_path = await this.launcher_path(repo_path)
     let launcher = await this.launcher({
       path: repo_path
     })
@@ -1882,7 +1883,7 @@ class Api {
       if (chunks.length == 2) {
         // the script is requesting a uri of the git repo
         // look for pinokio.js
-        let p = path.resolve(request.path, "pinokio.js")
+        let p = path.resolve(await this.launcher_path(request.path), "pinokio.js")
         let exists = await this.exists(p)
         if (exists) {
           await this.launch(request, p)

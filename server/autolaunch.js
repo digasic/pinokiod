@@ -406,7 +406,7 @@ class ServerAutolaunch {
         if (!localScript) {
           continue
         }
-        const scriptPath = path.resolve(launcherRoot, localScript)
+        const scriptPath = path.resolve(app.launcher_root && menuitem.href.trim().startsWith(apiPrefix) ? appRoot : launcherRoot, localScript)
         if (!this.server.is_subpath(appRoot, scriptPath)) {
           continue
         }

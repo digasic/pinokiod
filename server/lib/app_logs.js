@@ -1,5 +1,6 @@
 const fs = require('fs')
 const path = require('path')
+const NestedLayout = require('../../kernel/nested_layout')
 
 class AppLogService {
   constructor({ registry }) {
@@ -38,6 +39,7 @@ class AppLogService {
   }
 
   async resolveAppLogFile(appRoot, scriptQuery = '', runtimeScripts = []) {
+    ({ appRoot, scriptQuery, runtimeScripts } = await NestedLayout.appLogValues(this.registry, appRoot, scriptQuery, runtimeScripts))
     const apiLogsRoot = path.resolve(appRoot, 'logs', 'api')
     const candidates = []
     const addCandidate = (value) => {

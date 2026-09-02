@@ -729,8 +729,8 @@ class Socket {
       if (relative === null) return null
       let relative_parts = relative.split(path.sep).filter(Boolean)
       if (relative_parts[0] === "api" && relative_parts[1]) {
-        let filepath_chunks = relative_parts.slice(2)
         let cwd = this.parent.kernel.path(...relative_parts.slice(0, 2))
+        let filepath_chunks = await Util.NestedLayout.logScript(this.parent.kernel, p, relative_parts)
         let root = await Environment.get_root({ path: cwd }, this.parent.kernel)
         cwd = root.root
         return path.resolve(cwd, "logs/api", ...filepath_chunks)

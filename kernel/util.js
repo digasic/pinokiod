@@ -1246,6 +1246,7 @@ const rewrite_localhost= (kernel, obj, source) => {
 
 
 module.exports = {
+  NestedLayout: require('./nested_layout'),
   parse_env,
   log_path,
   api_path,

@@ -109,6 +109,7 @@ const loadMenu = async (api, repoPath) => {
 }
 
 module.exports = async (api, repoPath, preferred = []) => {
+  repoPath = await api.launcher_path(repoPath)
   let defaultTarget = await api.get_default(repoPath)
   if (defaultTarget) {
     return {
