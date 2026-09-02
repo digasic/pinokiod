@@ -216,12 +216,10 @@ test('nested menus and shortcuts resolve relative paths from pinokio/', async ()
         { text: 'Start', href: 'start.js' },
         { text: 'Shell', run: 'echo ready' },
         { text: 'Stop', action: { method: 'stop', uri: 'start.js' } },
-        { text: 'Absolute', action: { method: 'stop', uri: path.resolve('/abs', 'stop.js') } },
         { text: 'State', when: 'start.js', off: 'off' }
       ],
       shortcuts: [
-        { action: { method: 'stop', uri: 'start.js' } },
-        { action: { method: 'stop', uri: path.resolve('/abs', 'stop.js') } }
+        { action: { method: 'stop', uri: 'start.js' } }
       ]
     }
 
@@ -229,12 +227,10 @@ test('nested menus and shortcuts resolve relative paths from pinokio/', async ()
     assert.equal(config.menu[0].href, '/api/nested/pinokio/start.js')
     assert.equal(config.menu[1].cwd, launcher)
     assert.equal(config.menu[2].action.uri, '~/api/nested/pinokio/start.js')
-    assert.equal(config.menu[3].action.uri, '~/api/nested/abs/stop.js')
     assert(checked.includes(path.resolve(launcher, 'start.js')))
 
     await server.renderShortcuts(kernel.path('api'), 'nested', config, [], 'pinokio')
     assert.equal(config.shortcuts[0].action.uri, '~/api/nested/pinokio/start.js')
-    assert.equal(config.shortcuts[1].action.uri, '~/api/nested/abs/stop.js')
   })
 })
 

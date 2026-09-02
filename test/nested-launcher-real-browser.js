@@ -588,13 +588,21 @@ async function startRegistryStub() {
 }
 
 async function browserRequest(page, pathname, options = {}) {
-  return await page.evaluate(async ({ pathname, options }) => {
-    const response = await fetch(pathname, options)
-    const text = await response.text()
-    let json = null
-    try { json = JSON.parse(text) } catch (_) {}
-    return { status: response.status, ok: response.ok, text, json }
-  }, { pathname, options })
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      return await page.evaluate(async ({ pathname, options }) => {
+        const response = await fetch(pathname, options)
+        const text = await response.text()
+        let json = null
+        try { json = JSON.parse(text) } catch (_) {}
+        return { status: response.status, ok: response.ok, text, json }
+      }, { pathname, options })
+    } catch (error) {
+      const interrupted = /Execution context was destroyed|Cannot find context with specified id|Inspected target navigated or closed/i.test(String(error && error.message || error))
+      if (!interrupted || attempt === 2) throw error
+      await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {})
+    }
+  }
 }
 
 async function waitForBrowserRequest(page, pathname, predicate, timeoutMs = 15000) {
@@ -1067,6 +1075,7 @@ async function executeCase({ checkout, build, layout, playwright, executablePath
     await fsp.writeFile(path.resolve(artifacts, 'server.log'), logs.join('')).catch(() => {})
     await fsp.writeFile(path.resolve(artifacts, 'failure.txt'), error && error.stack ? error.stack : String(error)).catch(() => {})
     error.artifacts = artifacts
+    error.temporaryHome = home.root
     throw error
   } finally {
     if (page) await page.close().catch(() => {})
@@ -1309,6 +1318,7 @@ async function executeLiveCase({ checkout, build, controlName, control, playwrig
     await fsp.writeFile(path.resolve(artifacts, 'server.log'), logs.join('')).catch(() => {})
     await fsp.writeFile(path.resolve(artifacts, 'failure.txt'), error && error.stack ? error.stack : String(error)).catch(() => {})
     error.artifacts = artifacts
+    error.temporaryHome = home.root
     throw error
   } finally {
     if (page) await page.close().catch(() => {})
@@ -1572,6 +1582,9 @@ function checkoutIdentity(checkout) {
 
 async function parentMode() {
   const args = parseArgs()
+  const playwright = loadPlaywright()
+  const executablePath = browserExecutable(playwright)
+  assert.ok(executablePath, 'No supported Chromium or Brave executable is available')
   const started = new Date().toISOString().replace(/[:.]/g, '-')
   const artifactsRoot = path.resolve(outputRoot, started)
   const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'pinokio-nested-checkouts-'))
@@ -1609,9 +1622,6 @@ async function parentMode() {
       windows: process.platform === 'win32' ? null : 'This run does not provide Windows execution evidence.'
     }
   }
-  const playwright = loadPlaywright()
-  const executablePath = browserExecutable(playwright)
-  assert.ok(executablePath, 'No supported Chromium or Brave executable is available')
   evidence.browser = { executable: executablePath, version: null }
   const cases = args['tier6-only'] ? [] : [
     { build: 'baseline', checkout: baseline.path, layout: 'root' },
@@ -1634,7 +1644,7 @@ async function parentMode() {
         process.stdout.write(`${resultPrefix}${JSON.stringify({ state: 'collected', case: key, artifacts: result.artifacts })}\n`)
       } catch (error) {
         failed = true
-        results[key] = { error: error && error.stack ? error.stack : String(error), artifacts: error.artifacts || null }
+        results[key] = { error: error && error.stack ? error.stack : String(error), artifacts: error.artifacts || null, temporaryHome: error.temporaryHome || null }
         process.stdout.write(`${resultPrefix}${JSON.stringify({ state: 'failed', case: key, error: results[key].error, artifacts: results[key].artifacts })}\n`)
         break
       }
@@ -1683,7 +1693,7 @@ async function parentMode() {
           process.stdout.write(`${resultPrefix}${JSON.stringify({ state: 'collected', case: key, artifacts: result.artifacts })}\n`)
         } catch (error) {
           failed = true
-          results[key] = { error: error && error.stack ? error.stack : String(error), artifacts: error.artifacts || null }
+          results[key] = { error: error && error.stack ? error.stack : String(error), artifacts: error.artifacts || null, temporaryHome: error.temporaryHome || null }
           process.stdout.write(`${resultPrefix}${JSON.stringify({ state: 'failed', case: key, error: results[key].error, artifacts: results[key].artifacts })}\n`)
           break
         }
