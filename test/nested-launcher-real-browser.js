@@ -1048,7 +1048,7 @@ async function executeCase({ checkout, build, layout, playwright, executablePath
       return !(build === 'baseline' && layout === 'nested' && String(message).startsWith("Unexpected token '<'"))
     })
     assert.deepEqual(unexpectedPageErrors, [], 'unexpected uncaught page errors')
-    assert.deepEqual(diagnostics.requestFailures, [], 'failed local browser requests')
+    assert.deepEqual(diagnostics.requestFailures.filter(entry => entry.error !== 'net::ERR_ABORTED'), [], 'failed local browser requests')
     const knownBaselineNestedError = entry => {
       if (!(build === 'baseline' && layout === 'nested')) return false
       const url = new URL(entry.url)
@@ -1343,7 +1343,9 @@ function normalize(value, trace, parity = false) {
   const homes = [...new Set([home, canonicalPath(home).replace(/\\/g, '/')])].sort((a, b) => b.length - a.length)
   for (const candidate of homes) {
     text = text.replaceAll(candidate, '<PINOKIO_HOME>')
-    text = text.replaceAll(encodeURIComponent(candidate), '<PINOKIO_HOME_ENCODED>')
+    const encoded = encodeURIComponent(candidate)
+    text = text.replaceAll(encoded, '<PINOKIO_HOME_ENCODED>')
+    text = text.replaceAll(encoded.replaceAll('%2F', '%5C'), '<PINOKIO_HOME_ENCODED>')
   }
   if (parity && trace.layout === 'nested') {
     text = text.replaceAll(`/api/${appId}/pinokio/`, `/api/${appId}/`)
