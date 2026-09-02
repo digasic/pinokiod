@@ -762,7 +762,8 @@ async function exerciseRun({ page, baseUrl, home, build, layout, stub, artifacts
     }
   }
 
-  trace.status = (await browserRequest(page, `/apps/status/${appId}`))
+  trace.status = await waitForBrowserRequest(page, `/apps/status/${appId}`, response => response.json && response.json.state === 'starting')
+  assert.equal(trace.status.json && trace.status.json.state, 'starting', 'opening the app did not start its default script')
   trace.status = { status: trace.status.status, value: stableStatus(trace.status.json) }
   const expectedStart = trace.status.value && trace.status.value.start_script ? trace.status.value.start_script : `${prefix}start.js`
   trace.autolaunch = await browserRequest(page, `/autolaunch/candidates?app=${encodeURIComponent(appId)}`)
