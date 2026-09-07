@@ -57,6 +57,10 @@ function createTranslator(locale) {
   return t
 }
 
+function escapeRegExp(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 function buildPhrasePairs(locale) {
   const code = normalizeLocale(locale)
   if (code === 'en') return []
@@ -66,13 +70,40 @@ function buildPhrasePairs(locale) {
     .sort((a, b) => b[0].length - a[0].length)
 }
 
+function normalizeUiText(s) {
+  return String(s)
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/\\\\/g, '\\')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+/**
+ * Exact-match only (after trim + light normalization).
+ * Substring replacement of short/mid keys corrupts longer English copy
+ * ("Home Server" inside banners, "home" inside placeholders, etc.).
+ */
 function translateText(text, pairs) {
   if (!text || !pairs.length) return text
-  let out = text
+  const m = String(text).match(/^(\s*)([\s\S]*?)(\s*)$/)
+  if (!m) return text
+  const lead = m[1]
+  const core = m[2]
+  const trail = m[3]
+  if (!core) return text
+
+  const normCore = normalizeUiText(core)
   for (const [en, ru] of pairs) {
-    if (out.includes(en)) out = out.split(en).join(ru)
+    if (core === en || normCore === normalizeUiText(en)) {
+      return lead + ru + trail
+    }
   }
-  return out
+  return text
 }
 
 function translateHtml(html, locale) {
@@ -89,29 +120,24 @@ function translateHtml(html, locale) {
     return `\u0000I18N${i}\u0000`
   }
 
-  // Do not touch scripts / styles / pre / code
   let work = html
     .replace(/<script\b[\s\S]*?<\/script>/gi, stash)
     .replace(/<style\b[\s\S]*?<\/style>/gi, stash)
     .replace(/<pre\b[\s\S]*?<\/pre>/gi, stash)
     .replace(/<code\b[\s\S]*?<\/code>/gi, stash)
 
-  // Attribute values users see
   work = work.replace(
     /\b(aria-label|title|placeholder|alt|data-tippy-content)=("|&quot;)([^"&]*?)\2/gi,
     (full, attr, quote, value) => `${attr}=${quote}${translateText(value, pairs)}${quote}`
   )
 
-  // Text nodes between tags
   work = work.replace(/(>)([^<]+)(<)/g, (full, open, text, close) => {
     if (!/[A-Za-z]/.test(text)) return full
     return open + translateText(text, pairs) + close
   })
 
-  // Restore stashed blocks
   work = work.replace(/\u0000I18N(\d+)\u0000/g, (_, i) => stubs[Number(i)])
 
-  // Inject client dictionary before </body> once
   if (/<\/body>/i.test(work) && !work.includes('data-pinokio-i18n="1"')) {
     const payload = JSON.stringify({
       locale: code,
@@ -166,6 +192,7 @@ module.exports = {
   detectSystemLocale,
   createTranslator,
   translateHtml,
+  translateText,
   wrapRender,
   catalogs,
 }

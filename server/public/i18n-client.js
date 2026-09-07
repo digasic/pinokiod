@@ -8,13 +8,30 @@
     .filter(([en, ru]) => en && ru && en !== ru)
     .sort((a, b) => b[0].length - a[0].length)
 
+  const normalizeUiText = (s) => String(s)
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/\\\\/g, '\\')
+    .replace(/\s+/g, ' ')
+    .trim()
+
   const translate = (text) => {
     if (!text || typeof text !== 'string') return text
-    let out = text
+    const m = text.match(/^(\s*)([\s\S]*?)(\s*)$/)
+    if (!m) return text
+    const lead = m[1]
+    const core = m[2]
+    const trail = m[3]
+    if (!core) return text
+    const normCore = normalizeUiText(core)
     for (const [en, ru] of pairs) {
-      if (out.includes(en)) out = out.split(en).join(ru)
+      if (core === en || normCore === normalizeUiText(en)) return lead + ru + trail
     }
-    return out
+    return text
   }
 
   const ATTRS = ['aria-label', 'title', 'placeholder', 'alt', 'data-tippy-content']
@@ -72,7 +89,6 @@
   })
   mo.observe(document.documentElement, { childList: true, subtree: true })
 
-  // Tippy / dynamic title helpers
   const origSetAttribute = Element.prototype.setAttribute
   Element.prototype.setAttribute = function (name, value) {
     if (ATTRS.includes(String(name).toLowerCase()) && typeof value === 'string') {

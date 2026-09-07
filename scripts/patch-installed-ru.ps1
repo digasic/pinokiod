@@ -33,10 +33,19 @@ Write-Host 'Extract asar...'
 $Target = Join-Path $Extracted 'node_modules\pinokiod'
 if (-not (Test-Path $Target)) { throw "pinokiod missing in asar" }
 
-Copy-Item -Recurse -Force (Join-Path $Fork 'server\i18n') (Join-Path $Target 'server\i18n')
+# Remove destinations first — Copy-Item -Recurse won't reliably overwrite nested trees on Windows
+$i18nDst = Join-Path $Target 'server\i18n'
+if (Test-Path $i18nDst) { Remove-Item -Recurse -Force $i18nDst }
+Copy-Item -Recurse -Force (Join-Path $Fork 'server\i18n') $i18nDst
 Copy-Item -Force (Join-Path $Fork 'server\public\i18n-client.js') (Join-Path $Target 'server\public\i18n-client.js')
 Copy-Item -Force (Join-Path $Fork 'server\index.js') (Join-Path $Target 'server\index.js')
 Copy-Item -Force (Join-Path $Fork 'server\views\settings.ejs') (Join-Path $Target 'server\views\settings.ejs')
+
+# Sanity: safe translator must be present
+$i18nJs = Get-Content -Raw (Join-Path $i18nDst 'index.js')
+if ($i18nJs -notmatch 'normalizeUiText|Exact-match only|en\.length < 10') {
+  throw 'Patched i18n/index.js is stale (missing safe translator)'
+}
 
 $UnpackedPublic = Join-Path $Install 'resources\app.asar.unpacked\node_modules\pinokiod\server\public'
 New-Item -ItemType Directory -Force -Path $UnpackedPublic | Out-Null
