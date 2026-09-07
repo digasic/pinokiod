@@ -12,7 +12,7 @@
 | Где | Значение |
 |-----|----------|
 | Splash / `pinokio/package.json` | `8.2.0` (= upstream) |
-| GitHub Release tag | `v8.2.0-RU.v5` |
+| GitHub Release tag | `v8.2.0-RU.v6` |
 | Следующие digasic-сборки | `v8.2.0-RU.v6`, … |
 
 Релиз (Setup / Portable): https://github.com/digasic/pinokio/releases
@@ -68,7 +68,7 @@ Substring-replace запрещён. Фразы с `<code>`/`<a>` — фрагм�
 
 ### Рекомендуется: digasic Setup
 
-- `Pinokio-RU-Setup.exe` — установщик (NSIS, AUMID)
+- `Pinokio-RU-Setup.exe` — установщик (NSIS)
 - `Pinokio-RU-Portable.exe` — portable
 
 Сборка:
@@ -103,7 +103,7 @@ npx electron .
 | `desktop` | окно Electron |
 | `background` | tray (`minimal.js`), UI в браузере |
 
-На Windows background: без toast Notification и без auto-`openExternal` (иначе OpenWith при кривом AUMID).
+Background/tray — как upstream (toast + auto-open UI в браузере). Форк не урезает этот путь.
 
 ---
 
