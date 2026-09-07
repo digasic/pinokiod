@@ -5328,8 +5328,9 @@ class Server {
     this.mode = this.kernel.store.get("mode") || "desktop"
     // Locale (sunbora/digasic fork): en | ru
     const storedLocale = this.kernel.store.get("locale")
+    // digasic RU fork: default to Russian when unset (override via Settings / PINOKIO_LOCALE)
     this.locale = i18n.normalizeLocale(
-      storedLocale || process.env.PINOKIO_LOCALE || i18n.detectSystemLocale()
+      storedLocale || process.env.PINOKIO_LOCALE || "ru"
     )
     if (!storedLocale) {
       this.kernel.store.set("locale", this.locale)
