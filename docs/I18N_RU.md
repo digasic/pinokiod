@@ -1,186 +1,122 @@
 # Russian UI localization (I18N)
 
-Документация форка **digasic/pinokiod**: перевод интерфейса Pinokio на русский.
+Форк **digasic/pinokiod**: русский UI Pinokio.
 
-Связанный shell: [digasic/pinokio](https://github.com/digasic/pinokio).  
-Upstream: [pinokiocomputer/pinokiod](https://github.com/pinokiocomputer/pinokiod) · [issue #1034](https://github.com/pinokiocomputer/pinokio/issues/1034).
+- Shell: [digasic/pinokio](https://github.com/digasic/pinokio)
+- Upstream: [pinokiocomputer/pinokiod](https://github.com/pinokiocomputer/pinokiod) · [issue #1034](https://github.com/pinokiocomputer/pinokio/issues/1034)
 
 ---
 
-## 1. Цель и границы
+## Версии
+
+| Где | Значение |
+|-----|----------|
+| Splash / `pinokio/package.json` | `8.2.0` (= upstream) |
+| GitHub Release tag | `v8.2.0+RU.v5` |
+| Следующие digasic-сборки | `v8.2.0+RU.v6`, … |
+
+Релиз (Setup / Portable): https://github.com/digasic/pinokio/releases
+
+---
+
+## Границы перевода
 
 | Переводим | Не переводим |
 |-----------|----------------|
-| Chrome UI: сайдбар, Settings, Tools, Plugins, Skills, Logs, Vault, модалки | README/описания установленных приложений из git |
-| Статусы, подсказки, empty states | Имена брендов (Claude, VS Code, …) |
-| Динамические счётчики (`N ready…`) | Имена пакетов conda/npm |
+| Chrome UI: сайдбар, Settings, Tools, Plugins, Skills, Logs, Vault, модалки | README установленных приложений |
+| Статусы, подсказки, empty states | Бренды (Claude, VS Code, …) |
+| Динамические счётчики | Имена пакетов conda/npm |
 
 ---
 
-## 2. Файлы
+## Файлы
 
 ```
-server/i18n/index.js              # движок
+server/i18n/index.js
 server/i18n/locales/en.json
-server/i18n/locales/ru.json       # основной каталог
-server/public/i18n-client.js      # DOM после JS
-server/views/settings.ejs         # Language select + object options
-server/index.js                   # locale в syncConfig/setConfig + configArray ×2
-scripts/patch-installed-ru.ps1    # патч Windows installer
-test/i18n-*.js                    # smoke
+server/i18n/locales/ru.json
+server/public/i18n-client.js
+server/views/settings.ejs
+server/index.js                   # locale в syncConfig + configArray ×2
+scripts/patch-installed-ru.ps1
+test/i18n-*.js
 ```
 
 ---
 
-## 3. Выбор языка
+## Язык
 
-Приоритет:
-
-1. `store` / `%USERPROFILE%\.pinokio\config.json` → `"locale": "ru"|"en"`
-2. Settings → **Language** / **Язык** (пишет в store)
+1. `%USERPROFILE%\.pinokio\config.json` → `"locale": "ru"|"en"`
+2. Settings → **Язык** → **Сохранить**
 3. `PINOKIO_LOCALE`
-4. Системная локаль при первом запуске
+4. Системная локаль (первый запуск)
 
-Переключатель: **Настройки → Общие → Язык** (между theme и mode) → **Сохранить**.
+Оба `configArray` в `server/index.js` должны содержать `locale`.
 
-> Оба `configArray` в `server/index.js` должны содержать `locale`. Живой `/home?mode=settings` идёт по **home-route** (второй массив).
-
-### Осторожно с config.json
-
-Не делайте `ConvertTo-Json` всего конфига «с нуля» в PowerShell — можно стереть `"home"` → blue screen `paths[0] must be string`. Меняйте `locale` через UI или Node merge с сохранением остальных ключей.
+Не делайте `ConvertTo-Json` всего config в PowerShell — можно стереть `"home"`.
 
 ---
 
-## 4. Движок перевода
+## Движок
 
-### Сервер (`wrapRender`)
-
-После `res.render` HTML проходит `translateHtml(html, locale)`:
-
-1. Stash: `script`, `style`, `pre`, `code`, `a`, `b|strong`
-2. Перевод атрибутов `aria-label|title|placeholder|alt|…`
-3. Перевод text-nodes между `>` и `<`
-4. Unstash
-5. Inject `window.__PINOKIO_I18N__` + `/i18n-client.js`
-
-### Exact-match
-
-Ключ каталога = **целая** EN-фраза (после trim / лёгкой нормализации entity/whitespace).  
-Substring-replace запрещён (ломал слова).
-
-Фразы с `<code>`/`<a>` в середине режутся stash’ем → в каталог кладут **фрагменты** слева/справа от stub.
-
-### Динамика (`translateDynamic`)
-
-Примеры:
-
-- `N valid, M invalid.`
-- `N ready, M need install.`
-- `N updates needed` / `N checks`
-- `N checks total. M items need attention.`
-- `of N bundles ready`
-- `Includes …`
-- `Host (This Machine)`
-
-Клиент `i18n-client.js` дублирует ту же логику + `MutationObserver` для модалок/JS.
+После `res.render`: stash `script|style|pre|code|a|b` → exact-match EN→RU → unstash → inject `i18n-client.js`.  
+Substring-replace запрещён. Фразы с `<code>`/`<a>` — фрагментами. Динамика — `translateDynamic`.
 
 ---
 
-## 5. Установка для пользователя (Windows)
+## Windows
 
-### Готовый релиз (рекомендуется)
+### Рекомендуется: digasic Setup
 
-Скачайте установщик или portable с GitHub Releases:
+- `Pinokio-RU-Setup.exe` — установщик (NSIS, AUMID)
+- `Pinokio-RU-Portable.exe` — portable
 
-**https://github.com/digasic/pinokio/releases/tag/v8.2.0-ru.1**
-
-- `Pinokio Setup 8.2.0-ru.1.exe` — установщик  
-- `Pinokio 8.2.0-ru.1.exe` — portable  
-
-По умолчанию `locale=ru` (если в config ещё нет ключа). SmartScreen может предупредить — сборка без code-signing.
-
-### A. Патч установленного Pinokio (официальный installer)
+Сборка:
 
 ```powershell
-git clone https://github.com/digasic/pinokiod.git
-git clone https://github.com/digasic/pinokio.git
-cd pinokio
-npm install --ignore-scripts
-
-powershell -ExecutionPolicy Bypass -File ..\pinokiod\scripts\patch-installed-ru.ps1
+powershell -ExecutionPolicy Bypass -File pinokio\scripts\dist-win-ru.ps1
+powershell -ExecutionPolicy Bypass -File pinokio\scripts\install-unpacked-ru.ps1
 ```
 
-Скрипт:
+Release-сборка: **не** `npm install --ignore-scripts` (нужны native rebuild).
 
-- бэкапит `app.asar`;
-- копирует `server/i18n`, `i18n-client.js`, `settings.ejs`, `server/index.js` из форка;
-- выставляет `locale=ru` **без потери** `home` (Node merge);
-- кладёт client в `app.asar.unpacked/.../public` при необходимости.
-
-После апдейта Pinokio — повторить патч.
-
-### B. Source run
+### Патч официального Pinokio
 
 ```powershell
-cd pinokiod && npm install --ignore-scripts
-cd ..\pinokio && npm install --ignore-scripts
+powershell -ExecutionPolicy Bypass -File pinokiod\scripts\patch-installed-ru.ps1
+```
+
+### Source run
+
+```powershell
+cd pinokiod && npm install
+cd ..\pinokio && npm install
 npx electron .
 ```
 
-Node **20 LTS** предпочтителен.
-
 ---
 
-## 6. Mode: desktop vs background
+## Mode
 
 | Значение | Смысл |
 |----------|--------|
-| `desktop` | Окно Electron, иконка в **taskbar** |
-| `background` | `minimal.js`: **system tray**, UI в браузере |
+| `desktop` | окно Electron |
+| `background` | tray (`minimal.js`), UI в браузере |
 
-Это не «minimize to tray» при открытом окне — полный режим оболочки.
-
----
-
-## 7. Как допереводить
-
-1. Найти EN на экране (или `node` HTTP probe вкладки).
-2. Добавить `"English phrase": "Русская фраза"` в `locales/ru.json`.
-3. Если текст рвётся `<code>` — добавить левый/правый фрагменты.
-4. Если `N something` — расширить `translateDynamic` (+ client).
-5. Прогнать тесты / patch / Ctrl+F5.
-
-```powershell
-node test/i18n-basic.test.js
-node test/i18n-sidebar-smoke.test.js
-```
+На Windows background: без toast Notification и без auto-`openExternal` (иначе OpenWith при кривом AUMID).
 
 ---
 
-## 8. Синхронизация с upstream
+## Чеклист релиза
 
-```powershell
-git fetch upstream
-git merge upstream/main   # или rebase
-# проверить needles: require('./i18n'), configArray locale ×2, settings.ejs object options
-```
-
-При version skew asar ≠ fork: не подменяйте весь `index.js` вслепую — лучше surgical inject + sync только `i18n/`.
+- [ ] `ru.json` chrome ≥1500 ключей; locale в обоих `configArray`
+- [ ] `version` shell = `8.2.0`; tag = `v8.2.0+RU.vN`
+- [ ] `afterPack`: icon, `assets/*`, `conpty.node`, `better_sqlite3.node`
+- [ ] Setup через NSIS; smoke RU + нет sqlite/conpty errors
+- [ ] push digasic/pinokiod + digasic/pinokio; один актуальный GitHub Release
 
 ---
 
-## 9. Чеклист релиза форка
+## Лицензия
 
-- [ ] `ru.json` актуален (≥1500 ключей chrome)
-- [ ] locale в **обоих** settings `configArray`
-- [ ] `settings.ejs` поддерживает `c.label` и object options
-- [ ] `patch-installed-ru.ps1` не затирает `home`
-- [ ] тесты i18n зелёные
-- [ ] README + этот файл обновлены
-- [ ] push `digasic/pinokiod` (+ shell `digasic/pinokio` при изменении dep)
-
----
-
-## 10. Лицензия
-
-Наследует upstream pinokiod. Форк digasic — локализация; вклад в upstream welcome.
+Как upstream pinokiod. Форк digasic — локализация.
