@@ -26,6 +26,7 @@ const axios = require('axios')
 const crypto = require('crypto')
 const system = require('systeminformation')
 const serveIndex = require('./serveIndex')
+const i18n = require('./i18n')
 const registerFileRoutes = require('./routes/files')
 const registerAppRoutes = require('./routes/apps')
 const registerConnectRoutes = require('./routes/connect')
@@ -3250,6 +3251,7 @@ class Server {
       const hasHome = !!this.kernel.homedir
       let configArray = [{
         key: "home",
+        label: "home",
         val: this.kernel.homedir,
         placeholder: "Enter the absolute path to use as your Pinokio home folder (D:\\pinokio, /Users/alice/pinokiofs, etc.)"
 //      }, {
@@ -3258,10 +3260,20 @@ class Server {
 //        placeholder: "Pinokio virtual drives folder"
       }, {
         key: "theme",
+        label: "theme",
         val: this.theme,
         options: ["light", "dark"]
       }, {
+        key: "locale",
+        label: "Language",
+        val: this.locale || "en",
+        options: [
+          { value: "en", label: "English" },
+          { value: "ru", label: "Русский" }
+        ]
+      }, {
         key: "mode",
+        label: "mode",
         val: this.mode,
         options: ["desktop", "background"]
       }, {
@@ -5314,6 +5326,15 @@ class Server {
     // 1. THEME
     this.theme = this.kernel.store.get("theme") || "light"
     this.mode = this.kernel.store.get("mode") || "desktop"
+    // Locale (sunbora/digasic fork): en | ru
+    const storedLocale = this.kernel.store.get("locale")
+    this.locale = i18n.normalizeLocale(
+      storedLocale || process.env.PINOKIO_LOCALE || i18n.detectSystemLocale()
+    )
+    if (!storedLocale) {
+      this.kernel.store.set("locale", this.locale)
+    }
+    this.t = i18n.createTranslator(this.locale)
 
     // when loaded in electron but in minimal mode,
     // the app is loaded in the web so the agent should be "web"
@@ -5422,9 +5443,11 @@ class Server {
     let home = this.kernel.store.get("home") || process.env.PINOKIO_HOME
     let theme = this.kernel.store.get("theme")
     let mode = this.kernel.store.get("mode")
+    let locale = this.kernel.store.get("locale")
 //    let drive = this.kernel.store.get("drive")
 
     let theme_changed = false
+    let locale_changed = false
 
     // 1. Handle THEME
     if (config.theme) {
@@ -5433,6 +5456,16 @@ class Server {
       }
       this.kernel.store.set("theme", config.theme)
       //this.theme = config.theme
+    }
+    // 1b. Handle LOCALE
+    if (config.locale) {
+      const nextLocale = i18n.normalizeLocale(config.locale)
+      if (nextLocale !== i18n.normalizeLocale(locale || this.locale || "en")) {
+        locale_changed = true
+      }
+      this.kernel.store.set("locale", nextLocale)
+      this.locale = nextLocale
+      this.t = i18n.createTranslator(nextLocale)
     }
     // 2. Handle HOME
     if (config.home) {
@@ -5571,11 +5604,11 @@ class Server {
     this.kernel.store.set("HTTPS_PROXY", config.HTTPS_PROXY)
     this.kernel.store.set("NO_PROXY", config.NO_PROXY)
 
-    if (theme_changed) {
+    if (theme_changed || locale_changed) {
       await this.syncConfig()
       if (this.onrefresh) {
         try {
-          this.onrefresh({ theme: this.theme, colors: this.colors })
+          this.onrefresh({ theme: this.theme, colors: this.colors, locale: this.locale })
         } catch (err) {
           console.error('[Pinokiod] onrefresh error', err)
         }
@@ -5588,6 +5621,8 @@ class Server {
         text: "Please restart the app"
       }
     }
+
+    // locale applied in-process; client reloads via existing /restart path
   }
   async startLogging(homedir) {
     if (!this.debug) {
@@ -6704,10 +6739,16 @@ class Server {
     this.started = false
     this.app = express();
     this.app.use((req, res, next) => {
+      const locale = i18n.normalizeLocale(
+        (req.query && req.query.lang) || this.locale || "en"
+      )
       res.locals.vaultEnabled = !!(this.kernel.vault && this.kernel.vault.enabled)
       res.locals.vaultAutomaticSupported = !!(
         this.kernel.vault && this.kernel.vault.automaticScans &&
         this.kernel.vault.automaticScans.supported)
+      res.locals.locale = locale
+      res.locals.t = i18n.createTranslator(locale)
+      i18n.wrapRender(res, locale)
       next()
     })
     this.app.use(cors({

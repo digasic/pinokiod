@@ -1087,14 +1087,16 @@ document.addEventListener('DOMContentLoaded', function() {
         <form class='settings-form'>
           <% config.forEach((c) => { %>
             <div class='item settings-item <%=c.show_on_click ? "hidden" : ""%>' <%=c.show_on_click ? "data-onclick=" + c.show_on_click : ""%>>
-              <label><%=c.key%></label>
+              <label><%=c.label || c.key%></label>
               <% if (c.options) { %>
                 <select name="<%=c.key%>">
                   <% c.options.forEach((o) => { %>
-                    <% if (o === c.val) { %>
-                      <option value="<%=o%>" selected><%=o%></option>
+                    <% const optValue = (o && typeof o === 'object') ? o.value : o %>
+                    <% const optLabel = (o && typeof o === 'object') ? (o.label || o.value) : o %>
+                    <% if (optValue === c.val) { %>
+                      <option value="<%=optValue%>" selected><%=optLabel%></option>
                     <% } else { %>
-                      <option value="<%=o%>"><%=o%></option>
+                      <option value="<%=optValue%>"><%=optLabel%></option>
                     <% } %>
                   <% }) %>
                 </select>
