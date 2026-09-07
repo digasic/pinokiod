@@ -83,19 +83,112 @@ function normalizeUiText(s) {
     .trim()
 }
 
+const STUB_TOKEN = '\u0000I18N'
+
+/** Dynamic UI counters / patterned chrome that cannot be exact-keyed. */
+function translateDynamic(core) {
+  let m
+
+  m = core.match(/^(\d+) valid, (\d+) invalid\.$/)
+  if (m) return `${m[1]} корректных, ${m[2]} некорректных.`
+  m = core.match(/^(\d+) valid, (\d+) invalid$/)
+  if (m) return `${m[1]} корректных, ${m[2]} некорректных`
+
+  m = core.match(/^(\d+) ready, (\d+) need install\.$/)
+  if (m) return `${m[1]} готовы, ${m[2]} требуют установки.`
+  m = core.match(/^(\d+) ready, (\d+) need install$/)
+  if (m) return `${m[1]} готовы, ${m[2]} требуют установки`
+
+  m = core.match(/^(\d+) update needed$/)
+  if (m) return `${m[1]} обновление нужно`
+  m = core.match(/^(\d+) updates needed$/)
+  if (m) return `${m[1]} обновлений нужно`
+
+  m = core.match(/^(\d+) checks$/)
+  if (m) return `${m[1]} проверок`
+
+  m = core.match(/^(\d+) checks total\. (\d+) item needs attention\.$/)
+  if (m) return `${m[1]} проверок всего. ${m[2]} пункт требует внимания.`
+  m = core.match(/^(\d+) checks total\. (\d+) items need attention\.$/)
+  if (m) return `${m[1]} проверок всего. ${m[2]} пунктов требуют внимания.`
+
+  m = core.match(/^(\d+) update is needed before Pinokio can continue\.$/)
+  if (m) return `${m[1]} обновление нужно прежде чем Pinokio сможет продолжить.`
+  m = core.match(/^(\d+) updates are needed before Pinokio can continue\.$/)
+  if (m) return `${m[1]} обновления нужны прежде чем Pinokio сможет продолжить.`
+
+  m = core.match(/^(\d+) folders checked$/)
+  if (m) return `${m[1]} папок проверено`
+  m = core.match(/^(\d+) identical files$/)
+  if (m) return `${m[1]} одинаковых файлов`
+  m = core.match(/^(\d+) files here$/)
+  if (m) return `${m[1]} файлов здесь`
+  m = core.match(/^(\d+) locations selected$/)
+  if (m) return `${m[1]} расположений выбрано`
+  m = core.match(/^(\d+) files\/sec$/)
+  if (m) return `${m[1]} файлов/с`
+  m = core.match(/^(\d+) selected inside$/)
+  if (m) return `${m[1]} выбрано внутри`
+  m = core.match(/^Add (\d+) locations$/)
+  if (m) return `Добавить ${m[1]} расположений`
+
+  m = core.match(/^of (\d+) bundles ready$/)
+  if (m) return `из ${m[1]} наборов готовы`
+  m = core.match(/^(\d+) of (\d+) bundles ready$/)
+  if (m) return `${m[1]} из ${m[2]} наборов готовы`
+
+  m = core.match(/^Add a package through (.+)\.$/)
+  if (m) return `Добавить пакет через ${m[1]}.`
+
+  m = core.match(/^Includes (.+)$/)
+  if (m) return `Включает ${m[1]}`
+
+  m = core.match(/^(.+) \(This Machine\)$/)
+  if (m) return `${m[1]} (этот компьютер)`
+  m = core.match(/^(.+) \(Peer\)$/)
+  if (m) return `${m[1]} (пир)`
+
+  m = core.match(/^(\d+) startup enabled$/)
+  if (m) return `${m[1]} автозапусков включено`
+  m = core.match(/^(\d+) apps$/)
+  if (m) return `${m[1]} приложений`
+
+  m = core.match(/^Query:\s*(.*?)\s+Results:\s*(\d+)\s*$/i)
+  if (m) {
+    const q = m[1] === '(empty)' ? '(пусто)' : m[1]
+    return `Запрос: ${q} Результаты: ${m[2]}`
+  }
+
+  return null
+}
+
 /**
  * Exact-match only (after trim + light normalization).
  * Substring replacement of short/mid keys corrupts longer English copy
  * ("Home Server" inside banners, "home" inside placeholders, etc.).
+ *
+ * Text may contain \u0000I18Nn\u0000 stubs (stashed <code>/<pre>/...).
+ * Those are split so surrounding fragments can still exact-match.
  */
 function translateText(text, pairs) {
   if (!text || !pairs.length) return text
-  const m = String(text).match(/^(\s*)([\s\S]*?)(\s*)$/)
+  const raw = String(text)
+  if (raw.includes(STUB_TOKEN)) {
+    return raw
+      .split(/(\u0000I18N\d+\u0000)/)
+      .map((part) => (/^\u0000I18N\d+\u0000$/.test(part) ? part : translateText(part, pairs)))
+      .join('')
+  }
+
+  const m = raw.match(/^(\s*)([\s\S]*?)(\s*)$/)
   if (!m) return text
   const lead = m[1]
   const core = m[2]
   const trail = m[3]
   if (!core) return text
+
+  const dyn = translateDynamic(core)
+  if (dyn != null) return lead + dyn + trail
 
   const normCore = normalizeUiText(core)
   for (const [en, ru] of pairs) {
@@ -125,6 +218,9 @@ function translateHtml(html, locale) {
     .replace(/<style\b[\s\S]*?<\/style>/gi, stash)
     .replace(/<pre\b[\s\S]*?<\/pre>/gi, stash)
     .replace(/<code\b[\s\S]*?<\/code>/gi, stash)
+    // keep link/bold targets intact while translating surrounding chrome
+    .replace(/<a\b[\s\S]*?<\/a>/gi, stash)
+    .replace(/<(?:b|strong)\b[\s\S]*?<\/(?:b|strong)>/gi, stash)
 
   work = work.replace(
     /\b(aria-label|title|placeholder|alt|data-tippy-content)=("|&quot;)([^"&]*?)\2/gi,

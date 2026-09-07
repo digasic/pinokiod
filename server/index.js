@@ -10743,10 +10743,20 @@ class Server {
 //          placeholder: "Pinokio virtual drives folder"
         }, {
           key: "theme",
+          label: "theme",
           val: this.theme,
           options: ["light", "dark"]
         }, {
+          key: "locale",
+          label: "Language",
+          val: this.locale || "en",
+          options: [
+            { value: "en", label: "English" },
+            { value: "ru", label: "Русский" }
+          ]
+        }, {
           key: "mode",
+          label: "mode",
           val: this.mode,
           options: ["desktop", "background"]
         }, {
