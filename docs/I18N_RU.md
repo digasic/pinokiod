@@ -88,7 +88,18 @@ Substring-replace запрещён (ломал слова).
 
 ## 5. Установка для пользователя (Windows)
 
-### A. Патч установленного Pinokio
+### Готовый релиз (рекомендуется)
+
+Скачайте установщик или portable с GitHub Releases:
+
+**https://github.com/digasic/pinokio/releases/tag/v8.2.0-ru.1**
+
+- `Pinokio Setup 8.2.0-ru.1.exe` — установщик  
+- `Pinokio 8.2.0-ru.1.exe` — portable  
+
+По умолчанию `locale=ru` (если в config ещё нет ключа). SmartScreen может предупредить — сборка без code-signing.
+
+### A. Патч установленного Pinokio (официальный installer)
 
 ```powershell
 git clone https://github.com/digasic/pinokiod.git
