@@ -12,8 +12,8 @@
 | Где | Значение |
 |-----|----------|
 | Splash / `pinokio/package.json` | `8.2.0` (= upstream) |
-| GitHub Release tag | `v8.2.0+RU.v5` |
-| Следующие digasic-сборки | `v8.2.0+RU.v6`, … |
+| GitHub Release tag | `v8.2.0-RU.v5` |
+| Следующие digasic-сборки | `v8.2.0-RU.v6`, … |
 
 Релиз (Setup / Portable): https://github.com/digasic/pinokio/releases
 
@@ -110,7 +110,7 @@ npx electron .
 ## Чеклист релиза
 
 - [ ] `ru.json` chrome ≥1500 ключей; locale в обоих `configArray`
-- [ ] `version` shell = `8.2.0`; tag = `v8.2.0+RU.vN`
+- [ ] `version` shell = `8.2.0`; tag = `v8.2.0-RU.vN`
 - [ ] `afterPack`: icon, `assets/*`, `conpty.node`, `better_sqlite3.node`
 - [ ] Setup через NSIS; smoke RU + нет sqlite/conpty errors
 - [ ] push digasic/pinokiod + digasic/pinokio; один актуальный GitHub Release
